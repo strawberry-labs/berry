@@ -334,6 +334,57 @@ describe("Google Drive shared-drive scope", () => {
     expect(result).toMatchObject({ nextPageToken: "page-2", omittedIneligibleCount: 1 });
   });
 
+  describe("continuing a page found by the shared-drive retry", () => {
+    const listing = (url: URL) => ({
+      corpora: url.searchParams.get("corpora"),
+      q: url.searchParams.get("q"),
+      orderBy: url.searchParams.get("orderBy"),
+      pageSize: url.searchParams.get("pageSize"),
+      pageToken: url.searchParams.get("pageToken"),
+    });
+
+    it.each(["drive_search_files", "drive_list_recent_files", "drive_list_children"])("lets %s accept the returned searchScope", (name) => {
+      const definition = googleToolCatalog("google-workspace", "read", [DRIVE_READ]).find((tool) => tool.name === name)!;
+      expect(definition.inputSchema.additionalProperties).toBe(false);
+      expect(definition.inputSchema.properties).toHaveProperty("searchScope");
+    });
+
+    it("keeps recent files in the same corpus, order and page size on the next page", async () => {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(json({ files: [] }))
+        .mockResolvedValueOnce(json({ files: [file("shared-1")], nextPageToken: "shared-page-2" }))
+        .mockResolvedValueOnce(json({ files: [file("shared-2")] }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      const first = await run("drive_list_recent_files", { pageSize: 1 }) as { searchScope: string; nextPageToken: string };
+      expect(first).toMatchObject({ files: [{ id: "shared-1" }], searchScope: "allDrives", nextPageToken: "shared-page-2" });
+      await expect(run("drive_list_recent_files", { pageSize: 1, pageToken: first.nextPageToken, searchScope: first.searchScope }))
+        .resolves.toMatchObject({ files: [{ id: "shared-2" }], searchScope: "allDrives" });
+
+      const [, retried, next] = requested(fetchMock).map(listing);
+      expect(next).toEqual({ ...retried, pageToken: "shared-page-2" });
+      expect(next).toMatchObject({ corpora: "allDrives", q: "trashed = false", orderBy: "modifiedTime desc", pageSize: "1" });
+    });
+
+    it("keeps a My Drive folder listing in the same corpus on the next page", async () => {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(json({ id: "folder-1" }))
+        .mockResolvedValueOnce(json({ files: [] }))
+        .mockResolvedValueOnce(json({ files: [file("child-1")], nextPageToken: "children-2" }))
+        .mockResolvedValueOnce(json({ id: "folder-1" }))
+        .mockResolvedValueOnce(json({ files: [file("child-2")] }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      const first = await run("drive_list_children", { folderId: "folder-1", pageSize: 2 }) as { searchScope: string; nextPageToken: string };
+      expect(first).toMatchObject({ searchScope: "allDrives", nextPageToken: "children-2" });
+      await run("drive_list_children", { folderId: "folder-1", pageSize: 2, pageToken: first.nextPageToken, searchScope: first.searchScope });
+
+      const listings = requested(fetchMock).filter((url) => url.pathname.endsWith("/files")).map(listing);
+      expect(listings.map((entry) => entry.corpora)).toEqual(["user", "allDrives", "allDrives"]);
+      expect(listings[2]).toEqual({ ...listings[1], pageToken: "children-2" });
+    });
+  });
+
   it("searches only the named shared drive when a drive ID is given", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(json({ files: [] }));
     vi.stubGlobal("fetch", fetchMock);

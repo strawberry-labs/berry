@@ -27,6 +27,7 @@ import {
 } from "./sandbox-continuity.js";
 import { DurableTurnRetryableError, type DurableTurnSnapshot, type DurableTurnStep, type TurnToolResult } from "./turn-runner.js";
 import type { SqlExecutor } from "./sql-repositories.js";
+import { classifyToolFailure } from "./tool-failures.js";
 
 async function testPng(seed: number): Promise<Buffer> {
   return sharp({ create: { width: 2, height: 1, channels: 3, background: { r: seed, g: 40, b: 70 } } }).png().toBuffer();
@@ -165,10 +166,143 @@ describe("partial output publication (H-014)", () => {
     current.sandboxProvider = "e2b";
     current.sandboxState = "running";
     current.steps = [{ ...toolStep("bash", { command: "make files" }), state: "completed" }];
-    return { manager, repository, objects, current };
+    return { manager, repository, objects, current, provider };
   };
   const failures = (results: readonly TurnToolResult[]) => results.filter((result) => (result.output as { publication?: string }).publication === "failed");
   const receipts = (results: readonly TurnToolResult[]) => results.filter((result) => (result.output as { artifact?: unknown }).artifact);
+  const receiptNames = (results: readonly TurnToolResult[]) => receipts(results).map((result) => (result.output as { artifact: { name: string } }).artifact.name);
+
+  describe("with a draft image in the run (H-065)", () => {
+    // create_image purpose=draft keeps its base under drafts/, unpublished.
+    const draftImage = (path = "/workspace/drafts/background.png") => ({
+      ...toolStep("create_image", { prompt: "a working background", purpose: "draft" }),
+      id: `draft-${path}`,
+      state: "completed" as const,
+      output: { text: "Generated a draft image", visionPath: path, draft: { path, width: 2, height: 1, mimeType: "image/png" } },
+    });
+
+    it("publishes the final output and keeps the draft private", async () => {
+      const { manager, objects, current } = publication({ "/workspace/outputs/final.txt": "final deliverable" });
+      current.steps = [...current.steps, draftImage()];
+
+      const results = await manager.finalize(current);
+      expect(failures(results)).toEqual([]);
+      expect(receiptNames(results)).toEqual(["final.txt"]);
+      expect(objects.putArtifact).toHaveBeenCalledTimes(1);
+      expect(objects.putArtifact.mock.calls.map(([key]) => key).join(" ")).not.toContain("drafts");
+    });
+
+    it("reports nothing when the run made only a draft", async () => {
+      const { manager, objects, current } = publication({});
+      current.steps = [...current.steps, draftImage()];
+
+      expect(await manager.finalize(current)).toEqual([]);
+      expect(objects.putArtifact).not.toHaveBeenCalled();
+    });
+
+    it("does not upload a final that persist_artifact already published", async () => {
+      const { manager, objects, current } = publication({ "/workspace/outputs/final.png": "composited" });
+      current.steps = [...current.steps, draftImage(), {
+        ...toolStep("persist_artifact", { path: "outputs/final.png" }),
+        id: "persist-final",
+        state: "completed",
+        output: { artifact: { kind: "file", fileId: "file-final", name: "final.png" } },
+      }];
+
+      expect(await manager.finalize(current)).toEqual([]);
+      expect(objects.putArtifact).not.toHaveBeenCalled();
+    });
+
+    it("keeps the other receipts when one upload fails, and the failure stays repairable", async () => {
+      const { manager, current } = publication(
+        { "/workspace/outputs/a.txt": "alpha", "/workspace/outputs/b.txt": "bravo", "/workspace/outputs/c.txt": "charlie" },
+        { upload: async (key) => { if (key.endsWith("/b.txt")) throw new Error("access denied by storage policy"); return { bucket: "berry", key, etag: "etag" }; } },
+      );
+      current.steps = [...current.steps, draftImage()];
+
+      const results = await manager.finalize(current);
+      expect(receiptNames(results)).toEqual(["a.txt", "c.txt"]);
+      expect(failures(results)).toEqual([expect.objectContaining({
+        output: expect.objectContaining({ path: "/workspace/outputs/b.txt", reason: expect.stringContaining("access denied") }),
+      })]);
+      // The runner gives the model a repair turn only for failures without this flag (H-014).
+      expect((failures(results)[0]?.output as { workspaceUnavailable?: boolean }).workspaceUnavailable).toBeUndefined();
+    });
+
+    it("publishes once when finalization runs again", async () => {
+      const sha = (value: string) => createHash("sha256").update(Buffer.from(value)).digest("hex");
+      const first = publication({ "/workspace/outputs/final.txt": "final deliverable" });
+      first.current.steps = [...first.current.steps, draftImage()];
+      expect(receiptNames(await first.manager.finalize(first.current))).toEqual(["final.txt"]);
+
+      const again = publication({ "/workspace/outputs/final.txt": "final deliverable" }, { published: [{ sourcePath: "/workspace/outputs/final.txt", sha256: sha("final deliverable") }] });
+      again.current.steps = [...again.current.steps, draftImage()];
+      expect(await again.manager.finalize(again.current)).toEqual([]);
+      expect(again.objects.putArtifact).not.toHaveBeenCalled();
+    });
+  });
+
+  it("does not let a malformed earlier receipt stop valid files from publishing", async () => {
+    const { manager, current } = publication({ "/workspace/outputs/report.txt": "report" });
+    current.steps = [...current.steps, {
+      ...toolStep("persist_artifact", { path: "../outside/legacy.txt" }),
+      id: "legacy-persist",
+      state: "completed",
+      output: { artifact: { kind: "file", fileId: "file-legacy", name: "legacy.txt" } },
+    }];
+
+    const results = await manager.finalize(current);
+    expect(failures(results)).toEqual([]);
+    expect(receiptNames(results)).toEqual(["report.txt"]);
+  });
+
+  it("does not describe a local publication error as an unreachable workspace", async () => {
+    const { manager, repository, current } = publication({ "/workspace/outputs/report.txt": "report" });
+    repository.publishedOutputs.mockRejectedValueOnce(new Error("Published output metadata is malformed"));
+
+    const [failure, ...rest] = await manager.finalize(current);
+    expect(rest).toEqual([]);
+    expect(failure?.output).toMatchObject({ publication: "failed", reason: expect.stringContaining("Published output metadata is malformed") });
+    expect(String((failure?.output as { reason: string }).reason)).not.toContain("could not be reached");
+    expect((failure?.output as { workspaceUnavailable?: boolean }).workspaceUnavailable).toBeUndefined();
+  });
+
+  // Only the sandbox can make the workspace unreachable. A database or object
+  // storage failure leaves the files repairable, so the runner still offers
+  // its publication repair turn (H-014).
+  it.each(["database", "object storage"])("keeps a reachable workspace repairable when %s fails, and the next scan publishes once", async (layer) => {
+    let uploads = 0;
+    const fixture = publication({ "/workspace/outputs/report.txt": "finished report" }, layer === "object storage" ? {
+      upload: async (key) => {
+        uploads += 1;
+        // The bounded retry fails too.
+        if (uploads <= 2) throw new Error("503 Service Unavailable");
+        return { bucket: "berry", key, etag: "etag" };
+      },
+    } : {});
+    if (layer === "database") fixture.repository.publishedOutputs.mockRejectedValueOnce(new Error("read ECONNRESET"));
+
+    const first = await fixture.manager.finalize(fixture.current);
+    expect(failures(first)).toHaveLength(1);
+    expect((failures(first)[0]?.output as { workspaceUnavailable?: boolean }).workspaceUnavailable).toBeUndefined();
+    expect(String((failures(first)[0]?.output as { reason: string }).reason)).not.toContain("could not be reached");
+
+    const second = await fixture.manager.finalize(fixture.current);
+    expect(receiptNames(second)).toEqual(["report.txt"]);
+    // Every attempt wrote the same object.
+    expect(new Set(fixture.objects.putArtifact.mock.calls.map(([key]) => key)).size).toBe(1);
+  });
+
+  it.each([
+    ["listing outputs", "list", "connect ETIMEDOUT 10.0.0.1:443"],
+    ["reading a file", "read", "502: The sandbox is probably not running anymore"],
+  ] as const)("still reports an unreachable workspace when %s fails", async (_label, operation, message) => {
+    const fixture = publication({ "/workspace/outputs/report.txt": "finished report" });
+    (fixture.provider.files[operation] as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error(message));
+
+    const results = await fixture.manager.finalize(fixture.current);
+    expect(failures(results)).toEqual([expect.objectContaining({ output: expect.objectContaining({ workspaceUnavailable: true }) })]);
+  });
 
   it("keeps the first file's receipt when the second upload fails", async () => {
     const { manager, repository, current } = publication(
@@ -1483,6 +1617,85 @@ describe("SandboxContinuityManager", () => {
     await expect(manager.execute(snapshot(), toolStep("bash", {
       command: "grep never missing.txt",
     }))).rejects.toThrow("Command produced no output.\n\nCommand exited with code 2");
+  });
+
+  // A shell command that was sent may have run, and an earlier part of it
+  // (a POST) may have taken effect, whatever failed later (H-003).
+  describe("a shell failure after the command was sent", () => {
+    const post = "curl -X POST https://records.example.test/create -d title=TenderA";
+    const failure = async (exec: unknown, command = post) => {
+      const current = snapshot();
+      current.runtimeRequest = { networkPolicy: { egress: "on", allowedDomains: ["records.example.test"] } } as DurableTurnSnapshot["runtimeRequest"];
+      const manager = managerWithProvider({ read: vi.fn(), write: vi.fn(), list: vi.fn() }, exec);
+      return manager.execute(current, toolStep("bash", { command })).then(
+        () => { throw new Error("The command was expected to fail"); },
+        (error: unknown) => error,
+      );
+    };
+
+    it("keeps the exit status when a network hint replaces the output", async () => {
+      const error = await failure(async function* () {
+        yield { kind: "stdout", data: "create" };
+        yield { kind: "stderr", data: "curl: (35) LibreSSL SSL_connect: SSL_ERROR_SYSCALL in connection to blocked.example.test:443" };
+        yield { kind: "exit", exit_code: 35, signal: null };
+      }, `${post} && curl https://blocked.example.test/notify`);
+
+      expect((error as Error).message).toMatch(/^Network access to blocked\.example\.test is blocked by this task's sandbox policy\.[\s\S]*\n\nCommand exited with code 35$/);
+      expect(classifyToolFailure(error, { changesState: true }).outcome).toBe("unknown");
+    });
+
+    it.each([
+      ["an error event", async function* () {
+        yield { kind: "stdout", data: "create" };
+        yield { kind: "error", message: "invalid schema in post-processing" };
+      }],
+      ["a stream that broke", async function* () {
+        yield { kind: "stdout", data: "create" };
+        throw new Error("invalid response from the sandbox");
+      }],
+    ])("treats %s as a command that may have run", async (_label, exec) => {
+      const error = await failure(exec);
+
+      expect(error).toMatchObject({ toolCallPhase: "dispatched" });
+      expect(classifyToolFailure(error, { changesState: true }).outcome).toBe("unknown");
+    });
+
+    it("still tells failures from before the command was sent apart", async () => {
+      // Arguments refused (H-011).
+      const exec = vi.fn();
+      const refused = await failure(exec, "");
+      expect((refused as Error).message).toContain("bash was not run");
+      expect(classifyToolFailure(refused, { changesState: true }).outcome).toBe("not_applied");
+      expect(exec).not.toHaveBeenCalled();
+
+      // A workspace that could not be reached (H-009).
+      const provider = {
+        kind: "e2b",
+        create: vi.fn(),
+        resume: vi.fn(async () => { throw new Error("connect ETIMEDOUT 10.0.0.1:443"); }),
+        exec: vi.fn(),
+        files: { read: vi.fn(), write: vi.fn(), list: vi.fn() },
+      } as unknown as SandboxProvider;
+      const repository = {
+        loadRun: vi.fn(),
+        continuity: vi.fn(async () => null),
+        latest: vi.fn(async () => null),
+        inputFiles: vi.fn(async () => []),
+        persistOutput: vi.fn(),
+        persist: vi.fn(),
+        recordSandbox: vi.fn(async () => undefined),
+        recordTiming: vi.fn(async () => undefined),
+      } satisfies SandboxSnapshotRepository;
+      const current = snapshot();
+      current.sandboxId = "sandbox-existing";
+      current.sandboxProvider = "e2b";
+      current.sandboxState = "running";
+      const manager = new SandboxContinuityManager(provider, repository, null, { image: "berry-sandbox", resumeRetryDelayMs: 1 });
+      const unreachable = await manager.execute(current, toolStep("bash", { command: post })).catch((error: unknown) => error);
+      expect((unreachable as Error).message).toContain("Nothing was run");
+      expect(classifyToolFailure(unreachable, { changesState: true }).outcome).toBe("not_applied");
+      expect(provider.exec).not.toHaveBeenCalled();
+    });
   });
 
   it("rejects malformed raw tool wrappers with an actionable error", async () => {
@@ -2820,24 +3033,26 @@ describe("SandboxContinuityManager", () => {
       const paths = (steps: DurableTurnStep[]) => steps.map((step) => String((step.output as { visionPath: string }).visionPath));
 
       // Each request extends the previous one: images already sent stay where they were.
-      expect(exposedSandboxImages({ steps: first })).toEqual({ selected: paths(first), withheld: [] });
+      expect(exposedSandboxImages({ steps: first })).toEqual({ selected: paths(first), withheld: [], attachments: [] });
       expect(exposedSandboxImages({ steps: [...first, modelCall(4), ...second] }))
-        .toEqual({ selected: paths([...first, ...second]), withheld: [] });
+        .toEqual({ selected: paths([...first, ...second]), withheld: [], attachments: [] });
       // The next batch does not fit, so the earlier block is dropped as a whole once.
       expect(exposedSandboxImages({ steps: [...first, modelCall(4), ...second, modelCall(7), third] }))
-        .toEqual({ selected: paths([third]), withheld: [] });
+        .toEqual({ selected: paths([third]), withheld: [], attachments: [] });
     });
 
-    it("gives sandbox images only the slots attachments leave free", () => {
+    it("keeps the newest images of a batch larger than the window and discloses the rest", () => {
       const batch = [1, 2, 3].map((page) => completedRead(`/workspace/pages/page-${page}.png`, page));
 
       expect(exposedSandboxImages({ steps: batch }, 2)).toEqual({
         selected: ["/workspace/pages/page-2.png", "/workspace/pages/page-3.png"],
         withheld: ["/workspace/pages/page-1.png"],
+        attachments: [],
       });
       expect(exposedSandboxImages({ steps: batch }, 0)).toEqual({
         selected: [],
         withheld: batch.map((step) => String((step.output as { visionPath: string }).visionPath)),
+        attachments: [],
       });
     });
 
@@ -2963,6 +3178,162 @@ describe("SandboxContinuityManager", () => {
       "reference-version-7",
       undefined,
     );
+  });
+
+  describe("attachments and images read later in the turn", () => {
+    const fileId = (index: number) => `00000000-0000-7000-8000-${String(100 + index).padStart(12, "0")}`;
+    const attachmentPath = (index: number) => `/workspace/inputs/${fileId(index)}/reference-${index}.png`;
+    const crop = "/workspace/outputs/cropped-detail.png";
+    const modelCall = (sequence: number) => ({
+      ...toolStep("unused", {}),
+      id: `00000000-0000-7000-8000-${String(400 + sequence).padStart(12, "0")}`,
+      sequence,
+      type: "model.call",
+      state: "completed",
+    }) as DurableTurnStep;
+    const completedRead = (path: string, sequence: number): DurableTurnStep => ({
+      ...toolStep("read", { path }),
+      id: `00000000-0000-7000-8000-${String(500 + sequence).padStart(12, "0")}`,
+      sequence,
+      state: "completed",
+      output: { path, binary: true, mediaType: "image/png", visionPath: path },
+    });
+    const setup = async (attachmentCount: number, oversized: ReadonlySet<number> = new Set()) => {
+      const attached = await testPng(1);
+      const generated = await testPng(2);
+      const read = vi.fn(async (input: { path: string }) => ({ path: input.path, content: generated.toString("base64"), size_bytes: generated.length, mtime: null }));
+      const provider = {
+        kind: "e2b",
+        create: vi.fn(),
+        resume: vi.fn(async () => ({ sandbox_id: "existing", provider: "e2b", status: "running" })),
+        exec: async function* () { yield { kind: "exit", exit_code: 0, signal: null }; },
+        files: { read, write: vi.fn(), list: vi.fn(async (input: { path: string }) => ({ path: input.path, entries: [] })) },
+      } as unknown as SandboxProvider;
+      const repository = {
+        loadRun: vi.fn(), continuity: vi.fn(async () => null), latest: vi.fn(async () => null),
+        inputFiles: vi.fn(async () => Array.from({ length: attachmentCount }, (_, index) => ({
+          fileId: fileId(index + 1), name: `reference-${index + 1}.png`, mediaType: "image/png",
+          sizeBytes: oversized.has(index + 1) ? MODEL_IMAGE_LIMITS.maxSourceBytes + 1 : attached.length, objectKey: `reference-${index + 1}`,
+        }))),
+        persistOutput: vi.fn(), persist: vi.fn(), recordSandbox: vi.fn(),
+      } satisfies SandboxSnapshotRepository;
+      const objects = {
+        put: vi.fn(), putArtifact: vi.fn(), get: vi.fn(), getSource: vi.fn(async () => attached),
+        streamSource: vi.fn(async function* (key: string) {
+          yield oversized.has(Number(/reference-(\d+)/.exec(key)?.[1])) ? new Uint8Array(MODEL_IMAGE_LIMITS.maxSourceBytes + 1) : attached;
+        }),
+      } satisfies SandboxSnapshotObjectStore;
+      const manager = new SandboxContinuityManager(provider, repository, objects, { image: "berry" });
+      const current = (steps: DurableTurnStep[]) => {
+        const value = snapshot();
+        value.sandboxId = "existing";
+        value.sandboxProvider = "e2b";
+        value.sandboxState = "running";
+        value.steps = steps;
+        return value;
+      };
+      // The image each label names, as the model receives it.
+      const shown = (content: readonly { type: string; text?: string; image_url?: { url: string } }[]) => content.flatMap((part, index) => {
+        const next = content[index + 1];
+        const match = part.type === "text" ? /^Workspace image ("[^"]+")/.exec(part.text ?? "") : null;
+        return match && next?.type === "image_url" ? [{ path: JSON.parse(match[1]!) as string, url: next.image_url!.url }] : [];
+      });
+      const notices = (content: readonly { type: string; text?: string }[]) =>
+        content.flatMap((part) => part.type === "text" && part.text?.startsWith("[Image not sent:") ? [part.text] : []);
+      return { manager, current, read, objects, shown, notices, attached, generated };
+    };
+
+    it("sends a newly read image to the model when five attachments filled the window, and keeps sending it", async () => {
+      const { manager, current, read, objects, shown, notices, generated } = await setup(5);
+      const before = await manager.modelContent(current([]));
+      expect(shown(before).map((image) => image.path)).toEqual([1, 2, 3, 4, 5].map(attachmentPath));
+
+      const steps = [modelCall(1), completedRead(crop, 2)];
+      const first = await manager.modelContent(current(steps));
+      expect(shown(first)).toEqual([{ path: crop, url: `data:image/png;base64,${generated.toString("base64")}` }]);
+      expect(read.mock.calls.map(([input]) => input.path)).toEqual([crop]);
+      // The attachments gave up their slots; each one says so and how to see it again.
+      expect(notices(first)).toHaveLength(5);
+      for (const [index, notice] of notices(first).entries()) {
+        expect(notice).toContain(JSON.stringify(attachmentPath(index + 1)));
+        expect(notice).toContain("newer images took its place");
+        expect(notice).not.toContain("Do not repeat read");
+      }
+      expect(objects.getSource).toHaveBeenCalledTimes(5);
+
+      // A reread of the same image keeps its pixels in the request.
+      const reread = await manager.modelContent(current([...steps, modelCall(3), completedRead(crop, 4)]));
+      expect(shown(reread).map((image) => image.path)).toEqual([crop]);
+      // The attachments do not come back on later calls, so the request only grows.
+      const later = await manager.modelContent(current([...steps, modelCall(3), completedRead(crop, 4), modelCall(5)]));
+      expect(shown(later).map((image) => image.path)).toEqual([crop]);
+      expect(objects.getSource).toHaveBeenCalledTimes(5);
+    });
+
+    it("shows an attachment again when the model reads its path after it gave up its slot", async () => {
+      const { manager, current, read, shown, notices } = await setup(5);
+      const content = await manager.modelContent(current([modelCall(1), completedRead(crop, 2), modelCall(3), completedRead(attachmentPath(2), 4)]));
+
+      expect(shown(content).map((image) => image.path)).toEqual([crop, attachmentPath(2)]);
+      expect(read.mock.calls.map(([input]) => input.path)).toEqual([crop, attachmentPath(2)]);
+      expect(notices(content).map((notice) => notice.includes(JSON.stringify(attachmentPath(2))))).not.toContain(true);
+      expect(notices(content)).toHaveLength(4);
+    });
+
+    it("keeps attachments in place while later images still fit beside them", async () => {
+      const { manager, current, read, shown, notices } = await setup(3);
+      const content = await manager.modelContent(current([modelCall(1), completedRead(crop, 2)]));
+
+      expect(shown(content).map((image) => image.path)).toEqual([...[1, 2, 3].map(attachmentPath), crop]);
+      expect(read.mock.calls.map(([input]) => input.path)).toEqual([crop]);
+      expect(notices(content)).toEqual([]);
+    });
+
+    it("does not move a shown attachment when the model reads it again", async () => {
+      const { manager, current, read, shown } = await setup(5);
+      const content = await manager.modelContent(current([modelCall(1), completedRead(attachmentPath(1), 2)]));
+
+      expect(shown(content).map((image) => image.path)).toEqual([1, 2, 3, 4, 5].map(attachmentPath));
+      expect(read).not.toHaveBeenCalled();
+    });
+
+    it("does not give up attachment slots for an attachment that cannot be shown", async () => {
+      const { manager, current, read, shown, notices } = await setup(6, new Set([6]));
+      const content = await manager.modelContent(current([modelCall(1), completedRead(attachmentPath(6), 2)]));
+
+      expect(shown(content).map((image) => image.path)).toEqual([1, 2, 3, 4, 5].map(attachmentPath));
+      expect(read).not.toHaveBeenCalled();
+      expect(notices(content)).toEqual([expect.stringContaining("exceeds the 20 MiB image inspection limit")]);
+    });
+
+    it("says when an attachment beyond the first five is not shown, and shows it when read", async () => {
+      const { manager, current, shown, notices } = await setup(6);
+      const before = await manager.modelContent(current([]));
+      expect(shown(before).map((image) => image.path)).toEqual([1, 2, 3, 4, 5].map(attachmentPath));
+      expect(notices(before)).toEqual([expect.stringContaining(JSON.stringify(attachmentPath(6)))]);
+
+      const content = await manager.modelContent(current([modelCall(1), completedRead(attachmentPath(6), 2)]));
+      expect(shown(content).map((image) => image.path)).toEqual([attachmentPath(6)]);
+      expect(notices(content)).toHaveLength(5);
+      expect(notices(content).join("\n")).not.toContain(JSON.stringify(attachmentPath(6)));
+    });
+
+    it("selects whole batches and lets attachments yield only once", () => {
+      const attachments = [1, 2, 3].map(attachmentPath);
+      const first = [completedRead("/workspace/pages/a-1.png", 2), completedRead("/workspace/pages/a-2.png", 3)];
+      const second = completedRead("/workspace/pages/b-1.png", 5);
+      const third = completedRead("/workspace/pages/c-1.png", 7);
+
+      expect(exposedSandboxImages({ steps: [modelCall(1), ...first] }, 5, attachments))
+        .toEqual({ selected: ["/workspace/pages/a-1.png", "/workspace/pages/a-2.png"], withheld: [], attachments });
+      // The next batch does not fit beside the attachments: they yield, and
+      // the earlier batch keeps its place.
+      expect(exposedSandboxImages({ steps: [modelCall(1), ...first, modelCall(4), second] }, 5, attachments))
+        .toEqual({ selected: ["/workspace/pages/a-1.png", "/workspace/pages/a-2.png", "/workspace/pages/b-1.png"], withheld: [], attachments: [] });
+      // Later batches never bring them back, even when the window has room.
+      expect(exposedSandboxImages({ steps: [modelCall(1), ...first, modelCall(4), second, modelCall(6), third] }, 5, attachments).attachments)
+        .toEqual([]);
+    });
   });
 
   it("publishes completed output files into durable task storage", async () => {
@@ -3530,6 +3901,93 @@ describe("SandboxContinuityManager", () => {
       origin: "image_generation",
       sourcePath: "/workspace/outputs/Berry icon.png",
     }));
+  });
+
+  describe("image generation outcome survives delivery errors", () => {
+    it.each([
+      ["workspace", "unknown", 1], ["write", "unknown", 1],
+      ["storage", "unknown", 1], ["database", "unknown", 1],
+      ["download", "unknown", 1], ["pixels", "unknown", 1],
+      ["empty", "unknown", 1], ["json", "unknown", 1],
+      ["response", "unknown", 1], ["dispatch", "unknown", 1],
+      ["http408", "unknown", 1], ["http429", "not_applied", 1],
+      ["http402", "not_applied", 1], ["before-workspace", "not_applied", 0],
+      ["before-arguments", "not_applied", 0],
+    ] as const)("keeps the correct outcome after %s fails", async (stage, outcome, calls) => {
+      const bytes = await testPng(80);
+      let resumes = 0;
+      const provider = {
+        kind: "e2b", supportsResume: true,
+        resume: vi.fn(async () => {
+          resumes += 1;
+          if (stage === "before-workspace" || (stage === "workspace" && resumes > 1)) throw new Error("read ECONNRESET");
+          return { sandbox_id: "sandbox-image", provider: "e2b", status: "running" };
+        }),
+        files: {
+          read: vi.fn(),
+          write: vi.fn(async () => {
+            if (stage === "write") throw Object.assign(new Error("Path not found"), { status: 404 });
+            return { path: "/workspace/outputs/Berry.png", size_bytes: bytes.length, mtime: null };
+          }),
+          list: vi.fn(async (input: { path: string }) => ({ path: input.path, entries: [] })),
+        },
+      } as unknown as SandboxProvider;
+      const repository = {
+        recordSandbox: vi.fn(async () => undefined), recordTiming: vi.fn(async () => undefined),
+        persistOutput: vi.fn(async () => {
+          if (stage === "database") throw Object.assign(new Error("invalid schema"), { status: 422 });
+          return { fileId: "image", name: "Berry.png", mediaType: "image/png", sizeBytes: bytes.length };
+        }),
+      } as unknown as SandboxSnapshotRepository;
+      const objects = {
+        putArtifact: vi.fn(async () => {
+          if (stage === "storage") throw Object.assign(new Error("Invalid credentials"), { status: 401 });
+          return { bucket: "berry", key: "image", etag: "etag" };
+        }),
+      } as unknown as SandboxSnapshotObjectStore;
+      const manager = new SandboxContinuityManager(provider, repository, objects, {
+        image: "berry-sandbox", resumeRetryDelayMs: 0,
+        imageGeneration: {
+          endpoint: "https://images.example.test/generations", editsEndpoint: "https://images.example.test/edits",
+          model: "gpt-image-1", responseFormat: "b64_json",
+        },
+      });
+      const current = snapshot();
+      current.sandboxId = "sandbox-image";
+      current.sandboxProvider = "e2b";
+      current.sandboxState = "running";
+      current.runtimeRequest = { imageGeneration: { version: 1, model: "gpt-image-1" } };
+      let generations = 0;
+      const fetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+        if (init?.method !== "POST") return new Response("Download not found", { status: 404 });
+        generations += 1;
+        if (stage === "dispatch") throw Object.assign(new Error("Invalid response"), { status: 400 });
+        if (stage.startsWith("http")) return new Response("Request refused", { status: Number(stage.slice(4)) });
+        if (stage === "json") return new Response("{invalid", { status: 200 });
+        return new Response(JSON.stringify({
+          data: stage === "response" ? [] : [stage === "download"
+            ? { url: "https://images.example.test/image.png" }
+            : { b64_json: stage === "empty" ? "" : stage === "pixels" ? Buffer.from("invalid pixels").toString("base64") : bytes.toString("base64") }],
+        }), { status: 200 });
+      });
+      vi.stubGlobal("fetch", fetch);
+      try {
+        const error = await manager.execute(current, {
+          ...toolStep("create_image", { prompt: stage === "before-arguments" ? "" : "A berry icon", title: "Berry" }),
+          retryClass: "non_idempotent_manual",
+        }).then(() => null, (error: unknown) => error);
+        expect(error).toBeInstanceOf(Error);
+        expect(generations).toBe(calls);
+        expect(classifyToolFailure(error, { changesState: true }).outcome).toBe(outcome);
+        if (["workspace", "write", "storage", "database", "download", "pixels", "empty", "json", "response"].includes(stage)) {
+          expect(error).toMatchObject({ toolCallPhase: "dispatched", message: expect.stringContaining("could not deliver the image") });
+          expect((error as Error).message).not.toContain("Nothing was run");
+        }
+        if (stage === "http402") expect(classifyToolFailure(error, { changesState: true }).category).toBe("credit_exhausted");
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
   });
 
   describe("generated image metadata comes from the returned bytes (H-041)", () => {

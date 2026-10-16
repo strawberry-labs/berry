@@ -1,6 +1,9 @@
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import * as remoteFetch from "./remote-fetch.ts";
 import {
   McpToolSource,
   mcpServerSpecsFromJson,
@@ -9,6 +12,7 @@ import {
 } from "./mcp.ts";
 
 const fixturePath = join(dirname(fileURLToPath(import.meta.url)), "..", "test", "fixtures", "mcp-echo-server.mjs");
+const recordsFixturePath = join(dirname(fileURLToPath(import.meta.url)), "..", "test", "fixtures", "mcp-records-server.mjs");
 
 function stdioServer(overrides: Partial<McpServerSpec> = {}): McpServerSpec {
   return {
@@ -299,5 +303,88 @@ describe("McpToolSource", () => {
     })] });
 
     expect(source.approvalHints("mcp__Native__write")).toMatchObject({ requiresApproval: true });
+  });
+});
+
+// Whether a failed call reached its server decides whether a change may have
+// happened (H-003): the error says which side of dispatch it came from.
+describe("McpToolSource failure phase", () => {
+  const records = (output: string, writes: string): McpServerSpec => stdioServer({
+    id: "records", name: "records", args: [recordsFixturePath], env: { RECORD_OUTPUT: output, RECORD_WRITES: writes },
+  });
+
+  it.each([
+    ["malformed", /Structured content does not match the tool's output schema/],
+    ["missing", /has an output schema but did not return structured content/],
+  ])("marks a %s structured result, rejected after the tool ran, as dispatched", async (output, message) => {
+    const directory = mkdtempSync(join(tmpdir(), "berry-mcp-records-"));
+    const writes = join(directory, "writes.jsonl");
+    const source = new McpToolSource({ servers: [records(output, writes)] });
+    try {
+      await source.connect();
+      const create = source.listTools().find((tool) => tool.name === "mcp__records__create_record")!;
+      const failure = await create.execute("call_1", { title: "Tender A" } as never, undefined, undefined).then(() => null, (error: unknown) => error);
+
+      expect(failure).toMatchObject({ message: expect.stringMatching(message), toolCallPhase: "dispatched" });
+      expect(readFileSync(writes, "utf8").trim().split("\n")).toEqual([JSON.stringify({ title: "Tender A" })]);
+    } finally {
+      await source.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("marks a tool's own error result as dispatched", async () => {
+    const source = new McpToolSource({ servers: [stdioServer()] });
+    try {
+      await source.connect();
+      const fail = source.listTools().find((tool) => tool.name === "mcp__echo__fail")!;
+      await expect(fail.execute("call_1", {} as never, undefined, undefined)).rejects.toMatchObject({ toolCallPhase: "dispatched" });
+    } finally {
+      await source.close();
+    }
+  });
+
+  it.each([400, 401, 403, 409, 429, 408, 503])("records the provenance of a real SDK transport HTTP %i refusal", async (status) => {
+    const requests: string[] = [];
+    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method !== "POST") return new Response(null, { status: 405 });
+      const request = JSON.parse(String(init.body)) as { id?: number; method: string; params?: { protocolVersion: string } };
+      requests.push(request.method);
+      if (request.method === "tools/call") return new Response("Request refused", { status });
+      if (request.id === undefined) return new Response(null, { status: 202 });
+      const result = request.method === "initialize"
+        ? { protocolVersion: request.params?.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "records", version: "1" } }
+        : { tools: [{ name: "create_record", inputSchema: { type: "object" } }] };
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }), { headers: { "content-type": "application/json" } });
+    });
+    const mocked = vi.spyOn(remoteFetch, "createPublicRemoteFetch").mockReturnValue(fetch);
+    const source = new McpToolSource({ servers: [stdioServer({
+      transport: "streamable-http", command: null, args: [], url: "https://records.example.test/mcp",
+    })] });
+    try {
+      await source.connect();
+      const create = source.listTools().find(tool => tool.name === "mcp__echo__create_record")!;
+      expect(create).toBeDefined();
+      await expect(create.execute("call_1", {} as never, undefined, undefined)).rejects.toMatchObject({
+        code: status, toolCallPhase: status < 500 && status !== 408 ? "rejected" : "dispatched",
+      });
+      expect(requests.filter(method => method === "tools/call")).toHaveLength(1);
+    } finally {
+      await source.close();
+      mocked.mockRestore();
+    }
+  });
+
+  it("marks a server that could not be started as not sent", async () => {
+    const source = new McpToolSource({ servers: [stdioServer({
+      command: join(tmpdir(), "berry-missing-mcp-server"),
+      cachedTools: [{ name: "echo", description: "Echo a message back", inputSchema: { type: "object", properties: { message: { type: "string" } } } }],
+    })] });
+    try {
+      const echo = source.listTools().find((tool) => tool.name === "mcp__echo__echo")!;
+      await expect(echo.execute("call_1", { message: "berry" } as never, undefined, undefined)).rejects.toMatchObject({ toolCallPhase: "not_sent" });
+    } finally {
+      await source.close();
+    }
   });
 });

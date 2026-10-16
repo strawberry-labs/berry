@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   AgentStreamEventSchema,
-  DurableTurnRuntimeRequestSchema,
+  parseAdmittedRuntimeRequest,
   VISION_ADAPTER_MAX_ATTEMPTS,
   VISION_ADAPTER_MAX_OUTPUT_TOKENS,
   type AgentStreamEvent,
@@ -28,13 +28,18 @@ import {
 
 // v4: observations cut off at the output limit are no longer cached, so v3
 // entries of unknown completeness are not reused (they age out) (H-039).
-const VISION_PROMPT_VERSION = "vision-observation-v4";
+// v5: v4 could cache a cut-off answer whose continuation was empty as complete.
+// v6: v5 could cache a first answer a content filter stopped as complete.
+const VISION_PROMPT_VERSION = "vision-observation-v6";
 const DEFAULT_OVERVIEW_QUESTION = "Produce a comprehensive reusable observation of these images.";
 // About half of focused observations reached the old 1,024-token cap, mostly
 // on reasoning models (H-039).
 const FOCUSED_MAX_OUTPUT_TOKENS = 2_048;
 const MAX_OBSERVATION_CHARACTERS = 24_000;
 const OUTPUT_LIMIT_FINISH = /^(?:length|max_tokens|max_output_tokens)$/i;
+// Endings that complete an answer. No reported reason counts as one; any
+// other (a content filter, a refusal) leaves it unfinished.
+const NORMAL_FINISH = /^(?:stop|end_turn|stop_sequence)$/i;
 
 interface VisionAttemptDiagnostic {
   attempt: number;
@@ -118,18 +123,18 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
     // workspace state, including staging current-turn attachments. Text-only
     // models still need those files even though they cannot receive pixels.
     const inherited = await (this.base.modelContent?.(snapshot, signal, reportProgress) ?? []);
-    const runtime = DurableTurnRuntimeRequestSchema.safeParse(snapshot.runtimeRequest);
-    if (!runtime.success || runtime.data.modelAcceptsImages) {
+    const runtime = parseAdmittedRuntimeRequest(snapshot.runtimeRequest);
+    if (!runtime || runtime.modelAcceptsImages) {
       return inherited;
     }
     const nonImageContent = inherited.filter((part) => part.type !== "image_url");
-    const imageCount = inspectableImageCount(snapshot, runtime.data.attachments, runtime.data.workspacePath);
+    const imageCount = inspectableImageCount(snapshot, runtime.attachments, runtime.workspacePath);
     if (imageCount === 0) return nonImageContent;
     return [
       ...nonImageContent,
       {
         type: "text",
-        text: runtime.data.vision
+        text: runtime.vision
           ? `[${imageCount} image${imageCount === 1 ? " is" : "s are"} available through inspect_images. The selected language model has not received the image bytes.]`
           : `[${imageCount} image${imageCount === 1 ? " was" : "s were"} withheld because the selected language model does not accept images and no approved vision adapter is available.]`,
       },
@@ -203,8 +208,8 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
         `Vision inspection already failed and no new image was exposed afterward. Do not retry inspect_images in this turn. Previous error: ${priorFailure}`,
       );
     }
-    const runtime = DurableTurnRuntimeRequestSchema.parse(snapshot.runtimeRequest);
-    if (!runtime.vision) {
+    const runtime = parseAdmittedRuntimeRequest(snapshot.runtimeRequest);
+    if (!runtime?.vision) {
       const reason = capabilityNoticeReason(snapshot, "vision");
       throw new Error(reason ? `Image reading is unavailable for this message: ${reason}` : "Vision inspection was not admitted for this turn");
     }
@@ -268,6 +273,11 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
     const results: ChatCompletionResult[] = [];
     let observation = "";
     let answered = "";
+    // The finish reason that left the answer so far unfinished, if any. One cut
+    // off at the output limit is continued once; one the provider stopped for
+    // another reason, such as a content filter, is not asked for again. Only a
+    // response that ends normally finishes it (H-039).
+    let unfinished: string | null = null;
     const idempotencyKey = step.idempotencyKey ?? `${snapshot.id}:${step.id}`;
     for (let attempt = 1; attempt <= VISION_ADAPTER_MAX_ATTEMPTS; attempt += 1) {
       // An answer cut off at the output limit is continued once in the same
@@ -324,9 +334,18 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
       }
       results.push(result);
       attempts.push(visionAttemptDiagnostic(result, attempt, purpose));
-      answered = purpose === "continuation" ? `${answered}${result.content}` : result.content;
+      const finish = result.finishReason ?? "";
+      const ended = !finish || NORMAL_FINISH.test(finish);
+      if (purpose === "continuation") {
+        answered = `${answered}${result.content}`;
+        if (!ended) unfinished = finish;
+        else if (result.content.trim()) unfinished = null;
+      } else {
+        answered = result.content;
+        unfinished = ended ? null : finish;
+      }
       observation = answered.trim().slice(0, MAX_OBSERVATION_CHARACTERS);
-      if (observation && !OUTPUT_LIMIT_FINISH.test(result.finishReason ?? "")) break;
+      if (unfinished ? !OUTPUT_LIMIT_FINISH.test(unfinished) : observation) break;
     }
     if (!observation) {
       throw new DurableToolExecutionError(
@@ -345,9 +364,9 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
       part.type === "text" && part.text.startsWith("[Image not sent:") ? [part.text] : [],
     ).join("\n").slice(0, 4_000);
     if (omissionNotes) observation = `${omissionNotes}\n\n${observation}`;
-    // An observation cut off at the output limit is partial evidence: report
-    // it as such and never cache it as a reusable answer (H-039).
-    const complete = !OUTPUT_LIMIT_FINISH.test(results.at(-1)?.finishReason ?? "");
+    // An unfinished observation is partial evidence: report it as such and
+    // never cache it as a reusable answer (H-039).
+    const complete = !unfinished;
     if (complete) {
       await this.cache.put({
         tenantId: snapshot.tenantId,
@@ -378,8 +397,9 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
         paths?.length ?? 0,
         complete,
         questionNotSent,
+        unfinished,
       ),
-      summary: `Inspected ${images.length} image${images.length === 1 ? "" : "s"} with ${runtime.vision.model}${complete ? "" : " (incomplete: output limit reached)"}`,
+      summary: `Inspected ${images.length} image${images.length === 1 ? "" : "s"} with ${runtime.vision.model}${!unfinished ? "" : OUTPUT_LIMIT_FINISH.test(unfinished) ? " (incomplete: output limit reached)" : ` (incomplete: stopped early, ${unfinished})`}`,
       usage,
     };
   }
@@ -445,9 +465,14 @@ function visionOutput(
   requestedPathCount = 0,
   complete = true,
   questionNotSent = false,
+  unfinished: string | null = null,
 ): JsonValue {
+  const incomplete = complete ? ""
+    : unfinished && !OUTPUT_LIMIT_FINISH.test(unfinished)
+      ? `\n[Incomplete observation: the vision model stopped its answer early (${unfinished}), so the text above may be only part of it. Do not treat it as a complete check, and tell the user what could not be read.]`
+      : "\n[Incomplete observation: the vision model stopped at its output limit, so the text above may end before the answer does. Do not treat it as a complete check. For anything it does not cover, ask a narrower focused question.]";
   return {
-    content: `<untrusted_vision_observation>\n${observation}\n</untrusted_vision_observation>${complete ? "" : "\n[Incomplete observation: the vision model stopped at its output limit, so the text above may end before the answer does. Do not treat it as a complete check. For anything it does not cover, ask a narrower focused question.]"}${questionNotSent ? "\n[Overview mode returned a general digest; your question was not sent to the vision model. If the digest does not answer it, call inspect_images with mode \"focused\" and the question.]" : ""}`,
+    content: `<untrusted_vision_observation>\n${observation}\n</untrusted_vision_observation>${incomplete}${questionNotSent ? "\n[Overview mode returned a general digest; your question was not sent to the vision model. If the digest does not answer it, call inspect_images with mode \"focused\" and the question.]" : ""}`,
     vision: {
       providerId,
       model,

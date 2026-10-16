@@ -37,7 +37,7 @@ import {
   networkDomainAllowed,
   type NetworkPolicy,
 } from "@berry/shared";
-import { MODEL_IMAGE_LIMITS, describeImageBytes, modelImageLabel, modelImageOmission, prepareModelImage } from "./model-image.js";
+import { MODEL_IMAGE_LIMITS, describeImageBytes, modelImageLabel, modelImageOmission, modelImageWithheld, prepareModelImage } from "./model-image.js";
 import { durableAttachmentPath } from "./durable-attachments.js";
 import { ToolArgumentError, invalidJsonProblem, jsonSyntaxError, notRunMessage } from "./tool-arguments.js";
 import type { SandboxSnapshotJobPayload } from "./jobs.js";
@@ -979,15 +979,26 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const attachedImages = turnInputFiles.filter((file) => file.mediaType.startsWith("image/"));
     const attachedImageIds = new Set(attachedImages.map((file) => file.fileId));
     const explicitPaths = requestedInspectionImagePaths(snapshot, workspaceRoot);
-    // Valid attachments take their slots first and keep them for the run.
-    const attachmentSlots = Math.min(MAX_MODEL_IMAGES, attachedImages.filter((file) =>
-      file.sizeBytes > 0 && file.sizeBytes <= MAX_MODEL_IMAGE_BYTES
-    ).length);
-    const exposed = explicitPaths ? null : exposedSandboxImages(snapshot, MAX_MODEL_IMAGES - attachmentSlots);
+    // Valid attachments are shown first and keep their slots while images
+    // read later fit beside them; then they yield (exposedSandboxImages).
+    const unusableIds = new Set(attachedImages
+      .filter((file) => file.sizeBytes <= 0 || file.sizeBytes > MAX_MODEL_IMAGE_BYTES)
+      .map((file) => file.fileId));
+    const shownAttachments = attachedImages.filter((file) => !unusableIds.has(file.fileId)).slice(0, MAX_MODEL_IMAGES);
+    const exposed = explicitPaths ? null : exposedSandboxImages(
+      snapshot,
+      MAX_MODEL_IMAGES,
+      shownAttachments.map((file) => durableAttachmentPath(file, workspaceRoot)),
+      // An empty or oversized attachment is never shown, so reading it takes no slot.
+      (path) => unusableIds.has(sandboxAttachmentId(path, workspaceRoot) ?? ""),
+    );
+    const attachmentsYielded = exposed !== null && shownAttachments.length > 0 && exposed.attachments.length === 0;
     const requestedSandboxImages = (explicitPaths ?? exposed!.selected)
       .filter((path) => {
         const attachmentId = sandboxAttachmentId(path, workspaceRoot);
-        return !attachmentId || !attachedImageIds.has(attachmentId);
+        if (!attachmentId || !attachedImageIds.has(attachmentId)) return true;
+        // Once the attachments yielded their slots, one read again is shown like any image.
+        return attachmentsYielded && !unusableIds.has(attachmentId);
       });
     const selectedAttachments = explicitPaths
       ? explicitPaths.flatMap((path) => {
@@ -1107,26 +1118,38 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       return parts;
     }
 
-    // Attachments come first: they sit at a fixed place after the turn context
-    // for the whole run, so their slots must not depend on later reads (H-032).
-    // Oversized candidates are skipped so later valid files take their slots.
+    // Attachments come first: they sit at a fixed place after the turn context,
+    // so later reads do not move them (H-032). Oversized candidates are
+    // skipped so later valid files take their slots.
     const attachmentFiles: SandboxInputFile[] = [];
+    const notShown = (path: string) => !requestedSandboxImages.includes(path) && !withheld.includes(path);
     for (const file of selectedAttachments) {
-      if (attachmentFiles.length >= MAX_MODEL_IMAGES) break;
-      if (file.sizeBytes <= 0 || file.sizeBytes > MAX_MODEL_IMAGE_BYTES) {
-        omit(durableAttachmentPath(file, workspaceRoot), "the source is empty or exceeds the 20 MiB image inspection limit");
-        continue;
+      const path = durableAttachmentPath(file, workspaceRoot);
+      if (unusableIds.has(file.fileId)) {
+        omit(path, "the source is empty or exceeds the 20 MiB image inspection limit");
+      } else if (attachmentFiles.length < MAX_MODEL_IMAGES) {
+        attachmentFiles.push(file);
+      } else if (notShown(path)) {
+        parts.push({ type: "text", text: modelImageWithheld(path, `only ${MAX_MODEL_IMAGES} images are sent per request`) });
       }
-      attachmentFiles.push(file);
     }
-    const attachmentSources = await loadAttachmentSources(attachmentFiles);
-    for (const source of attachmentSources) {
-      if (source.bytes) await append(source.path, source.bytes);
-      else omit(source.path, `the attached image could not be loaded (${source.unavailable}), so it has not been seen; ask the user to send it again`);
+    if (attachmentsYielded) {
+      // Images read later in the turn did not fit beside them; the request
+      // changes at this point once, and the model can read them again.
+      for (const file of attachmentFiles) {
+        const path = durableAttachmentPath(file, workspaceRoot);
+        if (notShown(path)) parts.push({ type: "text", text: modelImageWithheld(path, `this attachment was shown earlier in this turn, but only ${MAX_MODEL_IMAGES} images are sent per request and newer images took its place`) });
+      }
+    } else {
+      const attachmentSources = await loadAttachmentSources(attachmentFiles);
+      for (const source of attachmentSources) {
+        if (source.bytes) await append(source.path, source.bytes);
+        else omit(source.path, `the attached image could not be loaded (${source.unavailable}), so it has not been seen; ask the user to send it again`);
+      }
     }
 
     for (const path of withheld) {
-      omit(path, `only ${MAX_MODEL_IMAGES} images are sent per request; read this image again on its own or in a batch of at most ${MAX_MODEL_IMAGES} to inspect it`);
+      parts.push({ type: "text", text: modelImageWithheld(path, `only ${MAX_MODEL_IMAGES} images are sent per request and this batch read more`) });
     }
     const sandboxSources = await loadSandboxSources(requestedSandboxImages);
     for (const source of sandboxSources) {
@@ -1772,7 +1795,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         throw new Error(reason ? `Image generation is unavailable for this message: ${reason}` : "Image generation is not configured for this durable turn");
       }
       const prompt = stringValue(args.prompt);
-      if (!prompt) throw new Error("create_image requires a prompt");
+      if (!prompt) throw new ToolArgumentError(notRunMessage("create_image", "prompt must be a non-empty string"));
       // The stored failure class also covers steps recorded with earlier wording.
       if ((snapshot.steps ?? []).some((candidate) => candidate.state === "failed"
         && (stringValue(candidate.input.toolName) ?? candidate.type.slice(5)) === "create_image"
@@ -1818,93 +1841,97 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         }
         throw error;
       });
-      const first = generated.data[0];
-      if (!first) throw new Error("The image provider returned no image");
-      const bytes = first.b64_json
-        ? Buffer.from(first.b64_json, "base64")
-        : await downloadGeneratedImage(first.url, signal);
-      if (bytes.byteLength === 0) throw new Error("The image provider returned an empty image");
-      // Describe what was returned; never assume it from the request (H-041).
-      const actual = await describeImageBytes(bytes);
-      if (!actual) throw new Error("The image provider returned data that is not a readable PNG, JPEG, WebP or GIF image");
-      // Image generation happens outside the sandbox and may outlive its
-      // provider TTL. Reconnect/resume before the first post-generation
-      // sandbox operation, including turns that created the sandbox earlier
-      // in this execution and have not persisted sandboxId on the snapshot.
-      const writableSandbox = await this.ensureSandbox({
-        ...snapshot,
-        sandboxProvider: sandbox.provider,
-        sandboxId: sandbox.id,
-        sandboxState: sandbox.state,
-      }, signal);
-      const title = safeArtifactName(stringValue(args.title) ?? "Generated image").replace(/\.(png|jpe?g|webp|gif)$/i, "");
-      const name = `${title}.${actual.extension}`;
-      // A draft is a working base for further editing (adding a title, logo or
-      // composite). It stays in the workspace, where snapshots keep it, and is
-      // not published as a finished image (H-065).
-      const draft = args.purpose === "draft";
-      const path = `${workspaceRoot}/${draft ? "drafts" : "outputs"}/${name}`;
-      const writeInput = { sandbox_id: writableSandbox.id, path, content: bytes.toString("base64"), encoding: "base64" } as const;
-      await (signal
-        ? this.provider.files.write(writeInput, { signal })
-        : this.provider.files.write(writeInput));
-      if (draft) {
+      try {
+        const first = generated.data[0];
+        if (!first) throw new Error("The image provider returned no image");
+        const bytes = first.b64_json
+          ? Buffer.from(first.b64_json, "base64")
+          : await downloadGeneratedImage(first.url, signal);
+        if (bytes.byteLength === 0) throw new Error("The image provider returned an empty image");
+        // Describe what was returned; never assume it from the request (H-041).
+        const actual = await describeImageBytes(bytes);
+        if (!actual) throw new Error("The image provider returned data that is not a readable PNG, JPEG, WebP or GIF image");
+        // Image generation happens outside the sandbox and may outlive its
+        // provider TTL. Reconnect/resume before the first post-generation
+        // sandbox operation, including turns that created the sandbox earlier
+        // in this execution and have not persisted sandboxId on the snapshot.
+        const writableSandbox = await this.ensureSandbox({
+          ...snapshot,
+          sandboxProvider: sandbox.provider,
+          sandboxId: sandbox.id,
+          sandboxState: sandbox.state,
+        }, signal);
+        const title = safeArtifactName(stringValue(args.title) ?? "Generated image").replace(/\.(png|jpe?g|webp|gif)$/i, "");
+        const name = `${title}.${actual.extension}`;
+        // A draft is a working base for further editing (adding a title, logo or
+        // composite). It stays in the workspace, where snapshots keep it, and is
+        // not published as a finished image (H-065).
+        const draft = args.purpose === "draft";
+        const path = `${workspaceRoot}/${draft ? "drafts" : "outputs"}/${name}`;
+        const writeInput = { sandbox_id: writableSandbox.id, path, content: bytes.toString("base64"), encoding: "base64" } as const;
+        await (signal
+          ? this.provider.files.write(writeInput, { signal })
+          : this.provider.files.write(writeInput));
+        if (draft) {
+          const shape = `${actual.width}x${actual.height}${exactAspectRatio(actual.width, actual.height)}`;
+          const notes = generatedImageMismatchNotes(args, actual);
+          return {
+            output: {
+              text: `Generated a draft image at ${path} (${shape}). It is not published: finish it, save the final file under ${workspaceRoot}/outputs and publish that with persist_artifact.${notes ? ` ${notes}` : ""}`,
+              visionPath: path,
+              draft: { path, width: actual.width, height: actual.height, mimeType: actual.mediaType },
+            },
+            summary: `Generated draft ${name} (${shape})`,
+            sandbox: writableSandbox,
+          };
+        }
+        if (!this.objects) throw new Error("Artifact object storage is not configured");
+        const sha256 = createHash("sha256").update(bytes).digest("hex");
+        const stored = await this.objects.putArtifact(
+          `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/${step.id}/${sha256}/original/${name}`,
+          bytes,
+          actual.mediaType,
+        );
+        const output = await this.repository.persistOutput({
+          snapshot,
+          fileId: step.id,
+          name,
+          mediaType: actual.mediaType,
+          sizeBytes: bytes.byteLength,
+          sha256,
+          bucket: stored.bucket,
+          objectKey: stored.key,
+          etag: stored.etag,
+          ...(stored.objectVersionId !== undefined ? { objectVersionId: stored.objectVersionId } : {}),
+          origin: "image_generation",
+          sourcePath: path,
+        });
+        const image = {
+          src: `/v1/files/${output.fileId}/content`,
+          downloadUrl: `/v1/files/${output.fileId}/content`,
+          fileId: output.fileId,
+          title,
+          prompt,
+          ...(first.revised_prompt ? { revisedPrompt: first.revised_prompt } : {}),
+          // The shared schema allows five presets; label the one nearest the actual shape.
+          aspectRatio: nearestAspectRatioPreset(actual.width, actual.height),
+          width: actual.width,
+          height: actual.height,
+          mimeType: actual.mediaType,
+          sizeBytes: output.sizeBytes,
+          transparentBackground: args.transparent_background === true && actual.transparent,
+          generationId: step.id,
+        };
         const shape = `${actual.width}x${actual.height}${exactAspectRatio(actual.width, actual.height)}`;
         const notes = generatedImageMismatchNotes(args, actual);
         return {
-          output: {
-            text: `Generated a draft image at ${path} (${shape}). It is not published: finish it, save the final file under ${workspaceRoot}/outputs and publish that with persist_artifact.${notes ? ` ${notes}` : ""}`,
-            visionPath: path,
-            draft: { path, width: actual.width, height: actual.height, mimeType: actual.mediaType },
-          },
-          summary: `Generated draft ${name} (${shape})`,
+          output: { text: `Generated ${name} (${shape}).${notes ? ` ${notes}` : ""}`, image, visionPath: path, artifact: { kind: "file", path: image.src, fileId: output.fileId, name: output.name, mediaType: output.mediaType, size: output.sizeBytes } },
+          summary: `Generated ${name} (${shape})`,
           sandbox: writableSandbox,
         };
+      } catch (error) {
+        throw imageDeliveryFailure(error);
       }
-      if (!this.objects) throw new Error("Artifact object storage is not configured");
-      const sha256 = createHash("sha256").update(bytes).digest("hex");
-      const stored = await this.objects.putArtifact(
-        `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/${step.id}/${sha256}/original/${name}`,
-        bytes,
-        actual.mediaType,
-      );
-      const output = await this.repository.persistOutput({
-        snapshot,
-        fileId: step.id,
-        name,
-        mediaType: actual.mediaType,
-        sizeBytes: bytes.byteLength,
-        sha256,
-        bucket: stored.bucket,
-        objectKey: stored.key,
-        etag: stored.etag,
-        ...(stored.objectVersionId !== undefined ? { objectVersionId: stored.objectVersionId } : {}),
-        origin: "image_generation",
-        sourcePath: path,
-      });
-      const image = {
-        src: `/v1/files/${output.fileId}/content`,
-        downloadUrl: `/v1/files/${output.fileId}/content`,
-        fileId: output.fileId,
-        title,
-        prompt,
-        ...(first.revised_prompt ? { revisedPrompt: first.revised_prompt } : {}),
-        // The shared schema allows five presets; label the one nearest the actual shape.
-        aspectRatio: nearestAspectRatioPreset(actual.width, actual.height),
-        width: actual.width,
-        height: actual.height,
-        mimeType: actual.mediaType,
-        sizeBytes: output.sizeBytes,
-        transparentBackground: args.transparent_background === true && actual.transparent,
-        generationId: step.id,
-      };
-      const shape = `${actual.width}x${actual.height}${exactAspectRatio(actual.width, actual.height)}`;
-      const notes = generatedImageMismatchNotes(args, actual);
-      return {
-        output: { text: `Generated ${name} (${shape}).${notes ? ` ${notes}` : ""}`, image, visionPath: path, artifact: { kind: "file", path: image.src, fileId: output.fileId, name: output.name, mediaType: output.mediaType, size: output.sizeBytes } },
-        summary: `Generated ${name} (${shape})`,
-        sandbox: writableSandbox,
-      };
     }
     if (toolName === "persist_artifact") {
       if (!this.objects) throw new Error("Artifact object storage is not configured");
@@ -1984,29 +2011,37 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       const fullOutputPath = `${workspaceRoot}/.berry-tool-output/bash-${createHash("sha256").update(step.id).digest("hex").slice(0, 16)}.log`;
       const output = new PiTailCollector();
       let exitCode: number | null = null;
-      for await (const event of this.provider.exec({
-        sandbox_id: sandbox.id,
-        request_id: step.idempotencyKey ?? step.id,
-        command: [
-          "bash",
-          "-c",
-          PI_BASH_WRAPPER_SCRIPT,
-          "berry-bash",
-          command,
-          fullOutputPath,
-        ],
-        cwd: workspaceRoot,
-        timeout_ms: requestedTimeoutMs,
-      }, { signal })) {
-        reportProgress?.();
-        if (event.kind === "stdout" || event.kind === "stderr") output.append(event.data);
-        else if (event.kind === "exit") exitCode = event.exit_code;
-        else if (event.kind === "error") throw new Error(event.message);
+      try {
+        for await (const event of this.provider.exec({
+          sandbox_id: sandbox.id,
+          request_id: step.idempotencyKey ?? step.id,
+          command: [
+            "bash",
+            "-c",
+            PI_BASH_WRAPPER_SCRIPT,
+            "berry-bash",
+            command,
+            fullOutputPath,
+          ],
+          cwd: workspaceRoot,
+          timeout_ms: requestedTimeoutMs,
+        }, { signal })) {
+          reportProgress?.();
+          if (event.kind === "stdout" || event.kind === "stderr") output.append(event.data);
+          else if (event.kind === "exit") exitCode = event.exit_code;
+          else if (event.kind === "error") throw new Error(event.message);
+        }
+      } catch (error) {
+        // The command was sent to the sandbox and may have run, whatever the
+        // error says (H-003). Cancellation keeps its own path.
+        throw signal?.aborted ? error : afterToolDispatch(error);
       }
       const truncated = output.result();
       const rawOutput = truncated.content;
       const networkFailure = sandboxNetworkFailureHint(command, networkPolicy(snapshot.runtimeRequest.networkPolicy), exitCode, rawOutput);
-      if (networkFailure) throw new Error(networkFailure);
+      // The command ran: a failure of a later part cannot show that an earlier
+      // part changed nothing, so the hint keeps its exit status (H-003).
+      if (networkFailure) throw new Error(`${networkFailure}\n\nCommand exited with code ${exitCode ?? "unknown"}`);
       const hasMeaningfulOutput = rawOutput.trim().length > 0;
       let text = hasMeaningfulOutput
         ? rawOutput
@@ -2065,11 +2100,23 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   async finalize(snapshot: DurableTurnSnapshot): Promise<readonly TurnToolResult[]> {
     if (!snapshot.sandboxId || !this.objects) return [];
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
+    let reached = false;
     try {
       const sandbox = await this.ensureSandbox(snapshot);
+      reached = true;
       const { published, failed } = await this.finalizeSandboxOutputs(snapshot, sandbox);
       return [...published, ...failed.map(publicationFailureResult)];
     } catch (error) {
+      // Only an unreachable workspace is reported as one. Another failure (a
+      // local check, the database, object storage) leaves the files
+      // repairable, so the model still gets its publication repair turn (H-014).
+      if (reached && !sandboxUnreachable(error) && runMayHaveWrittenFiles(snapshot)) {
+        return [publicationFailureResult({
+          path: `${workspaceRoot}/outputs`,
+          name: "files in outputs/",
+          reason: `publication failed (${errorDetail(error)}); the files stay in the workspace and are published by the next scan`,
+        })];
+      }
       // A run that executed nothing able to write files cannot have produced
       // new outputs, so an unavailable sandbox is skipped quietly (H-009).
       // A run that may have written files reports its outputs as not yet
@@ -2101,11 +2148,11 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     let listed: Awaited<ReturnType<SandboxProvider["files"]["list"]>>;
     try {
-      listed = await this.provider.files.list({
+      listed = await fromSandbox(() => this.provider.files.list({
         sandbox_id: sandbox.id,
         path: `${workspaceRoot}/outputs`,
         recursive: true,
-      });
+      }));
     } catch (error) {
       // The outputs directory is optional. E2B reports an absent directory as
       // FileNotFoundError, while local providers generally surface ENOENT.
@@ -2114,14 +2161,24 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       if (isMissingSandboxPath(error)) return { published: [], failed: [] };
       throw error;
     }
+    // Outputs this run already published. A draft image was never published:
+    // it stays private in drafts/ (H-065). A recorded path that is not a valid
+    // output cannot match a listed file, so it is skipped instead of stopping
+    // every other file from publishing.
     const explicitlyPersisted = new Set(snapshot.steps.flatMap((step) => {
       if (step.state !== "completed") return [];
       const name = stringValue(step.input.toolName) ?? step.type.slice(5);
       if (name !== "persist_artifact" && name !== "create_image") return [];
+      if (name === "create_image" && !objectValue(step.output).artifact) return [];
       const path = name === "persist_artifact"
         ? stringValue(objectValue(step.input.arguments).path)
         : stringValue(objectValue(step.output).visionPath);
-      return path ? [safeOutputPath(path, workspaceRoot)] : [];
+      if (!path) return [];
+      try {
+        return [safeOutputPath(path, workspaceRoot)];
+      } catch {
+        return [];
+      }
     }));
     const previouslyPublished = new Set<string>();
     for (const output of await this.repository.publishedOutputs?.(snapshot.tenantId, snapshot.sessionId) ?? []) {
@@ -2136,20 +2193,25 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const failed: OutputPublicationFailure[] = [];
     for (const entry of listed.entries) {
       if (entry.type !== "file" || explicitlyPersisted.has(entry.path) || !isDurableArtifact(entry.path)) continue;
-      const path = safeOutputPath(entry.path, workspaceRoot);
+      let path: string;
+      try {
+        path = safeOutputPath(entry.path, workspaceRoot);
+      } catch {
+        // A listed path that resolves outside outputs/ is never published.
+        continue;
+      }
       const name = safeArtifactName(path.split("/").at(-1) ?? "artifact");
       try {
         const published = await this.publishOutputFile(snapshot, sandbox, objects, path, name, workspaceRoot, previouslyPublished);
         if (published) results.push(published);
       } catch (error) {
-        const lifecycle = classifySandboxLifecycleFailure(error);
         failed.push({
           path,
           name,
           reason: isMissingSandboxPath(error)
             ? "the file no longer exists at this path"
             : errorDetail(error),
-          ...(lifecycle === "missing" || lifecycle === "transient" ? { workspaceUnavailable: true } : {}),
+          ...(sandboxUnreachable(error) ? { workspaceUnavailable: true } : {}),
         });
       }
     }
@@ -2166,7 +2228,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     workspaceRoot: string,
     previouslyPublished: ReadonlySet<string>,
   ): Promise<TurnToolResult | null> {
-    const source = await this.provider.files.read({ sandbox_id: sandbox.id, path, encoding: "base64" });
+    const source = await fromSandbox(() => this.provider.files.read({ sandbox_id: sandbox.id, path, encoding: "base64" }));
     const bytes = Buffer.from(source.content, "base64");
     if (bytes.byteLength === 0) return null;
     const mediaType = resolveArtifactMediaType({ bytes, sourcePath: path, requestedName: name });
@@ -2991,11 +3053,19 @@ async function sandboxFileEntry(
  * every request and defeated the provider's cache (H-032). `withheld` lists
  * images read since the last model call that do not fit; the model was
  * promised their pixels, so they are disclosed, not dropped.
+ *
+ * This turn's `attachments` are shown first, after the turn context, and
+ * reading one again changes nothing while they are. They keep their slots
+ * while every later batch fits beside them. The first batch that does not fit
+ * makes them yield for the rest of the run, so the request changes there once
+ * and then only grows again; a yielded attachment is read like any image.
  */
 export function exposedSandboxImages(
   snapshot: Pick<DurableTurnSnapshot, "steps">,
   capacity: number = MAX_MODEL_IMAGES,
-): { selected: string[]; withheld: string[] } {
+  attachments: readonly string[] = [],
+  takesNoSlot: (path: string) => boolean = () => false,
+): { selected: string[]; withheld: string[]; attachments: string[] } {
   const modelCalls = snapshot.steps
     .filter((step) => step.type === "model.call" && step.state === "completed")
     .map((step) => step.sequence);
@@ -3005,27 +3075,40 @@ export function exposedSandboxImages(
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName !== "read" && toolName !== "create_image") return [];
     const path = stringValue(objectValue(step.output).visionPath);
-    if (!path || !binaryMediaType(path)?.startsWith("image/")) return [];
+    if (!path || !binaryMediaType(path)?.startsWith("image/") || takesNoSlot(path)) return [];
     return [{ path, batch: batchOf(step.sequence) }];
   });
-  // A re-read moves an image to the batch that read it last.
-  const latest = new Map<string, number>();
-  for (const read of reads) {
-    latest.delete(read.path);
-    latest.set(read.path, read.batch);
-  }
-  const batches = new Map<number, string[]>();
-  for (const [path, batch] of latest) batches.set(batch, [...(batches.get(batch) ?? []), path]);
   const limit = Math.max(0, capacity);
-  let block: string[] = [];
-  for (const paths of [...batches.entries()].sort(([left], [right]) => left - right).map(([, paths]) => paths)) {
-    if (block.length + paths.length > limit) block = [];
-    block.push(...paths);
+  const blockAfter = (candidates: typeof reads, first: readonly string[]) => {
+    // A re-read moves an image to the batch that read it last.
+    const latest = new Map<string, number>();
+    for (const read of candidates) {
+      latest.delete(read.path);
+      latest.set(read.path, read.batch);
+    }
+    const batches = new Map<number, string[]>();
+    for (const [path, batch] of latest) batches.set(batch, [...(batches.get(batch) ?? []), path]);
+    let block = [...first];
+    let restarted = false;
+    for (const paths of [...batches.entries()].sort(([left], [right]) => left - right).map(([, paths]) => paths)) {
+      if (block.length + paths.length > limit) {
+        block = [];
+        restarted = true;
+      }
+      block.push(...paths);
+    }
+    return { block, restarted, current: batches.get(modelCalls.length) ?? [] };
+  };
+  const shown = attachments.slice(0, limit);
+  const attached = new Set(shown);
+  const beside = shown.length > 0 ? blockAfter(reads.filter((read) => !attached.has(read.path)), shown) : null;
+  if (beside && !beside.restarted) {
+    return { selected: beside.block.slice(shown.length), withheld: [], attachments: shown };
   }
+  const { block, current } = blockAfter(reads, []);
   const selected = limit === 0 ? [] : block.slice(-limit);
-  const current = batches.get(modelCalls.length) ?? [];
   const withheld = current.filter((path) => !selected.includes(path));
-  return { selected, withheld };
+  return { selected, withheld, attachments: [] };
 }
 
 function sandboxAttachmentId(path: string, workspaceRoot = "/workspace"): string | null {
@@ -4199,19 +4282,37 @@ async function generateDurableImage(
       ...(input.transparentBackground ? { output_format: "png" } : {}),
     }),
     signal: timeoutSignal(input.signal, DURABLE_IMAGE_REQUEST_TIMEOUT_MS),
-  });
+  }).catch((error: unknown) => { throw afterToolDispatch(error); });
   if (!response.ok) {
-    const body = (await response.text()).slice(0, 2_000);
+    const body = (await response.text().catch((error: unknown) => { throw afterToolDispatch(error); })).slice(0, 2_000);
     // Credit or quota exhaustion is an account problem: say so, so the model
     // stops rewording prompts against it (H-005).
-    if (response.status === 402 || IMAGE_PROVIDER_CREDIT_EXHAUSTED.test(body)) {
-      throw new ImageProviderCreditError(`${IMAGE_PROVIDER_CREDIT_MESSAGE} (HTTP ${response.status}: ${body.slice(0, 300)})`, response.status);
-    }
-    throw new Error(`Image provider request failed with ${response.status}: ${body}`);
+    const error = response.status === 402 || IMAGE_PROVIDER_CREDIT_EXHAUSTED.test(body)
+      ? new ImageProviderCreditError(`${IMAGE_PROVIDER_CREDIT_MESSAGE} (HTTP ${response.status}: ${body.slice(0, 300)})`, response.status)
+      : new Error(`Image provider request failed with ${response.status}: ${body}`);
+    throw Object.assign(error, {
+      status: response.status,
+      toolCallPhase: response.status >= 400 && response.status < 500 && response.status !== 408 ? "rejected" : "dispatched",
+    });
   }
-  const payload = await response.json() as ImageGenerationResult;
-  if (!Array.isArray(payload.data)) throw new Error("Image provider response did not include data");
-  return payload;
+  try {
+    const payload = await response.json() as ImageGenerationResult;
+    if (!Array.isArray(payload?.data)) throw new Error("Image provider response did not include data");
+    return payload;
+  } catch (error) {
+    throw imageDeliveryFailure(error);
+  }
+}
+
+/** A successful generation response must survive errors while delivering its result. */
+function imageDeliveryFailure(error: unknown): unknown {
+  const detail = (error instanceof Error ? error.message : String(error))
+    .replace("Nothing was run and no files were changed; retry this step.", "The workspace step did not run.")
+    .replace("Nothing was run.", "The workspace step did not run.");
+  return afterToolDispatch(new Error(
+    `The image provider accepted generation, but Berry could not deliver the image. Review the existing request before generating again. Delivery error: ${detail}`,
+    { cause: error },
+  ));
 }
 
 /** The latest completed publication of the same file, name and type earlier in this run. */
@@ -4361,6 +4462,41 @@ export interface OutputPublicationFailure {
   reason: string;
   /** The workspace itself could not be reached; the model cannot repair this file now. */
   workspaceUnavailable?: boolean;
+}
+
+// Failures that came from the sandbox itself, as opposed to the database or
+// object storage. Only these can show that the workspace is unreachable.
+const sandboxFailures = new WeakSet<object>();
+
+async function fromSandbox<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (error && typeof error === "object") sandboxFailures.add(error);
+    throw error;
+  }
+}
+
+/**
+ * Marks a failure after a state-changing request was sent. The target may
+ * have acted on it, whatever a later error's wording or status says (H-003).
+ */
+function afterToolDispatch(error: unknown): unknown {
+  if (error && typeof error === "object") {
+    try {
+      Object.defineProperty(error, "toolCallPhase", { value: "dispatched", configurable: true, enumerable: true });
+      return error;
+    } catch {
+      // A frozen error is wrapped below.
+    }
+  }
+  return Object.assign(new Error(error instanceof Error ? error.message : String(error), { cause: error }), { toolCallPhase: "dispatched" });
+}
+
+/** A sandbox operation failed because the sandbox is gone, unreachable or refused access (H-009, H-014). */
+function sandboxUnreachable(error: unknown): boolean {
+  if (!error || typeof error !== "object" || !sandboxFailures.has(error)) return false;
+  return classifySandboxLifecycleFailure(error) !== "unknown";
 }
 
 function publicationFailureResult(failure: OutputPublicationFailure): TurnToolResult {

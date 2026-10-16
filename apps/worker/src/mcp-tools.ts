@@ -4,7 +4,7 @@ import {
   type McpServerSpec,
 } from "@berry/local-agent/mcp";
 import {
-  DurableTurnRuntimeRequestSchema,
+  parseAdmittedRuntimeRequest,
   NetworkPolicySchema,
   normalizeWorkerRole,
   openDurableSecret,
@@ -281,14 +281,16 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   async #context(snapshot: DurableTurnSnapshot): Promise<DurableMcpTurnContext> {
     const existing = this.#turnContexts.get(snapshot.id);
     if (existing) return existing;
-    const runtime = DurableTurnRuntimeRequestSchema.safeParse(snapshot.runtimeRequest);
-    if (!runtime.success) {
+    // Only a run admitted before capability snapshots uses the deployment's
+    // connector list; an invalid snapshot throws rather than swap connectors.
+    const runtime = parseAdmittedRuntimeRequest(snapshot.runtimeRequest);
+    if (!runtime) {
       return { source: this.#source, servers: this.#allowedServers(snapshot), unavailable: [] };
     }
     // Each connector opens its own credentials: one that cannot be opened is
     // unavailable for this turn without blocking healthy connectors or a
     // request that needs none (H-077).
-    const enabled = runtime.data.mcpServers.filter((server) => server.enabled && server.trusted);
+    const enabled = runtime.mcpServers.filter((server) => server.enabled && server.trusted);
     const prepared = await Promise.allSettled(enabled
       .map(async (server): Promise<McpServerSpec> => {
         const credential = await durableMcpCredential(server.credential, server.credentialRef, this.env);
@@ -326,7 +328,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
           reason: `its credentials could not be opened (${(result.reason instanceof Error ? result.reason.message : String(result.reason)).replace(/\s+/g, " ").slice(0, 200)}). An administrator or the connection owner should reconnect it.`,
         }]
       : []);
-    const policy = NetworkPolicySchema.safeParse(runtime.data.networkPolicy);
+    const policy = NetworkPolicySchema.safeParse(runtime.networkPolicy);
     const source = new McpToolSource({
       servers: [...servers],
       ...(policy.success ? { networkPolicy: policy.data } : {}),

@@ -50,8 +50,16 @@ they should contact support or their administrator.
   Other providers are not checked. A key is only sent to its own provider host.
 - **At most one email per organization, provider and problem in 24 hours**,
   across all workers and restarts (recorded in `alert_events`; each send in
-  `delivery_attempts` with the SES message ID or the error). A failed send is
-  retried; a delivered one is never resent.
+  `delivery_attempts` with the SES message ID or the error). A send SES
+  refused with a client error (HTTP 4xx other than 408, such as an unverified
+  identity or throttling), or one that never reached SES, is retried, up to 5
+  attempts; a delivered one is never resent. A send whose result is unknown
+  stays `pending` with "The email may have been sent…" in `error` and is never
+  sent again automatically. That covers an SES server or gateway error (HTTP
+  5xx: SES can accept a message and still return one), a request timeout, a
+  lost connection, and a worker that stopped mid-send. To find them:
+  `SELECT id,created_at,error FROM delivery_attempts WHERE status='pending' AND error LIKE 'The email may have been sent%'`.
+  Check SES before resolving one by hand.
 - **Recipients:** the email destinations of an enabled "Credit health" alert
   rule; otherwise every configured email destination under Reports & alerts;
   otherwise the organization's active owners and admins with verified email

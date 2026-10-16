@@ -1,4 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DURABLE_BASE_BUILT_IN_TOOLS,
@@ -29,6 +33,7 @@ import {
   durableBuiltInToolDefinitions,
   durableToolManifestMetrics,
   queuedFollowUpRuntimeRequest,
+  budgetUsageAfterSequence,
   DurableToolTimeoutError,
   modelMessages,
   pendingContextEntries,
@@ -46,7 +51,11 @@ import {
   type TurnToolResult,
 } from "./turn-runner.js";
 import type { SqlExecutor } from "./sql-repositories.js";
-import { SandboxContinuityManager } from "./sandbox-continuity.js";
+import { SandboxContinuityManager, exposedSandboxImages } from "./sandbox-continuity.js";
+import { McpToolError, McpToolSource } from "@berry/local-agent/mcp";
+import { modelImageWithheld } from "./model-image.js";
+import { ToolArgumentError } from "./tool-arguments.js";
+import { TOOL_FAILURE_OUTCOME_VERSION } from "./tool-failures.js";
 import { DurableMcpToolExecutor } from "./mcp-tools.js";
 import { DurablePersonalMemoryToolExecutor } from "./memory/tools.js";
 import { ActiveTurnCancellationRegistry } from "./turn-cancellation.js";
@@ -297,6 +306,322 @@ describe("durable turn runner", () => {
       const call3 = modelMessages(current, [...page, ...attachment]).messages;
       expect(call3.slice(0, call2.length)).toEqual(call2);
       expect(call3.at(-1)).toMatchObject({ role: "tool", content: "outputs/" });
+    });
+
+    it("keeps an attachment in place when it is read while already shown (H-032)", async () => {
+      const fileId = "00000000-0000-7000-8000-0000000000a1";
+      const path = `/workspace/inputs/${fileId}/plan.png`;
+      const current = turn({}, ["read"], firstTurn);
+      current.runtimeRequest = { ...current.runtimeRequest, contextWindowTokens: 128_000, attachments: [{ fileId, name: "plan.png", mediaType: "image/png", size: 10 }] };
+      journal(current, await pendingContextEntries(current));
+      const content = [
+        { type: "text" as const, text: `Workspace image ${JSON.stringify(path)}` },
+        { type: "image_url" as const, image_url: { url: "data:image/png;base64,PLAN" } },
+      ];
+      const before = modelMessages(current, content).messages;
+      pushMessage(current, "assistant-read", { role: "assistant", content: [{ type: "toolCall", id: "call-read", name: "read", arguments: { path } }], stopReason: "toolUse" });
+      pushMessage(current, "result-read", { role: "toolResult", toolCallId: "call-read", toolName: "read", content: "Image ready" });
+      current.steps = [...current.steps, {
+        ...toolStep("completed", "read_only", false), id: "read-attachment", sequence: 10, type: "tool.read",
+        input: { toolCallId: "call-read", toolName: "read", arguments: { path } }, output: { visionPath: path },
+      } as DurableTurnStep];
+
+      const after = modelMessages(current, content).messages;
+      expect(after.slice(0, before.length)).toEqual(before);
+      expect(JSON.stringify(after).split("base64,PLAN")).toHaveLength(2);
+    });
+
+    describe("images whose read result was compacted away (H-032)", () => {
+      type Content = NonNullable<Parameters<typeof modelMessages>[1]>;
+      type Request = ReturnType<typeof modelMessages>["messages"];
+      const page = "/workspace/outputs/page-1.png";
+      const second = "/workspace/outputs/page-2.png";
+      const label = (path: string) => ({ type: "text" as const, text: `Workspace image ${JSON.stringify(path)}` });
+      const pixels = (value: string) => ({ type: "image_url" as const, image_url: { url: `data:image/png;base64,${value}` } });
+      const exposure = (path: string, value: string, anchor: string, read: string) => ({
+        path, anchor, read, sha256: createHash("sha256").update(label(path).text).update("\0").update(pixels(value).image_url.url).digest("hex"),
+      });
+      const images = (request: Request) => request.flatMap((message) => Array.isArray(message.content) ? message.content.filter((part) => part.type === "image_url") : []);
+      const afterResult = (request: Request, callId: string) => request[request.findIndex((message) => message.role === "tool" && message.toolCallId === callId) + 1];
+      const toolCall = (current: MutableSnapshot, id: string, name: "read" | "ls", path: string, sequence: number) => {
+        pushMessage(current, `assistant-${id}`, { role: "assistant", content: [{ type: "toolCall", id, name, arguments: { path } }], stopReason: "toolUse" });
+        pushMessage(current, `result-${id}`, { role: "toolResult", toolCallId: id, toolName: name, content: name === "read" ? "Image ready" : "page-1.png" });
+        return {
+          ...toolStep("completed", "read_only", false), id: `step-${id}`, sequence, type: `tool.${name}`,
+          input: { toolCallId: id, toolName: name, arguments: { path } }, output: name === "read" ? { visionPath: path } : { entries: ["page-1.png"] },
+        } as DurableTurnStep;
+      };
+      /**
+       * A run that read `reads`, whose next request placed their images as
+       * `recorded`, then listed the workspace. Compaction covered the reads;
+       * the next model call is pending.
+       */
+      const compactedRun = async (reads: readonly string[], recorded: ReadonlyArray<ReturnType<typeof exposure>>) => {
+        const current = turn({}, ["read", "ls"], firstTurn);
+        journal(current, await pendingContextEntries(current));
+        const steps: DurableTurnStep[] = [admittedStep(), modelStep("completed", 1)];
+        reads.forEach((path, index) => steps.push(toolCall(current, `call-read-${index}`, "read", path, index + 2)));
+        steps.push({ ...modelStep("completed", reads.length + 2), output: { imageExposures: [...recorded] } });
+        steps.push(toolCall(current, "call-ls", "ls", "/workspace", reads.length + 3));
+        steps.push(modelStep("pending", reads.length + 4));
+        current.steps = steps;
+        current.checkpointCoveredEntryId = `result-call-read-${reads.length - 1}`;
+        return current;
+      };
+
+      it("keeps showing an image whose read result was compacted away", async () => {
+        const current = await compactedRun([page], [exposure(page, "PAGE", "call-read-0", "call-read-0")]);
+        expect(exposedSandboxImages(current).selected).toEqual([page]);
+
+        const request = modelMessages(current, [label(page), pixels("PAGE")]).messages;
+        expect(images(request)).toEqual([pixels("PAGE")]);
+        expect(afterResult(request, "call-ls")?.content).toContainEqual(pixels("PAGE"));
+      });
+
+      it("records where it was shown and keeps it there afterwards, also after a restart", async () => {
+        const current = await compactedRun([page], [exposure(page, "PAGE", "call-read-0", "call-read-0")]);
+        const repository = new FakeTurnRepository(current);
+        const requests: Request[] = [];
+        const model: DurableTurnModel = {
+          call: async (snapshot, _step, context) => {
+            requests.push(modelMessages(snapshot, context.additionalUserContent).messages);
+            return requests.length === 1
+              ? { text: "", inputTokens: 1, outputTokens: 1, toolCalls: [{ id: "call-ls-2", name: "ls", input: { path: "/workspace/outputs" } as never, retryClass: "read_only", repeatPolicy: "compare_result", idempotencyKey: null, requiresApproval: false, approvalKind: "file-edit" }] }
+              : { text: "Done.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+          },
+        };
+        const tools: DurableTurnToolExecutor = {
+          execute: async () => ({ output: { entries: ["page-1.png"] }, summary: "Listed" }),
+          modelContent: async () => [label(page), pixels("PAGE")],
+        };
+        // The first call records the image's new place; a restarted worker makes the second.
+        for (const owner of ["before-restart", "before-restart", "after-restart", "after-restart"]) {
+          const { state } = await new DurableTurnRunner(repository, model, tools, { owner }).execute({ tenantId, runId, reason: "continue" });
+          if (state !== "calling_model" && state !== "executing_tool") break;
+        }
+
+        expect(requests).toHaveLength(2);
+        const recorded = repository.current.steps.filter((step) => step.type === "model.call" && step.state === "completed").at(-2);
+        expect((recorded?.output as { imageExposures?: unknown }).imageExposures).toEqual([expect.objectContaining({ path: page, anchor: "call-ls" })]);
+        expect(requests[1]!.slice(0, requests[0]!.length)).toEqual(requests[0]);
+        expect(images(requests[1]!)).toHaveLength(1);
+      });
+
+      it("keeps images that shared a compacted place together, in their earlier order", async () => {
+        const current = await compactedRun([page, second], [
+          exposure(page, "A", "call-read-1", "call-read-0"),
+          exposure(second, "B", "call-read-1", "call-read-1"),
+        ]);
+        // The selector now lists them the other way round.
+        const request = modelMessages(current, [label(second), pixels("B"), label(page), pixels("A")]).messages;
+        expect(afterResult(request, "call-ls")?.content).toEqual([expect.anything(), label(page), pixels("A"), label(second), pixels("B")]);
+      });
+
+      it("shows the image after a new read once the earlier read was compacted", async () => {
+        const current = await compactedRun([page], [exposure(page, "PAGE", "call-read-0", "call-read-0")]);
+        current.steps = [...current.steps.slice(0, -1), toolCall(current, "call-read-again", "read", page, 20), modelStep("pending", 21)];
+
+        const request = modelMessages(current, [label(page), pixels("PAGE")]).messages;
+        expect(images(request)).toHaveLength(1);
+        expect(afterResult(request, "call-read-again")?.content).toContainEqual(pixels("PAGE"));
+      });
+
+      it("shows changed pixels after the latest retained result, not where the old ones were", async () => {
+        const current = await compactedRun([page], [exposure(page, "PAGE", "call-read-0", "call-read-0")]);
+
+        const request = modelMessages(current, [label(page), pixels("EDITED")]).messages;
+        expect(images(request)).toEqual([pixels("EDITED")]);
+        expect(afterResult(request, "call-ls")?.content).toContainEqual(pixels("EDITED"));
+      });
+
+      it("still shows an attachment whose turn context was compacted", async () => {
+        const fileId = "00000000-0000-7000-8000-0000000000a1";
+        const plan = `/workspace/inputs/${fileId}/plan.png`;
+        const current = await compactedRun([page], [exposure(plan, "PLAN", "turn", "")]);
+        current.runtimeRequest = { ...current.runtimeRequest, attachments: [{ fileId, name: "plan.png", mediaType: "image/png", size: 10 }] };
+
+        expect(images(modelMessages(current, [label(plan), pixels("PLAN")]).messages)).toEqual([pixels("PLAN")]);
+      });
+    });
+
+    describe("images read again during a run (H-032)", () => {
+      type Content = NonNullable<Parameters<typeof modelMessages>[1]>;
+      type Call = { name: "read" | "bash"; args: Record<string, unknown> };
+      const page = "/workspace/outputs/page-1.png";
+      const label = (path: string) => ({ type: "text" as const, text: `Workspace image ${JSON.stringify(path)}` });
+      const pixels = (value: string) => ({ type: "image_url" as const, image_url: { url: `data:image/png;base64,${value}` } });
+      const readPage: Call = { name: "read", args: { path: page } };
+      /**
+       * One turn through the real runner: model call n makes `calls[n - 1]`
+       * (then answers) and Berry supplies `shown(n)` as its image content.
+       * Returns each request as the provider adapters build it.
+       */
+      async function driveTurn(calls: Call[], shown: (call: number) => Content, options: { attachments?: Array<Record<string, unknown>>; restartAfterCall?: number } = {}) {
+        const current = providerSnapshot("openai-responses");
+        current.runtimeRequest = { ...current.runtimeRequest, builtInTools: ["read", "bash"], contextWindowTokens: 128_000, attachments: options.attachments ?? [] };
+        const repository = new FakeTurnRepository(current);
+        const requests: Array<ReturnType<typeof modelMessages>["messages"]> = [];
+        const model: DurableTurnModel = {
+          call: async (snapshot, _step, context) => {
+            requests.push(modelMessages(snapshot, context.additionalUserContent).messages);
+            const call = calls[requests.length - 1];
+            if (!call) return { text: "Done.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+            return {
+              text: "", inputTokens: 1, outputTokens: 1,
+              toolCalls: [{
+                id: `call-${requests.length}`, name: call.name, input: call.args as never,
+                retryClass: call.name === "read" ? "read_only" : "non_idempotent_manual", repeatPolicy: "compare_result",
+                idempotencyKey: null, requiresApproval: false, approvalKind: "file-edit",
+              }],
+            };
+          },
+        };
+        const tools: DurableTurnToolExecutor = {
+          execute: async (_snapshot, step) => {
+            const path = String((step.input.arguments as { path?: unknown }).path ?? "");
+            return step.type === "tool.read"
+              ? { output: { path, binary: true, mediaType: "image/png", visionPath: path, content: "Image ready" }, summary: "Image ready" }
+              : { output: { exitCode: 0, output: "edited" }, summary: "Command completed" };
+          },
+          modelContent: async () => shown(requests.length + 1),
+        };
+        let runner = new DurableTurnRunner(repository, model, tools, { owner: "images-worker" });
+        let restartAfterCall = options.restartAfterCall;
+        for (let turn = 0; turn < 30; turn += 1) {
+          if (requests.length === restartAfterCall) {
+            runner = new DurableTurnRunner(repository, model, tools, { owner: "images-worker-restarted" });
+            restartAfterCall = undefined;
+          }
+          const { state } = await runner.execute({ tenantId, runId, reason: "continue" });
+          if (state !== "calling_model" && state !== "executing_tool") break;
+        }
+        return requests;
+      }
+      const afterResult = (request: ReturnType<typeof modelMessages>["messages"], callId: string) =>
+        request[request.findIndex((message) => message.role === "tool" && message.toolCallId === callId) + 1];
+      const occurrences = (request: unknown, value: string) => JSON.stringify(request).split(`base64,${value}"`).length - 1;
+
+      it("keeps an unchanged image where it was first shown when it is read again", async () => {
+        const requests = await driveTurn([readPage, readPage], (call) => call === 1 ? [] : [label(page), pixels("PAGE")]);
+
+        expect(requests).toHaveLength(3);
+        expect(requests[2]!.slice(0, requests[1]!.length)).toEqual(requests[1]);
+        expect(occurrences(requests[2], "PAGE")).toBe(1);
+      });
+
+      it("keeps that place after a worker restart", async () => {
+        const requests = await driveTurn([readPage, readPage], (call) => call === 1 ? [] : [label(page), pixels("PAGE")], { restartAfterCall: 2 });
+
+        expect(requests[2]!.slice(0, requests[1]!.length)).toEqual(requests[1]);
+      });
+
+      it("keeps a shown attachment in place when the model reads it", async () => {
+        const fileId = "00000000-0000-7000-8000-0000000000a1";
+        const plan = `/workspace/inputs/${fileId}/plan.png`;
+        const requests = await driveTurn([{ name: "read", args: { path: plan } }], () => [label(plan), pixels("PLAN")], {
+          attachments: [{ fileId, name: "plan.png", mediaType: "image/png", size: 10 }],
+        });
+
+        expect(requests).toHaveLength(2);
+        expect(requests[1]!.slice(0, requests[0]!.length)).toEqual(requests[0]);
+        expect(occurrences(requests[1], "PLAN")).toBe(1);
+      });
+
+      it("shows changed pixels after the read that returned them, not where the old image was", async () => {
+        const requests = await driveTurn([readPage, readPage], (call) => call === 1 ? [] : [label(page), pixels(call === 2 ? "PAGE" : "EDITED")]);
+
+        expect(occurrences(requests[2], "EDITED")).toBe(1);
+        expect(occurrences(requests[2], "PAGE")).toBe(0);
+        expect(afterResult(requests[2]!, "call-2")?.content).toContainEqual(pixels("EDITED"));
+        expect(afterResult(requests[2]!, "call-1")).toMatchObject({ role: "assistant" });
+      });
+
+      it("shows pixels that changed without a new read after the latest result, not where the old image was", async () => {
+        const edit: Call = { name: "bash", args: { command: "convert page-1.png -rotate 90 page-1.png" } };
+        const requests = await driveTurn([readPage, edit], (call) => call === 1 ? [] : [label(page), pixels(call === 2 ? "PAGE" : "EDITED")]);
+
+        expect(occurrences(requests[2], "EDITED")).toBe(1);
+        expect(afterResult(requests[2]!, "call-1")).toMatchObject({ role: "assistant" });
+        expect(afterResult(requests[2]!, "call-2")?.content).toContainEqual(pixels("EDITED"));
+      });
+
+      describe("two images that share a place", () => {
+        const second = "/workspace/outputs/page-2.png";
+        const readSecond: Call = { name: "read", args: { path: second } };
+        const editBoth: Call = { name: "bash", args: { command: "mogrify -rotate 90 page-1.png page-2.png" } };
+        // Both images change through one command, so the next request shows them
+        // together after its result; then the first is read again unchanged.
+        const shown = (lastPage: string) => (call: number): Content => {
+          if (call === 1) return [];
+          if (call === 2) return [label(page), pixels("PAGE1")];
+          if (call === 3) return [label(page), pixels("PAGE1"), label(second), pixels("PAGE2")];
+          if (call === 4) return [label(page), pixels("EDITED1"), label(second), pixels("EDITED2")];
+          // The selector now lists the reread image last.
+          return [label(second), pixels("EDITED2"), label(page), pixels(lastPage)];
+        };
+
+        it("keeps their order when one is read again unchanged", async () => {
+          const requests = await driveTurn([readPage, readSecond, editBoth, readPage], shown("EDITED1"));
+          const reads = [readPage, readSecond, readPage].map((call, index) => ({
+            sequence: index * 2 + 2, type: "tool.read", state: "completed", input: { toolName: "read" }, output: { visionPath: call.args.path },
+          }));
+          const selection = exposedSandboxImages({ steps: [
+            { sequence: 1, type: "model.call", state: "completed", input: {} }, reads[0]!,
+            { sequence: 3, type: "model.call", state: "completed", input: {} }, reads[1]!,
+            { sequence: 5, type: "model.call", state: "completed", input: {} },
+            { sequence: 6, type: "tool.bash", state: "completed", input: { toolName: "bash" }, output: {} },
+            { sequence: 7, type: "model.call", state: "completed", input: {} }, { ...reads[2]!, sequence: 8 },
+          ] as never });
+          expect(selection.selected).toEqual([second, page]);
+
+          expect(requests).toHaveLength(5);
+          expect(requests[4]!.slice(0, requests[3]!.length)).toEqual(requests[3]);
+          expect(afterResult(requests[4]!, "call-3")?.content).toEqual([
+            expect.anything(), label(page), pixels("EDITED1"), label(second), pixels("EDITED2"),
+          ]);
+        });
+
+        it("keeps their order after a worker restart", async () => {
+          const requests = await driveTurn([readPage, readSecond, editBoth, readPage], shown("EDITED1"), { restartAfterCall: 4 });
+
+          expect(requests[4]!.slice(0, requests[3]!.length)).toEqual(requests[3]);
+        });
+
+        it("moves only the image whose pixels changed again, after the read that returned them", async () => {
+          const requests = await driveTurn([readPage, readSecond, editBoth, readPage], shown("EDITED-AGAIN"));
+
+          expect(afterResult(requests[4]!, "call-4")?.content).toContainEqual(pixels("EDITED-AGAIN"));
+          expect(afterResult(requests[4]!, "call-3")?.content).toEqual([expect.anything(), label(second), pixels("EDITED2")]);
+          expect(occurrences(requests[4], "EDITED1")).toBe(0);
+        });
+      });
+
+      it("shows a newly read image after five attachments gave up their places", async () => {
+        const ids = [1, 2, 3, 4, 5].map((index) => `00000000-0000-7000-8000-00000000000${index}`);
+        const paths = ids.map((id) => `/workspace/inputs/${id}/a.png`);
+        const requests = await driveTurn([readPage], (call) => call === 1
+          ? paths.flatMap((path, index) => [label(path), pixels(`ATTACHMENT${index}`)])
+          : [...paths.map((path) => ({ type: "text" as const, text: modelImageWithheld(path, "newer images took its place") })), label(page), pixels("PAGE")], {
+          attachments: ids.map((fileId) => ({ fileId, name: "a.png", mediaType: "image/png", size: 10 })),
+        });
+
+        expect(afterResult(requests[1]!, "call-1")?.content).toContainEqual(pixels("PAGE"));
+        expect(occurrences(requests[1], "ATTACHMENT0")).toBe(0);
+        expect(JSON.stringify(requests[1]!.at(-1))).toContain("newer images took its place");
+      });
+
+      it("shows an attachment that was left out once the model reads it", async () => {
+        const ids = [1, 2, 3, 4, 5, 6].map((index) => `00000000-0000-7000-8000-00000000000${index}`);
+        const paths = ids.map((id) => `/workspace/inputs/${id}/a.png`);
+        const sixth = paths[5]!;
+        const requests = await driveTurn([{ name: "read", args: { path: sixth } }], (call) => call === 1
+          ? [...paths.slice(0, 5).flatMap((path, index) => [label(path), pixels(`ATTACHMENT${index}`)]), { type: "text" as const, text: modelImageWithheld(sixth, "only 5 images are sent per request") }]
+          : [...paths.slice(0, 5).map((path) => ({ type: "text" as const, text: modelImageWithheld(path, "newer images took its place") })), label(sixth), pixels("SIXTH")], {
+          attachments: ids.map((fileId) => ({ fileId, name: "a.png", mediaType: "image/png", size: 10 })),
+        });
+
+        expect(afterResult(requests[1]!, "call-1")?.content).toContainEqual(pixels("SIXTH"));
+      });
     });
 
     it("declares activate_skill without a skill-name list so enabling a skill keeps the tools unchanged (H-032)", () => {
@@ -1468,6 +1793,65 @@ describe("durable turn runner", () => {
     expect(repository.current.error).toBe("ambiguous_external_operation");
   });
 
+  // H-003: a lost response is not a failure the model may repair, however the run was interrupted.
+  it.each(["was cancelled", "lost its lease"] as const)("moves a mutation that %s and then lost its response to recovery", async (interruption) => {
+    const tool = toolStep("pending", "non_idempotent_manual", false);
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    if (interruption === "lost its lease") vi.spyOn(repository, "heartbeat").mockResolvedValue(false);
+    const cancellations = new ActiveTurnCancellationRegistry();
+    let started!: () => void;
+    let lose!: () => void;
+    let calls = 0;
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        calls += 1;
+        started();
+        return new Promise<TurnToolResult>((_resolve, reject) => { lose = () => reject(new Error("socket hang up")); });
+      },
+    }, { owner: "worker-mutation-interrupted", cancellations, heartbeatMs: 5 });
+    const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+
+    const execution = runner.execute({ tenantId, runId, reason: "continue" });
+    await startedPromise;
+    if (interruption === "was cancelled") expect(cancellations.cancel(runId)).toBe(1);
+    else await new Promise((resolve) => setTimeout(resolve, 30));
+    lose();
+
+    await expect(execution).resolves.toMatchObject({ state: "recovery_required" });
+    expect(calls).toBe(1);
+    expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
+      state: "recovery_required",
+      outcomeCertainty: "unknown",
+    });
+    expect(repository.mutations.some((mutation) => mutation.steps?.some((step) => step.id === tool.id && step.state === "failed"))).toBe(false);
+  });
+
+  it.each(["was cancelled", "lost its lease"] as const)("moves a command that %s and then failed to recovery, never to a failure the model repairs", async (interruption) => {
+    const tool = toolStep("pending", "non_idempotent_manual", false);
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    if (interruption === "lost its lease") vi.spyOn(repository, "heartbeat").mockResolvedValue(false);
+    const cancellations = new ActiveTurnCancellationRegistry();
+    let started!: () => void;
+    let fail!: () => void;
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        started();
+        return new Promise<TurnToolResult>((_resolve, reject) => { fail = () => reject(new Error("created\n\nCommand exited with code 1")); });
+      },
+    }, { owner: "worker-command-interrupted", cancellations, heartbeatMs: 5 });
+    const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+
+    const execution = runner.execute({ tenantId, runId, reason: "continue" });
+    await startedPromise;
+    if (interruption === "was cancelled") expect(cancellations.cancel(runId)).toBe(1);
+    else await new Promise((resolve) => setTimeout(resolve, 30));
+    fail();
+
+    await expect(execution).resolves.toMatchObject({ state: "recovery_required" });
+    expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({ state: "recovery_required", outcomeCertainty: "unknown" });
+    expect(repository.mutations.some((mutation) => mutation.steps?.some((step) => step.id === tool.id && step.state === "failed"))).toBe(false);
+  });
+
   it("caps the model output allowance to the remaining context capacity", async () => {
     const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
     current.runtimeRequest = {
@@ -2582,19 +2966,26 @@ describe("durable turn runner", () => {
     });
 
     it("turns memory off for the request when its settings cannot be read, never assuming consent", async () => {
+      const remember = vi.fn();
       const tools = new DurablePersonalMemoryToolExecutor(
         noTools(),
         { settings: async () => { throw new Error("settings temporarily unavailable"); } } as never,
-        {} as never,
+        { remember } as never,
         true,
       );
       const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
       const { model, seen } = recordingModel();
 
       await expect(new DurableTurnRunner(repository, model, tools).execute(job())).resolves.toMatchObject({ state: "finalizing" });
-      expect(seen[0]!.tools).not.toContain("remember_memory");
-      expect(seen[0]!.tools).not.toContain("forget_memory");
+      // The declared tools do not change with a failed read (H-032); using one does nothing.
+      expect(seen[0]!.tools).toEqual(expect.arrayContaining(["remember_memory", "forget_memory"]));
       expect(seen[0]!.extra).toContain("Personal memory is unavailable for this message");
+      await expect(tools.execute(repository.current, {
+        ...readOnlyToolStep("read", 9, "/workspace/a.txt"),
+        type: "tool.remember_memory",
+        input: { toolName: "remember_memory", arguments: { kind: "profile", content: "A fact" } },
+      })).rejects.toThrow("Personal memory is unavailable right now");
+      expect(remember).not.toHaveBeenCalled();
     });
 
     it("continues with a notice when optional context enrichment fails", async () => {
@@ -2712,6 +3103,87 @@ describe("durable turn runner", () => {
       expect(JSON.stringify(repository.current.entries)).toContain("Both files are ready.");
       expect(repository.current.steps.filter((step) => step.type === "turn.finalize").at(-1)?.output)
         .toMatchObject({ completed: true, unpublished: [expect.objectContaining({ name: "b.txt" })] });
+    });
+
+    it("offers the repair turn when a final beside a draft image fails to upload (H-065)", async () => {
+      const current = answered();
+      current.sandboxId = "publish-sandbox";
+      current.sandboxProvider = "e2b";
+      current.sandboxState = "running";
+      current.steps = [
+        ...current.steps,
+        { ...runCommandStep("completed", 1, "make final"), id: randomUUID(), output: { exitCode: 0 } },
+        {
+          ...toolStep("completed", "non_idempotent_manual", false), id: randomUUID(), sequence: 2, type: "tool.create_image",
+          input: { toolCallId: randomUUID(), toolName: "create_image", arguments: { prompt: "background", purpose: "draft" } },
+          output: { visionPath: "/workspace/drafts/background.png", draft: { path: "/workspace/drafts/background.png" } },
+        },
+      ];
+      const final = "/workspace/outputs/final.txt";
+      const manager = new SandboxContinuityManager(
+        {
+          kind: "e2b",
+          resume: async () => ({ sandbox_id: "publish-sandbox", provider: "e2b", status: "running" }),
+          files: {
+            read: async () => ({ path: final, content: Buffer.from("final").toString("base64"), size_bytes: 5, mtime: null }),
+            list: async () => ({ path: "/workspace/outputs", entries: [{ path: final, type: "file", size_bytes: 5, mtime: null }] }),
+            write: async () => ({}),
+          },
+        } as never,
+        {
+          latest: async () => null, continuity: async () => null, recordSandbox: async () => undefined, publishedOutputs: async () => [],
+          recordArtifactOperationStart: async () => undefined, failArtifactOperation: async () => undefined,
+        } as never,
+        { putArtifact: async () => { throw new Error("access denied by storage policy"); } } as never,
+        { image: "berry-sandbox", preparationRetryDelayMs: 1 },
+      );
+      const repository = new FakeTurnRepository(current);
+
+      await expect(new DurableTurnRunner(repository, unusedModel(), manager).execute(job())).resolves.toMatchObject({ state: "calling_model" });
+      expect(repository.current.steps.filter((step) => step.type === "turn.finalize").at(-1)?.output).toMatchObject({
+        completed: false,
+        unpublished: [expect.objectContaining({ name: "final.txt", reason: expect.stringContaining("access denied") })],
+      });
+    });
+
+    it("offers exactly one repair turn when the database fails while publishing, and the next scan publishes", async () => {
+      const current = answered();
+      current.sandboxId = "publish-sandbox";
+      current.sandboxProvider = "e2b";
+      current.sandboxState = "running";
+      current.steps = [...current.steps, { ...runCommandStep("completed", 1, "make report"), id: randomUUID(), output: { exitCode: 0 } }];
+      const report = "/workspace/outputs/report.txt";
+      const putArtifact = vi.fn(async (key: string) => ({ bucket: "berry", key, etag: "etag" }));
+      const manager = new SandboxContinuityManager(
+        {
+          kind: "e2b",
+          resume: async () => ({ sandbox_id: "publish-sandbox", provider: "e2b", status: "running" }),
+          files: {
+            read: async () => ({ path: report, content: Buffer.from("finished report").toString("base64"), size_bytes: 15, mtime: null }),
+            list: async () => ({ path: "/workspace/outputs", entries: [{ path: report, type: "file", size_bytes: 15, mtime: null }] }),
+            write: async () => ({}),
+          },
+        } as never,
+        {
+          latest: async () => null, continuity: async () => null, recordSandbox: async () => undefined, inputFiles: async () => [],
+          publishedOutputs: vi.fn().mockRejectedValueOnce(new Error("read ECONNRESET")).mockResolvedValue([]),
+          recordArtifactOperationStart: async () => undefined, recordArtifactOperationStorage: async () => undefined,
+          persistOutput: async (input: Record<string, unknown>) => ({ ...input }),
+          completeArtifactOperation: async () => undefined, failArtifactOperation: async () => undefined,
+        } as never,
+        { putArtifact } as never,
+        { image: "berry-sandbox", preparationRetryDelayMs: 1 },
+      );
+      const repository = new FakeTurnRepository(current);
+      const model: DurableTurnModel = { call: vi.fn(async () => ({ text: "report.txt is published.", inputTokens: 1, outputTokens: 1, toolCalls: [] })) };
+      const runner = new DurableTurnRunner(repository, model, manager);
+
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "calling_model" });
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "finalizing" });
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "completed" });
+      expect(model.call).toHaveBeenCalledTimes(1);
+      expect(putArtifact).toHaveBeenCalledTimes(1);
+      expect(repository.mutations.at(-1)?.toolResultMessages).toEqual([expect.objectContaining({ status: "completed", summary: "Published report.txt" })]);
     });
 
     it("completes without a repair turn when the workspace itself could not be reached", async () => {
@@ -2955,7 +3427,11 @@ describe("durable turn runner", () => {
     type ScriptedCall = { name: string; args: Record<string, unknown>; retryClass?: "read_only" | "idempotent" | "non_idempotent_manual" };
     // Each entry is one model turn issuing one or more tool calls; the tool
     // executor decides per call whether it fails.
-    async function driveCalls(turns: ScriptedCall[][], execute: (call: { name: string; args: Record<string, unknown> }) => unknown) {
+    async function driveCalls(
+      turns: ScriptedCall[][],
+      execute: (call: { name: string; args: Record<string, unknown> }) => unknown,
+      argumentSchema?: (name: string) => unknown,
+    ) {
       const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
       let modelCalls = 0;
       const executed: Array<{ name: string; args: Record<string, unknown> }> = [];
@@ -2986,6 +3462,7 @@ describe("durable turn runner", () => {
           executed.push(call);
           return { output: (await execute(call)) as never ?? { ok: true }, summary: "ok" };
         },
+        ...(argumentSchema ? { argumentSchema: (_snapshot: DurableTurnSnapshot, name: string) => argumentSchema(name) } : {}),
       });
       let state: string = "calling_model";
       for (let turn = 0; turn < turns.length * 4 + 4 && (state === "calling_model" || state === "executing_tool"); turn += 1) {
@@ -3000,7 +3477,7 @@ describe("durable turn runner", () => {
         const content = ((entry?.payload as { message?: { content?: Array<{ text?: string }> } } | undefined)?.message?.content ?? []);
         return content.map((part) => part.text ?? "").join("\n");
       };
-      return { state, executed, toolSteps, failure, modelText };
+      return { state, executed, toolSteps, failure, modelText, repository };
     }
     const countOf = (executed: Array<{ name: string }>, name: string) => executed.filter((call) => call.name === name).length;
 
@@ -3069,27 +3546,529 @@ describe("durable turn runner", () => {
       expect(result.toolSteps[1]?.state).toBe("completed");
     });
 
-    it("marks an interrupted change-making call as an unknown outcome and never replays it unchecked", async () => {
+    describe("a change-making call whose outcome is unknown", () => {
       const create = { name: "mcp__Connect_Aesg_MCP__create_record", args: { title: "Tender A" }, retryClass: "non_idempotent_manual" as const };
-      let creates = 0;
-      const result = await driveCalls([
-        [create],
-        [create],
-        [{ name: "mcp__Connect_Aesg_MCP__list_records", args: { title: "Tender A" } }],
-        [create],
-      ], ({ name }) => {
-        if (name === create.name) {
-          creates += 1;
-          if (creates === 1) throw new Error("socket hang up");
-        }
-        return { ok: true };
+      // The target applies the first write, then Berry loses its response.
+      const acceptThenLose = (lose: () => unknown) => {
+        const writes: Array<Record<string, unknown>> = [];
+        const execute = ({ name, args }: { name: string; args: Record<string, unknown> }) => {
+          if (name === "read") throw new Error("ENOENT: no such file or directory, open '/workspace/missing.md'");
+          if (name !== create.name) return { ok: true };
+          writes.push(args);
+          if (writes.length === 1) throw lose();
+          return { id: `record-${writes.length}` };
+        };
+        return { writes, execute };
+      };
+      const expectRecoveryRequired = (result: Awaited<ReturnType<typeof driveCalls>>) => {
+        expect(result.state).toBe("recovery_required");
+        expect(result.toolSteps).toHaveLength(1);
+        expect(result.toolSteps[0]).toMatchObject({ state: "recovery_required", outcomeCertainty: "unknown" });
+        expect(result.failure(0)).toMatchObject({ category: "unknown_outcome", outcome: "unknown" });
+        expect(result.repository.current.error).toBe("ambiguous_external_operation");
+      };
+
+      // Running a read is not reconciliation: it cannot show that the write failed.
+      it.each([
+        ["an unrelated workspace listing", { name: "ls", args: { path: "/workspace" } }],
+        ["a listing of the target's records", { name: "mcp__Connect_Aesg_MCP__list_records", args: { title: "Tender A" } }],
+        ["a read that fails", { name: "read", args: { path: "missing.md" } }],
+      ])("stops for recovery after a lost response; %s cannot unlock a replay", async (_label, between) => {
+        const target = acceptThenLose(() => new Error("socket hang up"));
+        const result = await driveCalls([[create], [between], [create]], target.execute);
+
+        expect(target.writes).toHaveLength(1);
+        expectRecoveryRequired(result);
       });
 
-      expect(countOf(result.executed, create.name)).toBe(2);
-      expect(result.failure(0)).toMatchObject({ category: "unknown_outcome", outcome: "unknown" });
-      expect(result.modelText(0)).toContain("may already have taken effect");
-      expect(result.failure(1)).toMatchObject({ category: "unknown_outcome", refusedUnchangedRetry: true });
-      expect(result.toolSteps[3]?.state).toBe("completed");
+      it("cannot be cleared by changing the call's arguments", async () => {
+        const target = acceptThenLose(() => new Error("socket hang up"));
+        const result = await driveCalls([[create], [{ ...create, args: { title: "Tender A", note: "second attempt" } }]], target.execute);
+
+        expect(target.writes).toHaveLength(1);
+        expectRecoveryRequired(result);
+      });
+
+      it.each([
+        ["a connection reset", () => Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" })],
+        ["a gateway error", () => Object.assign(new Error("Bad Gateway"), { status: 502 })],
+        ["a server error the connector reports", () => new McpToolError("The record service failed", { error: { status: 500, message: "internal error" } })],
+      ])("treats %s as an unknown outcome", async (_label, lose) => {
+        const target = acceptThenLose(lose);
+        const result = await driveCalls([[create], [create]], target.execute);
+
+        expect(target.writes).toHaveLength(1);
+        expectRecoveryRequired(result);
+      });
+
+      it("is not replayed by a restarted worker or a later wake-up", async () => {
+        const target = acceptThenLose(() => new Error("socket hang up"));
+        const result = await driveCalls([[create], [create]], target.execute);
+        expect(result.state).toBe("recovery_required");
+
+        for (const reason of ["continue", "lease-recovery"] as const) {
+          const restarted = new DurableTurnRunner(result.repository, unusedModel(), {
+            execute: async () => {
+              target.writes.push({ replayed: true });
+              return { output: {}, summary: "replayed" };
+            },
+          }, { owner: `restarted-${reason}` });
+          await expect(restarted.execute({ tenantId, runId, reason })).resolves.toMatchObject({ noOp: true });
+        }
+        expect(target.writes).toHaveLength(1);
+        expect(result.repository.current.state).toBe("recovery_required");
+      });
+
+      it("keeps the usage a failed call already incurred", async () => {
+        const usage = { kind: "usage" as const, inputTokens: 40, outputTokens: 8, totalTokens: 48, costRawMicros: "900", pricingSource: "measured" as const };
+        const result = await driveCalls([[create]], () => {
+          throw Object.assign(new DurableToolExecutionError("socket hang up", usage), { code: "ECONNRESET" });
+        });
+
+        expect(result.state).toBe("recovery_required");
+        expect(result.repository.events).toContainEqual(expect.objectContaining({ kind: "usage", costRawMicros: "900" }));
+      });
+
+      // A command that finished does not show that its change was not made (H-003).
+      describe("a shell command whose request may have been applied", () => {
+        const post = (command: string) => ({ name: "bash", args: { command }, retryClass: "non_idempotent_manual" as const });
+
+        it("stops for recovery when curl gave up waiting for a POST the server accepted", async () => {
+          const call = post("curl --max-time 0.1 -X POST https://records.example.test/create -d title=TenderA");
+          let accepted = 0;
+          const result = await driveCalls([[call], [call]], () => {
+            accepted += 1;
+            if (accepted === 1) throw new Error("curl: (28) Operation timed out after 100 milliseconds with 0 bytes received\n\nCommand exited with code 28");
+            return { exitCode: 0, output: "created" };
+          });
+
+          expect(accepted).toBe(1);
+          expect(result.state).toBe("recovery_required");
+          expect(result.failure(0)).toMatchObject({ category: "unknown_outcome", outcome: "unknown" });
+        });
+
+        it("holds the next shell call after a network hint replaced the output of a command that posted", async () => {
+          const create = "curl -X POST https://records.example.test/create -d title=TenderA";
+          let accepted = 0;
+          const manager = new SandboxContinuityManager({
+            kind: "e2b",
+            supportsResume: false,
+            exec: async function* (input: { command: string[] }) {
+              const command = input.command[4] ?? "";
+              if (command.includes("records.example.test/create")) accepted += 1;
+              yield { kind: "stdout", data: "create" };
+              if (command.includes("blocked.example.test")) {
+                yield { kind: "stderr", data: "curl: (35) SSL_connect: SSL_ERROR_SYSCALL in connection to blocked.example.test:443" };
+                yield { kind: "exit", exit_code: 35, signal: null };
+              } else {
+                yield { kind: "exit", exit_code: 0, signal: null };
+              }
+            },
+            files: { list: async (input: { path: string }) => ({ path: input.path, entries: [] }) },
+          } as never, { recordSandbox: async () => undefined, recordTiming: async () => undefined } as never, null, { image: "berry-sandbox" });
+          const sandboxed = {
+            ...snapshot("executing_tool", []),
+            sandboxId: "sandbox-shell",
+            sandboxProvider: "e2b",
+            sandboxState: "running",
+            runtimeRequest: { networkPolicy: { egress: "on", allowedDomains: ["records.example.test"] } },
+          } as DurableTurnSnapshot;
+          const shell = async ({ args }: { args: Record<string, unknown> }) => (await manager.execute(sandboxed, {
+            ...toolStep("running", "non_idempotent_manual", false),
+            type: "tool.bash",
+            input: { toolCallId: randomUUID(), toolName: "bash", arguments: args },
+          })).output;
+
+          const result = await driveCalls([[post(`${create} && curl https://blocked.example.test/notify`)], [post(create)]], shell);
+
+          expect(accepted).toBe(1);
+          expect(result.state).toBe("recovery_required");
+          expect(result.failure(0)).toMatchObject({ outcome: "unknown" });
+          expect(result.toolSteps[0]?.error).toMatch(/Network access to blocked\.example\.test is blocked[\s\S]*Command exited with code 35$/);
+        });
+
+        it("stops for recovery when a later part of a compound command loses its response after an earlier write", async () => {
+          const call = post("curl -X POST https://records.example.test/create -d title=TenderA && curl --max-time 0.1 -X POST https://records.example.test/notify");
+          let created = 0;
+          const result = await driveCalls([[call], [call]], () => {
+            created += 1;
+            if (created === 1) throw new Error("created\ncurl: (28) Operation timed out after 100 milliseconds with 0 bytes received\n\nCommand exited with code 28");
+            return { exitCode: 0, output: "created\nnotified" };
+          });
+
+          expect(created).toBe(1);
+          expect(result.state).toBe("recovery_required");
+        });
+
+        // The command ran: its exit status and output say nothing about whether
+        // the POST before the failing part took effect.
+        it.each([
+          ["false", "created"],
+          ["a local exception", "created\nTraceback (most recent call last):\n  File \"/workspace/import.py\", line 4, in <module>\nValueError: bad row"],
+          ["a missing file", "created\ncat: /workspace/receipt.json: No such file or directory"],
+        ])("holds the next shell call after an accepted POST followed by %s", async (_label, output) => {
+          const first = post("curl -X POST https://records.example.test/create -d title=TenderA && ./after-create.sh");
+          let accepted = 0;
+          const result = await driveCalls([[first], [post("curl -X POST https://records.example.test/create -d title=TenderA")]], () => {
+            accepted += 1;
+            if (accepted === 1) throw new Error(`${output}\n\nCommand exited with code 1`);
+            return { exitCode: 0, output: "created" };
+          });
+
+          expect(accepted).toBe(1);
+          expect(result.state).toBe("recovery_required");
+          expect(result.failure(0)).toMatchObject({ outcome: "unknown" });
+          expect(result.modelText(0)).toContain("waits for the user to review it");
+          expect(result.toolSteps[1]?.state).toBe("recovery_required");
+        });
+
+        it.each([
+          ["an unreachable workspace", () => new Error("The workspace is temporarily unreachable (connect ETIMEDOUT 10.0.0.1:443). Nothing was run and no files were changed; retry this step.")],
+          ["invalid arguments", () => new ToolArgumentError("bash was not run: command must be a non-empty string")],
+        ])("runs the next shell call after %s stopped the first before it started", async (_label, refuse) => {
+          let runs = 0;
+          const result = await driveCalls([[post("python report.py")], [post("python scripts/report.py")]], () => {
+            runs += 1;
+            if (runs === 1) throw refuse();
+            return { exitCode: 0, output: "Report written" };
+          });
+
+          expect(runs).toBe(2);
+          expect(result.failure(0)).toMatchObject({ outcome: "not_applied" });
+          expect(result.toolSteps[1]?.state).toBe("completed");
+          expect(result.repository.current.error).toBeNull();
+        });
+      });
+
+      // The MCP SDK checks a result against the tool's output schema after the
+      // tool ran on its server, so the create may already exist (H-003).
+      describe("a connector result the MCP SDK rejected after the tool ran", () => {
+        const recordsServer = join(dirname(fileURLToPath(import.meta.url)), "../../../packages/local-agent/test/fixtures/mcp-records-server.mjs");
+        const createRecord = (args: Record<string, unknown>) => ({ name: create.name, args, retryClass: "non_idempotent_manual" as const });
+        // Runs the calls through the real SDK against a server that records every create it accepts.
+        async function driveRecords(env: Record<string, string>, turns: ScriptedCall[][], argumentSchema?: (name: string) => unknown) {
+          const directory = mkdtempSync(join(tmpdir(), "berry-records-"));
+          const writes = join(directory, "writes.jsonl");
+          const source = new McpToolSource({ servers: [{
+            id: "records", name: "Connect_Aesg_MCP", transport: "stdio", command: process.execPath, args: [recordsServer], url: null,
+            env: { ...env, RECORD_WRITES: writes }, enabled: true, trusted: true,
+          }] });
+          try {
+            await source.connect();
+            const tools = new Map(source.listTools().map((tool) => [tool.name, tool]));
+            const result = await driveCalls(turns, async ({ name, args }) => {
+              const tool = tools.get(name);
+              if (!tool) return { entries: ["records"] };
+              return { content: (await tool.execute(randomUUID(), args as never, undefined, undefined)).content };
+            }, argumentSchema);
+            return { result, accepted: readFileSync(writes, "utf8").trim().split("\n").filter(Boolean) };
+          } finally {
+            await source.close();
+            rmSync(directory, { recursive: true, force: true });
+          }
+        }
+
+        it.each(["malformed", "missing"])("holds the next create after a %s structured result, whatever changed or ran since", async (output) => {
+          const { result, accepted } = await driveRecords({ RECORD_OUTPUT: output }, [
+            [createRecord({ title: "Tender A" })],
+            [{ name: "ls", args: { path: "/workspace" } }],
+            [createRecord({ title: "Tender A", note: "with the expected output" })],
+          ]);
+
+          expect(accepted).toEqual([JSON.stringify({ title: "Tender A" })]);
+          expect(result.state).toBe("recovery_required");
+          expect(result.failure(0)).toMatchObject({ outcome: "unknown" });
+          expect(result.toolSteps.at(-1)?.state).toBe("recovery_required");
+        });
+
+        // The server saved the record, then a dependency failed; the code in its
+        // error result describes that dependency, not the create (H-003).
+        it.each([
+          ["RATE_LIMIT", "", ""], ["ECONNREFUSED", "", ""],
+          ["RATE_LIMIT", "429", ""], ["CONFLICT", "409", ""], ["CONFLICT", "", "409"],
+        ])("holds the next create after an error with code %s, status %s and RPC code %s from a server that saved the record", async (code, status, rpcCode) => {
+          const { result, accepted } = await driveRecords({ RECORD_ERROR_CODE: code, RECORD_ERROR_STATUS: status, RECORD_RPC_CODE: rpcCode }, [
+            [createRecord({ title: "Tender A" })],
+            [{ name: "ls", args: { path: "/workspace" } }],
+            [createRecord({ title: "Tender A", note: "retry after indexing error" })],
+          ]);
+
+          expect(accepted).toEqual([JSON.stringify({ title: "Tender A" })]);
+          expect(result.state).toBe("recovery_required");
+          expect(result.failure(0)).toMatchObject({ outcome: "unknown", ...(!rpcCode ? { code } : {}) });
+        });
+
+        it("runs the corrected create after the reviewed schema refused the first before it was sent", async () => {
+          const inputSchema = { type: "object", properties: { title: { type: "string" }, note: { type: "string" } }, required: ["title"] };
+          const { result, accepted } = await driveRecords({}, [
+            [createRecord({ title: 5 })],
+            [createRecord({ title: "Tender A" })],
+          ], (name) => name === create.name ? inputSchema : undefined);
+
+          expect(accepted).toEqual([JSON.stringify({ title: "Tender A" })]);
+          expect(result.failure(0)).toMatchObject({ category: "invalid_input", outcome: "not_applied" });
+          expect(result.toolSteps[1]?.state).toBe("completed");
+          expect(result.repository.current.error).toBeNull();
+        });
+      });
+
+      // A rejection says the change was not made, so it stays repairable.
+      it.each([
+        ["an invalid argument", () => Object.assign(new Error("A record with this title already exists"), { status: 409 }), "invalid_input"],
+        ["a rate limit", () => Object.assign(new Error("Too Many Requests"), { status: 429 }), "transient"],
+      ])("lets the model repair %s", async (_label, refuse, category) => {
+        let calls = 0;
+        const result = await driveCalls([[create], [{ ...create, args: { title: "Tender A (2)" } }]], ({ name }) => {
+          if (name !== create.name) return { ok: true };
+          calls += 1;
+          if (calls === 1) throw refuse();
+          return { id: "record-1" };
+        });
+
+        expect(calls).toBe(2);
+        expect(result.failure(0)).toMatchObject({ category, outcome: "not_applied" });
+        expect(result.toolSteps[1]?.state).toBe("completed");
+        expect(result.repository.current.error).toBeNull();
+      });
+
+      // Steps written before runs stopped for recovery: older workers stored a
+      // plain failed step, without a failure class (H-003, H-014).
+      describe("a failed change recorded by an older worker", () => {
+        const legacyFailure = (error: string, overrides: Partial<DurableTurnStep> = {}) => ({
+          ...toolStep("failed", "non_idempotent_manual", false),
+          id: "legacy-create",
+          sequence: 2,
+          type: `tool.${create.name}`,
+          input: { toolCallId: "legacy-call", toolName: create.name, arguments: create.args },
+          error: `Tool failed (repair attempt 1/5). ${error}`,
+          output: null,
+          outcomeCertainty: null,
+          attempt: 1,
+          ...overrides,
+        } as DurableTurnStep);
+        const pendingCreate = (sequence: number, args: Record<string, unknown> = create.args) => ({
+          ...toolStep("pending", "non_idempotent_manual", false),
+          id: `create-${sequence}`,
+          sequence,
+          type: `tool.${create.name}`,
+          input: { toolCallId: `call-${sequence}`, toolName: create.name, arguments: args, repeatPolicy: "block_after_success" },
+        } as DurableTurnStep);
+        const resume = async (steps: DurableTurnStep[], repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), ...steps]))) => {
+          const execute = vi.fn(async () => ({ output: { id: "record-2" }, summary: "Created" }));
+          const result = await new DurableTurnRunner(repository, unusedModel(), { execute }).execute({ tenantId, runId, reason: "continue" });
+          return { repository, execute, result };
+        };
+        const expectHeld = (outcome: Awaited<ReturnType<typeof resume>>, heldId: string) => {
+          expect(outcome.execute).not.toHaveBeenCalled();
+          expect(outcome.result.state).toBe("recovery_required");
+          expect(outcome.repository.current.steps.find((step) => step.id === heldId)).toMatchObject({ state: "recovery_required" });
+          expect(outcome.repository.current.error).toBe("ambiguous_external_operation");
+        };
+
+        it.each([
+          ["a lost connection", "socket hang up"],
+          ["a reset", "read ECONNRESET"],
+          ["a timeout", "Request timed out after 30000ms"],
+          ["a gateway error", "502 Bad Gateway"],
+          ["a server error", "500 Internal Server Error"],
+          ["an unrecognised error", "The record service returned an unexpected response"],
+        ])("holds the next call for recovery after %s", async (_label, error) => {
+          expectHeld(await resume([legacyFailure(error), pendingCreate(3)]), "create-3");
+        });
+
+        it("holds a call with changed arguments after an intervening read, and a restarted worker does not run it", async () => {
+          const listed = { ...readOnlyToolStep("ls", 3, "/workspace"), state: "completed" } as DurableTurnStep;
+          const held = await resume([legacyFailure("socket hang up"), listed, pendingCreate(4, { title: "Tender A", note: "again" })]);
+          expectHeld(held, "create-4");
+
+          const restarted = await resume([], held.repository);
+          expect(restarted.execute).not.toHaveBeenCalled();
+          expect(restarted.result).toMatchObject({ noOp: true });
+        });
+
+        it("holds a call after a failure recorded with its class by the earlier version of this fix", async () => {
+          const typed = legacyFailure("socket hang up", {
+            output: { failure: { category: "unknown_outcome", outcome: "unknown", deterministic: false, action: "Check first." } },
+          });
+          expectHeld(await resume([typed, pendingCreate(3, { title: "Tender A", note: "again" })]), "create-3");
+        });
+
+        it.each([
+          ["an argument Berry refused", legacyFailure(`${create.name} was not run: title must not be empty`)],
+          ["a refused approval", legacyFailure("", { error: "Tool approval was denied", attempt: 0 })],
+        ])("keeps %s repairable", async (_label, failure) => {
+          const { execute, repository } = await resume([failure, pendingCreate(3)]);
+          expect(execute).toHaveBeenCalledTimes(1);
+          expect(repository.current.steps.find((step) => step.id === "create-3")?.state).toBe("completed");
+        });
+
+        it("runs the held call once after an explicit retry, and does not hold the next one", async () => {
+          const held = await resume([legacyFailure("socket hang up"), pendingCreate(3)]);
+          expectHeld(held, "create-3");
+          // What the operator's retry does (DurableTurnService.recover).
+          held.repository.current.state = "executing_tool";
+          held.repository.current.error = null;
+          held.repository.current.steps = held.repository.current.steps.map((step) =>
+            step.id === "create-3" ? { ...step, state: "pending", error: null } : step);
+
+          const retried = await resume([], held.repository);
+          expect(retried.execute).toHaveBeenCalledTimes(1);
+          expect(held.repository.current.steps.find((step) => step.id === "create-3")?.state).toBe("completed");
+
+          held.repository.current.state = "executing_tool";
+          held.repository.current.steps = [...held.repository.current.steps, pendingCreate(9, { title: "Tender B" })];
+          const next = await resume([], held.repository);
+          expect(next.execute).toHaveBeenCalledTimes(1);
+        });
+
+        // Only a decision about the uncertain call clears it (H-003, H-014).
+        const completedCreate = (sequence: number, args: Record<string, unknown>) => ({
+          ...pendingCreate(sequence, args), state: "completed", attempt: 1, output: { ok: true },
+        } as DurableTurnStep);
+        // What the operator's recovery actions do to the held call (DurableTurnService.recover).
+        const operator = (repository: FakeTurnRepository, heldId: string, action: "retry" | "mark-complete") => {
+          repository.current.state = action === "retry" ? "executing_tool" : "calling_model";
+          repository.current.error = null;
+          repository.current.steps = repository.current.steps.map((step) => step.id !== heldId ? step
+            : action === "retry"
+              ? { ...step, state: "pending", error: null }
+              : { ...step, state: "completed", error: null, output: { confirmedByOperator: true, summary: "Operator confirmed that the external tool completed." } });
+        };
+        const nextCall = async (repository: FakeTurnRepository, step: DurableTurnStep) => {
+          repository.current.state = "executing_tool";
+          repository.current.steps = [...repository.current.steps, step];
+          return resume([], repository);
+        };
+
+        // Classifiers before this one stored some executed changes as "not
+        // applied" (9f0139f wrote these exact records): they are assessed again.
+        const historicalCall = (type: string, error: string, failure: Record<string, unknown>, overrides: Partial<DurableTurnStep> = {}) => ({
+          ...legacyFailure(error, { output: { failure } as JsonValue, ...overrides }),
+          type,
+          input: { toolCallId: "historical-call", toolName: type.slice(5), arguments: type === "tool.bash" ? { command: "curl -X POST https://records.example.test/create && false" } : create.args },
+        } as DurableTurnStep);
+        const pendingCall = (type: string, sequence: number) => ({
+          ...pendingCreate(sequence),
+          type,
+          input: { toolCallId: `call-${sequence}`, toolName: type.slice(5), arguments: type === "tool.bash" ? { command: "curl -X POST https://records.example.test/create" } : { title: "Tender A", note: "again" } },
+        } as DurableTurnStep);
+        const old = (category: string, deterministic: boolean) => ({ category, deterministic, outcome: "not_applied", action: "Read the error, change the approach or the arguments, and do not repeat the same call unchanged." });
+
+        it.each([
+          ["a command whose later part failed", "tool.bash", "created\n\nCommand exited with code 1", old("unknown", false)],
+          ["a command that mentions a missing file", "tool.bash", "created\ncat: /workspace/receipt.json: No such file or directory\n\nCommand exited with code 1", old("missing_resource", true)],
+          ["a command that mentions validation", "tool.bash", "created\nValueError: title must be unique\n\nCommand exited with code 1", old("invalid_input", true)],
+          ["a connector result rejected after the tool ran", `tool.${create.name}`, "MCP error -32602: Structured content does not match the tool's output schema: data/id must be string", old("invalid_input", true)],
+        ])("holds the next call after %s that an older classifier stored as not applied", async (_label, type, error, failure) => {
+          expectHeld(await resume([historicalCall(type, error, failure), pendingCall(type, 3)]), "create-3");
+        });
+
+        // Workers keep at most 4,000 characters of an error; a long command
+        // output loses the "Command exited with code 1" that showed it ran.
+        const cut = `create\ninvalid schema in post-processing: ${"0".repeat(5_000)}\n\nCommand exited with code 1`.slice(0, 4_000);
+        it.each([
+          ["a class an older classifier stored", `Tool failed (repair attempt 1/5). ${cut}`, { output: { failure: old("invalid_input", true) } as JsonValue }],
+          ["no class", `Tool failed (repair attempt 1/5). ${cut}`, { output: null }],
+          ["no class, before the repair prefix", cut, { output: null }],
+        ])("holds the next shell call after a cut command error stored with %s", async (_label, error, overrides) => {
+          const stored = { ...historicalCall("tool.bash", "", old("invalid_input", true)), error, ...overrides } as DurableTurnStep;
+          expectHeld(await resume([stored, pendingCall("tool.bash", 3)]), "create-3");
+        });
+
+        // The previous version of this classifier read codes a target returned
+        // after dispatch, and a network hint without its exit status, as not applied.
+        it.each([
+          ["a connector error result with a code", `tool.${create.name}`, "The record was saved, but updating its search index failed", { category: "transient", code: "RATE_LIMIT" }],
+          ["a network hint", "tool.bash", "Network access to blocked.example.test is blocked by this task's sandbox policy. An organization admin must allow the hostname in Execution & network, then retry in a new turn.", { category: "invalid_input" }],
+        ])("holds the next call after %s that the previous classifier stored as not applied", async (_label, type, error, failure) => {
+          const stored = historicalCall(type, error, { ...old(failure.category, false), ...failure, outcomeVersion: 2 });
+          expectHeld(await resume([stored, pendingCall(type, 3)]), "create-3");
+        });
+
+        it.each([
+          ["its arguments were refused", "bash was not run: command must be a non-empty string. Correct the arguments and call it again."],
+          ["the workspace could not be reached", "The workspace is temporarily unreachable (connect ETIMEDOUT 10.0.0.1:443). Nothing was run and no files were changed; retry this step."],
+        ])("keeps a shell call repairable when an older worker reported it was not run because %s", async (_label, error) => {
+          const { execute, repository } = await resume([historicalCall("tool.bash", error, old("invalid_input", true)), pendingCall("tool.bash", 3)]);
+          expect(execute).toHaveBeenCalledTimes(1);
+          expect(repository.current.steps.find((step) => step.id === "create-3")?.state).toBe("completed");
+        });
+
+        it.each([
+          ["a nested rate limit", `tool.${create.name}`, "Index update failed", { status: 429 }],
+          ["a nested conflict", `tool.${create.name}`, "A record with this title already exists", { status: 409 }],
+          ["validation wording without provenance", `tool.${create.name}`, "title must not be empty", {}],
+          ["missing-resource wording without provenance", `tool.${create.name}`, "404 Not Found: the record collection does not exist", {}],
+          ["image delivery after generation", "tool.create_image", "The workspace is temporarily unreachable (read ECONNRESET). Nothing was run and no files were changed; retry this step.", {}],
+        ])("holds %s stored by version 3 or without a class", async (_label, type, error, details) => {
+          for (const output of [{ failure: { ...old("invalid_input", true), ...details, outcomeVersion: 3 } }, null]) {
+            const earlier = historicalCall(type, error, {}, { output: output as JsonValue });
+            expectHeld(await resume([earlier, pendingCall(type, 3)]), "create-3");
+          }
+        });
+
+        it("does not let a stored classification override an unknown outcome recorded on the step", async () => {
+          const recorded = historicalCall(`tool.${create.name}`, "A record with this title already exists", { ...old("invalid_input", true), status: 409, outcomeVersion: 2 }, { outcomeCertainty: "unknown" });
+          expectHeld(await resume([recorded, pendingCall(`tool.${create.name}`, 3)]), "create-3");
+        });
+
+        it.each([
+          ["arguments refused before the call ran", `${create.name} was not run: title must be a string`, old("invalid_input", true)],
+          ["a not-applied outcome recorded with current evidence", "Connectors are unavailable for this message: Connector setup failed for this message.", { ...old("configuration", true), outcomeVersion: TOOL_FAILURE_OUTCOME_VERSION }],
+        ])("keeps %s, stored by an older classifier, repairable", async (_label, error, failure) => {
+          const { execute, repository } = await resume([historicalCall(`tool.${create.name}`, error, failure), pendingCall(`tool.${create.name}`, 3)]);
+          expect(execute).toHaveBeenCalledTimes(1);
+          expect(repository.current.steps.find((step) => step.id === "create-3")?.state).toBe("completed");
+        });
+
+        it("is not cleared by an unrelated completed call of the same tool", async () => {
+          const held = await resume([legacyFailure("socket hang up"), completedCreate(3, { title: "Tender B" }), pendingCreate(4)]);
+          expectHeld(held, "create-4");
+        });
+
+        it("is not cleared by an unrelated successful shell command", async () => {
+          const command = (id: string, sequence: number, state: "failed" | "completed" | "pending", command: string) => ({
+            ...toolStep(state, "non_idempotent_manual", false), id, sequence, type: "tool.bash", attempt: state === "pending" ? 0 : 1,
+            input: { toolCallId: `call-${id}`, toolName: "bash", arguments: { command } },
+            ...(state === "failed" ? { error: "Tool failed (repair attempt 1/5). created\n\nCommand exited with code 1", output: null } : {}),
+          } as DurableTurnStep);
+          const held = await resume([
+            command("post", 2, "failed", "curl -X POST https://records.example.test/create && false"),
+            command("listing", 3, "completed", "ls -la"),
+            command("again", 4, "pending", "curl -X POST https://records.example.test/create"),
+          ]);
+          expectHeld(held, "again");
+        });
+
+        it("holds for every unresolved call at once, and one explicit decision resolves them all", async () => {
+          const other = { ...legacyFailure("socket hang up"), id: "legacy-create-c", sequence: 3, input: { toolCallId: "legacy-call-c", toolName: create.name, arguments: { title: "Tender C" } } } as DurableTurnStep;
+          const held = await resume([legacyFailure("socket hang up"), other, pendingCreate(4)]);
+          expectHeld(held, "create-4");
+          expect(held.repository.current.steps.find((step) => step.id === "create-4")?.input.heldBy).toEqual(["legacy-create-c", "legacy-create"]);
+
+          operator(held.repository, "create-4", "retry");
+          expect((await resume([], held.repository)).execute).toHaveBeenCalledTimes(1);
+          expect((await nextCall(held.repository, pendingCreate(9, { title: "Tender D" }))).execute).toHaveBeenCalledTimes(1);
+        });
+
+        it("is resolved when the operator marks the held call complete, after a restart", async () => {
+          const held = await resume([legacyFailure("socket hang up"), pendingCreate(3)]);
+          operator(held.repository, "create-3", "mark-complete");
+
+          expect((await nextCall(held.repository, pendingCreate(9, { title: "Tender D" }))).execute).toHaveBeenCalledTimes(1);
+        });
+
+        it("stays unresolved when the call the operator released is rejected", async () => {
+          const held = await resume([legacyFailure("socket hang up"), pendingCreate(3)]);
+          operator(held.repository, "create-3", "retry");
+          const rejected = vi.fn(async () => { throw Object.assign(new Error("A record with this title already exists"), { status: 409 }); });
+          await new DurableTurnRunner(held.repository, unusedModel(), { execute: rejected }).execute({ tenantId, runId, reason: "continue" });
+          expect(rejected).toHaveBeenCalledTimes(1);
+          expect(held.repository.current.steps.find((step) => step.id === "create-3")?.state).toBe("failed");
+
+          expectHeld(await nextCall(held.repository, pendingCreate(9, { title: "Tender A" })), "create-9");
+        });
+      });
     });
 
     it("refuses an unchanged deterministic repeat inside a parallel read batch", async () => {
@@ -3193,6 +4172,7 @@ describe("durable turn runner", () => {
 
     describe("final answer after tool use stops", () => {
       const reason = "read failed 5 times with the same input and the same error. Last error: ENOENT";
+      const fallback = `I stopped working on this because ${reason}\n\nTell me how you would like to continue, or correct the input and ask again.`;
       const lateCall = {
         id: "call-late",
         name: "read",
@@ -3203,25 +4183,37 @@ describe("durable turn runner", () => {
         requiresApproval: false,
         approvalKind: "file-edit" as const,
       };
-      const answerWith = async (text: string) => {
+      const publishCall = {
+        id: "call-publish",
+        name: "persist_artifact",
+        input: { path: "/workspace/outputs/report.docx" },
+        retryClass: "idempotent_with_key" as const,
+        repeatPolicy: "block_after_success" as const,
+        idempotencyKey: "publish-report",
+        requiresApproval: false,
+        approvalKind: "file-edit" as const,
+      };
+      const answerWith = async (text: string, toolCalls: TurnModelToolIntent[] = [lateCall]) => {
         const repository = new FakeTurnRepository(snapshot("calling_model", [
           admittedStep(),
           { ...modelStep("pending", 1), input: { iteration: 1, wrapUp: reason } },
         ]));
         let lastMessage: unknown;
+        const execute = vi.fn(async (): Promise<TurnToolResult> => { throw new Error("no tool may run after tool use stopped"); });
         const runner = new DurableTurnRunner(repository, {
           call: async (current) => {
             lastMessage = modelMessages(current).messages.at(-1);
-            return { text, inputTokens: 1, outputTokens: 1, toolCalls: [lateCall] };
+            return { text, inputTokens: 1, outputTokens: 1, toolCalls };
           },
-        }, { execute: async () => { throw new Error("no tool may run after tool use stopped"); } });
+        }, { execute });
         const result = await runner.execute({ tenantId, runId, reason: "continue" });
         const assistant = repository.mutations.flatMap((mutation) => mutation.assistantMessage ? [mutation.assistantMessage] : []).at(-1);
-        return { result, repository, lastMessage, assistant };
+        const modelCall = repository.current.steps.find((step) => step.type === "model.call");
+        return { result, repository, lastMessage, assistant, execute, modelCall };
       };
 
-      it("asks last for an answer without tools and does not run tool calls in it", async () => {
-        const { result, repository, lastMessage, assistant } = await answerWith("I could not open a.txt because it does not exist.");
+      it("asks last for an answer without tools and keeps a text-only answer", async () => {
+        const { result, repository, lastMessage, assistant } = await answerWith("I could not open a.txt because it does not exist.", []);
 
         expect(result.state).toBe("finalizing");
         expect(lastMessage).toEqual({ role: "user", content: expect.stringContaining(`Berry has stopped tool use for this task: ${reason}`) });
@@ -3230,11 +4222,156 @@ describe("durable turn runner", () => {
         expect(assistant).toMatchObject({ text: "I could not open a.txt because it does not exist.", toolCalls: [] });
       });
 
+      it("does not save a claim about a publication it discarded", async () => {
+        const { result, repository, assistant, execute, modelCall } = await answerWith("I have published the finished report.docx.", [publishCall]);
+
+        expect(result.state).toBe("finalizing");
+        expect(execute).not.toHaveBeenCalled();
+        expect(repository.current.steps.some((step) => step.type.startsWith("tool."))).toBe(false);
+        expect(assistant).toMatchObject({ text: fallback, toolCalls: [] });
+        expect(JSON.stringify(repository.mutations)).not.toContain("I have published");
+        expect(modelCall?.output).toMatchObject({ text: fallback, toolCallIds: [] });
+      });
+
+      it("does not keep text that came with any discarded call", async () => {
+        const { assistant, execute } = await answerWith("Let me read a.txt once more.");
+
+        expect(execute).not.toHaveBeenCalled();
+        expect(assistant).toMatchObject({ text: fallback, toolCalls: [] });
+      });
+
       it("answers for the model when it returns only tool calls", async () => {
         const { result, assistant } = await answerWith("");
 
         expect(result.state).toBe("finalizing");
-        expect(assistant?.text).toBe(`I stopped working on this because ${reason}\n\nTell me how you would like to continue, or correct the input and ask again.`);
+        expect(assistant?.text).toBe(fallback);
+      });
+
+      it("answers for the model when it returns nothing", async () => {
+        const { result, assistant, repository } = await answerWith("", []);
+
+        expect(result.state).toBe("finalizing");
+        expect(assistant).toMatchObject({ text: fallback, toolCalls: [] });
+        // The wrap-up answer is final: no empty-response retry is queued.
+        expect(repository.current.steps.filter((step) => step.type === "model.call")).toHaveLength(1);
+      });
+
+      describe("what the user sees streamed", () => {
+        const claim = "I have published the finished report.docx.";
+        const wrapUpSnapshot = () => snapshot("calling_model", [
+          admittedStep(),
+          { ...modelStep("pending", 1), input: { iteration: 1, wrapUp: reason } },
+        ]);
+        const textDeltas = (events: readonly AgentStreamEvent[]) => events.flatMap((event) =>
+          event.kind === "message.delta" && event.channel !== "reasoning" ? [event.delta] : []);
+        /** Streams each chunk as the provider would, then returns the response. */
+        const streamingModel = (chunks: readonly string[], response: { text: string; toolCalls: TurnModelToolIntent[] }): DurableTurnModel => ({
+          call: async (_snapshot, _step, context) => {
+            for (const chunk of chunks) await context.emitDelta(chunk, "text");
+            await context.emitDelta("Thinking about the report.", "reasoning");
+            return { ...response, inputTokens: 1, outputTokens: 1 };
+          },
+        });
+
+        it.each([
+          ["a discarded publication", ["I have published ", "the finished report.docx."], claim, [publishCall]],
+          ["only tool calls", [], "", [lateCall]],
+          ["nothing", [], "", []],
+        ] as const)("streams Berry's answer, not the model's, for a wrap-up that returned %s", async (_label, chunks, text, toolCalls) => {
+          const repository = new FakeTurnRepository(wrapUpSnapshot());
+          const execute = vi.fn(async (): Promise<TurnToolResult> => { throw new Error("no tool may run after tool use stopped"); });
+
+          const result = await new DurableTurnRunner(repository, streamingModel(chunks, { text, toolCalls: [...toolCalls] }), { execute })
+            .execute({ tenantId, runId, reason: "continue" });
+
+          expect(result.state).toBe("finalizing");
+          expect(execute).not.toHaveBeenCalled();
+          expect(textDeltas(repository.events).join("")).not.toContain("I have published");
+          expect(latestAssistantStreamDraft(repository.events)).toMatchObject({ text: fallback, reasoning: "Thinking about the report.", open: false });
+          const assistant = repository.mutations.flatMap((mutation) => mutation.assistantMessage ? [mutation.assistantMessage] : []).at(-1);
+          expect(assistant).toMatchObject({ text: fallback, toolCalls: [] });
+        });
+
+        it("streams a valid text-only wrap-up answer exactly once", async () => {
+          const answer = "I could not open a.txt because it does not exist.";
+          const repository = new FakeTurnRepository(wrapUpSnapshot());
+
+          await new DurableTurnRunner(repository, streamingModel(["I could not open a.txt ", "because it does not exist."], { text: answer, toolCalls: [] }), noTools())
+            .execute({ tenantId, runId, reason: "continue" });
+
+          expect(textDeltas(repository.events).join("")).toBe(answer);
+          expect(latestAssistantStreamDraft(repository.events)).toMatchObject({ text: answer, open: false });
+          const assistant = repository.mutations.flatMap((mutation) => mutation.assistantMessage ? [mutation.assistantMessage] : []).at(-1);
+          expect(assistant?.text).toBe(answer);
+        });
+
+        it("still streams an ordinary answer as it arrives", async () => {
+          const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+
+          await new DurableTurnRunner(repository, streamingModel(["Here is ", "the summary."], { text: "Here is the summary.", toolCalls: [] }), noTools())
+            .execute({ tenantId, runId, reason: "continue" });
+
+          const deltas = textDeltas(repository.events);
+          expect(deltas.join("")).toBe("Here is the summary.");
+          // Streamed before the response was committed, not added by the commit.
+          const committed = repository.mutations.flatMap((mutation) => mutation.events ?? []);
+          expect(textDeltas(committed)).toEqual([]);
+        });
+
+        it("shows nothing of a withheld claim when the provider fails after streaming it", async () => {
+          const repository = new FakeTurnRepository(wrapUpSnapshot());
+          const runner = new DurableTurnRunner(repository, {
+            call: async (_snapshot, _step, context) => {
+              await context.emitDelta(claim, "text");
+              throw new Error("upstream connection reset");
+            },
+          }, noTools());
+
+          await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ state: "failed" });
+          expect(textDeltas(repository.events).join("")).not.toContain("I have published");
+          expect(latestAssistantStreamDraft(repository.events)?.text).toBe("");
+          expect(repository.mutations.some((mutation) => mutation.assistantMessage?.text)).toBe(false);
+        });
+
+        it("shows nothing of a withheld claim and commits nothing when ownership is lost", async () => {
+          const repository = new FakeTurnRepository(wrapUpSnapshot());
+          repository.heartbeat = async () => false;
+          const runner = new DurableTurnRunner(repository, {
+            call: async (_snapshot, _step, context) => {
+              await context.emitDelta(claim, "text");
+              await new Promise((resolve) => setTimeout(resolve, 15));
+              return { text: claim, inputTokens: 1, outputTokens: 1, toolCalls: [publishCall] };
+            },
+          }, noTools(), { owner: "worker-wrap-up-lease", heartbeatMs: 1, leaseSeconds: 1 });
+
+          await expect(runner.execute({ tenantId, runId, reason: "continue" })).rejects.toBeInstanceOf(DurableTurnRetryableError);
+          expect(textDeltas(repository.events).join("")).not.toContain("I have published");
+          expect(repository.mutations.some((mutation) => mutation.assistantMessage)).toBe(false);
+          expect(repository.current.state).toBe("calling_model");
+        });
+
+        it("shows nothing of a withheld claim when the turn is cancelled", async () => {
+          const repository = new FakeTurnRepository(wrapUpSnapshot());
+          const cancellations = new ActiveTurnCancellationRegistry();
+          let streamed!: () => void;
+          const claimStreamed = new Promise<void>((resolve) => { streamed = resolve; });
+          const runner = new DurableTurnRunner(repository, {
+            call: async (_snapshot, _step, context) => {
+              await context.emitDelta(claim, "text");
+              streamed();
+              return new Promise<never>((_resolve, reject) => {
+                context.signal?.addEventListener("abort", () => reject(context.signal?.reason), { once: true });
+              });
+            },
+          }, noTools(), { owner: "worker-wrap-up-cancel", cancellations });
+
+          const execution = runner.execute({ tenantId, runId, reason: "continue" });
+          await claimStreamed;
+          expect(cancellations.cancel(runId)).toBe(1);
+          await expect(execution).resolves.toMatchObject({ state: "cancelled" });
+          expect(textDeltas(repository.events).join("")).not.toContain("I have published");
+          expect(repository.mutations.some((mutation) => mutation.assistantMessage?.text)).toBe(false);
+        });
       });
     });
 
@@ -5978,3 +7115,159 @@ function unusedModel(): DurableTurnModel {
 function safeBigIntForTest(value: string): bigint {
   return BigInt(value || "0");
 }
+
+describe("admitted runtime metadata", () => {
+  const providerContext = () => ({
+    messageId: randomUUID(),
+    tools: [],
+    additionalUserContent: [],
+    emitDelta: async () => undefined,
+    policyForTool: () => ({
+      retryClass: "read_only" as const,
+      repeatPolicy: "compare_result" as const,
+      requiresApproval: false,
+      approvalKind: "mcp" as const,
+    }),
+  });
+  const providerResponse = () => new Response([
+    'data: {"type":"response.output_text.delta","delta":"ok"}',
+    'data: {"type":"response.completed","response":{"id":"resp-admitted","model":"test-model","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}',
+    "data: [DONE]",
+    "",
+  ].join("\n\n"), { status: 200, headers: { "content-type": "text/event-stream" } });
+
+  /** The runtime JSON each API write path leaves on a run, from one admitted snapshot. */
+  function writtenRuntime(path: "queued" | "continued" | "recovered"): Record<string, unknown> {
+    const admitted = {
+      ...providerSnapshot("openai-responses").runtimeRequest,
+      requestId: "request_1",
+      budgetReservationRequired: true,
+      workflowCategory: "documents",
+      workflowCategoryVersion: "workflow-v1",
+      builtInTools: [...DURABLE_BASE_BUILT_IN_TOOLS, "create_image"],
+      imageGeneration: { providerId: "image-provider", model: "image-model", costMicros: "40000" },
+    };
+    if (path === "queued") {
+      // queued-follow-up.service.ts stores the active run's runtime plus the
+      // queue budget identity; delivery turns it into the new run's runtime.
+      return queuedFollowUpRuntimeRequest(
+        { ...admitted, queuedBudgetRequestId: "queued:browser-key", budgetReservationRequired: true },
+        { id: "queue-id", attempt_count: 0, input: "Follow up", intent: null, attachments: [] },
+      );
+    }
+    if (path === "continued") {
+      return {
+        ...admitted,
+        continueInterruptedTurn: true,
+        continuationSourceRunId: "00000000-0000-7000-8000-000000000099",
+        continuationHeadEntryId: "entry-user",
+        input: "",
+      };
+    }
+    // renewRecoveryBudget merges this patch with runtime_request || patch.
+    return {
+      ...admitted,
+      requestId: "request_1:recovery:1",
+      budgetBaseRequestId: "request_1",
+      budgetGeneration: 1,
+      budgetUsageAfterSequence: 12,
+      budgetBaselineCostMicros: "5000",
+      budgetReservationRequired: true,
+    };
+  }
+
+  it.each(["queued", "continued", "recovered"] as const)(
+    "calls the admitted provider for a %s run, with or without a global router",
+    async (path) => {
+      const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>) => providerResponse());
+      vi.stubGlobal("fetch", fetchMock);
+      const legacy = { call: vi.fn(async () => ({ text: "global provider", inputTokens: 0, outputTokens: 0, toolCalls: [] })) };
+      for (const fallback of [legacy, null]) {
+        const current = providerSnapshot("openai-responses");
+        current.runtimeRequest = writtenRuntime(path);
+        const result = await new SnapshotProviderDurableTurnModel({}, fallback).call(current, modelStep("pending", 1), providerContext());
+        expect(result.text).toBe("ok");
+      }
+      expect(legacy.call).not.toHaveBeenCalled();
+      expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+        "https://provider.example.test/v1/responses",
+        "https://provider.example.test/v1/responses",
+      ]);
+    },
+  );
+
+  it.each(["queued", "continued", "recovered"] as const)("keeps the admitted tools for a %s run", (path) => {
+    const current = providerSnapshot("openai-responses");
+    current.runtimeRequest = writtenRuntime(path);
+    expect(durableBuiltInToolDefinitions(current).map((tool) => tool.function.name)).toContain("create_image");
+  });
+
+  it("never sends a malformed version-1 request to the global router", async () => {
+    const fetchMock = vi.fn(async () => providerResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    const legacy = { call: vi.fn(async () => ({ text: "global provider", inputTokens: 0, outputTokens: 0, toolCalls: [] })) };
+    const admitted = providerSnapshot("openai-responses").runtimeRequest;
+    const { baseUrl: _baseUrl, ...providerWithoutUrl } = admitted.provider as Record<string, unknown>;
+    for (const runtimeRequest of [
+      { ...admitted, unexpectedSetting: true },
+      { ...admitted, provider: providerWithoutUrl },
+      { ...admitted, capabilityVersion: 2 },
+    ]) {
+      const current = providerSnapshot("openai-responses");
+      current.runtimeRequest = runtimeRequest;
+      await expect(new SnapshotProviderDurableTurnModel({}, legacy).call(current, modelStep("pending", 1), providerContext()))
+        .rejects.toThrow("admitted model configuration");
+      expect(() => durableBuiltInToolDefinitions(current)).toThrow("admitted model configuration");
+    }
+    expect(legacy.call).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("calls the admitted provider for a run stored by the previous API release", async () => {
+    const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>) => providerResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    const current = providerSnapshot("openai-responses");
+    // The previous release stored its parsed request plus the admission fields,
+    // without workflow routing, capability notices or the new metadata.
+    current.runtimeRequest = {
+      ...current.runtimeRequest,
+      admissionFingerprint: "a".repeat(64),
+      budgetReservationRequired: false,
+      continueInterruptedTurn: false,
+      requestId: "request_previous_release",
+      input: "Say ok",
+    };
+    const legacy = { call: vi.fn() };
+    await expect(new SnapshotProviderDurableTurnModel({}, legacy).call(current, modelStep("pending", 1), providerContext()))
+      .resolves.toMatchObject({ text: "ok" });
+    expect(legacy.call).not.toHaveBeenCalled();
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://provider.example.test/v1/responses");
+  });
+
+  it("still sends a run admitted before capability snapshots to the global router", async () => {
+    const legacy = { call: vi.fn(async () => ({ text: "global provider", inputTokens: 0, outputTokens: 0, toolCalls: [] })) };
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    const result = await new SnapshotProviderDurableTurnModel({}, legacy).call(current, modelStep("pending", 1), providerContext());
+    expect(result.text).toBe("global provider");
+    await expect(new SnapshotProviderDurableTurnModel({}, null).call(current, modelStep("pending", 1), providerContext()))
+      .rejects.toThrow("Legacy durable turns require the global Berry Router configuration");
+  });
+
+  it("starts a queued run with its own budget generation and no inherited continuation", () => {
+    const runtime = queuedFollowUpRuntimeRequest({
+      ...writtenRuntime("recovered"),
+      continueInterruptedTurn: true,
+      continuationSourceRunId: "00000000-0000-7000-8000-000000000099",
+      continuationHeadEntryId: "entry-user",
+      queuedBudgetRequestId: "queued:browser-key",
+    }, { id: "queue-id", attempt_count: 2, input: "Next", intent: null, attachments: [] });
+
+    expect(runtime).toMatchObject({ requestId: "queued:browser-key", budgetReservationRequired: true, continueInterruptedTurn: false });
+    for (const key of [
+      "queuedBudgetRequestId", "continuationSourceRunId", "continuationHeadEntryId",
+      "budgetBaseRequestId", "budgetGeneration", "budgetUsageAfterSequence", "budgetBaselineCostMicros",
+    ]) expect(runtime).not.toHaveProperty(key);
+    // The new run's own usage events start at sequence 1; none may be skipped.
+    expect(budgetUsageAfterSequence(runtime)).toBe(0);
+  });
+});

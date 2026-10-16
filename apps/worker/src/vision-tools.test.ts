@@ -38,6 +38,44 @@ describe("DurableVisionToolExecutor", () => {
     await expect(executor.modelContent(snapshot)).resolves.toEqual(parts);
   });
 
+  it("keeps the admitted vision adapter on queued, Continue and recovered runs", async () => {
+    const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>) => new Response(JSON.stringify({
+      id: "vision-response",
+      model: "minimax-m3",
+      choices: [{ message: { content: "A red safety helmet on a desk." }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 },
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const base: DurableTurnToolExecutor = {
+      modelContent: async () => [{ type: "image_url", image_url: { url: "data:image/png;base64,aGVsbG8=" } }],
+      execute: async () => { throw new Error("unexpected base execution"); },
+    };
+    const executor = new DurableVisionToolExecutor(base, new MemoryVisionCache(), { VISION_TEST_KEY: "secret" });
+    const snapshot = visionSnapshot();
+    snapshot.runtimeRequest = {
+      ...snapshot.runtimeRequest,
+      queuedBudgetRequestId: "queued:browser-key",
+      continuationSourceRunId: "00000000-0000-7000-8000-000000000099",
+      continuationHeadEntryId: "entry-head",
+      budgetBaseRequestId: "request-1",
+      budgetGeneration: 1,
+      budgetUsageAfterSequence: 12,
+      budgetBaselineCostMicros: "5000",
+    };
+
+    // A text-only model gets the notice, never the raw pixels.
+    await expect(executor.modelContent(snapshot)).resolves.toEqual([
+      { type: "text", text: "[1 image is available through inspect_images. The selected language model has not received the image bytes.]" },
+    ]);
+    await expect(executor.execute(snapshot, visionStep())).resolves.toMatchObject({
+      output: { vision: { providerId: "router", model: "canopywave/minimax/minimax-m3" } },
+    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://router.example/v1/chat/completions");
+
+    snapshot.runtimeRequest = { ...snapshot.runtimeRequest, unexpectedSetting: true };
+    await expect(executor.modelContent(snapshot)).rejects.toThrow("admitted model configuration is invalid");
+  });
+
   it("withholds images from a text-only model when no approved adapter is available", async () => {
     const base: DurableTurnToolExecutor = {
       modelContent: async () => [{ type: "image_url", image_url: { url: "data:image/png;base64,aGVsbG8=" } }],
@@ -490,13 +528,124 @@ describe("DurableVisionToolExecutor", () => {
       expect(result.usage).toMatchObject({ inputTokens: 20, outputTokens: 40 });
     });
 
+    const replying = (replies: ReadonlyArray<{ content: string; finish: string }>) => {
+      const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>) => {
+        const reply = replies[(fetchMock.mock.calls.length - 1) % replies.length]!;
+        return new Response(JSON.stringify({
+          id: "vision-response",
+          model: "minimax-m3",
+          choices: [{ message: { content: reply.content }, finish_reason: reply.finish }],
+          usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      });
+      return fetchMock;
+    };
+
+    it.each([
+      ["empty", "", "stop"],
+      ["blank", "  \n", "stop"],
+      ["blocked", " Wei", "content_filter"],
+    ])("keeps a cut-off observation incomplete and uncached when its continuation is %s", async (_label, content, finish) => {
+      const fetchMock = replying([
+        { content: "1. Amal Haddad\n2. Bilal Khan\n3. Chen", finish: "length" },
+        { content, finish },
+      ]);
+      vi.stubGlobal("fetch", fetchMock);
+      const cache = new MemoryVisionCache();
+      const executor = new DurableVisionToolExecutor(base, cache, { VISION_TEST_KEY: "secret" });
+
+      const first = await executor.execute(visionSnapshot(), visionStep(question));
+      expect(first.output).toMatchObject({
+        vision: {
+          complete: false,
+          cacheHit: false,
+          diagnostics: [{ purpose: "first", finishReason: "length" }, { purpose: "continuation", finishReason: finish }],
+        },
+      });
+      expect((first.output as { content: string }).content).toContain("Incomplete observation");
+      expect((first.output as { content: string }).content).toContain("1. Amal Haddad\n2. Bilal Khan\n3. Chen");
+      expect(first.summary).toContain("incomplete");
+      // Both completed provider calls are billed.
+      expect(first.usage).toMatchObject({ inputTokens: 20, outputTokens: 40 });
+      expect(cache.values.size).toBe(0);
+
+      // Asking again goes back to the provider instead of reusing a partial answer.
+      const repeated = await executor.execute(visionSnapshot(), visionStep(question));
+      expect(repeated.output).toMatchObject({ vision: { complete: false, cacheHit: false } });
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+    });
+
+    // A provider that stops an answer for another reason than the output
+    // limit, such as a content filter, returned part of it. It is not asked
+    // again around the filter and never cached as complete (H-039).
+    it("keeps a first answer stopped by a content filter incomplete and uncached, without asking again", async () => {
+      const fetchMock = respond("1. Amal Haddad\n2. Bilal", "content_filter");
+      vi.stubGlobal("fetch", fetchMock);
+      const cache = new MemoryVisionCache();
+      const executor = new DurableVisionToolExecutor(base, cache, { VISION_TEST_KEY: "secret" });
+
+      const first = await executor.execute(visionSnapshot(), visionStep(question));
+      expect(first.output).toMatchObject({
+        vision: { complete: false, cacheHit: false, diagnostics: [{ purpose: "first", finishReason: "content_filter" }] },
+      });
+      expect((first.output as { content: string }).content).toContain("stopped its answer early (content_filter)");
+      expect((first.output as { content: string }).content).not.toContain("output limit");
+      expect(first.summary).toContain("incomplete");
+      expect(first.usage).toMatchObject({ inputTokens: 10, outputTokens: 1_024 });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(cache.values.size).toBe(0);
+
+      const repeated = await executor.execute(visionSnapshot(), visionStep(question));
+      expect(repeated.output).toMatchObject({ vision: { complete: false, cacheHit: false } });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("keeps an answer that followed an empty one incomplete when a content filter stopped it", async () => {
+      const fetchMock = replying([{ content: "", finish: "stop" }, { content: "1. Amal Haddad", finish: "content_filter" }]);
+      vi.stubGlobal("fetch", fetchMock);
+      const cache = new MemoryVisionCache();
+
+      const result = await new DurableVisionToolExecutor(base, cache, { VISION_TEST_KEY: "secret" }).execute(visionSnapshot(), visionStep(question));
+      expect(result.output).toMatchObject({
+        vision: { complete: false, diagnostics: [{ purpose: "first", finishReason: "stop" }, { purpose: "empty_retry", finishReason: "content_filter" }] },
+      });
+      expect((result.output as { content: string }).content).toContain("stopped its answer early (content_filter)");
+      expect(result.usage).toMatchObject({ inputTokens: 20, outputTokens: 40 });
+      expect(cache.values.size).toBe(0);
+    });
+
+    it("says a continuation stopped by a content filter was stopped early, not cut off", async () => {
+      const fetchMock = replying([{ content: "1. Amal Haddad\n2. Bilal Khan\n3. Chen", finish: "length" }, { content: " Wei", finish: "content_filter" }]);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const result = await new DurableVisionToolExecutor(base, new MemoryVisionCache(), { VISION_TEST_KEY: "secret" }).execute(visionSnapshot(), visionStep(question));
+      expect(result.output).toMatchObject({ vision: { complete: false } });
+      expect((result.output as { content: string }).content).toContain("stopped its answer early (content_filter)");
+    });
+
+    it("treats a missing finish reason as a normal ending", async () => {
+      const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>) => new Response(JSON.stringify({
+        id: "vision-response",
+        model: "minimax-m3",
+        choices: [{ message: { content: "1. Amal Haddad\n2. Bilal Khan" }, finish_reason: null }],
+        usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+      vi.stubGlobal("fetch", fetchMock);
+      const cache = new MemoryVisionCache();
+
+      const result = await new DurableVisionToolExecutor(base, cache, { VISION_TEST_KEY: "secret" }).execute(visionSnapshot(), visionStep(question));
+      expect(result.output).toMatchObject({ vision: { complete: true } });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(cache.values.size).toBe(1);
+    });
+
     it("still caches and reuses a complete observation", async () => {
       const fetchMock = respond("1. Amal Haddad\n2. Bilal Khan", "stop");
       vi.stubGlobal("fetch", fetchMock);
       const executor = new DurableVisionToolExecutor(base, new MemoryVisionCache(), { VISION_TEST_KEY: "secret" });
 
       const first = await executor.execute(visionSnapshot(), visionStep(question));
-      expect(first.output).toMatchObject({ vision: { complete: true, cacheHit: false, promptVersion: "vision-observation-v4" } });
+      expect(first.output).toMatchObject({ vision: { complete: true, cacheHit: false, promptVersion: "vision-observation-v6" } });
       expect((first.output as { content: string }).content).not.toContain("Incomplete observation");
       const repeated = await executor.execute(visionSnapshot(), visionStep(question));
       expect(repeated.output).toMatchObject({ vision: { complete: true, cacheHit: true } });

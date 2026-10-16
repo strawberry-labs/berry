@@ -87,7 +87,10 @@ const workspaceTools: ToolDefinition[] = [
     orderBy: string("Drive orderBy expression."), driveId: string("Optional shared drive ID."),
     searchScope: string("Return the searchScope from the previous page here when continuing with pageToken."),
   }), "read", driveReadScopes, searchDriveFiles),
-  tool("drive_list_recent_files", "List recently modified eligible Drive files.", object({ pageSize: integer("Maximum results.", 1, 100), pageToken: string("Continuation token.") }), "read", driveReadScopes,
+  tool("drive_list_recent_files", "List recently modified eligible Drive files.", object({
+    pageSize: integer("Maximum results.", 1, 100), pageToken: string("Continuation token."),
+    searchScope: string("Return the searchScope from the previous page here when continuing with pageToken."),
+  }), "read", driveReadScopes,
     (token, input) => searchDriveFiles(token, { ...input, query: "trashed = false", orderBy: "modifiedTime desc" })),
   tool("drive_get_file_metadata", "Get safe metadata and current capabilities for one Drive file.", object({ fileId: string("Drive file ID.") }, ["fileId"]), "read", driveReadScopes,
     async (token, input) => driveFilePreflight(token, requiredString(input.fileId, "fileId"), "read")),
@@ -96,7 +99,11 @@ const workspaceTools: ToolDefinition[] = [
     exportMimeType: string("Optional export MIME type for Google-native files."),
     saveToLibrary: boolean("Save the file to the Berry Library and queue searchable extraction. Defaults to false. Use true only for clear durable user intent, never only because the current task needs the file."),
   }, ["fileId"]), "read", driveReadScopes, readDriveFile),
-  tool("drive_list_children", "List eligible files directly inside a Drive folder, including folders in shared drives.", object({ folderId: string("Folder ID."), pageSize: integer("Maximum results.", 1, 100), pageToken: string("Continuation token."), driveId: string("Optional shared drive ID of the folder; found automatically when omitted.") }, ["folderId"]), "read", driveReadScopes,
+  tool("drive_list_children", "List eligible files directly inside a Drive folder, including folders in shared drives.", object({
+    folderId: string("Folder ID."), pageSize: integer("Maximum results.", 1, 100), pageToken: string("Continuation token."),
+    driveId: string("Optional shared drive ID of the folder; found automatically when omitted."),
+    searchScope: string("Return the searchScope from the previous page here when continuing with pageToken."),
+  }, ["folderId"]), "read", driveReadScopes,
     listDriveChildren),
   tool("drive_list_permissions", "List existing Drive permissions without changing sharing.", object({ fileId: string("Drive file ID."), pageSize: integer("Maximum permissions.", 1, 100), pageToken: string("Continuation token.") }, ["fileId"]), "read", driveReadScopes, async (token, input) => {
     const fileId = requiredString(input.fileId, "fileId");
@@ -308,7 +315,7 @@ async function listDriveChildren(token: string, input: Record<string, unknown>):
   // A shared-drive folder's children are only listed reliably within that drive.
   const driveId = optionalString(input.driveId)
     ?? optionalString(record(await googleJson(token, driveUrl(`files/${encodeURIComponent(folderId)}`, { fields: "id,driveId", supportsAllDrives: true })))?.driveId);
-  return searchDriveFiles(token, { query: `'${escapeDriveQuery(folderId)}' in parents and trashed = false`, pageSize: input.pageSize, pageToken: input.pageToken, driveId });
+  return searchDriveFiles(token, { query: `'${escapeDriveQuery(folderId)}' in parents and trashed = false`, pageSize: input.pageSize, pageToken: input.pageToken, searchScope: input.searchScope, driveId });
 }
 /**
  * A listing gives each eligible file's identity and the three permissions a

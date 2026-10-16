@@ -466,6 +466,31 @@ describe("durable MCP tool exposure", () => {
   });
 });
 
+describe("admitted connectors on runs with stored metadata", () => {
+  it("keeps the admitted connector for queued, Continue and recovered runs and refuses an invalid snapshot", async () => {
+    const tools = new DurableMcpToolExecutor({ execute: vi.fn(async () => ({ output: {}, summary: "base" })) }, [], undefined);
+    const drive = connectorServer("org-drive", "Org Drive", true, "search_files", "Search the organization drive");
+    drive.defaultTools = ["search_files"];
+    const snapshot = mcpSnapshot("Search my workspace");
+    snapshot.runtimeRequest = {
+      ...admittedRuntimeRequest(snapshot, drive),
+      queuedBudgetRequestId: "queued:browser-key",
+      continuationSourceRunId: "00000000-0000-7000-8000-000000000099",
+      continuationHeadEntryId: "entry-head",
+      budgetBaseRequestId: "request_1",
+      budgetGeneration: 1,
+      budgetUsageAfterSequence: 12,
+      budgetBaselineCostMicros: "5000",
+    };
+    expect(await tools.turnContext(snapshot)).toContain("- mcp__Org_Drive__search_files: ");
+    await tools.release(snapshot);
+
+    snapshot.runtimeRequest = { ...snapshot.runtimeRequest, unexpectedSetting: true };
+    await expect(tools.turnContext(snapshot)).rejects.toThrow("admitted model configuration is invalid (unexpectedSetting)");
+    await tools.close();
+  });
+});
+
 describe("durable MCP journal serialization", () => {
   it("says what it left out when a value exceeds the journal limits (H-070)", () => {
     const fields = Object.fromEntries(Array.from({ length: 130 }, (_, index) => [`field${index}`, index]));

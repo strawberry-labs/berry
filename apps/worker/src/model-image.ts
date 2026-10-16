@@ -205,6 +205,11 @@ export function modelImageOmission(path: string, reason: string): string {
   return `[Image not sent: ${JSON.stringify(path)}; ${reason}. The original file is unchanged. Use bash to create a smaller PNG/JPEG copy or crop the relevant region, then read that new path. Do not repeat read on this unchanged image or claim to have seen its pixels.]`;
 }
 
+/** An image left out only by the per-request image count; reading it again shows it. */
+export function modelImageWithheld(path: string, reason: string): string {
+  return `[Image not sent: ${JSON.stringify(path)}; ${reason}. Its pixels are not in this request. To see it, read this path again on its own or in a batch of at most ${MODEL_IMAGE_LIMITS.maxCount} images; until then do not describe details of it you have not seen.]`;
+}
+
 /** Final image gate includes text, schemas, UTF-8 bytes, and JSON framing. */
 export function limitModelImagePayload(
   messages: ChatMessage[],

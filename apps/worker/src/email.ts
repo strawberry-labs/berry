@@ -62,7 +62,42 @@ export function emailConfigFromEnv(env: NodeJS.ProcessEnv): { config: EmailConfi
 
 export function createEmailSender(config: EmailConfig, client?: SesSendClient): EmailSender | null {
   if (config.provider === "none") return null;
-  return new SesEmailSender(client ?? new SESv2Client({ region: config.region }), config);
+  // SendEmail is not idempotent: an SDK retry after a timeout or a lost
+  // connection could send the message twice. Delivery decides retries itself.
+  return new SesEmailSender(client ?? new SESv2Client({ region: config.region, maxAttempts: 1 }), config);
+}
+
+/** A send refused before anything left Berry, so it certainly did not happen. */
+export class EmailNotSentError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "EmailNotSentError";
+  }
+}
+
+// Client errors SES returns for a message it did not accept.
+const SES_REJECTIONS = new Set([
+  "AccountSuspendedException", "BadRequestException", "LimitExceededException", "MailFromDomainNotVerifiedException",
+  "MessageRejected", "NotFoundException", "SendingPausedException", "TooManyRequestsException",
+]);
+// Failures before a connection to SES was made.
+const NOT_CONNECTED = new Set(["CredentialsProviderError", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"]);
+
+/**
+ * Whether a failed send certainly did not send the email: SES refused it with
+ * a client error, no connection was made, or Berry refused it first. Anything
+ * else is uncertain and must not be sent again automatically: a server or
+ * gateway error (SES can accept a message and still answer 500 or 503), a
+ * request timeout, or a connection lost after the request left.
+ */
+export function emailSendRejected(error: unknown): boolean {
+  if (error instanceof EmailNotSentError) return true;
+  if (!error || typeof error !== "object") return false;
+  const { $metadata, name, code } = error as { $metadata?: { httpStatusCode?: unknown }; name?: unknown; code?: unknown };
+  const status = $metadata?.httpStatusCode;
+  if (typeof status === "number") return status >= 400 && status < 500 && status !== 408;
+  return (typeof name === "string" && (SES_REJECTIONS.has(name) || NOT_CONNECTED.has(name)))
+    || (typeof code === "string" && NOT_CONNECTED.has(code));
 }
 
 export class SesEmailSender implements EmailSender {
@@ -79,7 +114,7 @@ export class SesEmailSender implements EmailSender {
       if (!unique.has(address.toLowerCase())) unique.set(address.toLowerCase(), address);
     }
     const to = [...unique.values()].slice(0, MAX_RECIPIENTS);
-    if (to.length === 0) throw new Error("The email has no valid recipients");
+    if (to.length === 0) throw new EmailNotSentError("The email has no valid recipients");
     const input: SendEmailCommandInput = {
       FromEmailAddress: this.options.from,
       Destination: { ToAddresses: to },

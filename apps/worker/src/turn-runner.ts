@@ -21,7 +21,7 @@ import {
   AgentStreamEventSchema,
   classifyProviderFailure,
   DURABLE_BASE_BUILT_IN_TOOLS,
-  DurableTurnRuntimeRequestSchema,
+  parseAdmittedRuntimeRequest,
   normalizeWorkerRole,
   routedBuiltInToolNames,
   VISION_ADAPTER_MAX_ATTEMPTS,
@@ -82,7 +82,7 @@ import {
   operationalDuration,
   persistWorkerOperationalEvent,
 } from "./operational-telemetry.js";
-import { classifyToolFailure, storedToolFailure, type ToolFailure } from "./tool-failures.js";
+import { TOOL_FAILURE_OUTCOME_VERSION, classifyToolFailure, storedToolFailure, type ToolFailure } from "./tool-failures.js";
 import {
   PROVIDER_CREDIT_EXHAUSTED_MESSAGE,
   raiseProviderCreditAlert,
@@ -105,6 +105,8 @@ const TERMINAL_STATES = new Set<TurnRunState>([
   "recovery_required",
 ]);
 const IDENTICAL_TOOL_FAILURE_LIMIT = 5;
+// Characters of a tool error a failed step stores; uncertainFailure reads them back.
+const STORED_TOOL_ERROR_LIMIT = 4_000;
 
 export type ToolRepeatPolicy =
   | "compare_result"
@@ -758,7 +760,7 @@ export class DurableTurnRunner {
       }
       if (hasAmbiguousNonIdempotentTool(snapshot)) {
         try {
-          await this.transitionAmbiguousToolToRecovery(snapshot, message);
+          await this.transitionAmbiguousToolToRecovery(snapshot, message, { outcomeCertainty: "unknown" });
           return { runId: snapshot.id, state: "recovery_required" };
         } catch (persistenceError) {
           if (persistenceError instanceof DurableTurnRetryableError) throw persistenceError;
@@ -808,9 +810,17 @@ export class DurableTurnRunner {
       timedOut?: boolean;
       outcomeCertainty?: "known" | "unknown" | "not_applicable";
       abortAcknowledged?: boolean;
+      /** The class of the failure that left the outcome unknown (H-003). */
+      failure?: ToolFailure;
+      /** Usage the interrupted call already incurred. */
+      usage?: Extract<AgentStreamEvent, { kind: "usage" }>;
+      /** A pending call held before it runs, in place of an interrupted one. */
+      held?: DurableTurnStep;
+      /** The earlier calls whose unknown outcome holds it; kept in its input, which recovery leaves unchanged. */
+      heldBy?: readonly string[];
     } = {},
   ): Promise<void> {
-    const step = snapshot.steps.find((candidate) =>
+    const step = details.held ?? snapshot.steps.find((candidate) =>
       candidate.type.startsWith("tool.")
       && candidate.state === "running"
       && candidate.retryClass === "non_idempotent_manual"
@@ -822,15 +832,18 @@ export class DurableTurnRunner {
       nextState: "recovery_required",
       steps: [{
         ...step,
+        ...(details.heldBy ? { input: { ...step.input, heldBy: [...details.heldBy] } } : {}),
         state: "recovery_required",
         error: reason.slice(0, 4_000),
         cancellationAcknowledged: true,
+        ...(details.failure ? { output: { failure: toolFailureJson(details.failure) } } : {}),
         ...(details.timedOut !== undefined ? { timedOut: details.timedOut } : {}),
         ...(details.outcomeCertainty ? { outcomeCertainty: details.outcomeCertainty } : {}),
         ...(details.abortAcknowledged !== undefined ? { abortAcknowledged: details.abortAcknowledged } : {}),
       }],
       events: [
         { kind: "tool.end", toolCallId, status: "failed", summary: "The external mutation outcome is uncertain." },
+        ...(details.usage ? [AgentStreamEventSchema.parse(details.usage)] : []),
         { kind: "error", message: "The external mutation outcome is uncertain. Operator review is required before retry." },
         { kind: "turn.end", turnId: snapshot.id, status: "failed" },
       ],
@@ -984,6 +997,8 @@ export class DurableTurnRunner {
       maxDurationMs: this.options.modelPreparationTimeoutMs ?? 120_000,
     });
     const definitions = [...durableBuiltInToolDefinitions(snapshot), ...extensionTools];
+    // Recorded with the call so the next one keeps unchanged images in place (H-032).
+    const imageExposures = modelImageExposures(snapshot, additionalUserContent);
     const toolManifest = durableToolManifestMetrics(definitions);
     emitWorkerOperationalEvent("tool.manifest", this.options.workerRole ?? "unknown", this.options.sourceRevision ?? "unknown", {
       runId: snapshot.id,
@@ -1086,6 +1101,10 @@ export class DurableTurnRunner {
       { kind: "message.start", messageId, role: "assistant" },
     ]);
     const writer = new DurableMessageEventWriter(this.repository, snapshot, messageId);
+    // After a loop or budget guard stopped tool use, the response is the final
+    // answer (H-004). Its text is not streamed: it may describe a tool call that
+    // will be discarded, so only the accepted answer is shown, with its commit.
+    const wrapUpReason = stringValue(record(step.input)?.wrapUp);
     const repetitionGuard = new ExactOutputRepetitionGuard();
     const providerAttempts: ProviderAttemptReport[] = [];
     const attemptLayer = runnerAttemptLayer(step);
@@ -1115,6 +1134,7 @@ export class DurableTurnRunner {
                 abort(error);
                 throw error;
               }
+              if (wrapUpReason && channel === "text") return;
               await writer.write(delta, channel);
             },
             policyForTool: (name) => this.tools.policy?.(snapshot, name, permissionMode)
@@ -1296,15 +1316,11 @@ export class DurableTurnRunner {
       );
     }
 
-    // After a loop or budget guard stopped tool use, the response is the final
-    // answer: tool calls are not run, and an empty answer gets Berry's (H-004).
-    const wrapUpReason = stringValue(record(step.input)?.wrapUp);
+    // A wrap-up response's tool calls are not run, and an empty answer gets
+    // Berry's (H-004). Text sent with a discarded call can describe that call
+    // as done ("I have published the report"), so it is replaced by Berry's too.
     if (wrapUpReason && (result.toolCalls.length > 0 || !result.text.trim())) {
-      result = {
-        ...result,
-        toolCalls: [],
-        text: result.text.trim() ? result.text : finalAnswerFallback(wrapUpReason),
-      };
+      result = { ...result, toolCalls: [], text: finalAnswerFallback(wrapUpReason) };
     }
     const emptyResponse = !result.text.trim() && result.toolCalls.length === 0;
     if (emptyResponse) {
@@ -1318,6 +1334,7 @@ export class DurableTurnRunner {
         ...(result.providerResponseId ? { providerResponseId: result.providerResponseId } : {}),
         providerDiagnostics,
         reasoningCharacters: result.reasoning?.length ?? 0,
+        imageExposures,
       };
       if (record(step.input)?.recoveryReason === "empty_response") {
         const activeModelStep = latestStep(snapshot.steps, "model.call");
@@ -1360,6 +1377,8 @@ export class DurableTurnRunner {
     }
 
     const messageEvents: AgentStreamEvent[] = [
+      // The wrap-up answer that was withheld while streaming.
+      ...(wrapUpReason ? [{ kind: "message.delta" as const, messageId, delta: result.text, channel: "text" as const }] : []),
       { kind: "message.end", messageId },
       ...responseProviderAttempts,
       ...responseUsageEvents,
@@ -1451,6 +1470,7 @@ export class DurableTurnRunner {
             ...(result.providerResponseId ? { providerResponseId: result.providerResponseId } : {}),
             ...(Object.keys(providerToolCalls).length > 0 ? { providerToolCalls } : {}),
             providerDiagnostics,
+            imageExposures,
           },
           sessionEntryId: messageId,
           completedAt: new Date().toISOString(),
@@ -1609,6 +1629,25 @@ export class DurableTurnRunner {
         progressKind: "repair_budget",
       });
     }
+    // An earlier call of this tool may have taken effect: no further call of it
+    // runs until an explicit recovery decision (H-003, H-014).
+    const uncertain = step.state === "pending" && step.retryClass === "non_idempotent_manual"
+      ? uncertainEarlierCalls(snapshot, step)
+      : [];
+    const latestUncertain = uncertain[0];
+    if (latestUncertain) {
+      await this.transitionAmbiguousToolToRecovery(snapshot, [
+        `Not run: ${uncertain.length === 1 ? `an earlier ${toolName} call` : `${uncertain.length} earlier ${toolName} calls`} may already have taken effect.`,
+        `${uncertain.length === 1 ? "Its" : "The latest"} error: ${toolFailureIdentity(latestUncertain.previous.error).split("\n")[0]?.slice(0, 500) ?? ""}`,
+        "Review it before this call runs.",
+      ].join(" "), {
+        held: step,
+        heldBy: uncertain.map(({ previous }) => previous.id),
+        failure: latestUncertain.failure,
+        outcomeCertainty: "not_applicable",
+      });
+      return "recovery_required";
+    }
     const repeatedFailure = repeatedToolFailure(snapshot, step);
     if (repeatedFailure) return this.stopToolUse(snapshot, step, identicalFailureGuard(step, repeatedFailure));
     const unchangedRetry = step.state === "pending" ? unchangedFailedRetry(snapshot, step) : null;
@@ -1683,7 +1722,12 @@ export class DurableTurnRunner {
       await this.repository.commit(snapshot, {
         expectedState: "executing_tool",
         nextState: "recovery_required",
-        steps: [{ ...step, state: "recovery_required", error: "The worker stopped after this non-idempotent tool began; its outcome is ambiguous." }],
+        steps: [{
+          ...step,
+          state: "recovery_required",
+          error: "The worker stopped after this non-idempotent tool began; its outcome is ambiguous.",
+          outcomeCertainty: "unknown",
+        }],
         events: [
           {
             kind: "tool.end",
@@ -1922,7 +1966,7 @@ export class DurableTurnRunner {
         throw error;
       }
       const failureUsage = error instanceof DurableToolExecutionError ? error.usage : undefined;
-      const message = (error instanceof Error ? error.message : String(error)).slice(0, 4_000).replace(/\u0000/g, "\uFFFD");
+      const message = (error instanceof Error ? error.message : String(error)).slice(0, STORED_TOOL_ERROR_LIMIT).replace(/\u0000/g, "\uFFFD");
       const repairAttempt = priorRepairAttempts + 1;
       const timedOut = error instanceof DurableToolTimeoutError;
       const failureDurationMs = Math.max(0, Date.now() - toolStartedAt);
@@ -1943,6 +1987,20 @@ export class DurableTurnRunner {
         changesState: step.retryClass === "non_idempotent_manual",
         timedOut,
       });
+      // A change the target may have applied before the connection dropped or
+      // it answered with a server error is never repeated automatically. Like
+      // a timeout, it waits for an explicit recovery decision (H-003, H-014).
+      // Another failure whose effects are unknown (a command that ran, an
+      // unrecognised error) is shown to the model; the next call of the tool
+      // is held instead (uncertainEarlierCalls).
+      if (failure.category === "unknown_outcome" && step.retryClass === "non_idempotent_manual") {
+        await this.transitionAmbiguousToolToRecovery(snapshot, message, {
+          outcomeCertainty: "unknown",
+          failure,
+          ...(failureUsage ? { usage: failureUsage } : {}),
+        });
+        return "recovery_required";
+      }
       const typedRepairMessage = `Tool failed (repair attempt ${repairAttempt}/${repairBudget}${sameErrorGuidance}). ${message}`;
       const entryId = randomUUID();
       const remaining = snapshot.steps.some((candidate) =>
@@ -1967,7 +2025,7 @@ export class DurableTurnRunner {
               abortAcknowledged: error instanceof DurableToolTimeoutError
                 ? error.abortAcknowledged
                 : false,
-            } : {}),
+            } : failure.outcome === "unknown" ? { outcomeCertainty: "unknown" as const } : {}),
           },
           ...(!remaining ? [{
             id: randomUUID(),
@@ -3412,6 +3470,10 @@ export class DurableTurnRunner {
         }
         if (timeoutFailure || heartbeatFailure) {
           throw longOperationAbortError(timeoutFailure, heartbeatFailure);
+        }
+        // As for a result that arrives after cancellation: the run stopped.
+        if (controller.signal.aborted && controller.signal.reason instanceof DurableTurnCancellationError) {
+          throw controller.signal.reason;
         }
         throw error;
       }
@@ -5019,7 +5081,12 @@ function providerFailureDiagnostics(
 
 /** The run's admitted provider; legacy runs fall back to the deployment's router in the sink. */
 function creditAlertProvider(snapshot: DurableTurnSnapshot): Pick<ProviderCreditAlert, "providerId" | "providerName" | "providerHost"> {
-  const provider = durableRuntimeRequest(snapshot)?.provider;
+  let provider: DurableProviderTransport | undefined;
+  try {
+    provider = durableRuntimeRequest(snapshot)?.provider;
+  } catch {
+    // Reporting a failure must not raise another one.
+  }
   return provider
     ? { providerId: provider.id, providerName: provider.name, providerHost: urlHost(provider.baseUrl) }
     : {};
@@ -5293,16 +5360,19 @@ function toolFailureJson(failure: ToolFailure): Record<string, JsonValue> {
 }
 
 function toolFailureNote(failure: ToolFailure): string {
-  return `Failure class: ${failure.category}. ${failure.action}`;
+  const held = failure.outcome === "unknown" && failure.category !== "unknown_outcome"
+    ? " This call may already have changed something, so the next call of this tool waits for the user to review it."
+    : "";
+  return `Failure class: ${failure.category}. ${failure.action}${held}`;
 }
 
 /**
  * The latest identical earlier call (same tool, same arguments up to path
  * spelling) when it failed in a way an unchanged repeat cannot fix (H-003).
  * Credentials, configuration and credit need a person; invalid input and
- * missing resources need a change-making step in between; a call with an
- * unknown outcome must be checked by some other step before it is repeated.
- * Transient and unclassified failures keep the bounded repeat limit.
+ * missing resources need a change-making step in between. Transient and
+ * unclassified failures keep the bounded repeat limit. A call whose outcome
+ * is unknown holds later calls of its tool for recovery (uncertainEarlierCalls).
  */
 function unchangedFailedRetry(snapshot: DurableTurnSnapshot, step: DurableTurnStep): UnchangedFailedRetry | null {
   const fingerprint = failureArgumentFingerprint(snapshot, step);
@@ -5333,11 +5403,93 @@ function unchangedFailedRetry(snapshot: DurableTurnSnapshot, step: DurableTurnSt
     case "invalid_input":
     case "missing_resource":
       return ranBetween.some((candidate) => candidate.retryClass !== "read_only") ? null : refusal;
-    case "unknown_outcome":
-      return ranBetween.length > 0 ? null : refusal;
     default:
       return null;
   }
+}
+
+/**
+ * Earlier calls of this tool that may already have taken effect and that no
+ * explicit decision has resolved, latest first (H-003, H-014). A call held
+ * because of them lists them in its input; an operator's retry releases that
+ * call, and once it completes, or the operator marks it complete, they are
+ * resolved. Nothing else resolves them, not even another completed call.
+ */
+function uncertainEarlierCalls(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Array<{ previous: DurableTurnStep; failure: ToolFailure }> {
+  const resolved = new Set([
+    // This call was held, and the operator released it.
+    ...heldByIds(step),
+    ...snapshot.steps.flatMap((candidate) => candidate.type === step.type && candidate.state === "completed" ? heldByIds(candidate) : []),
+  ]);
+  return snapshot.steps
+    .filter((candidate) => candidate.sequence < step.sequence
+      && candidate.type === step.type
+      && candidate.state === "failed"
+      && !resolved.has(candidate.id))
+    .sort((left, right) => right.sequence - left.sequence)
+    .flatMap((candidate) => {
+      const failure = uncertainFailure(candidate);
+      return failure ? [{ previous: candidate, failure }] : [];
+    });
+}
+
+/** The uncertain calls a held call was waiting for. */
+function heldByIds(step: DurableTurnStep): string[] {
+  const value = step.input.heldBy;
+  return Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
+}
+
+/**
+ * The class of a failed step whose change may have been applied, or null.
+ * An unknown outcome, stored or recorded on the step, is never weakened. A
+ * stored "not applied" is trusted only when this classifier set it: earlier
+ * ones called some executed changes not applied, and older workers stored no
+ * class at all. Missing or older metadata does not show that nothing was
+ * applied, so such a step's stored error is classified again; it is cleared
+ * only if it never started or its whole error is evidence that it was not
+ * applied. An error cut at the stored limit may have lost the end that showed
+ * the call ran ("Command exited with code 1"), so it proves nothing. Neither
+ * does a shell error unless Berry reported that the command was not run: any
+ * other is the command's own output or a failure after it was sent.
+ */
+function uncertainFailure(step: DurableTurnStep): ToolFailure | null {
+  const stored = record(record(step.output)?.failure);
+  if (stored?.refusedUnchangedRetry === true) return null;
+  const typed = storedToolFailure(step.output);
+  if (typed?.outcome === "unknown") return typed;
+  if (typed?.outcomeVersion === TOOL_FAILURE_OUTCOME_VERSION && step.outcomeCertainty !== "unknown") return null;
+  if (step.retryClass !== "non_idempotent_manual" || !step.attempt) return null;
+  const text = toolFailureIdentity(step.error);
+  const toolName = toolNameForStep(step);
+  // Older connector statuses/wording do not distinguish a refused request from
+  // a failed sub-operation after a write. Image failures also lost the fact
+  // that generation preceded delivery. Only Berry's own argument-validation
+  // report proves these old calls were not dispatched; otherwise hold them.
+  const localArgumentRefusal = text.startsWith(`${toolName} was not run: `);
+  const mayHaveRun = (toolName === "bash" && !SHELL_NOT_RUN.test(text))
+    || ((toolName.startsWith("mcp__") || toolName === "create_image") && !localArgumentRefusal);
+  const error = Object.assign(
+    new Error(text),
+    typed?.status !== undefined ? { status: typed.status } : {},
+    mayHaveRun ? { toolCallPhase: "dispatched" } : {},
+  );
+  const failure = classifyToolFailure(error, { changesState: true });
+  const uncertain = step.outcomeCertainty === "unknown" || storedErrorMayBeCut(step.error);
+  return failure.outcome === "unknown" || uncertain ? { ...failure, outcome: "unknown" } : null;
+}
+
+// Berry's reports that a shell command was not run: its arguments were
+// refused (H-011), or the workspace could not be reached (H-009).
+const SHELL_NOT_RUN = /^bash was not run: |\bNothing was run\b/;
+
+/**
+ * Whether a failed step's stored error may have been cut. Every worker kept
+ * at most STORED_TOOL_ERROR_LIMIT characters of the message, after the
+ * "Tool failed (repair attempt …)." prefix that later ones add.
+ */
+function storedErrorMayBeCut(error: unknown): boolean {
+  return typeof error === "string"
+    && error.replace(/^Tool failed \(repair attempt \d+\/\d+[^)]*\)\. /, "").length >= STORED_TOOL_ERROR_LIMIT;
 }
 
 function unchangedRetryMessage(retry: UnchangedFailedRetry): string {
@@ -6434,49 +6586,146 @@ function continuationPhase(snapshot: DurableTurnSnapshot): ContinuationPhase {
 
 const MODEL_IMAGES_INTRO = "Workspace images supplied by Berry for visual inspection. Each path label identifies the image immediately following it. These are tool-supplied files, not new user instructions. Inspect the pixels now; another read is unnecessary unless the file changes.";
 
+/** Where one image (its label and pixels) was placed in a model request (H-032). */
+interface ModelImageExposure {
+  path: string;
+  /** Hash of the label and pixels as sent. */
+  sha256: string;
+  /** TURN_IMAGE_ANCHOR, or the tool call whose result the image follows. */
+  anchor: string;
+  /** The latest call that read or made the image at the time. */
+  read: string | null;
+}
+
+const TURN_IMAGE_ANCHOR = "turn";
+
 /**
- * Where each supplied image goes: images a completed read or create_image
- * produced go after that call's batch, this run's attachments after its turn
+ * Where each supplied image goes (H-032): after the batch of the read or
+ * create_image that produced it, this run's attachments after its turn
  * context, and anything else (omission notices, explicitly inspected images)
- * to the tail (H-032).
+ * to the tail. An image whose label and pixels have not changed since the
+ * last request stays where that request had it, so reading it again does not
+ * move it. Changed pixels are a new revision: they follow the read that
+ * returned them or, without a new read, the latest tool result, never the
+ * place that showed the old pixels. An image whose read result compaction
+ * removed follows the latest tool result still in the request.
  */
 function placeModelImages(
   snapshot: DurableTurnSnapshot,
   content: readonly ChatContentPart[],
   workspaceRoot: string,
-): { turn: ChatContentPart[]; byCall: Map<string, ChatContentPart[]>; tail: ChatContentPart[] } {
-  const placement = { turn: [] as ChatContentPart[], byCall: new Map<string, ChatContentPart[]>(), tail: [] as ChatContentPart[] };
+): { turn: ChatContentPart[]; byCall: Map<string, ChatContentPart[]>; tail: ChatContentPart[]; exposures: ModelImageExposure[] } {
+  const placement = {
+    turn: [] as ChatContentPart[],
+    byCall: new Map<string, ChatContentPart[]>(),
+    tail: [] as ChatContentPart[],
+    exposures: [] as ModelImageExposure[],
+  };
   if (content.length === 0) return placement;
-  const producedBy = new Map<string, string>();
+  // Tool results still in the request; a recorded place is kept only while its result is.
+  const results = new Set<string>();
+  let latestResult: string | null = null;
+  for (const entry of uncompactedEntries(snapshot)) {
+    const message = record(record(entry.payload)?.message);
+    if (stringValue(message?.role) !== "toolResult") continue;
+    latestResult = stringValue(message?.toolCallId) ?? entry.entryId;
+    results.add(latestResult);
+  }
+  const latestRead = new Map<string, string>();
   for (const step of [...snapshot.steps].sort((left, right) => left.sequence - right.sequence)) {
     if (step.state !== "completed") continue;
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName !== "read" && toolName !== "create_image") continue;
     const path = stringValue(record(step.output)?.visionPath);
     const callId = stringValue(step.input.toolCallId);
-    if (path && callId) producedBy.set(path, callId);
+    if (path && callId) latestRead.set(path, callId);
   }
+  const previous = previousModelImageExposures(snapshot);
   const runtime = durableRuntimeRequest(snapshot);
   const attachmentIds = new Set((runtime?.attachments ?? []).flatMap((attachment) =>
     attachment.fileId ? [attachment.fileId.toLowerCase()] : []
   ));
   const inputs = `${workspaceRoot}/inputs/`;
+  // The previous request's order: unchanged images keep it within their place.
+  const previousOrder = new Map([...(previous?.keys() ?? [])].map((path, order) => [path, order]));
+  const anchored: Array<{ part: ChatContentPart; next: ChatContentPart; exposure: ModelImageExposure; rank: number; order: number }> = [];
   for (let index = 0; index < content.length; index += 1) {
     const part = content[index]!;
     const next = content[index + 1];
     const path = part.type === "text" ? modelImageLabelPath(part.text) : null;
-    if (!path || next?.type !== "image_url") {
+    if (!path || part.type !== "text" || next?.type !== "image_url") {
       placement.tail.push(part);
       continue;
     }
     index += 1;
-    const callId = producedBy.get(path);
+    const sha256 = createHash("sha256").update(part.text).update("\0").update(next.image_url.url).digest("hex");
+    const read = latestRead.get(path) ?? null;
     const attachmentId = path.startsWith(inputs) ? path.slice(inputs.length).split("/", 1)[0]!.toLowerCase() : null;
-    if (callId) placement.byCall.set(callId, [...(placement.byCall.get(callId) ?? []), part, next]);
-    else if (attachmentId && attachmentIds.has(attachmentId)) placement.turn.push(part, next);
-    else placement.tail.push(part, next);
+    const attachment = Boolean(attachmentId && attachmentIds.has(attachmentId));
+    const shown = previous?.get(path);
+    let anchor: string | null;
+    if (shown && shown.sha256 === sha256 && (shown.anchor === TURN_IMAGE_ANCHOR ? attachment : results.has(shown.anchor))) {
+      anchor = shown.anchor;
+    } else if (shown && shown.sha256 !== sha256 && shown.read === read && latestResult) {
+      anchor = latestResult;
+    } else if (attachment && (!previous || !read)) {
+      // An attachment stays where the turn showed it unless a recorded
+      // request left it out and the model then read it.
+      anchor = TURN_IMAGE_ANCHOR;
+    } else if (read && !results.has(read)) {
+      // Compaction removed the read's result: the image follows the latest
+      // result still in the request, instead of a call that is no longer sent.
+      anchor = latestResult;
+    } else {
+      anchor = read;
+    }
+    if (!anchor) {
+      placement.tail.push(part, next);
+      continue;
+    }
+    // Images that kept their place come first, in their earlier order; images
+    // moved together keep their earlier order after them; new revisions follow
+    // in the order Berry supplied them.
+    const unchanged = shown?.sha256 === sha256;
+    anchored.push({
+      part, next, exposure: { path, sha256, anchor, read },
+      rank: unchanged && shown?.anchor === anchor ? 0 : unchanged ? 1 : 2,
+      order: unchanged ? previousOrder.get(path)! : 0,
+    });
+  }
+  const ordered = anchored
+    .map((item, index) => ({ ...item, index }))
+    .sort((left, right) => left.rank - right.rank || left.order - right.order || left.index - right.index);
+  for (const { part, next, exposure } of ordered) {
+    if (exposure.anchor === TURN_IMAGE_ANCHOR) placement.turn.push(part, next);
+    else placement.byCall.set(exposure.anchor, [...(placement.byCall.get(exposure.anchor) ?? []), part, next]);
+    placement.exposures.push(exposure);
   }
   return placement;
+}
+
+/** The images the latest completed model call placed; null before any recorded them. */
+function previousModelImageExposures(snapshot: DurableTurnSnapshot): Map<string, ModelImageExposure> | null {
+  const call = snapshot.steps
+    .filter((step) => step.type === "model.call" && step.state === "completed")
+    .sort((left, right) => right.sequence - left.sequence)[0];
+  const recorded = record(call?.output)?.imageExposures;
+  if (!Array.isArray(recorded)) return null;
+  const exposures = new Map<string, ModelImageExposure>();
+  for (const value of recorded) {
+    const item = record(value);
+    const path = stringValue(item?.path);
+    const sha256 = stringValue(item?.sha256);
+    const anchor = stringValue(item?.anchor);
+    if (path && sha256 && anchor) exposures.set(path, { path, sha256, anchor, read: stringValue(item?.read) ?? null });
+  }
+  return exposures;
+}
+
+/** What a model call records about its images, so the next call keeps them in place (H-032). */
+function modelImageExposures(snapshot: DurableTurnSnapshot, content: readonly ChatContentPart[]): JsonValue {
+  const workspacePath = durableWorkspacePath(snapshot, durableRuntimeRequest(snapshot)?.workspacePath);
+  return placeModelImages(snapshot, content, workspacePath).exposures.map((exposure) => ({ ...exposure }));
 }
 
 /**
@@ -7024,9 +7273,9 @@ export function modelMessages(
   return { messages, stableSystemPrompt };
 }
 
+/** The admitted request, or null for a run admitted before capability snapshots; throws when invalid. */
 function durableRuntimeRequest(snapshot: DurableTurnSnapshot): DurableTurnRuntimeRequest | null {
-  const parsed = DurableTurnRuntimeRequestSchema.safeParse(snapshot.runtimeRequest);
-  return parsed.success ? parsed.data : null;
+  return parseAdmittedRuntimeRequest(snapshot.runtimeRequest);
 }
 
 function durableSkills(snapshot: DurableTurnSnapshot): DurableSkill[] {
@@ -8209,10 +8458,23 @@ export function queuedFollowUpRuntimeRequest(
   // Runtime capabilities remain the admission snapshot captured when the row
   // was queued, but turn intent belongs to this prompt. Never inherit the
   // predecessor's image intent or drop an explicit queued image request.
-  const { intent: _previousIntent, ...runtime } = record(previousRuntime) ?? {};
+  // Continuation anchors and recovery budget generations describe the
+  // predecessor run: a new run that kept them would skip its own first usage
+  // events when settling, or reuse the predecessor's recovery request ids.
+  const {
+    intent: _previousIntent,
+    queuedBudgetRequestId,
+    continuationSourceRunId: _continuationSourceRunId,
+    continuationHeadEntryId: _continuationHeadEntryId,
+    budgetBaseRequestId: _budgetBaseRequestId,
+    budgetGeneration: _budgetGeneration,
+    budgetUsageAfterSequence: _budgetUsageAfterSequence,
+    budgetBaselineCostMicros: _budgetBaselineCostMicros,
+    ...runtime
+  } = record(previousRuntime) ?? {};
   return {
     ...runtime,
-    requestId: typeof runtime.queuedBudgetRequestId === "string" ? runtime.queuedBudgetRequestId : `queued:${queued.id}:${queued.attempt_count}`,
+    requestId: typeof queuedBudgetRequestId === "string" ? queuedBudgetRequestId : `queued:${queued.id}:${queued.attempt_count}`,
     input: queued.input,
     ...(queued.intent ? { intent: queued.intent } : {}),
     continueInterruptedTurn: false,

@@ -216,6 +216,47 @@ describe("DurablePersonalSkillToolExecutor", () => {
     );
   });
 
+  it("activates admitted skills on queued, Continue and recovered runs", async () => {
+    const resources = [
+      { path: "scripts/build.py", content: Buffer.from("print('ok')\n"), mode: 0o755 },
+      { path: "assets/template.docx", content: Buffer.from("template-bytes"), mode: 0o644 },
+    ].map((resource) => ({
+      path: resource.path,
+      mode: resource.mode,
+      size_bytes: resource.content.byteLength,
+      sha256: createHash("sha256").update(resource.content).digest("hex"),
+    }));
+    const tools = new DurablePersonalSkillToolExecutor({ execute: vi.fn(async () => ({ output: {}, summary: "base" })) }, {
+      execute: vi.fn(),
+      query: vi.fn(async (sql: string) => sql.includes("SELECT path,size_bytes,sha256,mode") ? resources : []) as never,
+    });
+    const snapshot = storedSkillSnapshot();
+    snapshot.runtimeRequest = {
+      ...snapshot.runtimeRequest,
+      requestId: "request_1:recovery:1",
+      queuedBudgetRequestId: "queued:browser-key",
+      continuationSourceRunId: "00000000-0000-7000-8000-000000000099",
+      continuationHeadEntryId: "entry-head",
+      budgetBaseRequestId: "request_1",
+      budgetGeneration: 1,
+      budgetUsageAfterSequence: 12,
+      budgetBaselineCostMicros: "5000",
+    };
+
+    await expect(tools.execute(snapshot, {
+      id: "activate-1",
+      type: "tool.activate_skill",
+      input: { toolName: "activate_skill", arguments: { name: "branding" } },
+    } as never)).resolves.toMatchObject({ output: { skill: "branding", availableResources: ["scripts/build.py", "assets/template.docx"] } });
+
+    snapshot.runtimeRequest = { ...snapshot.runtimeRequest, unexpectedSetting: true };
+    await expect(tools.execute(snapshot, {
+      id: "activate-2",
+      type: "tool.activate_skill",
+      input: { toolName: "activate_skill", arguments: { name: "branding" } },
+    } as never)).rejects.toThrow("admitted model configuration is invalid (unexpectedSetting)");
+  });
+
   it("activates instructions without sandbox calls, then bulk-loads only requested files", async () => {
     const resources = [
       { path: "scripts/build.py", content: Buffer.from("print('ok')\n"), mode: 0o755 },
