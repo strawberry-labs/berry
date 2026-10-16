@@ -5,7 +5,8 @@ import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
-import { toast } from "sonner";
+import { copyText } from "@berry/desktop-ui/lib/copy-text";
+import { directedLines, markdownDirection, rehypeTextDirection, type ScriptWords } from "@berry/desktop-ui/lib/text-direction";
 import type { BundledLanguage, BundledTheme, ThemedToken } from "shiki";
 import type { HighlightResponse } from "./berry-markdown-highlight.worker";
 
@@ -105,15 +106,19 @@ function MarkdownTable({ children, className, ...props }: React.ComponentProps<"
   React.useEffect(() => {
     const scroller = scrollerRef.current;
     if (!scroller) return;
+    // Right-to-left tables start at their right edge and scroll to negative
+    // offsets, so the hidden side is mirrored.
+    const rtl = getComputedStyle(scroller).direction === "rtl";
     const update = () => {
       const overflow = scroller.scrollWidth - scroller.clientWidth;
       if (overflow <= 1) {
         setShadow("none");
         return;
       }
-      const atStart = scroller.scrollLeft <= 1;
-      const atEnd = scroller.scrollLeft >= overflow - 1;
-      setShadow(atStart ? "right" : atEnd ? "left" : "both");
+      const offset = Math.abs(scroller.scrollLeft);
+      const atStart = offset <= 1;
+      const atEnd = offset >= overflow - 1;
+      setShadow(atStart ? (rtl ? "left" : "right") : atEnd ? (rtl ? "right" : "left") : "both");
     };
     update();
     scroller.addEventListener("scroll", update, { passive: true });
@@ -162,6 +167,8 @@ function linkifyFilePaths(children: ReactNode): ReactNode {
           key={`${childIndex}:${match.index}`}
           type="button"
           className="font-mono text-primary underline"
+          // The path is part of the sentence, so a selection copy keeps it as text (H-044).
+          data-copy-text=""
           onClick={() => openFilePath(path, line)}
         >
           {path}{line ? `:${line}` : ""}
@@ -189,34 +196,44 @@ export const Markdown = memo(function Markdown({
   const settings = useCodePreviewSettings();
   const revealed = useWordReveal(children, streaming);
   const source = revealed;
+  // Mixed Arabic/English text needs an explicit direction per block (H-047).
+  const [lineWords] = React.useState(() => new Map<string, ScriptWords>());
+  const direction = React.useMemo(() => (streaming ? null : markdownDirection(source)), [source, streaming]);
   if (streaming) {
     // Markdown parsing and syntax highlighting are deliberately deferred until
     // the response settles. A plain, accessible live surface keeps token
     // updates cheap while the final render still uses the full GFM/KaTeX path.
+    const live = directedLines(source, lineWords);
     return (
       <div
         data-markdown-live="true"
+        dir={live.direction}
         className={cn(
           "font-sans min-w-0 whitespace-pre-wrap text-[13px] leading-[1.75] tracking-wide wrap-break-word",
           className,
         )}
       >
-        {source}
+        {live.lines.map((line, index) => (
+          <div key={index} data-markdown-line="" dir={line.dir}>
+            {line.text || "\n"}
+          </div>
+        ))}
       </div>
     );
   }
   return (
     <div
+      dir={direction ?? undefined}
       className={cn(
         // Berry AP prose: 13px, 1.75 leading, wide tracking, trimmed ends.
         "font-sans min-w-0 text-[13px] leading-[1.75] tracking-wide wrap-break-word [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
-        "[&>p]:my-3",
+        "[&>p]:my-3 [&_.katex]:[direction:ltr]",
         className,
       )}
     >
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[[rehypeKatex, { strict: false, throwOnError: false }]]}
+        rehypePlugins={[[rehypeTextDirection, { direction: direction ?? "ltr" }], [rehypeKatex, { strict: false, throwOnError: false }]]}
         components={{
           h1: ({ className: c, ...props }) => <h1 className={cn("mt-6 mb-4 text-lg font-semibold", c)} {...props} />,
           h2: ({ className: c, ...props }) => <h2 className={cn("mt-6 mb-4 text-base font-semibold", c)} {...props} />,
@@ -230,24 +247,24 @@ export const Markdown = memo(function Markdown({
             </p>
           ),
           a: ({ className: c, ...props }) => (
-            <a className={cn("wrap-anywhere font-medium text-primary underline", c)} target="_blank" rel="noreferrer" {...props} />
+            <a className={cn("wrap-anywhere font-medium text-primary underline", c)} dir="auto" target="_blank" rel="noreferrer" {...props} />
           ),
           strong: ({ className: c, ...props }) => <strong className={cn("font-medium", c)} {...props} />,
           ul: ({ className: c, ...props }) => (
             <ul
-              className={cn("my-3 list-outside list-disc space-y-1.5 pl-5 marker:text-muted-foreground/70 [&_ul]:my-1.5 [&_ol]:my-1.5", c)}
+              className={cn("my-3 list-outside list-disc space-y-1.5 ps-5 marker:text-muted-foreground/70 [&_ul]:my-1.5 [&_ol]:my-1.5", c)}
               {...props}
             />
           ),
           ol: ({ className: c, ...props }) => (
             <ol
-              className={cn("my-3 list-inside list-decimal space-y-1.5 pl-0 marker:text-muted-foreground/70 [&_ul]:my-1.5 [&_ol]:my-1.5", c)}
+              className={cn("my-3 list-inside list-decimal space-y-1.5 ps-0 marker:text-muted-foreground/70 [&_ul]:my-1.5 [&_ol]:my-1.5", c)}
               {...props}
             />
           ),
-          li: ({ className: c, children, ...props }) => <li className={cn("pl-1 [&>p]:my-0 [&>p]:inline", c)} {...props}>{linkifyFilePaths(children)}</li>,
+          li: ({ className: c, children, ...props }) => <li className={cn("ps-1 [&>p]:my-0 [&>p]:inline", c)} {...props}>{linkifyFilePaths(children)}</li>,
           blockquote: ({ className: c, ...props }) => (
-            <blockquote className={cn("my-4 border-l-2 border-border pl-3 text-muted-foreground [&_p]:my-0 [&_p+p]:mt-2", c)} {...props} />
+            <blockquote className={cn("my-4 border-s-2 border-border ps-3 text-muted-foreground [&_p]:my-0 [&_p+p]:mt-2", c)} {...props} />
           ),
           hr: ({ className: c, ...props }) => <hr className={cn("my-4 border-border", c)} {...props} />,
           pre({ children }) {
@@ -265,7 +282,7 @@ export const Markdown = memo(function Markdown({
                 {children}
               </code>
             ) : (
-              <code className="rounded-lg bg-[var(--berry-surface-inset)] px-2 py-0.5 font-mono" {...props}>
+              <code dir="ltr" className="rounded-lg bg-[var(--berry-surface-inset)] px-2 py-0.5 font-mono" {...props}>
                 {children}
               </code>
             );
@@ -276,7 +293,7 @@ export const Markdown = memo(function Markdown({
           ),
           th: ({ className: c, ...props }) => (
             <th
-              className={cn("min-w-32 max-w-md border-b border-border px-3 py-2 text-left font-normal whitespace-normal break-words text-muted-foreground/70", c)}
+              className={cn("min-w-32 max-w-md border-b border-border px-3 py-2 text-start font-normal whitespace-normal break-words text-muted-foreground/70", c)}
               {...props}
             />
           ),
@@ -293,6 +310,20 @@ export const Markdown = memo(function Markdown({
     </div>
   );
 });
+
+/** Plain text such as a submitted prompt, each line in its own direction (H-047). */
+export function DirectedText({ text, className }: { text: string; className?: string }) {
+  const { direction, lines } = React.useMemo(() => directedLines(text), [text]);
+  return (
+    <span dir={direction} className={cn("block whitespace-pre-wrap", className)}>
+      {lines.map((line, index) => (
+        <span key={index} dir={line.dir} className="block">
+          {line.text || "\n"}
+        </span>
+      ))}
+    </span>
+  );
+}
 
 interface CodePreviewSettings {
   fontSize: number;
@@ -528,6 +559,7 @@ function CodeBlock({
   const highlighted = useHighlightedCode(code, language, settings.theme);
   return (
     <div
+      dir="ltr"
       className="group relative my-4 w-full overflow-hidden rounded-xl border border-border bg-[var(--berry-surface-inset)]"
       data-language={language}
       data-highlight-status={highlighted.status}
@@ -540,10 +572,7 @@ function CodeBlock({
           aria-label="Copy code"
           title="Copy code"
           className="shrink-0 cursor-pointer rounded-md p-1 opacity-0 transition-opacity hover:bg-muted/40 focus-visible:opacity-100 group-hover:opacity-100"
-          onClick={() => {
-            void navigator.clipboard.writeText(code);
-            toast.success("Copied");
-          }}
+          onClick={() => copyText(code)}
         >
           <Copy className="size-3.5" />
         </button>

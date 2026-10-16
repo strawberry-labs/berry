@@ -643,3 +643,97 @@ describe("ConnectorsService Google authorization policy", () => {
     expect(executions.some((sql) => sql.includes("DELETE FROM connector_oauth_states"))).toBe(true);
   });
 });
+
+describe("ConnectorsService internal Google session lifetime", () => {
+  const TASK_ID = "00000000-0000-7000-8000-000000000301";
+  const SESSION_ID = "00000000-0000-7000-8000-000000000302";
+  const listTools = { jsonrpc: "2.0", id: 1, method: "tools/list" };
+
+  function harness(activeRun: boolean) {
+    const runQueries: Array<readonly unknown[]> = [];
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string, params: readonly unknown[] = []) => {
+        if (sql.includes("ORDER BY kind, name") || sql.includes("SELECT * FROM organization_connectors WHERE id=")) {
+          return [googleRow({ id: "builtin_google_workspace" })] as T[];
+        }
+        if (sql.includes("SELECT * FROM connector_connections")) {
+          return [{
+            id: "connection_1", connector_id: "builtin_google_workspace", user_id: USER_ID, access_level: "read",
+            credential_envelope: null, account_email: "member@example.test", account_subject: "sub",
+            granted_scopes: ["https://www.googleapis.com/auth/drive.readonly"], status: "connected", expires_at: null,
+          }] as T[];
+        }
+        if (sql.includes("FROM turn_runs r")) {
+          runQueries.push(params);
+          return (activeRun ? [{ active: true }] : []) as T[];
+        }
+        return [] as T[];
+      },
+    };
+    const database = { withTenant: async <T>(_tenantId: string, callback: (db: SqlExecutor) => Promise<T>) => callback(executor) };
+    const service = new ConnectorsService(database as never, { NODE_ENV: "development", BERRY_CONNECTOR_ENCRYPTION_KEY: ENCRYPTION_KEY });
+    return { service, runQueries };
+  }
+
+  async function mint(service: ConnectorsService, context: { taskId?: string; sessionId?: string }) {
+    const [server] = await service.runtime(TENANT_ID, USER_ID, context);
+    expect(server?.credential).toBeTruthy();
+    return `Bearer ${server!.credential}`;
+  }
+
+  it.each([
+    ["past its 20-minute lease during a 35-minute wait", 35 * 60_000],
+    ["past its lease after 23 hours of an active run", 23 * 60 * 60_000],
+  ])("keeps a task session usable %s while the run is active", async (_label, elapsedMs) => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-10-14T08:00:00.000Z"));
+      const { service, runQueries } = harness(true);
+      const authorization = await mint(service, { taskId: TASK_ID, sessionId: SESSION_ID });
+      vi.setSystemTime(new Date(Date.parse("2026-10-14T08:00:00.000Z") + elapsedMs));
+
+      const result = await service.handleGoogleMcp(authorization, "google-workspace", listTools);
+
+      expect(result.status).toBe(200);
+      expect(runQueries).toEqual([[TENANT_ID, TASK_ID, SESSION_ID, USER_ID]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not consult run state while the lease is still valid", async () => {
+    const { service, runQueries } = harness(false);
+    const authorization = await mint(service, { taskId: TASK_ID, sessionId: SESSION_ID });
+
+    await expect(service.handleGoogleMcp(authorization, "google-workspace", listTools)).resolves.toMatchObject({ status: 200 });
+    expect(runQueries).toEqual([]);
+  });
+
+  it.each([
+    ["the run has ended or access was removed", { taskId: TASK_ID, sessionId: SESSION_ID }, false, 25 * 60_000],
+    ["the hard cap has passed", { taskId: TASK_ID, sessionId: SESSION_ID }, true, 25 * 60 * 60_000],
+    ["the session has no task scope", {}, true, 25 * 60_000],
+  ] as const)("ends an expired session when %s, without asking for a Google reconnect", async (_label, context, activeRun, elapsedMs) => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-10-14T08:00:00.000Z"));
+      const { service } = harness(activeRun);
+      const authorization = await mint(service, context);
+      vi.setSystemTime(new Date(Date.parse("2026-10-14T08:00:00.000Z") + elapsedMs));
+
+      await expect(service.handleGoogleMcp(authorization, "google-workspace", listTools))
+        .rejects.toThrow("This is not a Google sign-in problem");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still rejects a token with an invalid signature", async () => {
+    const { service } = harness(true);
+    const authorization = await mint(service, { taskId: TASK_ID, sessionId: SESSION_ID });
+
+    await expect(service.handleGoogleMcp(`${authorization}x`, "google-workspace", listTools))
+      .rejects.toThrow("Connector token signature is invalid");
+  });
+});

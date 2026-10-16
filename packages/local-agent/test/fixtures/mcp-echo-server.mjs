@@ -20,7 +20,11 @@ server.registerTool(
     description: "Always fails",
     inputSchema: {},
   },
-  async () => ({ isError: true, content: [{ type: "text", text: "intentional failure" }] }),
+  async () => ({
+    isError: true,
+    content: [{ type: "text", text: "intentional failure" }],
+    structuredContent: { error: { code: "INTENTIONAL_FAILURE", status: 409 } },
+  }),
 );
 
 const transport = new StdioServerTransport();

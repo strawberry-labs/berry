@@ -5,6 +5,7 @@ import {
 } from "@berry/personal-memory";
 import {
   MemoryOperationSchema,
+  memoryCandidateEligibility,
   normalizeMemoryStableKey,
 } from "@berry/shared";
 import type { ChatContentPart, ChatToolDefinition } from "@berry/router-client";
@@ -39,7 +40,7 @@ const PERSONAL_MEMORY_TOOL_DEFINITIONS: readonly ChatToolDefinition[] = [
     type: "function",
     function: {
       name: "remember_memory",
-      description: "Store a durable personal fact or preference for this user across chats. Use this when the user explicitly asks you to remember something. Never store credentials, secrets, copied documents, or temporary task details.",
+      description: "Store a durable personal fact or preference for this user across chats. Use this when the user explicitly asks you to remember something. Store only what the user stated or confirmed in their own words, not your own guesses, estimates or suggestions. Never store credentials, secrets, copied documents, or temporary task details.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -85,6 +86,9 @@ const PERSONAL_MEMORY_TOOL_DEFINITIONS: readonly ChatToolDefinition[] = [
   },
 ];
 
+const SETTINGS_UNREADABLE_NOTICE = "[Personal memory is unavailable for this message: its settings could not be read. Do not save or forget memories, and do not say that anything was remembered.]";
+const MEMORY_OFF_NOTICE = "[Personal memory is turned off for this user. Do not save or forget memories, and do not say that anything was remembered.]";
+
 export class DurablePersonalMemoryToolExecutor implements DurableTurnToolExecutor {
   constructor(
     private readonly base: DurableTurnToolExecutor,
@@ -95,9 +99,11 @@ export class DurablePersonalMemoryToolExecutor implements DurableTurnToolExecuto
 
   async definitions(snapshot: DurableTurnSnapshot): Promise<readonly ChatToolDefinition[]> {
     const inherited = await this.base.definitions?.(snapshot) ?? [];
-    return await this.enabled(snapshot)
-      ? [...inherited, ...PERSONAL_MEMORY_TOOL_DEFINITIONS]
-      : inherited;
+    // Declared from the deployment alone, so neither a user's setting nor a
+    // failed settings lookup changes the tool list and the provider's cached
+    // prefix (H-032, H-077). Declaring authorizes nothing: execute reads the
+    // settings again and refuses unless memory is on.
+    return this.#deploymentHasMemory() ? [...inherited, ...PERSONAL_MEMORY_TOOL_DEFINITIONS] : inherited;
   }
 
   async modelContent(
@@ -105,7 +111,29 @@ export class DurablePersonalMemoryToolExecutor implements DurableTurnToolExecuto
     signal?: AbortSignal,
     reportProgress?: () => void,
   ): Promise<readonly ChatContentPart[]> {
-    return this.base.modelContent?.(snapshot, signal, reportProgress) ?? [];
+    const [inherited, notice] = await Promise.all([
+      this.base.modelContent?.(snapshot, signal, reportProgress) ?? [],
+      this.#settingsNotice(snapshot),
+    ]);
+    return notice ? [...inherited, { type: "text", text: notice }] : inherited;
+  }
+
+  /**
+   * What this request tells the model about memory for its user. Settings
+   * that cannot be read leave memory off for the request with a notice
+   * instead of failing it; consent is never assumed (H-077).
+   */
+  async #settingsNotice(snapshot: DurableTurnSnapshot): Promise<string | null> {
+    if (!this.#deploymentHasMemory()) return null;
+    try {
+      return await this.enabled(snapshot) ? null : MEMORY_OFF_NOTICE;
+    } catch {
+      return SETTINGS_UNREADABLE_NOTICE;
+    }
+  }
+
+  #deploymentHasMemory(): boolean {
+    return this.globallyEnabled && this.personalMemory !== null;
   }
 
   async stageAssociatedInputFiles(
@@ -169,7 +197,13 @@ export class DurablePersonalMemoryToolExecutor implements DurableTurnToolExecuto
         ? this.base.execute(snapshot, step, signal, reportProgress)
         : this.base.execute(snapshot, step);
     }
-    if (!await this.enabled(snapshot)) {
+    let enabled: boolean;
+    try {
+      enabled = await this.enabled(snapshot);
+    } catch {
+      throw new Error("Personal memory is unavailable right now: its settings could not be read. Nothing was saved or forgotten; do not say that anything was remembered.");
+    }
+    if (!enabled) {
       throw new Error("Personal memory is disabled for this user");
     }
     if (!this.personalMemory) {
@@ -205,6 +239,9 @@ export class DurablePersonalMemoryToolExecutor implements DurableTurnToolExecuto
       expiresAt: input.expires_at ?? null,
       reason: "explicit_user_memory",
     });
+    // Explicit memories skip the implicit-memory filters, but never secrets (H-040).
+    const eligibility = memoryCandidateEligibility(operation, "personal");
+    if (!eligibility.eligible) throw new Error(`Not stored: ${eligibility.reason.replaceAll("_", " ")}.`);
     const result = await this.personalMemory!.remember(operationToPersonalMemoryInput(
       { tenantId: snapshot.tenantId, userId: snapshot.userId },
       operation,

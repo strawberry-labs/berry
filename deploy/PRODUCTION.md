@@ -97,7 +97,7 @@ the bucket placeholder; do not apply this rule to the audit bucket.
 ```sh
 aws s3api put-bucket-cors \
   --bucket YOUR_ARTIFACT_BUCKET \
-  --cors-configuration '{"CORSRules":[{"AllowedOrigins":["https://ai.example.com"],"AllowedMethods":["PUT"],"AllowedHeaders":["*"],"ExposeHeaders":["ETag"],"MaxAgeSeconds":3600}]}'
+  --cors-configuration '{"CORSRules":[{"AllowedOrigins":["https://ai.example.com"],"AllowedMethods":["PUT","GET","HEAD"],"AllowedHeaders":["*"],"ExposeHeaders":["ETag","Content-Range"],"MaxAgeSeconds":3600}]}'
 ```
 
 Before enabling Google Workspace, Gmail, or Calendar in the admin UI, complete

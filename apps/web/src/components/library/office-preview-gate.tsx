@@ -1,8 +1,8 @@
 import * as React from "react";
 import type { StoredFile } from "@berry/shared";
 import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
-import { FileDown, FileText } from "@berry/desktop-ui/lib/icons";
-import { Button } from "@berry/desktop-ui/components/ui/button";
+import { FileText } from "@berry/desktop-ui/lib/icons";
+import { FileDownloadButton } from "./file-download-controls";
 import { filePreviewDecision, PREVIEW_LIMITS, type FilePreviewKind } from "./file-preview-policy";
 import type { OfficePreviewKind, OfficePreviewWorkerRequest, OfficePreviewWorkerResponse } from "./office-preview-types";
 
@@ -108,7 +108,7 @@ export function DownloadOnlyPreview({ file, reason }: { file: StoredFile; reason
       <FileText />
       <strong>This file is download-only</strong>
       <span>{reason}</span>
-      <Button asChild variant="outline"><a href={file.downloadUrl} download={file.name}><FileDown /> Download file</a></Button>
+      <FileDownloadButton file={file} />
     </div>
   );
 }

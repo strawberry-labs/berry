@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1085.0",
+    "@aws-sdk/client-sesv2": "3.1085.0",
     "@berry/db": "workspace:*",
     "@berry/harness": "workspace:*",
     "@berry/local-agent": "workspace:*",
@@ -26,6 +27,7 @@
     "bullmq": "^5.65.1",
     "ioredis": "^5.10.1",
     "pg": "8.16.3",
+    "sharp": "0.35.5",
     "zod": "^3.25.76"
   },
   "devDependencies": {

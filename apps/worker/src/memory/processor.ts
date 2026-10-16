@@ -45,15 +45,14 @@ export class MemoryProcessor {
 
   private async ingestPersonal(payload: MemoryExtractJobPayload): Promise<{ applied: number; noops: number }> {
     const userText = sanitizePersonalMemorySource(payload.userText);
-    const assistantText = sanitizePersonalMemorySource(payload.assistantText);
     if (!userText) return { applied: 0, noops: 1 };
+    // Mem0's extractor also mines assistant replies, so an assistant estimate
+    // became a fact "the user confirmed" under the user's provenance. Personal
+    // memories must be supported by the user's own words (H-040).
     const result = await this.personalMemory!.ingestConversation({
       tenantId: payload.tenantId,
       userId: payload.userId,
-      messages: [
-        { role: "user", content: userText },
-        ...(assistantText ? [{ role: "assistant" as const, content: assistantText }] : []),
-      ],
+      messages: [{ role: "user", content: userText }],
       source: {
         actorUserId: null,
         taskId: payload.taskId,

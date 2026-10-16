@@ -341,7 +341,9 @@ export class MemoryService {
         ? this.recallPersonal(() => this.personalMemory!.search({
             tenantId: input.tenantId,
             userId: input.userId,
-            query: input.query,
+            // The memory service rejects queries over 4,000 characters, which
+            // silently dropped every personal memory for long requests (H-040).
+            query: input.query.slice(0, 4_000),
             limit: 40,
             ...(input.signal ? { signal: input.signal } : {}),
           }))

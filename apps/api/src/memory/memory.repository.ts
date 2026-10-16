@@ -187,6 +187,13 @@ export class SqlMemoryRepository implements MemoryRepository {
           AND COALESCE(settings.memory_enabled, true) = true
           AND mi.status = 'active'
           AND (mi.expires_at IS NULL OR mi.expires_at > now())
+          -- A memory learned in a task the user has since deleted is not
+          -- recalled; restoring the task restores it (H-040).
+          AND (mi.source_task_id IS NULL OR EXISTS (
+            SELECT 1 FROM tasks source_task
+            WHERE source_task.tenant_id = mi.tenant_id AND source_task.id = mi.source_task_id
+              AND source_task.deleted_at IS NULL
+          ))
           AND (
             (mi.scope = 'personal' AND mi.workspace_id IS NULL) OR
             (mi.scope = 'project' AND mi.workspace_id = $3::uuid)

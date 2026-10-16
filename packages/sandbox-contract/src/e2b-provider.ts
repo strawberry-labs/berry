@@ -479,7 +479,7 @@ export class E2BSandboxProvider implements SandboxProvider {
     const parsed = SandboxResumeInputSchema.parse(input);
     options.signal?.throwIfAborted();
     const current = this.#sandboxes.get(parsed.sandbox_id);
-    if (current) {
+    if (current && !parsed.force_reconnect) {
       const remainingMs = current.activeUntil - this.#now().getTime();
       // A durable turn calls resume before every phase. Do not issue an E2B
       // timeout-update request for a healthy local handle; the normal data

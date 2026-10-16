@@ -146,6 +146,8 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      AccelerateConfiguration:
+        AccelerationStatus: Enabled
       VersioningConfiguration:
         Status: Enabled
       CorsConfiguration:
@@ -154,10 +156,13 @@ Resources:
               - "*"
             AllowedMethods:
               - PUT
+              - GET
+              - HEAD
             AllowedOrigins:
               - !Sub https://${DomainName}
             ExposedHeaders:
               - ETag
+              - Content-Range
             MaxAge: 3600
       LifecycleConfiguration:
         Rules:

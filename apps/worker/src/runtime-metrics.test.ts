@@ -18,6 +18,21 @@ describe("worker runtime metrics", () => {
     expect(output).toContain("berry_worker_provider_requests_aborted_total 1");
   });
 
+  it("records time to first token and preparation steps (H-013)", () => {
+    const metrics = new WorkerRuntimeMetrics();
+    metrics.providerRequest({ model: "glm-5.3", outcome: "success", status: 200, latencyMs: 9_000, firstTokenMs: 1_800 });
+    metrics.providerRequest({ model: "glm-5.3", outcome: "failure", status: 500, latencyMs: 300, firstTokenMs: 100 });
+    metrics.preparationStep("skill.stage", "success", 420);
+    metrics.preparationStep("snapshot.capture", "failure", 31_000);
+
+    const output = metrics.render();
+    expect(output).toContain('berry_worker_provider_first_token_seconds_bucket{model="glm-5.3",le="2"} 1');
+    expect(output).toContain('berry_worker_provider_first_token_seconds_count{model="glm-5.3"} 1');
+    expect(output).toContain('berry_worker_preparation_duration_seconds_bucket{operation="skill.stage",outcome="success",le="0.5"} 1');
+    expect(output).toContain('berry_worker_preparation_duration_seconds_bucket{operation="snapshot.capture",outcome="failure",le="30"} 0');
+    expect(output).toContain('berry_worker_preparation_duration_seconds_count{operation="snapshot.capture",outcome="failure"} 1');
+  });
+
   it("bounds provider label values", () => {
     const metrics = new WorkerRuntimeMetrics();
     metrics.providerRequest({ model: "x".repeat(500), outcome: "other", status: 999, latencyMs: null });

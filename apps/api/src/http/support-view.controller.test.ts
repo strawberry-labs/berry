@@ -75,6 +75,7 @@ async function controllerFor(role: "owner" | "admin" | "member", agentApi?: unkn
   };
   const files = {
     describe: vi.fn(async () => ({ id: fileId })),
+    downloadUrl: vi.fn(async () => ({ url: "https://storage.test/signed", expiresIn: 60 })),
     streamContent: vi.fn(async () => undefined),
   };
   const audit = { append: vi.fn(async () => ({ id: "audit_1" })) };
@@ -158,6 +159,25 @@ describe("SupportViewController", () => {
     }));
   });
 
+  it("keeps the submission's Idempotency-Key when creating a task for the member (H-035)", async () => {
+    const agentApi = {
+      createTask: vi.fn(async (_request: unknown, _body: unknown) => ({ task: { id: taskId }, session: { id: sessionId } })),
+    };
+    const { controller } = await controllerFor("admin", agentApi);
+    const key = "6f0c2b1a-9d8e-4f7a-8b6c-5d4e3f2a1b0c";
+
+    await controller.createTask(
+      { ...requestFor(actorId), headers: { "idempotency-key": key } },
+      SELF_HOST_TENANT_ID,
+      subjectId,
+      { title: "Support draft" },
+    );
+
+    const delegatedRequest = agentApi.createTask.mock.calls[0]?.[0] as any;
+    expect(delegatedRequest.auth.user.id).toBe(subjectId);
+    expect(delegatedRequest.headers["idempotency-key"]).toBe(key);
+  });
+
   it("verifies session ownership before returning messages", async () => {
     const { controller, store } = await controllerFor("owner");
 
@@ -193,6 +213,22 @@ describe("SupportViewController", () => {
     )).rejects.toBeInstanceOf(BadRequestException);
 
     expect(store.listMessagePage).not.toHaveBeenCalled();
+  });
+
+  it("authorizes and audits direct download grants without claiming completed delivery", async () => {
+    const { audit, controller, files } = await controllerFor("admin");
+    const response = { setHeader: vi.fn() };
+    await expect(controller.fileDownloadUrl(requestFor(actorId), SELF_HOST_TENANT_ID, subjectId, fileId, response as any)).resolves.toMatchObject({ expiresIn: 60 });
+    expect(files.downloadUrl).toHaveBeenCalledWith(SELF_HOST_TENANT_ID, subjectId, fileId);
+    expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", "private, no-store");
+    expect(audit.append).toHaveBeenCalledOnce();
+    expect(audit.append).toHaveBeenCalledWith(expect.objectContaining({ action: "support-view-file-download-requested", metadata: { subjectUserId: subjectId, delivery: "signed-url" } }));
+  });
+
+  it("rejects support download grants for a non-admin before signing", async () => {
+    const { controller, files } = await controllerFor("member");
+    await expect(controller.fileDownloadUrl(requestFor(actorId), SELF_HOST_TENANT_ID, subjectId, fileId, { setHeader: vi.fn() } as any)).rejects.toThrow();
+    expect(files.downloadUrl).not.toHaveBeenCalled();
   });
 
   it("audits file download attempts and successful delivery separately", async () => {

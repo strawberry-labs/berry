@@ -13,7 +13,8 @@ export const QueuedFollowUpSchema = z.object({
   input: z.string().min(1),
   intent: TurnIntentSchema.optional(),
   attachments: z.array(AttachmentInputSchema).default([]),
-  status: z.enum(["queued", "sending", "paused", "failed"]),
+  // "expired" text was never sent; it is listed only so it can be copied (H-015).
+  status: z.enum(["queued", "sending", "paused", "failed", "expired"]),
   error: z.string().nullable().default(null),
   pausedReason: z.string().nullable().default(null),
   messageId: z.string().nullable().default(null),
@@ -35,7 +36,11 @@ export function serverQueuedFollowUpToClient(item: ServerQueuedFollowUp): Queued
     input: item.input,
     ...(item.intent ? { intent: item.intent } : {}),
     attachments: item.attachments,
-    status: item.status === "delivering" ? "sending" : item.status === "paused" ? "paused" : item.status === "failed" ? "failed" : "queued",
+    status: item.status === "delivering" ? "sending"
+      : item.status === "paused" ? "paused"
+        : item.status === "failed" ? "failed"
+          : item.status === "expired" ? "expired"
+            : "queued",
     error: item.error,
     pausedReason: item.status === "paused" ? item.error : null,
     messageId: null,
@@ -145,7 +150,8 @@ export function nextQueuedFollowUp(
   followUps: readonly QueuedFollowUp[],
   editingFollowUpId: string | null = null,
 ): QueuedFollowUp | null {
-  const next = followUps[0];
+  // Expired text is never sent, so it neither delivers nor holds up the queue.
+  const next = followUps.find((followUp) => followUp.status !== "expired");
   return next?.status === "queued" && next.id !== editingFollowUpId ? next : null;
 }
 

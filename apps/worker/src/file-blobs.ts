@@ -681,7 +681,8 @@ async function completeVerificationWatchdog(executor: SqlExecutor, payload: File
   `, [payload.tenantId, payload.blobId, `file.verify-blob:${payload.blobId}`, payload.outboxId ?? null, payload.leaseEpoch ?? null]);
 }
 
-async function acknowledgeBlobOutbox(
+/** Exported for the PostgreSQL receipt regression (scripts/test-blob-receipt.mjs). */
+export async function acknowledgeBlobOutbox(
   executor: SqlExecutor,
   payload: FileDeleteBlobJobPayload,
   note: string | null,
@@ -693,7 +694,7 @@ async function acknowledgeBlobOutbox(
         delivered_at = COALESCE(delivered_at, now()),
         receipt_at = COALESCE(receipt_at, now()), receipt_due_at = NULL,
         lease_owner = NULL, lease_expires_at = NULL,
-        last_error = $4, error_category = CASE WHEN $4 IS NULL THEN NULL ELSE 'cancelled' END, updated_at = now()
+        last_error = $4::text, error_category = CASE WHEN $4::text IS NULL THEN NULL ELSE 'cancelled' END, updated_at = now()
     WHERE tenant_id = $1::uuid AND id = $2::uuid
       AND event_type = 'file.delete-blob' AND aggregate_id = $3
       AND completed_at IS NULL AND dead_lettered_at IS NULL

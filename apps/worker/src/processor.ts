@@ -1,4 +1,4 @@
-import { AlertEvaluationJobPayloadSchema, BerryWorkerJobNameSchema, CompactionJobPayloadSchema, ContextBackfillJobPayloadSchema, FileBlobJobPayloadSchema, FileDeleteBlobJobPayloadSchema, FileDeleteObjectJobPayloadSchema, KnowledgeIndexTaskJobPayloadSchema, KnowledgeRevisionJobPayloadSchema, MemoryExtractJobPayloadSchema, ReportRunJobPayloadSchema, RetentionCleanupJobPayloadSchema, SandboxSnapshotJobPayloadSchema, TitleGenJobPayloadSchema, TurnExecuteJobPayloadSchema, TurnResumeJobPayloadSchema, UsageRollupJobPayloadSchema, parseWorkerJob } from "./jobs.js";
+import { AlertEvaluationJobPayloadSchema, BerryWorkerJobNameSchema, CompactionJobPayloadSchema, ContextBackfillJobPayloadSchema, FileBlobJobPayloadSchema, FileDeleteBlobJobPayloadSchema, FileDeleteObjectJobPayloadSchema, KnowledgeIndexTaskJobPayloadSchema, KnowledgeRevisionJobPayloadSchema, MemoryExtractJobPayloadSchema, ProviderBalanceCheckJobPayloadSchema, ProviderCreditAlertJobPayloadSchema, ReportRunJobPayloadSchema, RetentionCleanupJobPayloadSchema, SandboxSnapshotJobPayloadSchema, TitleGenJobPayloadSchema, TurnExecuteJobPayloadSchema, TurnResumeJobPayloadSchema, UsageRollupJobPayloadSchema, parseWorkerJob } from "./jobs.js";
 import { processAlertEvaluationJob, processReportRunJob, type ManagementJobRepository } from "./reporting-alerts.js";
 import { processCompactionJob, type SessionCompactionRunner } from "./compaction.js";
 import { processTitleGenerationJob, type TaskTitleRepository, type TitleGenerator } from "./title-gen.js";
@@ -10,6 +10,8 @@ import type { SandboxContinuityManager } from "./sandbox-continuity.js";
 import type { MaintenanceRunner } from "./maintenance.js";
 import type { FileObjectDeleter } from "./file-deletion.js";
 import type { FileBlobProcessor } from "./file-blobs.js";
+import type { ProviderCreditAlertProcessor } from "./provider-credit-alerts.js";
+import type { ProviderBalanceChecker } from "./provider-balance.js";
 import { acknowledgeDeliveryAtStart, type RuntimeOutboxDeliveryReceipts } from "./outbox.js";
 
 export interface BerryWorkerDependencies {
@@ -26,6 +28,9 @@ export interface BerryWorkerDependencies {
   fileDeleter?: FileObjectDeleter | undefined;
   fileBlobs?: FileBlobProcessor | undefined;
   outboxReceipts?: RuntimeOutboxDeliveryReceipts | undefined;
+  /** Present only when administrator email is configured (H-005). */
+  providerCreditAlerts?: Pick<ProviderCreditAlertProcessor, "deliver"> | undefined;
+  providerBalance?: Pick<ProviderBalanceChecker, "check"> | undefined;
   tenantContext?: {
     run<T>(tenantId: string, callback: () => Promise<T>): Promise<T>;
   } | undefined;
@@ -103,6 +108,15 @@ export async function processBerryWorkerJob(
     return jobName === "context.backfill"
       ? dependencies.maintenance.backfill(ContextBackfillJobPayloadSchema.parse(data))
       : dependencies.maintenance.cleanup(RetentionCleanupJobPayloadSchema.parse(data));
+  }
+  // Raised before email was turned off, these finish without sending or retrying.
+  if (jobName === "alerts.provider-credits") {
+    if (!dependencies.providerCreditAlerts) return { outcome: "email_disabled" };
+    return dependencies.providerCreditAlerts.deliver(ProviderCreditAlertJobPayloadSchema.parse(data));
+  }
+  if (jobName === "alerts.provider-balance") {
+    if (!dependencies.providerBalance) return { outcome: "email_disabled" };
+    return dependencies.providerBalance.check(ProviderBalanceCheckJobPayloadSchema.parse(data));
   }
   if(!dependencies.management)throw new Error("Management job repository is not configured");
   if(jobName==="report.run")return processReportRunJob(ReportRunJobPayloadSchema.parse(data),{management:dependencies.management});

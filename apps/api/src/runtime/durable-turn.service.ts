@@ -313,8 +313,9 @@ FOR UPDATE
       if (!input.continueInterruptedTurn && input.replaceFromMessageId) {
         await rewindProjectionForEdit(executor, input);
       }
-      const requestMessageId = input.continueInterruptedTurn
-        ? await continuableRequestMessageId(executor, input)
+      const continuation = input.continueInterruptedTurn ? await continuableRequest(executor, input) : null;
+      const requestMessageId = continuation
+        ? continuation.requestMessageId
         : await ensureUserMessage(executor, input);
       await syncMessageJournal(executor, input);
       if (!input.continueInterruptedTurn) {
@@ -364,6 +365,10 @@ INSERT INTO turn_runs (
             admissionFingerprint: input.operationFingerprint,
             budgetReservationRequired: input.budgetReservationRequired,
             continueInterruptedTurn: input.continueInterruptedTurn === true,
+            ...(continuation ? {
+              continuationSourceRunId: continuation.sourceRunId,
+              ...(continuation.headEntryId ? { continuationHeadEntryId: continuation.headEntryId } : {}),
+            } : {}),
             input: input.input,
           }),
           JSON.stringify(input.groundingContext),
@@ -1779,6 +1784,7 @@ ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
     userId: string,
     runId: string,
     action: "retry" | "mark-complete" | "cancel",
+    reserveRecoveryBudget?: RecoveryBudgetReserver,
   ): Promise<boolean> {
     if (!this.enabled) return false;
     return this.database.withTenant(tenantId, async (executor) => {
@@ -1834,6 +1840,7 @@ FOR UPDATE OF r
       if (action === "mark-complete" && !recovered.tool_call_name) {
         throw new Error("Recovery-required run has no exact failed tool reference to mark complete");
       }
+      await renewRecoveryBudget(executor, tenantId, runId, recovered, reserveRecoveryBudget);
       await reopenRecoveryLifecycle(executor, tenantId, runId, recovered.sandbox_id);
       if (action === "mark-complete") {
         const entryId = randomUUID();
@@ -2141,6 +2148,13 @@ async function cancelActiveDurableRun(
   tenantId: string,
   active: { id: string; task_id: string; session_id: string; request_message_id: string | null; sandbox_id: string | null },
 ): Promise<void> {
+  await transaction.execute(
+    `UPDATE queued_follow_up_items
+     SET status='paused',last_error='Queue paused because the active turn was cancelled',updated_at=now()
+     WHERE tenant_id=$1::uuid AND session_id=$2::uuid
+       AND status IN ('queued','delivering') AND expires_at>now()`,
+    [tenantId, active.session_id],
+  );
   const ambiguousRows = await transaction.query<{ step_id: string; tool_call_id: string }>(
     `
 SELECT s.id AS step_id,tc.id AS tool_call_id
@@ -2578,24 +2592,48 @@ function nullableIso(value: Date | string | null): string | null {
   return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
 }
 
-async function continuableRequestMessageId(
+async function continuableRequest(
   executor: SqlExecutor,
   input: DurableTurnAdmission,
-): Promise<string> {
-  const rows = await executor.query<{ request_message_id: string | null }>(
+): Promise<{ requestMessageId: string; sourceRunId: string; headEntryId: string | null }> {
+  // The continued run's own journal entries descend from the shared request
+  // message. Record the current leaf as the continuation head only when it is
+  // on that request's branch, so workspace recovery follows the same branch as
+  // the conversation instead of the request message's ancestors alone.
+  const rows = await executor.query<{ id: string; request_message_id: string | null; head_entry_id: string | null }>(
     `
-SELECT request_message_id
-FROM turn_runs
-WHERE tenant_id=$1::uuid AND session_id=$2::uuid
-  AND state IN ('failed','cancelled')
-ORDER BY created_at DESC
-LIMIT 1
+WITH RECURSIVE source AS (
+  SELECT id,request_message_id
+  FROM turn_runs
+  WHERE tenant_id=$1::uuid AND session_id=$2::uuid
+    AND state IN ('failed','cancelled')
+  ORDER BY created_at DESC
+  LIMIT 1
+), leaf AS (
+  SELECT entry_id,parent_entry_id
+  FROM session_entries
+  WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND is_leaf_marker=true
+  ORDER BY sequence DESC
+  LIMIT 1
+), leaf_branch AS (
+  SELECT entry_id,parent_entry_id FROM leaf
+  UNION ALL
+  SELECT parent.entry_id,parent.parent_entry_id
+  FROM session_entries parent
+  JOIN leaf_branch child ON child.parent_entry_id=parent.entry_id
+  WHERE parent.tenant_id=$1::uuid AND parent.session_id=$2::uuid
+)
+SELECT source.id,source.request_message_id,
+  CASE WHEN EXISTS (
+    SELECT 1 FROM leaf_branch WHERE leaf_branch.entry_id=source.request_message_id::text
+  ) THEN (SELECT entry_id FROM leaf) END AS head_entry_id
+FROM source
     `.trim(),
     [input.tenantId, input.sessionId],
   );
-  const requestMessageId = rows[0]?.request_message_id;
-  if (!requestMessageId) throw new Error("No failed or cancelled durable turn can be continued");
-  return requestMessageId;
+  const source = rows[0];
+  if (!source?.request_message_id) throw new Error("No failed or cancelled durable turn can be continued");
+  return { requestMessageId: source.request_message_id, sourceRunId: source.id, headEntryId: source.head_entry_id };
 }
 
 async function ensureUserMessage(
@@ -3213,6 +3251,9 @@ function projectMessageParts(parts: Array<{ type: string; content: unknown }>): 
       return [{ type: "text", text: `[Image artifact: ${stringValue(value?.title) ?? stringValue(value?.name) ?? stringValue(value?.fileId) ?? "image"}]` }];
     }
     if (part.type === "reasoning") return [{ type: "thinking", thinking: durableProjectionText(part.content) }];
+    // A platform/provider failure is a diagnostic, not something the assistant
+    // said. Keep it typed so model history never replays it as an answer.
+    if (part.type === "error") return [{ type: "error", text: durableProjectionText(part.content) }];
     return [{ type: "text", text: durableProjectionText(part.content) }];
   });
 }
@@ -3371,6 +3412,77 @@ export function parseEventCursor(value: string | null | undefined): { runId: str
   return { runId: match[1]!, sequence: Number(match[2]) };
 }
 
+/** Reserves a new budget generation for a reopened recovery run; false when budgets are not enforced. */
+export type RecoveryBudgetReserver = (input: {
+  requestId: string;
+  taskId: string;
+  sessionId: string;
+  runtimeRequest: Record<string, unknown>;
+}) => Promise<boolean>;
+
+/**
+ * Terminal recovery settlement reconciles the run's reservation. Reopening the
+ * same run must not reuse that settled reservation (the worker refuses it) and
+ * must not re-bill earlier usage: reserve a new generation through normal
+ * budget admission and settle only usage recorded after this point under it.
+ */
+async function renewRecoveryBudget(
+  executor: SqlExecutor,
+  tenantId: string,
+  runId: string,
+  recovered: { task_id: string; session_id: string },
+  reserveRecoveryBudget: RecoveryBudgetReserver | undefined,
+): Promise<void> {
+  const rows = await executor.query<{
+    runtime_request: unknown;
+    reservation_status: string | null;
+    after_sequence: number | string;
+    settled_cost_micros: string;
+  }>(
+    `
+SELECT r.runtime_request,b.status AS reservation_status,
+  (SELECT COALESCE(MAX(e.sequence),0) FROM turn_events e
+   WHERE e.tenant_id=r.tenant_id AND e.run_id=r.id) AS after_sequence,
+  (SELECT COALESCE(SUM(COALESCE((e.payload->>'costRawMicros')::bigint,0)),0)::text FROM turn_events e
+   WHERE e.tenant_id=r.tenant_id AND e.run_id=r.id AND e.event_type='usage') AS settled_cost_micros
+FROM turn_runs r
+LEFT JOIN budget_reservations b
+  ON b.tenant_id=r.tenant_id AND b.request_id=r.runtime_request->>'requestId'
+WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
+    `.trim(),
+    [tenantId, runId],
+  );
+  const row = rows[0];
+  const runtimeRequest = recordValue(row?.runtime_request) ?? {};
+  const requestId = stringValue(runtimeRequest.requestId);
+  if (!row || !requestId || row.reservation_status === "reserved") return;
+  if (row.reservation_status === null && runtimeRequest.budgetReservationRequired !== true) return;
+  const generation = Math.max(0, Number(runtimeRequest.budgetGeneration ?? 0) || 0) + 1;
+  const baseRequestId = stringValue(runtimeRequest.budgetBaseRequestId) ?? requestId;
+  const nextRequestId = `${baseRequestId}:recovery:${generation}`;
+  if (!reserveRecoveryBudget) {
+    throw new ConflictException("Budget admission is required before reopening this recovery run");
+  }
+  const reserved = await reserveRecoveryBudget({
+    requestId: nextRequestId,
+    taskId: recovered.task_id,
+    sessionId: recovered.session_id,
+    runtimeRequest,
+  });
+  await executor.execute(
+    `UPDATE turn_runs SET runtime_request=runtime_request || $3::jsonb,updated_at=now()
+     WHERE tenant_id=$1::uuid AND id=$2::uuid`,
+    [tenantId, runId, JSON.stringify({
+      requestId: nextRequestId,
+      budgetBaseRequestId: baseRequestId,
+      budgetGeneration: generation,
+      budgetUsageAfterSequence: Number(row.after_sequence),
+      budgetBaselineCostMicros: row.settled_cost_micros,
+      budgetReservationRequired: reserved,
+    })],
+  );
+}
+
 async function reconcileTerminalUsage(
   executor: SqlExecutor,
   tenantId: string,
@@ -3392,6 +3504,9 @@ async function reconcileTerminalUsage(
   if (!run) return;
   const runtimeRequest = recordValue(run.runtime_request) ?? {};
   const requestId = stringValue(runtimeRequest.requestId) ?? `turn_${runId}`;
+  // Usage before an operator-recovery baseline belongs to an earlier, already
+  // settled budget generation.
+  const afterSequence = Math.max(0, Number(runtimeRequest.budgetUsageAfterSequence ?? 0) || 0);
   const usage = await executor.query<{
     input_tokens: number | string;
     output_tokens: number | string;
@@ -3415,9 +3530,9 @@ SELECT
   COUNT(*) FILTER (WHERE event_type='usage' AND payload ? 'costRawMicros') AS priced_event_count,
   COALESCE(SUM(CASE WHEN event_type='usage' THEN COALESCE((payload->>'costRawMicros')::bigint,0) ELSE 0 END),0)::text AS exact_cost_micros
 FROM turn_events
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND sequence>$3
     `.trim(),
-    [tenantId, runId],
+    [tenantId, runId, afterSequence],
   );
   const totals = usage[0] ?? {
     input_tokens: 0,
@@ -3432,9 +3547,9 @@ WHERE tenant_id=$1::uuid AND run_id=$2::uuid
   };
   const lastUsageRows = await executor.query<{ payload: unknown }>(
     `SELECT payload FROM turn_events
-     WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type='usage'
+     WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type='usage' AND sequence>$3
      ORDER BY sequence DESC LIMIT 1`,
-    [tenantId, runId],
+    [tenantId, runId, afterSequence],
   );
   const lastUsage = recordValue(lastUsageRows[0]?.payload) ?? {};
   const reservations = await executor.query<{

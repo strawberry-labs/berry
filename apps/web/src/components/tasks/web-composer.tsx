@@ -12,6 +12,7 @@ import { reduceStream, type QuestionPrompt } from "@berry/desktop-ui/components/
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
 import { AtSign, Brain, Check, ChevronDown, FileText, Hash, ImagePlus, SlashSquare } from "@berry/desktop-ui/lib/icons";
 import type { WebConfig } from "@/lib/config";
+import { splitEmptyUploads } from "@/lib/empty-uploads";
 import { MentionMenu, useStaticMentions } from "../mention-menu";
 import { PromptEditor, type PromptEditorHandle, type PromptMentionConfig } from "../prompt-editor";
 import { ProjectSwitcher } from "../projects/project-switcher";
@@ -235,6 +236,11 @@ export function Composer({
   const uploadControllersRef = React.useRef(new Map<string, AbortController>());
   const promptImprovementControllerRef = React.useRef<AbortController | null>(null);
   const latestTextRef = React.useRef(text);
+  const followUpSubmittingRef = React.useRef(false);
+  // A new task or a command such as /image is still being created; a second
+  // Enter or click used to create a duplicate task with the same text (H-035).
+  const submitInFlightRef = React.useRef(false);
+  const pendingQueueSubmissionRef = React.useRef<QueuedFollowUp | null>(null);
   const queueEditDraftRef = React.useRef<{ text: string; attachments: AttachmentInput[]; createImageMode: boolean } | null>(null);
   const queueEditIndexRef = React.useRef<number | null>(null);
   const editingFollowUpRef = React.useRef<QueuedFollowUp | null>(null);
@@ -522,6 +528,8 @@ export function Composer({
     if (submitIntent === "ignore") return;
     const command = submitIntent === "send" ? parseSlashCommand(input) : null;
     if (command) {
+      if (submitInFlightRef.current) return;
+      submitInFlightRef.current = true;
       setUploadError("");
       try {
         await onCommand(command.name, command.args);
@@ -530,23 +538,37 @@ export function Composer({
         editorRef.current?.clear();
       } catch (cause) {
         setUploadError(cause instanceof Error ? cause.message : `Unable to run /${command.name}`);
+      } finally {
+        submitInFlightRef.current = false;
       }
       return;
     }
     if (working && activeTask?.activeSessionId) {
       if (submitIntent === "queue") {
-        await onQueuedFollowUp(createQueuedFollowUp({
-          taskId: activeTask.id,
-          sessionId: activeTask.activeSessionId,
-          ordinal: queuedFollowUps.length,
-          input,
-          ...(intent ? { intent } : {}),
-          attachments,
-        }));
-        setComposerText("");
-        setCreateImageMode(false);
-        editorRef.current?.clear();
-        setAttachments([]);
+        if (followUpSubmittingRef.current) return;
+        followUpSubmittingRef.current = true;
+        setUploadError("");
+        const previous = pendingQueueSubmissionRef.current;
+        const followUp = previous && previous.sessionId === activeTask.activeSessionId
+          && previous.input === input && previous.intent === intent
+          && JSON.stringify(previous.attachments) === JSON.stringify(attachments)
+          ? previous : createQueuedFollowUp({
+            taskId: activeTask.id, sessionId: activeTask.activeSessionId,
+            ordinal: queuedFollowUps.length, input, ...(intent ? { intent } : {}), attachments,
+          });
+        pendingQueueSubmissionRef.current = followUp;
+        try {
+          await onQueuedFollowUp(followUp);
+          pendingQueueSubmissionRef.current = null;
+          setComposerText("");
+          setCreateImageMode(false);
+          editorRef.current?.clear();
+          setAttachments([]);
+        } catch (cause) {
+          setUploadError("Unable to queue this prompt. Your text is still here; retry to send it.");
+        } finally {
+          followUpSubmittingRef.current = false;
+        }
         return;
       }
 
@@ -557,6 +579,8 @@ export function Composer({
         setAttachments([]);
         return;
       }
+      if (followUpSubmittingRef.current) return;
+      followUpSubmittingRef.current = true;
       try {
         await onSteerMessage(activeTask, input, attachments, intent);
         setComposerText("");
@@ -565,48 +589,55 @@ export function Composer({
         setAttachments([]);
       } catch (cause) {
         setUploadError(cause instanceof Error ? cause.message : "Unable to steer the running task");
+      } finally {
+        followUpSubmittingRef.current = false;
       }
       return;
     }
-    if (working) return;
-    const task = activeTask ?? await onCreateTask({ title: input.slice(0, 42) });
-    if (!task?.activeSessionId) return;
-    const sessionId = task.activeSessionId;
-    const profileContext = variant === "home" ? personalizationRuntimeContext(personalization) : "";
-    const runtimeInput = profileContext ? `${input}\n\nExplicit user profile context:\n${profileContext}` : input;
-    setBusy(true);
-    setUploadError("");
-    const requestMessageId = globalThis.crypto.randomUUID();
-    onUserMessage(input, sessionId, task.id, attachments, requestMessageId);
-    setComposerText("");
-    setCreateImageMode(false);
-    editorRef.current?.clear();
+    if (working || submitInFlightRef.current) return;
+    submitInFlightRef.current = true;
     try {
-      if (client) {
-        const sent = attachments;
-        setAttachments([]);
-        await runTurn(task, {
-          input: runtimeInput,
-          ...(intent ? { intent } : {}),
-          ...(runtimeInput !== input ? { messageInput: input } : {}),
-          requestMessageId,
-          ...(sent.length > 0 ? { attachments: sent } : {}),
-        });
-      } else {
-        onEvent(sessionId, { kind: "turn.start", turnId: `pending_${Date.now()}` });
-        const turnId = `turn_${Date.now()}`;
-        onEvent(sessionId, { kind: "turn.start", turnId });
-        onEvent(sessionId, { kind: "message.start", messageId: `msg_live_${turnId}`, role: "assistant" });
-        onEvent(sessionId, { kind: "tool.start", toolCallId: `tool_${turnId}`, name: "sandbox.exec", title: "Fixture sandbox" });
-        onEvent(sessionId, { kind: "tool.end", toolCallId: `tool_${turnId}`, status: "completed", summary: "ready" });
-        onEvent(sessionId, { kind: "message.delta", messageId: `msg_live_${turnId}`, delta: "Fixture sandbox ready. In demo mode this stays in the browser; set `BERRY_WEB_API_BASE_URL` to run it through the Phase 8 API/SSE surface.", channel: "text" });
-        onEvent(sessionId, { kind: "turn.end", turnId, status: "completed" });
-        window.setTimeout(() => onAssistantMessage("Fixture sandbox ready. In demo mode this stays in the browser; set `BERRY_WEB_API_BASE_URL` to run it through the Phase 8 API/SSE surface.", sessionId, task.id), 60);
+      const task = activeTask ?? await onCreateTask({ title: input.slice(0, 42) });
+      if (!task?.activeSessionId) return;
+      const sessionId = task.activeSessionId;
+      const profileContext = variant === "home" ? personalizationRuntimeContext(personalization) : "";
+      const runtimeInput = profileContext ? `${input}\n\nExplicit user profile context:\n${profileContext}` : input;
+      setBusy(true);
+      setUploadError("");
+      const requestMessageId = globalThis.crypto.randomUUID();
+      onUserMessage(input, sessionId, task.id, attachments, requestMessageId);
+      setComposerText("");
+      setCreateImageMode(false);
+      editorRef.current?.clear();
+      try {
+        if (client) {
+          const sent = attachments;
+          setAttachments([]);
+          await runTurn(task, {
+            input: runtimeInput,
+            ...(intent ? { intent } : {}),
+            ...(runtimeInput !== input ? { messageInput: input } : {}),
+            requestMessageId,
+            ...(sent.length > 0 ? { attachments: sent } : {}),
+          });
+        } else {
+          onEvent(sessionId, { kind: "turn.start", turnId: `pending_${Date.now()}` });
+          const turnId = `turn_${Date.now()}`;
+          onEvent(sessionId, { kind: "turn.start", turnId });
+          onEvent(sessionId, { kind: "message.start", messageId: `msg_live_${turnId}`, role: "assistant" });
+          onEvent(sessionId, { kind: "tool.start", toolCallId: `tool_${turnId}`, name: "sandbox.exec", title: "Fixture sandbox" });
+          onEvent(sessionId, { kind: "tool.end", toolCallId: `tool_${turnId}`, status: "completed", summary: "ready" });
+          onEvent(sessionId, { kind: "message.delta", messageId: `msg_live_${turnId}`, delta: "Fixture sandbox ready. In demo mode this stays in the browser; set `BERRY_WEB_API_BASE_URL` to run it through the Phase 8 API/SSE surface.", channel: "text" });
+          onEvent(sessionId, { kind: "turn.end", turnId, status: "completed" });
+          window.setTimeout(() => onAssistantMessage("Fixture sandbox ready. In demo mode this stays in the browser; set `BERRY_WEB_API_BASE_URL` to run it through the Phase 8 API/SSE surface.", sessionId, task.id), 60);
+        }
+      } catch (cause) {
+        setUploadError(cause instanceof Error ? cause.message : "Unable to complete the turn");
+      } finally {
+        setBusy(false);
       }
-    } catch (cause) {
-      setUploadError(cause instanceof Error ? cause.message : "Unable to complete the turn");
     } finally {
-      setBusy(false);
+      submitInFlightRef.current = false;
     }
   }, [activeTask, attachments, client, continueInterruptedTurn, createImageMode, editingFollowUp, onAssistantMessage, onCommand, onCreateTask, onEditingFollowUpChange, onEvent, onQueuedFollowUp, onSteerMessage, onUpdateFollowUp, onUserMessage, onUserMessagePersisted, pendingUploads, personalization, queuedFollowUps.length, runTurn, savingQueuedEdit, setComposerText, text, variant, working]);
 
@@ -614,7 +645,9 @@ export function Composer({
     if (!files?.length) return;
     setUploadError("");
     try {
-      const selected = Array.from(files);
+      const { accepted: selected, message: emptyUploads } = splitEmptyUploads(Array.from(files));
+      if (emptyUploads) setUploadError(emptyUploads);
+      if (selected.length === 0) return;
       if (attachments.length + pendingUploads.length + selected.length > 100) throw new Error("Attach no more than 100 files to one message.");
       const queued = selected.map((file, index): PendingFileUpload => ({
         id: globalThis.crypto.randomUUID(),

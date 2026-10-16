@@ -37,6 +37,25 @@ export const ProviderAttemptStatusClassSchema = z.enum([
 ]);
 export type ProviderAttemptStatusClass = z.infer<typeof ProviderAttemptStatusClassSchema>;
 
+/**
+ * The layer that issued one physical provider request (H-033). The first
+ * request of a logical call is `initial`; every later request names the
+ * retry or fallback that made it, so a same-route stream-to-buffer fallback
+ * is distinguishable from a runner retry of the whole model step.
+ */
+export const ProviderAttemptRetryLayerSchema = z.enum([
+  "initial",
+  "transport_retry",
+  "stream_buffer_fallback",
+  "runner_retry",
+  "empty_response_recovery",
+  "other",
+]);
+export type ProviderAttemptRetryLayer = z.infer<typeof ProviderAttemptRetryLayerSchema>;
+
+export const ProviderAttemptTransportSchema = z.enum(["stream", "buffer"]);
+export type ProviderAttemptTransport = z.infer<typeof ProviderAttemptTransportSchema>;
+
 export const ProviderAttemptEventSchema = z.object({
   kind: z.literal("provider.attempt"),
   logicalStepId: z.string().min(1).max(128),
@@ -51,6 +70,13 @@ export const ProviderAttemptEventSchema = z.object({
   cacheReadTokens: z.number().int().nonnegative(),
   cacheWriteTokens: z.number().int().nonnegative(),
   finishReason: z.string().max(128).nullable(),
+  // Optional so events recorded before H-033 still parse. `physicalAttempt`
+  // restarts for every runner retry; `attemptId` is unique per request.
+  attemptId: z.string().uuid().optional(),
+  retryLayer: ProviderAttemptRetryLayerSchema.optional(),
+  transport: ProviderAttemptTransportSchema.optional(),
+  provider: z.string().min(1).max(128).optional(),
+  route: z.string().min(1).max(256).optional(),
 });
 export type ProviderAttemptEvent = z.infer<typeof ProviderAttemptEventSchema>;
 
@@ -183,6 +209,14 @@ export interface ProviderAttemptReport {
   cacheReadTokens?: number;
   cacheWriteTokens?: number;
   finishReason?: string | null;
+  /** Unique ID of this physical request; never part of the prompt. */
+  attemptId?: string;
+  retryLayer?: ProviderAttemptRetryLayer;
+  transport?: ProviderAttemptTransport;
+  /** Configured provider that received the request. */
+  provider?: string;
+  /** Endpoint path, or API type when the provider uses its default path. */
+  route?: string;
 }
 
 function errorChain(error: unknown): unknown[] {

@@ -251,7 +251,11 @@ export class FallbackChatCompletionClient implements ChatCompletionStreamClient 
       if (emitted || options.signal?.aborted || !classifyProviderFailure(error).retryable) throw error;
       options.onProviderAttemptDecision?.(primaryAttempt, "fallback");
     }
-    yield* this.fallback.stream({ ...options, providerAttemptOrdinal: primaryAttempt + 1 });
+    yield* this.fallback.stream({
+      ...options,
+      providerAttemptOrdinal: primaryAttempt + 1,
+      providerAttemptLayer: "transport_retry",
+    });
   }
 }
 
@@ -289,7 +293,13 @@ export class ContentFallbackChatCompletionClient implements ChatCompletionStream
       if (emittedContent || options.signal?.aborted || !classifyProviderFailure(error).retryable) throw error;
       options.onProviderAttemptDecision?.(primaryAttempt, "fallback");
     }
-    yield* this.fallback.stream({ ...options, providerAttemptOrdinal: primaryAttempt + 1 });
+    // Same route, buffered: the attempt names this layer so it is not mistaken
+    // for a provider or route fallback (H-033).
+    yield* this.fallback.stream({
+      ...options,
+      providerAttemptOrdinal: primaryAttempt + 1,
+      providerAttemptLayer: "stream_buffer_fallback",
+    });
   }
 }
 
@@ -583,7 +593,11 @@ export class BerryModelAdapter {
     applyPromptCache(message, promptCache);
     let openTextIndex = -1;
     let openThinkingIndex = -1;
-    const toolBuffers = new Map<number, ToolCallBuffer>();
+    // Keyed by arrival slot rather than provider index: some gateways restart
+    // tool indices for every event, which used to merge separate calls (H-038).
+    // `identified` records whether the provider sent an id (not the fallback).
+    const toolBuffers = new Map<number, ToolCallBuffer & { index: number; identified: boolean }>();
+    const slotForIndex = new Map<number, number>();
     let finishReason: string | null = null;
 
     const closeText = () => {
@@ -667,8 +681,13 @@ export class BerryModelAdapter {
         for (const delta of chunk.toolCalls ?? []) {
           closeText();
           closeThinking();
-          let buffer = toolBuffers.get(delta.index);
-          if (!buffer) {
+          const slot = slotForIndex.get(delta.index);
+          let buffer = slot === undefined ? undefined : toolBuffers.get(slot);
+          // A call starts with its id and name. A different id that arrives with
+          // a name on an index already holding a named call is a new call.
+          const startsNewCall = buffer !== undefined && Boolean(delta.id && delta.function?.name)
+            && buffer.name.length > 0 && buffer.identified && delta.id !== buffer.id;
+          if (!buffer || startsNewCall) {
             message.content.push({
               type: "toolCall",
               id: delta.id ?? `call_${delta.index}`,
@@ -677,11 +696,15 @@ export class BerryModelAdapter {
             });
             buffer = {
               contentIndex: message.content.length - 1,
+              index: delta.index,
               id: delta.id ?? `call_${delta.index}`,
+              identified: Boolean(delta.id),
               name: delta.function?.name ?? "",
               args: delta.function?.arguments ?? "",
             };
-            toolBuffers.set(delta.index, buffer);
+            const nextSlot = toolBuffers.size;
+            slotForIndex.set(delta.index, nextSlot);
+            toolBuffers.set(nextSlot, buffer);
             stream.push({ type: "toolcall_start", contentIndex: buffer.contentIndex, partial: message });
             if (buffer.args.length > 0) {
               stream.push({
@@ -693,7 +716,10 @@ export class BerryModelAdapter {
             }
             continue;
           }
-          if (delta.id) buffer.id = delta.id;
+          if (delta.id) {
+            buffer.id = delta.id;
+            buffer.identified = true;
+          }
           if (delta.function?.name) buffer.name += delta.function.name;
           if (delta.function?.arguments) {
             buffer.args += delta.function.arguments;
@@ -710,7 +736,9 @@ export class BerryModelAdapter {
 
       closeText();
       closeThinking();
-      const orderedBuffers = [...toolBuffers.entries()].sort((a, b) => a[0] - b[0]).map(([, buffer]) => buffer);
+      const orderedBuffers = [...toolBuffers.entries()]
+        .sort(([leftSlot, left], [rightSlot, right]) => left.index - right.index || leftSlot - rightSlot)
+        .map(([, buffer]) => buffer);
       for (const buffer of orderedBuffers) {
         const toolCall: ToolCall = {
           type: "toolCall",

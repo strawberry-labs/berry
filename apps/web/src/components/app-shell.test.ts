@@ -3,7 +3,7 @@ import { BerryApiError, type StartTurnRequest } from "@berry/api-client";
 import type { Task } from "@berry/shared";
 import { parseCloudShellLocation } from "@/lib/cloud-shell-state";
 import { PERSONAL_NAV, visibleAdministrationGroups } from "./management/management-navigation";
-import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, continueAfterMessageRefresh, durableTurnPhase, existingTaskTurnModelOverride, findPersistedMessageById, findPersistedMessagesByIds, greetingForDate, greetingForHour, historyDeletionRevisionChanged, historyRevisionChanged, hydratedExistingTaskModel, initialCloudContent, isInterruptedTurnAvailable, isLegacyMessageHistoryPage, mergeMessagePage, mergeRefreshedMessagePage, mergeTaskSnapshots, newTaskModelOverride, preferredNewTaskModel, prepareTurnCancellation, reconcileAcceptedTurnState, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldKeepTurnPendingAfterFailedConfirmation, shouldMountTaskSurface, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, shouldUpdateDurableStateForEvent, type ShellData } from "./app-shell";
+import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, continueAfterMessageRefresh, durableTurnPhase, existingTaskTurnModelOverride, findPersistedMessageById, findPersistedMessagesByIds, greetingForDate, greetingForHour, historyDeletionRevisionChanged, historyRevisionChanged, hydratedExistingTaskModel, initialCloudContent, isInterruptedTurnAvailable, isLegacyMessageHistoryPage, mergeMessagePage, mergeRefreshedMessagePage, mergeTaskSnapshots, newTaskModelOverride, nextTaskCreationAttempt, preferredNewTaskModel, prepareTurnCancellation, reconcileAcceptedTurnState, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldKeepTurnPendingAfterFailedConfirmation, shouldMountTaskSurface, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, shouldUpdateDurableStateForEvent, type ShellData } from "./app-shell";
 import { accountAvatarInitial, allowanceProgress, formatAllowanceResetDate } from "./shell/web-sidebar";
 
 describe("cloud shell bootstrap", () => {
@@ -151,6 +151,30 @@ describe("cloud shell bootstrap", () => {
       [localOnly, stale],
       [settled],
     )).toEqual([localOnly, settled]);
+  });
+
+  it("reuses a new-task idempotency key only to retry the same unconfirmed submission (H-035)", () => {
+    let generated = 0;
+    const newKey = () => `key-${++generated}`;
+    const request = JSON.stringify({ workspaceId: "workspace_1", title: "Draw five foxes" });
+
+    const first = nextTaskCreationAttempt(null, request, newKey);
+    expect(first).toEqual({ idempotencyKey: "key-1", request, retryable: false });
+    // Another submission while the first is still in flight is not a retry.
+    expect(nextTaskCreationAttempt(first, request, newKey).idempotencyKey).toBe("key-2");
+    // The first ended with an unknown outcome; sending the same request retries it.
+    const unconfirmed = { ...first, retryable: true };
+    expect(nextTaskCreationAttempt(unconfirmed, request, newKey)).toEqual({ idempotencyKey: "key-1", request, retryable: false });
+    // A changed request is a new submission.
+    const changed = JSON.stringify({ workspaceId: "workspace_1", title: "Draw six foxes" });
+    expect(nextTaskCreationAttempt(unconfirmed, changed, newKey).idempotencyKey).toBe("key-3");
+    // A confirmed task or a definitive rejection clears the attempt, so the
+    // next send, including an intentional rerun, gets a new key.
+    expect(nextTaskCreationAttempt(null, request, newKey).idempotencyKey).toBe("key-4");
+    // Only an unknown outcome makes the attempt retryable.
+    expect(shouldConfirmTurnAdmission(new TypeError("Failed to fetch"))).toBe(true);
+    expect(shouldConfirmTurnAdmission(new BerryApiError("Bad gateway", 502, null))).toBe(true);
+    expect(shouldConfirmTurnAdmission(new BerryApiError("Conflict", 409, { code: "idempotency_key_reused" }))).toBe(false);
   });
 
   it("keeps ambiguous and active-conflict admission confirmations pending", () => {
@@ -356,7 +380,7 @@ describe("cloud shell bootstrap", () => {
       label: group.label,
       items: group.items.map((item) => [item.id, item.label]),
     }))).toEqual([
-      { label: "", items: [["general", "General"], ["account", "Account"], ["personalization", "Personalization"], ["connectors", "Connectors"], ["skills", "Skills"], ["mcp", "MCP servers"], ["usage", "Usage"], ["archived", "Archived tasks"]] },
+      { label: "", items: [["general", "General"], ["account", "Account"], ["personalization", "Personalization"], ["connectors", "Connectors"], ["skills", "Skills"], ["mcp", "MCP servers"], ["schedules", "Scheduled tasks"], ["usage", "Usage"], ["archived", "Archived tasks"]] },
     ]);
   });
 

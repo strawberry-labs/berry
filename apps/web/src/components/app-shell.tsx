@@ -1,6 +1,6 @@
 import * as React from "react";
 import { ArrowUp, CreditCard, Plus, Settings, Square, X } from "lucide-react";
-import { BerryApiClient, BerryApiError, type ImageGenerationCapabilityStatus, type StartTurnRequest } from "@berry/api-client";
+import { BerryApiClient, BerryApiError, type CreateTaskRequest, type ImageGenerationCapabilityStatus, type StartTurnRequest } from "@berry/api-client";
 import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
 import { IMAGE_ASPECT_RATIO_DIMENSIONS, MessageAttachmentContentSchema, PersonalizationProfileSchema, messageAttachmentContent, resolveModelCapabilities, type AllowanceBalance, type AttachmentInput, type ImageAspectRatio, type Message, type MessageHistoryPage, type MessagePart, type OrgMembership, type OrgPermission, type PermissionMode, type PersonalizationProfile, type ReasoningLevel, type Task, type TurnIntent, type TurnState, type Workspace } from "@berry/shared";
 import { toast } from "sonner";
@@ -522,6 +522,32 @@ export function newTaskModelOverride(
   model: string,
 ): { modelProviderId?: string; model?: string } {
   return source === "user" ? { modelProviderId: providerId, model } : {};
+}
+
+export type TaskCreationAttempt = {
+  idempotencyKey: string;
+  request: string;
+  /** Ended with an unknown outcome, so the task may exist without the client knowing it. */
+  retryable: boolean;
+};
+
+/**
+ * One idempotency key per new-task submission (H-035). A request reuses the
+ * previous key only when that attempt ended with an unknown outcome and the
+ * request is identical: the user is retrying the same submission, and the API
+ * returns the task a lost response may already have created. That task never
+ * received a turn, because the client never learned it. A rerun after a
+ * confirmed task, a changed request, or an attempt still in flight gets a new
+ * key and therefore a new task.
+ */
+export function nextTaskCreationAttempt(
+  previous: TaskCreationAttempt | null,
+  request: string,
+  newKey: () => string,
+): TaskCreationAttempt {
+  return previous?.retryable && previous.request === request
+    ? { ...previous, retryable: false }
+    : { idempotencyKey: newKey(), request, retryable: false };
 }
 
 type PendingTurnSubmission = {
@@ -1393,19 +1419,25 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     return () => { cancelled = true; };
   }, [client, shellLocation, taskRouteError, tasks, tasksLoaded]);
 
+  const taskCreationAttemptRef = React.useRef<TaskCreationAttempt | null>(null);
   const createTask = React.useCallback(async (options?: { title?: string }) => {
     const title = options?.title?.trim().slice(0, 80) || "New cloud task";
     if (client) {
+      let attempt: TaskCreationAttempt | null = null;
       try {
         const preferredModel = preferredNewTaskModel(browserModelRef.current, organizationModelRef.current, modelOptions);
-        const created = await client.createTask({
+        const request: CreateTaskRequest = {
           workspaceId: activeWorkspaceId,
           title,
           permissionMode,
           ...(preferredModel
             ? newTaskModelOverride(preferredModel.source, preferredModel.providerId, preferredModel.model)
             : {}),
-        });
+        };
+        attempt = nextTaskCreationAttempt(taskCreationAttemptRef.current, JSON.stringify(request), () => globalThis.crypto.randomUUID());
+        taskCreationAttemptRef.current = attempt;
+        const created = await client.createTask(request, { idempotencyKey: attempt.idempotencyKey });
+        if (taskCreationAttemptRef.current === attempt) taskCreationAttemptRef.current = null;
         if (created.session.modelProviderId && created.session.model) {
           sessionModelsRef.current.set(created.session.id, {
             providerId: created.session.modelProviderId,
@@ -1417,6 +1449,13 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         navigateToTask(created.task.id);
         return created.task;
       } catch (cause) {
+        // The prompt stays in the composer. After an unknown outcome (the same
+        // classification as turn admission), sending it again reuses this key;
+        // a definitive rejection created nothing, so the next send starts fresh.
+        if (attempt && taskCreationAttemptRef.current === attempt) {
+          if (shouldConfirmTurnAdmission(cause)) attempt.retryable = true;
+          else taskCreationAttemptRef.current = null;
+        }
         setResourceError("tasks", cause instanceof Error ? cause.message : "Unable to create a task");
       }
       return null;
@@ -1952,8 +1991,11 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                 // that newer pending turn.
                 if (!state.active && activeSessionsRef.current.has(sessionId)) return;
                 applyDurableState(sessionId, state);
-                if (state.active) activeSessionsRef.current.add(sessionId);
-                else resetSessionStream(sessionId);
+                if (state.active) {
+                  activeSessionsRef.current.add(sessionId);
+                  trackedSessionsRef.current.add(sessionId);
+                  void connect(0).catch(() => undefined);
+                } else resetSessionStream(sessionId);
               })
               .catch((cause) => {
                 if (attempt < 2) {
@@ -2727,13 +2769,14 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       const mapped = page.items.map(serverQueuedFollowUpToClient);
       followUpsBySessionRef.current = { ...followUpsBySessionRef.current, [sessionId]: mapped };
       setFollowUpsBySession((state) => ({ ...state, [sessionId]: mapped }));
+      await attachSessionStream(sessionId);
       return;
     }
     updateSessionFollowUps(sessionId, (current) => current.map((followUp) => followUp.status === "paused"
       ? { ...followUp, status: "queued", pausedReason: null, error: null, updatedAt: new Date().toISOString() }
       : followUp));
     window.setTimeout(() => sendNextQueuedFollowUpRef.current(sessionId), 0);
-  }, [client, updateSessionFollowUps]);
+  }, [attachSessionStream, client, updateSessionFollowUps]);
 
   /**
    * A steer is an interruption, not an inline instruction to the old turn.
@@ -2884,11 +2927,24 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     // browser only changes the durable queue state; the worker promotes the
     // next item in the same transaction that completes the active turn.
     if (client) {
-      const persisted = await client.updateQueuedFollowUp(requestedFollowUp.id, { status: "queued" });
+      const sessionId = requestedFollowUp.sessionId;
+      if (activeSessionsRef.current.has(sessionId)) {
+        await client.cancelTurn(sessionId);
+        stopSessionConnection(sessionId);
+        activeSessionsRef.current.delete(sessionId);
+        resetSessionStream(sessionId);
+        await refreshSessionMessages(sessionId);
+      }
+      const page = await client.listQueuedFollowUps(sessionId, { limit: 100 });
+      const persisted = await client.updateQueuedFollowUp(requestedFollowUp.id, {
+        status: "queued",
+        orderedIds: [requestedFollowUp.id, ...page.items.filter((item) => item.id !== requestedFollowUp.id).map((item) => item.id)],
+      });
       updateSessionFollowUps(requestedFollowUp.sessionId, (current) => [
         ...current.filter((item) => item.id !== persisted.id),
         serverQueuedFollowUpToClient(persisted),
       ].sort((left, right) => left.ordinal - right.ordinal));
+      await attachSessionStream(sessionId);
       return;
     }
     const deliverCurrent = async () => {
@@ -2910,7 +2966,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       return;
     }
     await locks.request(`berry.web.queueDelivery:${requestedFollowUp.sessionId}`, { mode: "exclusive" }, deliverCurrent);
-  }, [client, deliverFollowUp, updateSessionFollowUps]);
+  }, [attachSessionStream, client, deliverFollowUp, refreshSessionMessages, resetSessionStream, stopSessionConnection, updateSessionFollowUps]);
 
   const retryFollowUp = React.useCallback(async (followUp: QueuedFollowUp) => {
     const queued = { ...followUp, status: "queued" as const, error: null, pausedReason: null, updatedAt: new Date().toISOString() };

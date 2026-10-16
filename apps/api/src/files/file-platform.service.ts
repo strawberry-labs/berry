@@ -17,6 +17,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createHash, randomUUID } from "node:crypto";
 import type { ServerResponse } from "node:http";
 import { once } from "node:events";
+import { FileResponseTransfer } from "./file-response-transfer.ts";
 import { open as openFile, rm } from "node:fs/promises";
 import {
   FILE_RESPONSE_SECURITY_VERSION,
@@ -31,6 +32,7 @@ import { CloudDatabaseService, type SqlExecutor } from "../db/cloud-database.ser
 import { garbageCollectFileIfUnreferenced } from "./file-lifecycle.ts";
 import {
   bufferBodyPrefix,
+  contentDisposition,
   detectMediaType,
   FILE_TYPE_SAMPLE_BYTES,
   fileResponsePolicy,
@@ -924,6 +926,15 @@ export class FilePlatformService {
         `, [fileId, tenantId, userId, blobId, name, input.contentType || "application/octet-stream", stored.size, stored.sha256, config.bucket, objectKey, stored.etag, stored.versionId, shouldIndex ? "processing" : "available", JSON.stringify(metadata)]);
         if (!created) throw new Error("Unable to register the Drive artifact");
         if (input.saveToLibrary) await reviveLibraryEntry(executor, tenantId, userId, fileId);
+        else {
+          // The legacy files_library_after_insert_compat trigger adds every new
+          // owned file to the Library. A temporary task import must not appear
+          // there; this removes only the row created for this new file (H-069).
+          await executor.execute(
+            "DELETE FROM file_library_entries WHERE tenant_id=$1::uuid AND user_id=$2::uuid AND file_id=$3::uuid",
+            [tenantId, userId, fileId],
+          );
+        }
         await associate(executor, { tenantId, fileId, taskId: input.taskId, sessionId: input.sessionId, role: "input", userId });
         if (input.saveToLibrary) {
           await linkWorkspaceFile(executor, { tenantId, workspaceId: task.workspace_id, fileId, taskId: input.taskId, userId });
@@ -1084,6 +1095,24 @@ export class FilePlatformService {
     });
   }
 
+  /** A short-lived capability for attachment downloads; previews remain authenticated. */
+  async downloadUrl(tenantId: string, userId: string, fileId: string) {
+    const config = this.requireConfig();
+    const file = await this.get(tenantId, userId, fileId);
+    if (file.status !== "available" && file.status !== "processing") throw new NotFoundException("File is not available");
+    requireVerifiedStorage(file, "File is not available");
+    const expiresIn = 60;
+    const url = await getSignedUrl(config.presignClient, new GetObjectCommand({
+      Bucket: file.bucket,
+      Key: file.object_key,
+      ...(file.object_version_id ? { VersionId: file.object_version_id } : {}),
+      ResponseContentType: "application/octet-stream",
+      ResponseContentDisposition: contentDisposition("attachment", file.display_name),
+      ResponseCacheControl: "private, no-store",
+    }), { expiresIn });
+    return { url, expiresIn };
+  }
+
   async streamContent(
     tenantId: string,
     userId: string,
@@ -1116,43 +1145,48 @@ export class FilePlatformService {
       response.end();
       return;
     }
-    const object = await config.client.send(new GetObjectCommand({
-      Bucket: file.bucket,
-      Key: file.object_key,
-      ...(file.object_version_id ? { VersionId: file.object_version_id } : {}),
-      ...(range ? { Range: range } : {}),
-    }));
-    if (!object.Body) throw new NotFoundException("File content is unavailable");
-    let body = object.Body as AsyncIterable<Uint8Array>;
-    let detectedMediaType = normalizeMediaType(file.detected_media_type) ?? "application/octet-stream";
-    if (!range || /^bytes=0-/i.test(range.trim())) {
-      const inspected = await bufferBodyPrefix(body);
-      detectedMediaType = detectMediaType(inspected.sample);
-      body = inspected.body;
-      if (normalizeMediaType(file.detected_media_type) !== detectedMediaType) {
-        try {
-          await this.recordDetectedMediaType(tenantId, file.id, detectedMediaType);
-        } catch (cause) {
-          await inspected.cancel();
-          throw cause;
+    const transfer = new FileResponseTransfer(response);
+    try {
+      const object = await config.client.send(new GetObjectCommand({
+        Bucket: file.bucket,
+        Key: file.object_key,
+        ...(file.object_version_id ? { VersionId: file.object_version_id } : {}),
+        ...(range ? { Range: range } : {}),
+      }), { abortSignal: transfer.signal });
+      transfer.track(object.Body);
+      if (!object.Body) throw new NotFoundException("File content is unavailable");
+      let body = object.Body as AsyncIterable<Uint8Array>;
+      let detectedMediaType = normalizeMediaType(file.detected_media_type) ?? "application/octet-stream";
+      if (!range || /^bytes=0-/i.test(range.trim())) {
+        const inspected = await bufferBodyPrefix(body);
+        detectedMediaType = detectMediaType(inspected.sample);
+        body = inspected.body;
+        if (normalizeMediaType(file.detected_media_type) !== detectedMediaType) {
+          try {
+            await this.recordDetectedMediaType(tenantId, file.id, detectedMediaType);
+          } catch (cause) {
+            await inspected.cancel();
+            throw cause;
+          }
         }
       }
-    }
-    const policy = fileResponsePolicy({
-      declaredMediaType: file.media_type,
-      detectedMediaType,
-      allowInline: !download,
-    });
-    response.setHeader("Cache-Control", PROTECTED_FILE_CACHE_CONTROL);
-    response.statusCode = object.ContentRange ? 206 : 200;
-    if (object.ContentLength != null) response.setHeader("Content-Length", String(object.ContentLength));
-    if (object.ContentRange) response.setHeader("Content-Range", object.ContentRange);
-    response.setHeader("Accept-Ranges", object.AcceptRanges ?? "bytes");
-    setUntrustedFileResponseHeaders(response, { fileName: file.display_name, policy });
-    for await (const chunk of body) {
-      if (!response.write(chunk)) await once(response, "drain");
-    }
-    response.end();
+      const policy = fileResponsePolicy({
+        declaredMediaType: file.media_type,
+        detectedMediaType,
+        allowInline: !download,
+      });
+      response.setHeader("Cache-Control", PROTECTED_FILE_CACHE_CONTROL);
+      response.statusCode = object.ContentRange ? 206 : 200;
+      if (object.ContentLength != null) response.setHeader("Content-Length", String(object.ContentLength));
+      if (object.ContentRange) response.setHeader("Content-Range", object.ContentRange);
+      response.setHeader("Accept-Ranges", object.AcceptRanges ?? "bytes");
+      setUntrustedFileResponseHeaders(response, { fileName: file.display_name, policy });
+      await transfer.stream(body);
+    } catch (error) {
+      if (response.destroyed) return;
+      if (response.headersSent) { response.destroy(error instanceof Error ? error : new Error("File transfer failed")); return; }
+      throw transfer.signal.aborted ? transfer.signal.reason : error;
+    } finally { transfer.dispose(); }
   }
 
   async streamBrandingAsset(
@@ -1209,73 +1243,77 @@ export class FilePlatformService {
       response.end();
       return;
     }
-    let object: GetObjectCommandOutput;
+    const transfer = new FileResponseTransfer(response);
     try {
-      object = await config.client.send(new GetObjectCommand({
-        Bucket: file.bucket,
-        Key: file.object_key,
-        ...(file.object_version_id ? { VersionId: file.object_version_id } : {}),
-      }));
-      if (!object.Body) throw new NotFoundException("Branding asset content is unavailable");
-    } catch (cause) {
-      response.setHeader("Cache-Control", INVALID_FILE_CACHE_CONTROL);
-      throw cause;
-    }
-    const maximumBytes = kind === "logo" ? ORGANIZATION_LOGO_MAX_BYTES : ORGANIZATION_FAVICON_MAX_BYTES;
-    const contentLength = Number(object.ContentLength);
-    if (object.ContentLength == null
-      || !Number.isSafeInteger(contentLength)
-      || contentLength <= 0
-      || contentLength > maximumBytes
-      || contentLength !== Number(file.size_bytes)) {
-      await cancelStoredObjectBody(object.Body).catch(() => undefined);
-      response.setHeader("Cache-Control", INVALID_FILE_CACHE_CONTROL);
-      throw new NotFoundException("Branding asset not found");
-    }
-    let inspected: Awaited<ReturnType<typeof bufferBodyPrefix>>;
-    try {
-      inspected = await bufferBodyPrefix(object.Body as AsyncIterable<Uint8Array>);
-    } catch {
-      response.setHeader("Cache-Control", INVALID_FILE_CACHE_CONTROL);
-      throw new NotFoundException("Branding asset not found");
-    }
-    const detectedMediaType = detectMediaType(inspected.sample);
-    const policy = fileResponsePolicy({
-      declaredMediaType: file.media_type,
-      detectedMediaType,
-      allowInline: true,
-    });
-    if (normalizeMediaType(file.detected_media_type) !== detectedMediaType) {
+      let object: GetObjectCommandOutput;
       try {
-        await this.recordDetectedMediaType(tenantId, file.id, detectedMediaType);
+        object = await config.client.send(new GetObjectCommand({
+          Bucket: file.bucket,
+          Key: file.object_key,
+          ...(file.object_version_id ? { VersionId: file.object_version_id } : {}),
+        }), { abortSignal: transfer.signal });
+        transfer.track(object.Body);
+        if (!object.Body) throw new NotFoundException("Branding asset content is unavailable");
       } catch (cause) {
-        await inspected.cancel();
+        response.setHeader("Cache-Control", INVALID_FILE_CACHE_CONTROL);
         throw cause;
       }
-    }
-    if (policy.disposition !== "inline" || !(allowed as readonly string[]).includes(policy.detectedMediaType)) {
-      await inspected.cancel();
-      response.setHeader("Cache-Control", INVALID_FILE_CACHE_CONTROL);
-      throw new NotFoundException("Branding asset not found");
-    }
-    setPublicBrandingHeaders(response, etag);
-    setUntrustedFileResponseHeaders(response, {
-      fileName: file.display_name,
-      policy,
-      crossOriginResourcePolicy: "cross-origin",
-    });
-    if (requestEntityTagMatches(ifNoneMatch, etag)) {
-      await inspected.cancel();
-      response.statusCode = 304;
-      response.end();
-      return;
-    }
-    response.statusCode = 200;
-    response.setHeader("Content-Length", String(contentLength));
-    for await (const chunk of inspected.body) {
-      if (!response.write(chunk)) await once(response, "drain");
-    }
-    response.end();
+      const maximumBytes = kind === "logo" ? ORGANIZATION_LOGO_MAX_BYTES : ORGANIZATION_FAVICON_MAX_BYTES;
+      const contentLength = Number(object.ContentLength);
+      if (object.ContentLength == null
+        || !Number.isSafeInteger(contentLength)
+        || contentLength <= 0
+        || contentLength > maximumBytes
+        || contentLength !== Number(file.size_bytes)) {
+          response.setHeader("Cache-Control", INVALID_FILE_CACHE_CONTROL);
+        throw new NotFoundException("Branding asset not found");
+      }
+      let inspected: Awaited<ReturnType<typeof bufferBodyPrefix>>;
+      try {
+        inspected = await bufferBodyPrefix(object.Body as AsyncIterable<Uint8Array>);
+      } catch {
+        response.setHeader("Cache-Control", INVALID_FILE_CACHE_CONTROL);
+        throw new NotFoundException("Branding asset not found");
+      }
+      const detectedMediaType = detectMediaType(inspected.sample);
+      const policy = fileResponsePolicy({
+        declaredMediaType: file.media_type,
+        detectedMediaType,
+        allowInline: true,
+      });
+      if (normalizeMediaType(file.detected_media_type) !== detectedMediaType) {
+        try {
+          await this.recordDetectedMediaType(tenantId, file.id, detectedMediaType);
+        } catch (cause) {
+          await inspected.cancel();
+          throw cause;
+        }
+      }
+      if (policy.disposition !== "inline" || !(allowed as readonly string[]).includes(policy.detectedMediaType)) {
+        await inspected.cancel();
+        response.setHeader("Cache-Control", INVALID_FILE_CACHE_CONTROL);
+        throw new NotFoundException("Branding asset not found");
+      }
+      setPublicBrandingHeaders(response, etag);
+      setUntrustedFileResponseHeaders(response, {
+        fileName: file.display_name,
+        policy,
+        crossOriginResourcePolicy: "cross-origin",
+      });
+      if (requestEntityTagMatches(ifNoneMatch, etag)) {
+        await inspected.cancel();
+        response.statusCode = 304;
+        response.end();
+        return;
+      }
+      response.statusCode = 200;
+      response.setHeader("Content-Length", String(contentLength));
+      await transfer.stream(inspected.body);
+    } catch (error) {
+      if (response.destroyed) return;
+      if (response.headersSent) { response.destroy(error instanceof Error ? error : new Error("File transfer failed")); return; }
+      throw transfer.signal.aborted ? transfer.signal.reason : error;
+    } finally { transfer.dispose(); }
   }
 
   private requireConfig(): FileStorageConfig {
@@ -1819,28 +1857,6 @@ function assertPublicBrandingFile(file: FileRow, kind: OrganizationBrandingAsset
     || sizeBytes <= 0
     || sizeBytes > maximumBytes) {
     throw new NotFoundException("Branding asset not found");
-  }
-}
-
-async function cancelStoredObjectBody(body: unknown): Promise<void> {
-  if (!body || (typeof body !== "object" && typeof body !== "function")) return;
-  const candidate = body as {
-    destroy?: () => void;
-    cancel?: () => Promise<unknown> | unknown;
-    [Symbol.asyncIterator]?: () => AsyncIterator<unknown>;
-  };
-  if (typeof candidate.destroy === "function") {
-    candidate.destroy.call(body);
-    return;
-  }
-  if (typeof candidate.cancel === "function") {
-    await candidate.cancel.call(body);
-    return;
-  }
-  const createIterator = candidate[Symbol.asyncIterator];
-  if (typeof createIterator === "function") {
-    const iterator = createIterator.call(body);
-    await iterator.return?.();
   }
 }
 

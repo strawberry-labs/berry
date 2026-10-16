@@ -1,9 +1,14 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DURABLE_BASE_BUILT_IN_TOOLS,
   latestAssistantStreamDraft,
   type AgentStreamEvent,
+  type JsonValue,
   type TurnRunState,
 } from "@berry/shared";
 import {
@@ -17,17 +22,24 @@ import {
   DurableTurnRetryableError,
   DurableToolExecutionError,
   DURABLE_IMAGE_TOOL_SELECTION_PROMPT,
+  DURABLE_REWRITING_PROMPT,
   DURABLE_TOOL_DEFINITIONS,
   RouterDurableTurnModel,
   SnapshotProviderDurableTurnModel,
   SqlDurableTurnRepository,
   createDurableTurnModel,
   durableImageToolSelectionPrompt,
+  journalSafeToolResult,
   durableBuiltInToolDefinitions,
   durableToolManifestMetrics,
   queuedFollowUpRuntimeRequest,
+  budgetUsageAfterSequence,
+  DurableToolTimeoutError,
   modelMessages,
+  pendingContextEntries,
+  stepTimingFields,
   usageCostMicros,
+  type BudgetReservationDecision,
   type DurableTurnModel,
   type DurableTurnMutation,
   type DurableTurnRepository,
@@ -35,10 +47,19 @@ import {
   type DurableTurnSnapshot,
   type DurableTurnStep,
   type DurableTurnToolExecutor,
+  type TurnModelToolIntent,
   type TurnToolResult,
 } from "./turn-runner.js";
 import type { SqlExecutor } from "./sql-repositories.js";
+import { SandboxContinuityManager, exposedSandboxImages } from "./sandbox-continuity.js";
+import { McpToolError, McpToolSource } from "@berry/local-agent/mcp";
+import { modelImageWithheld } from "./model-image.js";
+import { ToolArgumentError } from "./tool-arguments.js";
+import { TOOL_FAILURE_OUTCOME_VERSION } from "./tool-failures.js";
+import { DurableMcpToolExecutor } from "./mcp-tools.js";
+import { DurablePersonalMemoryToolExecutor } from "./memory/tools.js";
 import { ActiveTurnCancellationRegistry } from "./turn-cancellation.js";
+import type { ProviderCreditAlert, ProviderCreditAlertSink } from "./provider-credits.js";
 
 const tenantId = "00000000-0000-7000-8000-000000000001";
 const runId = "00000000-0000-7000-8000-000000000002";
@@ -83,6 +104,677 @@ describe("durable turn runner", () => {
     expect(prompt.stableSystemPrompt).toContain("tool_search");
     expect(prompt.stableSystemPrompt).toContain("remote file id");
     expect(prompt.stableSystemPrompt).toContain("outputs directory");
+  });
+
+  it("includes faithful rewriting instructions in the actual provider system prompt", () => {
+    const prompt = modelMessages(providerSnapshot("openai-responses"));
+    expect(prompt.stableSystemPrompt).toContain(DURABLE_REWRITING_PROMPT);
+    expect(prompt.messages.filter((message) => message.role === "system").map((message) => message.content).join("\n"))
+      .toContain(DURABLE_REWRITING_PROMPT);
+  });
+
+  it("never replays a failed run's platform error as an assistant answer", () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    const providerError = "The model provider rejected this request (HTTP 400). Check the model configuration.";
+    const entry = (id: string, message: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
+      entryId: id, parentEntryId: current.entries.at(-1)?.entryId ?? null, entryType: "message", sequence: current.entries.length + 1,
+      payload: { type: "message", id, parentId: current.entries.at(-1)?.entryId ?? null, ...extra, message },
+    });
+    current.entries.push(
+      // Pre-fix API projection of a failed message: the error stored as text.
+      entry("failed-legacy", { role: "assistant", content: [{ type: "text", text: providerError }], stopReason: "error" }, { projectionSource: "messages" }),
+      // Fixed projection keeps the diagnostic typed.
+      entry("failed-typed", { role: "assistant", content: [{ type: "error", text: providerError }], stopReason: "error" }, { projectionSource: "messages" }),
+      // Genuine partial output journaled by the worker itself is still context.
+      entry("partial", { role: "assistant", content: [{ type: "text", text: "Partial draft: the fee is AED 450" }], stopReason: "failed" }),
+      // A user may legitimately quote the error; user text is never filtered.
+      entry("quote", { role: "user", content: `Rewrite this error for my team: ${providerError}` }),
+    );
+
+    const history = modelMessages(current).messages;
+    const assistantText = history.filter((message) => message.role === "assistant").map((message) => JSON.stringify(message.content)).join("\n");
+    expect(assistantText).not.toContain("HTTP 400");
+    expect(assistantText).toContain("Partial draft: the fee is AED 450");
+    expect(JSON.stringify(history.at(-1)?.content)).toContain("Rewrite this error for my team");
+    expect(history.filter((message) => message.role === "assistant")).toHaveLength(1);
+  });
+
+  describe("prompt layout for provider prefix caching", () => {
+    const turn = (grounding: Record<string, unknown>, builtInTools: string[], history: Array<Record<string, unknown>>) => {
+      const current = providerSnapshot("openai-responses");
+      current.runtimeRequest = { ...current.runtimeRequest, builtInTools };
+      current.groundingContext = grounding;
+      current.entries = history.map((message, index) => ({
+        entryId: `entry-${index}`, parentEntryId: index ? `entry-${index - 1}` : null, entryType: "message", sequence: index + 1,
+        payload: { type: "message", id: `entry-${index}`, message },
+      }));
+      current.requestMessageId = `entry-${lastIndex(history, (message) => message.role === "user")}`;
+      return current;
+    };
+    const lastIndex = <T,>(items: readonly T[], match: (item: T) => boolean) => {
+      for (let index = items.length - 1; index >= 0; index -= 1) if (match(items[index]!)) return index;
+      return -1;
+    };
+    const firstTurn = [{ role: "user", content: "Summarise section 4." }];
+    const firstAnswer = [
+      ...firstTurn,
+      { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "spec.pdf" } }], stopReason: "toolUse" },
+      { role: "toolResult", toolCallId: "call-1", toolName: "read", content: "Section 4: fire pumps" },
+      { role: "assistant", content: [{ type: "text", text: "Section 4 covers fire pumps." }], stopReason: "stop" },
+    ];
+
+    const journal = (current: MutableSnapshot, entries: Array<{ entryId: string; entryType: string; payload: unknown }>) => {
+      for (const entry of entries) {
+        current.entries.push({
+          entryId: entry.entryId,
+          parentEntryId: current.entries.at(-1)?.entryId ?? null,
+          entryType: entry.entryType,
+          sequence: current.entries.length + 1,
+          payload: entry.payload,
+        });
+      }
+    };
+    const pushMessage = (current: MutableSnapshot, id: string, message: Record<string, unknown>) => {
+      current.entries.push({
+        entryId: id, parentEntryId: current.entries.at(-1)?.entryId ?? null, entryType: "message", sequence: current.entries.length + 1,
+        payload: { type: "message", id, message },
+      });
+    };
+
+    it("journals each run's turn context once so the whole earlier run stays a prefix of the next turn (H-032)", async () => {
+      const current = turn({ memory: "project uses NFPA 20" }, ["read"], firstTurn);
+      const first = await pendingContextEntries(current);
+      expect(first).toHaveLength(1);
+      expect(first[0]).toMatchObject({ entryType: "context", payload: { runId: current.id, scope: "turn" } });
+      journal(current, first);
+      // Written once: the next call of the run adds nothing and splices no copy.
+      expect(await pendingContextEntries(current)).toEqual([]);
+      const call1 = modelMessages(current).messages;
+      expect(call1.filter((message) => String(message.content).startsWith("<berry_turn_context>"))).toHaveLength(1);
+      expect(String(call1[2]?.content)).toContain("project uses NFPA 20");
+
+      pushMessage(current, "assistant-1", { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "spec.pdf" } }], stopReason: "toolUse" });
+      pushMessage(current, "result-1", { role: "toolResult", toolCallId: "call-1", toolName: "read", content: "Section 4: fire pumps" });
+      const call2 = modelMessages(current).messages;
+      expect(call2.slice(0, call1.length)).toEqual(call1);
+      pushMessage(current, "answer-1", { role: "assistant", content: [{ type: "text", text: "Section 4 covers fire pumps." }], stopReason: "stop" });
+
+      // The next turn: a new run, new grounding, a new request.
+      const next = turn({ memory: "pumps were replaced in 2025" }, ["read"], []);
+      next.id = "00000000-0000-7000-8000-0000000000f2";
+      next.entries = [...current.entries];
+      pushMessage(next, "request-2", { role: "user", content: "Now check section 5." });
+      next.requestMessageId = "request-2";
+      journal(next, await pendingContextEntries(next));
+      const turn2 = modelMessages(next).messages;
+      // Everything the provider saw in the earlier run is reused byte for byte.
+      expect(turn2.slice(0, call2.length)).toEqual(call2);
+      expect(String(turn2.at(-1)?.content)).toContain("pumps were replaced in 2025");
+    });
+
+    it("does not repeat grounding that an earlier turn already gave (H-032)", async () => {
+      const memory = (id: string, content: string) => ({ memoryId: id, content, label: "fact", explicit: false, confidence: 0.7, sourceTaskId: null, sourceMessageId: null });
+      const fact = (id: string, content: string) => ({ sourceId: `source-${id}`, chunkId: id, content, citationLabel: `Doc ${id}` });
+      const grounding = (facts: ReturnType<typeof fact>[]) => ({
+        personalMemory: [memory("m1", "Prefers metric units")],
+        projectFacts: facts,
+        citations: facts.map((item) => ({ sourceId: item.sourceId, chunkId: item.chunkId, label: item.citationLabel, href: null })),
+        retrieval: { snapshotId: null, queryHash: "q", tokenBudget: 5000, tokensSelected: 100, degradedReason: "none" },
+      });
+      const current = turn(grounding([fact("c1", "Pump room is level B2")]), ["read"], firstTurn);
+      journal(current, await pendingContextEntries(current));
+      pushMessage(current, "answer-1", { role: "assistant", content: [{ type: "text", text: "Done." }], stopReason: "stop" });
+
+      const next = turn(grounding([fact("c1", "Pump room is level B2"), fact("c2", "Sprinklers are wet-pipe")]), ["read"], []);
+      next.id = "00000000-0000-7000-8000-0000000000f3";
+      next.entries = [...current.entries];
+      pushMessage(next, "request-2", { role: "user", content: "And the sprinklers?" });
+      next.requestMessageId = "request-2";
+      const [context] = await pendingContextEntries(next);
+      const text = String((context?.payload as { text: string }).text);
+      expect(text).toContain("Sprinklers are wet-pipe");
+      expect(text).not.toContain("Pump room is level B2");
+      expect(text).not.toContain("Prefers metric units");
+      expect(text).toContain("2 grounding items were given earlier in this conversation and still apply");
+    });
+
+    it("appends a document skill found mid-run instead of rewriting the turn context (H-032)", async () => {
+      const pdf = { name: "pdf", description: "Work with PDFs", content: "# PDF skill", filePath: "/organization-skills/pdf/SKILL.md", disableModelInvocation: false, resources: [] };
+      const current = turn({}, ["read", "activate_skill"], firstTurn);
+      current.runtimeRequest = { ...current.runtimeRequest, extraSkills: [pdf] };
+      journal(current, await pendingContextEntries(current));
+      const before = modelMessages(current).messages;
+      expect(JSON.stringify(before)).not.toContain("# PDF skill");
+
+      current.steps = [...current.steps, {
+        ...toolStep("completed", "read_only", false), type: "tool.mcp__Drive__download", id: "import",
+        output: { artifacts: [{ name: "spec.pdf", mediaType: "application/pdf" }] },
+      } as DurableTurnStep];
+      const update = await pendingContextEntries(current);
+      expect(update).toHaveLength(1);
+      expect(update[0]).toMatchObject({ payload: { scope: "update", attachmentSkill: "pdf" } });
+      journal(current, update);
+      const after = modelMessages(current).messages;
+      expect(after.slice(0, before.length)).toEqual(before);
+      expect(String(after.at(-1)?.content)).toMatch(/^<berry_context_update>[\s\S]*# PDF skill/);
+      expect(await pendingContextEntries(current)).toEqual([]);
+    });
+
+    it("restates the time when a run resumes long after its turn started (H-023)", async () => {
+      const current = turn({}, ["read"], firstTurn);
+      current.createdAt = "2026-10-15T08:00:00.000Z";
+      journal(current, await pendingContextEntries(current, () => "", new Date("2026-10-15T08:00:05.000Z")));
+      expect(await pendingContextEntries(current, () => "", new Date("2026-10-15T08:20:00.000Z"))).toEqual([]);
+      const [update] = await pendingContextEntries(current, () => "", new Date("2026-10-15T11:45:00.000Z"));
+      expect(String((update?.payload as { text: string }).text))
+        .toContain("Current date and time now (this turn resumed later than it started): Thursday, 15 October 2026 at 11:45 (UTC)");
+    });
+
+    it("keeps each supplied image at a fixed place so later calls reuse it from the cache (H-032)", async () => {
+      const attachmentId = "00000000-0000-7000-8000-0000000000a1";
+      const current = turn({}, ["read"], firstTurn);
+      current.runtimeRequest = {
+        ...current.runtimeRequest,
+        contextWindowTokens: 128_000,
+        attachments: [{ fileId: attachmentId, name: "plan.png", mediaType: "image/png", size: 10 }],
+      };
+      journal(current, await pendingContextEntries(current));
+      const label = (path: string) => ({ type: "text" as const, text: `Workspace image ${JSON.stringify(path)}` });
+      const pixels = (value: string) => ({ type: "image_url" as const, image_url: { url: `data:image/png;base64,${value}` } });
+      const attachment = [label(`/workspace/inputs/${attachmentId}/plan.png`), pixels("PLAN")];
+
+      const call1 = modelMessages(current, attachment).messages;
+      // The attachment follows the turn context, not the end of the request.
+      expect(String(call1[2]?.content)).toMatch(/^<berry_turn_context>/);
+      expect(call1[3]?.content).toContainEqual(pixels("PLAN"));
+
+      pushMessage(current, "assistant-1", { role: "assistant", content: [{ type: "toolCall", id: "call-render", name: "read", arguments: { path: "/workspace/outputs/page-1.png" } }], stopReason: "toolUse" });
+      pushMessage(current, "result-1", { role: "toolResult", toolCallId: "call-render", toolName: "read", content: "Image ready" });
+      current.steps = [...current.steps, {
+        ...toolStep("completed", "read_only", false), id: "render", sequence: 10, type: "tool.read",
+        input: { toolCallId: "call-render", toolName: "read", arguments: {} }, output: { visionPath: "/workspace/outputs/page-1.png" },
+      } as DurableTurnStep];
+      const page = [label("/workspace/outputs/page-1.png"), pixels("PAGE")];
+      const call2 = modelMessages(current, [...page, ...attachment]).messages;
+      expect(call2.slice(0, call1.length)).toEqual(call1);
+      // The read image follows its own tool result.
+      expect(call2.at(-2)).toMatchObject({ role: "tool", content: "Image ready" });
+      expect(call2.at(-1)?.content).toContainEqual(pixels("PAGE"));
+
+      pushMessage(current, "assistant-2", { role: "assistant", content: [{ type: "toolCall", id: "call-ls", name: "ls", arguments: { path: "/workspace" } }], stopReason: "toolUse" });
+      pushMessage(current, "result-2", { role: "toolResult", toolCallId: "call-ls", toolName: "ls", content: "outputs/" });
+      const call3 = modelMessages(current, [...page, ...attachment]).messages;
+      expect(call3.slice(0, call2.length)).toEqual(call2);
+      expect(call3.at(-1)).toMatchObject({ role: "tool", content: "outputs/" });
+    });
+
+    it("keeps an attachment in place when it is read while already shown (H-032)", async () => {
+      const fileId = "00000000-0000-7000-8000-0000000000a1";
+      const path = `/workspace/inputs/${fileId}/plan.png`;
+      const current = turn({}, ["read"], firstTurn);
+      current.runtimeRequest = { ...current.runtimeRequest, contextWindowTokens: 128_000, attachments: [{ fileId, name: "plan.png", mediaType: "image/png", size: 10 }] };
+      journal(current, await pendingContextEntries(current));
+      const content = [
+        { type: "text" as const, text: `Workspace image ${JSON.stringify(path)}` },
+        { type: "image_url" as const, image_url: { url: "data:image/png;base64,PLAN" } },
+      ];
+      const before = modelMessages(current, content).messages;
+      pushMessage(current, "assistant-read", { role: "assistant", content: [{ type: "toolCall", id: "call-read", name: "read", arguments: { path } }], stopReason: "toolUse" });
+      pushMessage(current, "result-read", { role: "toolResult", toolCallId: "call-read", toolName: "read", content: "Image ready" });
+      current.steps = [...current.steps, {
+        ...toolStep("completed", "read_only", false), id: "read-attachment", sequence: 10, type: "tool.read",
+        input: { toolCallId: "call-read", toolName: "read", arguments: { path } }, output: { visionPath: path },
+      } as DurableTurnStep];
+
+      const after = modelMessages(current, content).messages;
+      expect(after.slice(0, before.length)).toEqual(before);
+      expect(JSON.stringify(after).split("base64,PLAN")).toHaveLength(2);
+    });
+
+    describe("images whose read result was compacted away (H-032)", () => {
+      type Content = NonNullable<Parameters<typeof modelMessages>[1]>;
+      type Request = ReturnType<typeof modelMessages>["messages"];
+      const page = "/workspace/outputs/page-1.png";
+      const second = "/workspace/outputs/page-2.png";
+      const label = (path: string) => ({ type: "text" as const, text: `Workspace image ${JSON.stringify(path)}` });
+      const pixels = (value: string) => ({ type: "image_url" as const, image_url: { url: `data:image/png;base64,${value}` } });
+      const exposure = (path: string, value: string, anchor: string, read: string) => ({
+        path, anchor, read, sha256: createHash("sha256").update(label(path).text).update("\0").update(pixels(value).image_url.url).digest("hex"),
+      });
+      const images = (request: Request) => request.flatMap((message) => Array.isArray(message.content) ? message.content.filter((part) => part.type === "image_url") : []);
+      const afterResult = (request: Request, callId: string) => request[request.findIndex((message) => message.role === "tool" && message.toolCallId === callId) + 1];
+      const toolCall = (current: MutableSnapshot, id: string, name: "read" | "ls", path: string, sequence: number) => {
+        pushMessage(current, `assistant-${id}`, { role: "assistant", content: [{ type: "toolCall", id, name, arguments: { path } }], stopReason: "toolUse" });
+        pushMessage(current, `result-${id}`, { role: "toolResult", toolCallId: id, toolName: name, content: name === "read" ? "Image ready" : "page-1.png" });
+        return {
+          ...toolStep("completed", "read_only", false), id: `step-${id}`, sequence, type: `tool.${name}`,
+          input: { toolCallId: id, toolName: name, arguments: { path } }, output: name === "read" ? { visionPath: path } : { entries: ["page-1.png"] },
+        } as DurableTurnStep;
+      };
+      /**
+       * A run that read `reads`, whose next request placed their images as
+       * `recorded`, then listed the workspace. Compaction covered the reads;
+       * the next model call is pending.
+       */
+      const compactedRun = async (reads: readonly string[], recorded: ReadonlyArray<ReturnType<typeof exposure>>) => {
+        const current = turn({}, ["read", "ls"], firstTurn);
+        journal(current, await pendingContextEntries(current));
+        const steps: DurableTurnStep[] = [admittedStep(), modelStep("completed", 1)];
+        reads.forEach((path, index) => steps.push(toolCall(current, `call-read-${index}`, "read", path, index + 2)));
+        steps.push({ ...modelStep("completed", reads.length + 2), output: { imageExposures: [...recorded] } });
+        steps.push(toolCall(current, "call-ls", "ls", "/workspace", reads.length + 3));
+        steps.push(modelStep("pending", reads.length + 4));
+        current.steps = steps;
+        current.checkpointCoveredEntryId = `result-call-read-${reads.length - 1}`;
+        return current;
+      };
+
+      it("keeps showing an image whose read result was compacted away", async () => {
+        const current = await compactedRun([page], [exposure(page, "PAGE", "call-read-0", "call-read-0")]);
+        expect(exposedSandboxImages(current).selected).toEqual([page]);
+
+        const request = modelMessages(current, [label(page), pixels("PAGE")]).messages;
+        expect(images(request)).toEqual([pixels("PAGE")]);
+        expect(afterResult(request, "call-ls")?.content).toContainEqual(pixels("PAGE"));
+      });
+
+      it("records where it was shown and keeps it there afterwards, also after a restart", async () => {
+        const current = await compactedRun([page], [exposure(page, "PAGE", "call-read-0", "call-read-0")]);
+        const repository = new FakeTurnRepository(current);
+        const requests: Request[] = [];
+        const model: DurableTurnModel = {
+          call: async (snapshot, _step, context) => {
+            requests.push(modelMessages(snapshot, context.additionalUserContent).messages);
+            return requests.length === 1
+              ? { text: "", inputTokens: 1, outputTokens: 1, toolCalls: [{ id: "call-ls-2", name: "ls", input: { path: "/workspace/outputs" } as never, retryClass: "read_only", repeatPolicy: "compare_result", idempotencyKey: null, requiresApproval: false, approvalKind: "file-edit" }] }
+              : { text: "Done.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+          },
+        };
+        const tools: DurableTurnToolExecutor = {
+          execute: async () => ({ output: { entries: ["page-1.png"] }, summary: "Listed" }),
+          modelContent: async () => [label(page), pixels("PAGE")],
+        };
+        // The first call records the image's new place; a restarted worker makes the second.
+        for (const owner of ["before-restart", "before-restart", "after-restart", "after-restart"]) {
+          const { state } = await new DurableTurnRunner(repository, model, tools, { owner }).execute({ tenantId, runId, reason: "continue" });
+          if (state !== "calling_model" && state !== "executing_tool") break;
+        }
+
+        expect(requests).toHaveLength(2);
+        const recorded = repository.current.steps.filter((step) => step.type === "model.call" && step.state === "completed").at(-2);
+        expect((recorded?.output as { imageExposures?: unknown }).imageExposures).toEqual([expect.objectContaining({ path: page, anchor: "call-ls" })]);
+        expect(requests[1]!.slice(0, requests[0]!.length)).toEqual(requests[0]);
+        expect(images(requests[1]!)).toHaveLength(1);
+      });
+
+      it("keeps images that shared a compacted place together, in their earlier order", async () => {
+        const current = await compactedRun([page, second], [
+          exposure(page, "A", "call-read-1", "call-read-0"),
+          exposure(second, "B", "call-read-1", "call-read-1"),
+        ]);
+        // The selector now lists them the other way round.
+        const request = modelMessages(current, [label(second), pixels("B"), label(page), pixels("A")]).messages;
+        expect(afterResult(request, "call-ls")?.content).toEqual([expect.anything(), label(page), pixels("A"), label(second), pixels("B")]);
+      });
+
+      it("shows the image after a new read once the earlier read was compacted", async () => {
+        const current = await compactedRun([page], [exposure(page, "PAGE", "call-read-0", "call-read-0")]);
+        current.steps = [...current.steps.slice(0, -1), toolCall(current, "call-read-again", "read", page, 20), modelStep("pending", 21)];
+
+        const request = modelMessages(current, [label(page), pixels("PAGE")]).messages;
+        expect(images(request)).toHaveLength(1);
+        expect(afterResult(request, "call-read-again")?.content).toContainEqual(pixels("PAGE"));
+      });
+
+      it("shows changed pixels after the latest retained result, not where the old ones were", async () => {
+        const current = await compactedRun([page], [exposure(page, "PAGE", "call-read-0", "call-read-0")]);
+
+        const request = modelMessages(current, [label(page), pixels("EDITED")]).messages;
+        expect(images(request)).toEqual([pixels("EDITED")]);
+        expect(afterResult(request, "call-ls")?.content).toContainEqual(pixels("EDITED"));
+      });
+
+      it("still shows an attachment whose turn context was compacted", async () => {
+        const fileId = "00000000-0000-7000-8000-0000000000a1";
+        const plan = `/workspace/inputs/${fileId}/plan.png`;
+        const current = await compactedRun([page], [exposure(plan, "PLAN", "turn", "")]);
+        current.runtimeRequest = { ...current.runtimeRequest, attachments: [{ fileId, name: "plan.png", mediaType: "image/png", size: 10 }] };
+
+        expect(images(modelMessages(current, [label(plan), pixels("PLAN")]).messages)).toEqual([pixels("PLAN")]);
+      });
+    });
+
+    describe("images read again during a run (H-032)", () => {
+      type Content = NonNullable<Parameters<typeof modelMessages>[1]>;
+      type Call = { name: "read" | "bash"; args: Record<string, unknown> };
+      const page = "/workspace/outputs/page-1.png";
+      const label = (path: string) => ({ type: "text" as const, text: `Workspace image ${JSON.stringify(path)}` });
+      const pixels = (value: string) => ({ type: "image_url" as const, image_url: { url: `data:image/png;base64,${value}` } });
+      const readPage: Call = { name: "read", args: { path: page } };
+      /**
+       * One turn through the real runner: model call n makes `calls[n - 1]`
+       * (then answers) and Berry supplies `shown(n)` as its image content.
+       * Returns each request as the provider adapters build it.
+       */
+      async function driveTurn(calls: Call[], shown: (call: number) => Content, options: { attachments?: Array<Record<string, unknown>>; restartAfterCall?: number } = {}) {
+        const current = providerSnapshot("openai-responses");
+        current.runtimeRequest = { ...current.runtimeRequest, builtInTools: ["read", "bash"], contextWindowTokens: 128_000, attachments: options.attachments ?? [] };
+        const repository = new FakeTurnRepository(current);
+        const requests: Array<ReturnType<typeof modelMessages>["messages"]> = [];
+        const model: DurableTurnModel = {
+          call: async (snapshot, _step, context) => {
+            requests.push(modelMessages(snapshot, context.additionalUserContent).messages);
+            const call = calls[requests.length - 1];
+            if (!call) return { text: "Done.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+            return {
+              text: "", inputTokens: 1, outputTokens: 1,
+              toolCalls: [{
+                id: `call-${requests.length}`, name: call.name, input: call.args as never,
+                retryClass: call.name === "read" ? "read_only" : "non_idempotent_manual", repeatPolicy: "compare_result",
+                idempotencyKey: null, requiresApproval: false, approvalKind: "file-edit",
+              }],
+            };
+          },
+        };
+        const tools: DurableTurnToolExecutor = {
+          execute: async (_snapshot, step) => {
+            const path = String((step.input.arguments as { path?: unknown }).path ?? "");
+            return step.type === "tool.read"
+              ? { output: { path, binary: true, mediaType: "image/png", visionPath: path, content: "Image ready" }, summary: "Image ready" }
+              : { output: { exitCode: 0, output: "edited" }, summary: "Command completed" };
+          },
+          modelContent: async () => shown(requests.length + 1),
+        };
+        let runner = new DurableTurnRunner(repository, model, tools, { owner: "images-worker" });
+        let restartAfterCall = options.restartAfterCall;
+        for (let turn = 0; turn < 30; turn += 1) {
+          if (requests.length === restartAfterCall) {
+            runner = new DurableTurnRunner(repository, model, tools, { owner: "images-worker-restarted" });
+            restartAfterCall = undefined;
+          }
+          const { state } = await runner.execute({ tenantId, runId, reason: "continue" });
+          if (state !== "calling_model" && state !== "executing_tool") break;
+        }
+        return requests;
+      }
+      const afterResult = (request: ReturnType<typeof modelMessages>["messages"], callId: string) =>
+        request[request.findIndex((message) => message.role === "tool" && message.toolCallId === callId) + 1];
+      const occurrences = (request: unknown, value: string) => JSON.stringify(request).split(`base64,${value}"`).length - 1;
+
+      it("keeps an unchanged image where it was first shown when it is read again", async () => {
+        const requests = await driveTurn([readPage, readPage], (call) => call === 1 ? [] : [label(page), pixels("PAGE")]);
+
+        expect(requests).toHaveLength(3);
+        expect(requests[2]!.slice(0, requests[1]!.length)).toEqual(requests[1]);
+        expect(occurrences(requests[2], "PAGE")).toBe(1);
+      });
+
+      it("keeps that place after a worker restart", async () => {
+        const requests = await driveTurn([readPage, readPage], (call) => call === 1 ? [] : [label(page), pixels("PAGE")], { restartAfterCall: 2 });
+
+        expect(requests[2]!.slice(0, requests[1]!.length)).toEqual(requests[1]);
+      });
+
+      it("keeps a shown attachment in place when the model reads it", async () => {
+        const fileId = "00000000-0000-7000-8000-0000000000a1";
+        const plan = `/workspace/inputs/${fileId}/plan.png`;
+        const requests = await driveTurn([{ name: "read", args: { path: plan } }], () => [label(plan), pixels("PLAN")], {
+          attachments: [{ fileId, name: "plan.png", mediaType: "image/png", size: 10 }],
+        });
+
+        expect(requests).toHaveLength(2);
+        expect(requests[1]!.slice(0, requests[0]!.length)).toEqual(requests[0]);
+        expect(occurrences(requests[1], "PLAN")).toBe(1);
+      });
+
+      it("shows changed pixels after the read that returned them, not where the old image was", async () => {
+        const requests = await driveTurn([readPage, readPage], (call) => call === 1 ? [] : [label(page), pixels(call === 2 ? "PAGE" : "EDITED")]);
+
+        expect(occurrences(requests[2], "EDITED")).toBe(1);
+        expect(occurrences(requests[2], "PAGE")).toBe(0);
+        expect(afterResult(requests[2]!, "call-2")?.content).toContainEqual(pixels("EDITED"));
+        expect(afterResult(requests[2]!, "call-1")).toMatchObject({ role: "assistant" });
+      });
+
+      it("shows pixels that changed without a new read after the latest result, not where the old image was", async () => {
+        const edit: Call = { name: "bash", args: { command: "convert page-1.png -rotate 90 page-1.png" } };
+        const requests = await driveTurn([readPage, edit], (call) => call === 1 ? [] : [label(page), pixels(call === 2 ? "PAGE" : "EDITED")]);
+
+        expect(occurrences(requests[2], "EDITED")).toBe(1);
+        expect(afterResult(requests[2]!, "call-1")).toMatchObject({ role: "assistant" });
+        expect(afterResult(requests[2]!, "call-2")?.content).toContainEqual(pixels("EDITED"));
+      });
+
+      describe("two images that share a place", () => {
+        const second = "/workspace/outputs/page-2.png";
+        const readSecond: Call = { name: "read", args: { path: second } };
+        const editBoth: Call = { name: "bash", args: { command: "mogrify -rotate 90 page-1.png page-2.png" } };
+        // Both images change through one command, so the next request shows them
+        // together after its result; then the first is read again unchanged.
+        const shown = (lastPage: string) => (call: number): Content => {
+          if (call === 1) return [];
+          if (call === 2) return [label(page), pixels("PAGE1")];
+          if (call === 3) return [label(page), pixels("PAGE1"), label(second), pixels("PAGE2")];
+          if (call === 4) return [label(page), pixels("EDITED1"), label(second), pixels("EDITED2")];
+          // The selector now lists the reread image last.
+          return [label(second), pixels("EDITED2"), label(page), pixels(lastPage)];
+        };
+
+        it("keeps their order when one is read again unchanged", async () => {
+          const requests = await driveTurn([readPage, readSecond, editBoth, readPage], shown("EDITED1"));
+          const reads = [readPage, readSecond, readPage].map((call, index) => ({
+            sequence: index * 2 + 2, type: "tool.read", state: "completed", input: { toolName: "read" }, output: { visionPath: call.args.path },
+          }));
+          const selection = exposedSandboxImages({ steps: [
+            { sequence: 1, type: "model.call", state: "completed", input: {} }, reads[0]!,
+            { sequence: 3, type: "model.call", state: "completed", input: {} }, reads[1]!,
+            { sequence: 5, type: "model.call", state: "completed", input: {} },
+            { sequence: 6, type: "tool.bash", state: "completed", input: { toolName: "bash" }, output: {} },
+            { sequence: 7, type: "model.call", state: "completed", input: {} }, { ...reads[2]!, sequence: 8 },
+          ] as never });
+          expect(selection.selected).toEqual([second, page]);
+
+          expect(requests).toHaveLength(5);
+          expect(requests[4]!.slice(0, requests[3]!.length)).toEqual(requests[3]);
+          expect(afterResult(requests[4]!, "call-3")?.content).toEqual([
+            expect.anything(), label(page), pixels("EDITED1"), label(second), pixels("EDITED2"),
+          ]);
+        });
+
+        it("keeps their order after a worker restart", async () => {
+          const requests = await driveTurn([readPage, readSecond, editBoth, readPage], shown("EDITED1"), { restartAfterCall: 4 });
+
+          expect(requests[4]!.slice(0, requests[3]!.length)).toEqual(requests[3]);
+        });
+
+        it("moves only the image whose pixels changed again, after the read that returned them", async () => {
+          const requests = await driveTurn([readPage, readSecond, editBoth, readPage], shown("EDITED-AGAIN"));
+
+          expect(afterResult(requests[4]!, "call-4")?.content).toContainEqual(pixels("EDITED-AGAIN"));
+          expect(afterResult(requests[4]!, "call-3")?.content).toEqual([expect.anything(), label(second), pixels("EDITED2")]);
+          expect(occurrences(requests[4], "EDITED1")).toBe(0);
+        });
+      });
+
+      it("shows a newly read image after five attachments gave up their places", async () => {
+        const ids = [1, 2, 3, 4, 5].map((index) => `00000000-0000-7000-8000-00000000000${index}`);
+        const paths = ids.map((id) => `/workspace/inputs/${id}/a.png`);
+        const requests = await driveTurn([readPage], (call) => call === 1
+          ? paths.flatMap((path, index) => [label(path), pixels(`ATTACHMENT${index}`)])
+          : [...paths.map((path) => ({ type: "text" as const, text: modelImageWithheld(path, "newer images took its place") })), label(page), pixels("PAGE")], {
+          attachments: ids.map((fileId) => ({ fileId, name: "a.png", mediaType: "image/png", size: 10 })),
+        });
+
+        expect(afterResult(requests[1]!, "call-1")?.content).toContainEqual(pixels("PAGE"));
+        expect(occurrences(requests[1], "ATTACHMENT0")).toBe(0);
+        expect(JSON.stringify(requests[1]!.at(-1))).toContain("newer images took its place");
+      });
+
+      it("shows an attachment that was left out once the model reads it", async () => {
+        const ids = [1, 2, 3, 4, 5, 6].map((index) => `00000000-0000-7000-8000-00000000000${index}`);
+        const paths = ids.map((id) => `/workspace/inputs/${id}/a.png`);
+        const sixth = paths[5]!;
+        const requests = await driveTurn([{ name: "read", args: { path: sixth } }], (call) => call === 1
+          ? [...paths.slice(0, 5).flatMap((path, index) => [label(path), pixels(`ATTACHMENT${index}`)]), { type: "text" as const, text: modelImageWithheld(sixth, "only 5 images are sent per request") }]
+          : [...paths.slice(0, 5).map((path) => ({ type: "text" as const, text: modelImageWithheld(path, "newer images took its place") })), label(sixth), pixels("SIXTH")], {
+          attachments: ids.map((fileId) => ({ fileId, name: "a.png", mediaType: "image/png", size: 10 })),
+        });
+
+        expect(afterResult(requests[1]!, "call-1")?.content).toContainEqual(pixels("SIXTH"));
+      });
+    });
+
+    it("declares activate_skill without a skill-name list so enabling a skill keeps the tools unchanged (H-032)", () => {
+      const skill = (name: string) => ({ name, description: name, content: `# ${name}`, filePath: `/personal-skills/${name}/SKILL.md`, disableModelInvocation: false, resources: [] });
+      const definitions = (skills: ReturnType<typeof skill>[]) => {
+        const current = turn({}, ["read", "activate_skill"], firstTurn);
+        current.runtimeRequest = { ...current.runtimeRequest, extraSkills: skills };
+        return JSON.stringify(durableBuiltInToolDefinitions(current));
+      };
+      expect(definitions([skill("pdf")])).toBe(definitions([skill("pdf"), skill("docx")]));
+      expect(definitions([skill("pdf")])).not.toContain("enum");
+    });
+
+    it("shows an unavailable capability's reason in the turn context (H-050)", async () => {
+      const current = turn({}, ["read"], firstTurn);
+      current.runtimeRequest = { ...current.runtimeRequest, capabilityNotices: [{ capability: "vision", reason: "The image-reading service did not finish in time for this message." }] };
+      const [context] = await pendingContextEntries(current);
+      expect(String((context?.payload as { text: string }).text))
+        .toContain("- Image reading (inspect_images): The image-reading service did not finish in time for this message.");
+    });
+
+    it("points an explicitly requested short skill name at the enabled skill (H-052)", () => {
+      const skill = (name: string, description: string) => ({
+        name, description, content: `# ${name}`, filePath: `/personal-skills/${name}/SKILL.md`, disableModelInvocation: false, resources: [],
+      });
+      const turnContext = (input: string, skills: ReturnType<typeof skill>[], steps: DurableTurnStep[] = []) => {
+        const current = turn({}, ["read", "activate_skill"], [{ role: "user", content: input }]);
+        current.runtimeRequest = { ...current.runtimeRequest, input, extraSkills: skills };
+        current.steps = [...current.steps, ...steps];
+        return String(modelMessages(current).messages.find((message) => String(message.content).startsWith("<berry_turn_context>"))?.content);
+      };
+      // Task 1164: "BSBG" with bsbg-cv-converter enabled.
+      const bsbg = skill("bsbg-cv-converter", "Convert CVs to the BSBG format.");
+      expect(turnContext("Please use BSBG on the attached CV", [bsbg])).toContain('asks to use "bsbg", which matches the enabled skill bsbg-cv-converter');
+      expect(turnContext("Write an email to the AESG team", [skill("aesg-branding", "AESG brand rules.")])).not.toContain("matches the enabled skill");
+      expect(turnContext("Use AESG for this deck", [skill("aesg-branding", "AESG brand rules."), skill("aesg-cv", "AESG CVs.")]))
+        .toContain("matches several enabled skills: aesg-branding, aesg-cv");
+      const activated = { ...toolStep("completed", "read_only", false), type: "tool.activate_skill", input: { toolCallId: "a", toolName: "activate_skill", arguments: { name: "bsbg-cv-converter" }, requiresApproval: false, approvalKind: "file-edit" } } as DurableTurnStep;
+      expect(turnContext("Please use BSBG on the attached CV", [bsbg], [activated])).not.toContain("matches the enabled skill");
+    });
+
+    it("states the run's start date in the turn context and keeps it stable across calls (H-023)", () => {
+      const current = turn({}, ["read"], firstTurn);
+      current.createdAt = "2026-10-14T21:30:00.000Z";
+      const turnContext = () => String(modelMessages(current).messages.find((message) => String(message.content).startsWith("<berry_turn_context>"))?.content);
+      const first = turnContext();
+      expect(first).toContain("Current date and time when this turn started: Wednesday, 14 October 2026 at 21:30 (UTC)");
+      expect(turnContext()).toBe(first);
+      current.runtimeRequest = { ...current.runtimeRequest, timezone: "Asia/Dubai" };
+      expect(turnContext()).toContain("Thursday, 15 October 2026 at 01:30 (Asia/Dubai)");
+      current.runtimeRequest = { ...current.runtimeRequest, timezone: "Mars/Olympus" };
+      expect(turnContext()).toContain("at 21:30 (UTC)");
+      // The cached system prefix carries no date.
+      expect(String(modelMessages(current).messages[0]?.content)).not.toContain("Current date");
+    });
+
+    it("keeps the system message and earlier turns identical when grounding and routed tools change", () => {
+      const last = modelMessages(turn({ memory: "project uses NFPA 20" }, ["read"], firstAnswer)).messages;
+      const next = modelMessages(turn({ memory: "pumps were replaced in 2025" }, ["read", "bash"], [
+        ...firstAnswer, { role: "user", content: "Now check section 5." },
+      ])).messages;
+
+      expect(next[0]).toEqual(last[0]);
+      expect(String(next[0]?.content)).not.toContain("untrusted_grounding");
+      expect(String(next[0]?.content)).toContain("Runtime environment:");
+      // Everything before the earlier turn's context message is reused verbatim.
+      const earlierContext = last.findIndex((message) => String(message.content).startsWith("<berry_turn_context>"));
+      expect(earlierContext).toBe(2);
+      expect(next.slice(0, earlierContext)).toEqual(last.slice(0, earlierContext));
+      const context = next.find((message, index) => index > 2 && String(message.content).startsWith("<berry_turn_context>"));
+      expect(String(context?.content)).toContain("pumps were replaced in 2025");
+      expect(next.indexOf(context!) - 1).toBe(lastIndex(next, (message) => message.content === "Now check section 5."));
+    });
+
+    it("appends within a run without rewriting the request or its context", () => {
+      const grounding = { memory: "project uses NFPA 20" };
+      const call1 = modelMessages(turn(grounding, ["read"], firstTurn)).messages;
+      const call2 = modelMessages(turn(grounding, ["read"], firstAnswer.slice(0, 3))).messages;
+      expect(call2.slice(0, call1.length)).toEqual(call1);
+    });
+
+    it("adds per-call recovery text at the end instead of changing the prefix", () => {
+      const normal = turn({ memory: "x" }, ["read"], firstAnswer.slice(0, 3));
+      const recovering = turn({ memory: "x" }, ["read"], firstAnswer.slice(0, 3));
+      recovering.steps = [...recovering.steps, { ...modelStep("pending", 2), input: { iteration: 2, recoveryReason: "empty_response" } }];
+      const before = modelMessages(normal).messages;
+      const after = modelMessages(recovering).messages;
+      expect(after.slice(0, before.length)).toEqual(before);
+      expect(after.at(-1)).toMatchObject({ role: "user", content: expect.stringContaining("Recovery instruction") });
+    });
+
+    it("keeps the original single system message when the request anchor is unavailable", () => {
+      const current = turn({ memory: "legacy grounding" }, ["read"], firstTurn);
+      current.requestMessageId = "compacted-away";
+      const messages = modelMessages(current).messages;
+      expect(String(messages[0]?.content)).toContain("legacy grounding");
+      expect(messages.some((message) => String(message.content).startsWith("<berry_turn_context>"))).toBe(false);
+    });
+  });
+
+  describe("explicit Continue", () => {
+    const continued = (after: Array<Record<string, unknown>>) => {
+      const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+      current.runtimeRequest = { ...current.runtimeRequest, continueInterruptedTurn: true };
+      const push = (id: string, message: Record<string, unknown>) => current.entries.push({
+        entryId: id, parentEntryId: current.entries.at(-1)?.entryId ?? null, entryType: "message", sequence: current.entries.length + 1,
+        payload: { type: "message", id, parentId: current.entries.at(-1)?.entryId ?? null, message },
+      });
+      push("earlier-answer", { role: "assistant", content: [{ type: "text", text: "Comment 4 covers the old cable routing." }], stopReason: "stop" });
+      push("latest-request", { role: "user", content: "Now refocus the comments on remote monitoring." });
+      current.requestMessageId = "latest-request";
+      after.forEach((message, index) => push(`after-${index}`, message));
+      const built = modelMessages(current);
+      const contextIndex = built.messages.findIndex((message) => String(message.content).startsWith("<berry_turn_context>"));
+      return {
+        system: String(built.messages[0]?.content),
+        context: String(built.messages[contextIndex]?.content),
+        beforeContext: built.messages[contextIndex - 1],
+        last: built.messages.at(-1),
+      };
+    };
+
+    it("answers the pending request when the interrupted attempt produced nothing", () => {
+      const { system, context, beforeContext, last } = continued([]);
+      expect(context).toContain("failed before producing any response to the user's latest message");
+      expect(context).not.toContain("from the persisted partial output");
+      expect(system).not.toContain("explicit continuation request");
+      // The pending request is the latest user message; no synthetic "continue" turn follows.
+      expect(beforeContext).toMatchObject({ role: "user", content: "Now refocus the comments on remote monitoring." });
+      expect(String(last?.content)).toMatch(/^<berry_turn_context>/);
+    });
+
+    it("still continues genuine partial output without repeating it", () => {
+      const { context, last } = continued([{ role: "assistant", content: [{ type: "text", text: "Remote monitoring: 1." }], stopReason: "failed" }]);
+      expect(context).toContain("from the persisted partial output");
+      expect(last).toMatchObject({ role: "user", content: "Continue the interrupted response from where it stopped. Do not repeat the completed portion." });
+    });
+
+    it("continues from completed tool results without redoing them", () => {
+      const { context, last } = continued([
+        { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "spec.pdf" } }], stopReason: "toolUse" },
+        { role: "toolResult", toolCallId: "call-1", toolName: "read", content: "Section 7: remote monitoring requirements" },
+      ]);
+      expect(context).toContain("completed the tool work shown above");
+      expect(JSON.stringify(last)).toContain("Continue from the completed tool results above");
+    });
+  });
+
+  it("keeps a queued prompt's billing identity across delivery retries", () => {
+    const runtime = queuedFollowUpRuntimeRequest({ queuedBudgetRequestId: "queued:browser-key", budgetReservationRequired: true }, {
+      id: "row-id", attempt_count: 3, input: "Rewrite this email", intent: null, attachments: [],
+    });
+    expect(runtime).toMatchObject({ requestId: "queued:browser-key", budgetReservationRequired: true, continueInterruptedTurn: false });
   });
 
   it("guides ordinary image-edit turns toward the admitted image tool", () => {
@@ -221,6 +913,54 @@ describe("durable turn runner", () => {
   it("starts in live mode without a global router for snapshot-admitted providers", () => {
     expect(createDurableTurnModel({ BERRY_API_MODEL_MODE: "live" }))
       .toBeInstanceOf(SnapshotProviderDurableTurnModel);
+  });
+
+  it("measures the time to the first streamed output (H-013)", async () => {
+    const encoder = new TextEncoder();
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(new ReadableStream({
+      async start(controller) {
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        controller.enqueue(encoder.encode('data: {"type":"response.output_text.delta","delta":"ok"}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"response.completed","response":{"id":"resp-timed","model":"served-model","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}\n\ndata: [DONE]\n\n'));
+        controller.close();
+      },
+    }), { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch);
+    const result = await new SnapshotProviderDurableTurnModel({}, null).call(
+      providerSnapshot("openai-responses"),
+      modelStep("pending", 1),
+      {
+        messageId: randomUUID(),
+        tools: [],
+        additionalUserContent: [],
+        emitDelta: async () => undefined,
+        policyForTool: () => ({
+          retryClass: "read_only",
+          repeatPolicy: "compare_result",
+          requiresApproval: false,
+          approvalKind: "mcp",
+        }),
+      },
+    );
+
+    expect(result.text).toBe("ok");
+    expect(result.firstTokenMs).toBeGreaterThanOrEqual(50);
+    expect(result.firstTokenMs).toBeLessThan(5_000);
+  });
+
+  it("adds step durations and time to first token to phase events (H-013)", () => {
+    expect(stepTimingFields({
+      state: "completed",
+      output: { providerDiagnostics: { latencyMs: 1_250, firstTokenMs: 400 } },
+      startedAt: "2026-10-15T08:00:00.000Z",
+      completedAt: "2026-10-15T08:00:09.000Z",
+    })).toEqual({ durationMs: 1_250, firstTokenMs: 400 });
+    expect(stepTimingFields({
+      state: "failed",
+      output: null,
+      startedAt: "2026-10-15T08:00:00.000Z",
+      completedAt: "2026-10-15T08:00:02.500Z",
+    })).toEqual({ durationMs: 2_500 });
+    expect(stepTimingFields({ state: "running", output: null, startedAt: "2026-10-15T08:00:00.000Z", completedAt: null })).toEqual({});
   });
 
   it.each([
@@ -382,6 +1122,149 @@ describe("durable turn runner", () => {
       .toBe(true);
   });
 
+  it("runs a use_tool call as the connector tool it names and journals the call as written (H-032)", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => ({
+        text: "",
+        inputTokens: 3,
+        outputTokens: 2,
+        toolCalls: [{
+          id: "call-drive",
+          name: "use_tool",
+          input: { tool: "mcp__Drive__search", arguments: { query: "pump schedule" } },
+          retryClass: "non_idempotent_manual",
+          idempotencyKey: null,
+          requiresApproval: true,
+          approvalKind: "mcp",
+        }],
+      }),
+    }, {
+      ...noTools(),
+      policy: (_snapshot, name) => name === "mcp__Drive__search"
+        ? { retryClass: "read_only", repeatPolicy: "compare_result", requiresApproval: false, approvalKind: "mcp" }
+        : undefined,
+    }, { owner: "worker-use-tool" });
+
+    await runner.execute({ tenantId, runId, reason: "continue" });
+
+    const step = repository.current.steps.find((candidate) => candidate.type === "tool.mcp__Drive__search");
+    expect(step?.input).toMatchObject({
+      toolName: "mcp__Drive__search",
+      arguments: { query: "pump schedule" },
+      invokedAs: "use_tool",
+      requiresApproval: false,
+    });
+    expect(step?.retryClass).toBe("read_only");
+    const assistant = repository.current.entries
+      .map((entry) => (entry.payload as { message?: { role?: string; content?: unknown[] } }).message)
+      .find((message) => message?.role === "assistant");
+    expect(assistant?.content).toEqual([{
+      type: "toolCall", id: "call-drive", name: "use_tool",
+      arguments: { tool: "mcp__Drive__search", arguments: { query: "pump schedule" } },
+    }]);
+    // The run's turn context was journaled before the call.
+    expect(repository.current.entries.filter((entry) => entry.entryType === "context")).toHaveLength(1);
+    // The result replays under the call's name, as providers require.
+    repository.current.entries.push({
+      entryId: "drive-result", parentEntryId: repository.current.entries.at(-1)?.entryId ?? null, entryType: "message",
+      sequence: repository.current.entries.length + 1,
+      payload: { type: "message", id: "drive-result", message: { role: "toolResult", toolCallId: "call-drive", toolName: "mcp__Drive__search", content: "3 files" } },
+    });
+    expect(modelMessages(repository.current).messages.at(-1)).toMatchObject({ role: "tool", name: "use_tool", content: "3 files" });
+  });
+
+  describe("malformed tool arguments (H-011)", () => {
+    const callWith = (name: string, input: JsonValue, overrides: Partial<TurnModelToolIntent> = {}): DurableTurnModel => ({
+      call: async () => ({
+        text: "",
+        inputTokens: 3,
+        outputTokens: 2,
+        toolCalls: [{
+          id: "call-bad",
+          name,
+          input,
+          retryClass: "idempotent",
+          idempotencyKey: null,
+          requiresApproval: false,
+          approvalKind: "file-edit",
+          ...overrides,
+        }],
+      }),
+    });
+    const run = async (model: DurableTurnModel, tools: Partial<DurableTurnToolExecutor> = {}) => {
+      const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      const execute = vi.fn(async () => ({ output: { ok: true }, summary: "ran" }));
+      const runner = new DurableTurnRunner(repository, model, { execute, ...tools }, { owner: "worker-arguments" });
+      await runner.execute({ tenantId, runId, reason: "continue" });
+      const state = (await runner.execute({ tenantId, runId, reason: "continue" })).state;
+      const step = repository.current.steps.find((candidate) => candidate.type.startsWith("tool."));
+      const result = repository.current.entries
+        .map((entry) => (entry.payload as { message?: { role?: string; content?: Array<{ text?: string }> } }).message)
+        .find((message) => message?.role === "toolResult");
+      const assistant = repository.current.entries
+        .map((entry) => (entry.payload as { message?: { role?: string; content?: unknown[] } }).message)
+        .find((message) => message?.role === "assistant");
+      return { repository, execute, state, step, resultText: result?.content?.[0]?.text ?? "", assistant };
+    };
+
+    it("does not run a call whose JSON is invalid and says where it broke", async () => {
+      const broken = '{"path": "/workspace/a.ts", "edits": [{"oldText": "x", "newText": "\\d+"}]}';
+      const { execute, state, step, resultText, assistant } = await run(callWith("edit", { raw: broken }));
+      expect(execute).not.toHaveBeenCalled();
+      expect(state).toBe("calling_model");
+      expect(step).toMatchObject({ state: "failed", output: { failure: { category: "invalid_input", outcome: "not_applied" } } });
+      expect(resultText).toContain(`edit was not run: its arguments are invalid JSON: bad escape "\\d" in a string; a backslash must start`);
+      expect(resultText).toContain(`at character ${broken.indexOf("\\d") + 1} of ${broken.length}`);
+      expect(resultText).toContain('"newText": "⟨HERE⟩\\d+"}]}');
+      // The journal keeps the call as the model made it, so provider history stays valid.
+      expect(assistant?.content).toEqual([{ type: "toolCall", id: "call-bad", name: "edit", arguments: { raw: broken } }]);
+    });
+
+    it("does not run a call that breaks the tool schema and names each field", async () => {
+      const { execute, step, resultText } = await run(callWith("compose_message", { id: "draft", kind: "sms", variants: "[]" }));
+      expect(execute).not.toHaveBeenCalled();
+      expect(step?.state).toBe("failed");
+      expect(resultText).toContain('compose_message was not run: its arguments do not match the tool schema: "kind" must be one of "email", "textMessage", "other", but "sms" was sent; "variants" must be an array, but a string ("[]") was sent; send the value itself, not JSON text inside a string');
+    });
+
+    it("keeps use_tool with non-object arguments from running the connector with empty arguments", async () => {
+      const { execute, step, resultText } = await run(
+        callWith("use_tool", { tool: "mcp__Drive__search", arguments: '{"query": "pump"}' }),
+        {
+          definitions: async () => [{
+            type: "function",
+            function: {
+              name: "use_tool",
+              parameters: { type: "object", required: ["tool", "arguments"], properties: { tool: { type: "string" }, arguments: { type: "object" } } },
+            },
+          }],
+        },
+      );
+      expect(execute).not.toHaveBeenCalled();
+      expect(step?.type).toBe("tool.use_tool");
+      expect(resultText).toContain('use_tool was not run: its arguments do not match the tool schema: "arguments" must be an object, but a string');
+    });
+
+    it("refuses a connector call missing a required field before asking for approval", async () => {
+      const { repository, execute, step, resultText } = await run(
+        callWith("use_tool", { tool: "mcp__Drive__search", arguments: { limit: 5 } }, { retryClass: "read_only", approvalKind: "mcp" }),
+        {
+          policy: (_snapshot, name) => name === "mcp__Drive__search"
+            ? { retryClass: "non_idempotent_manual", repeatPolicy: "block_after_success", requiresApproval: true, approvalKind: "mcp" }
+            : undefined,
+          argumentSchema: (_snapshot, name) => name === "mcp__Drive__search"
+            ? { type: "object", required: ["query"], properties: { query: { type: "string" }, limit: { type: "integer" } } }
+            : undefined,
+        },
+      );
+      expect(execute).not.toHaveBeenCalled();
+      expect(repository.current.approvals).toHaveLength(0);
+      expect(step).toMatchObject({ type: "tool.mcp__Drive__search", state: "failed" });
+      expect(resultText).toContain('mcp__Drive__search was not run: its arguments do not match the tool schema: "query" is required but missing (sent fields: limit)');
+    });
+  });
+
   it("does not spend the turn wall-clock budget on persisted human wait", async () => {
     const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
     const humanWaitMs = 6 * 24 * 60 * 60 * 1_000;
@@ -528,6 +1411,8 @@ describe("durable turn runner", () => {
         cacheWriteTokens: 0,
         finishReason: null,
         errorCode: "UPSTREAM_UNAVAILABLE",
+        failureCause: "server",
+        attemptCauses: [{ cause: "server", latencyMs: expect.any(Number) }],
       },
     });
     expect(JSON.stringify(repository.releasedRetryDiagnostics)).not.toContain("sensitive upstream response body");
@@ -535,6 +1420,20 @@ describe("durable turn runner", () => {
     expect(repository.releasedError).toBe(
       "The model provider returned a server error (HTTP 503). Berry will retry it.",
     );
+  });
+
+  it("explains an HTTP 413 as a payload-size failure without leaking provider content", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    const repository = new FakeTurnRepository(current);
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => { throw new RouterClientError("private response", 413, "private image payload", { code: "request_too_large" }); },
+    }, noTools(), { owner: "worker-image-budget" });
+    await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ state: "failed" });
+    expect(repository.current.error).toContain("payload size limit (HTTP 413)");
+    expect(repository.current.error).toContain("Reduce the image sizes");
+    expect(repository.current.error).not.toContain("configuration");
+    expect(JSON.stringify(repository.events)).not.toContain("private");
+    expect(repository.releasedRetryDiagnostics).toBeUndefined();
   });
 
   it("terminally fails provider HTTP 409 instead of releasing it for a BullMQ retry", async () => {
@@ -753,11 +1652,15 @@ describe("durable turn runner", () => {
       abortCleanupTimeoutMs: 10,
     });
 
+    // Both reads time out: they are reported to the model, not retried as a batch (H-078).
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
-      .rejects.toThrow("Parallel read-only tool batch stalled");
+      .resolves.toMatchObject({ state: "calling_model" });
     expect(aborted).toBe(2);
     expect(repository.current.steps.filter((step) => step.type.startsWith("tool.")))
-      .toEqual([expect.objectContaining({ id: first.id, state: "running" }), expect.objectContaining({ id: second.id, state: "running" })]);
+      .toEqual([
+        expect.objectContaining({ id: first.id, state: "failed", timedOut: true, error: expect.stringContaining("Parallel read-only tool batch stalled") }),
+        expect.objectContaining({ id: second.id, state: "failed", timedOut: true }),
+      ]);
   });
 
   it("does not abort a parallel read-only batch when one step lacks support", async () => {
@@ -778,9 +1681,12 @@ describe("durable turn runner", () => {
       abortCleanupTimeoutMs: 10,
     });
 
+    // Not aborted: the batch waits for both reads, which settle after the
+    // deadline and are therefore reported as timed out (H-078).
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
-      .rejects.toThrow("Parallel read-only tool batch stalled");
+      .resolves.toMatchObject({ state: "calling_model" });
     expect(aborted).toBe(false);
+    expect(repository.current.steps.filter((step) => step.type.startsWith("tool.")).every((step) => step.state === "failed" && step.timedOut)).toBe(true);
   });
 
   it("cancels a read-only adapter that observes its signal", async () => {
@@ -800,6 +1706,61 @@ describe("durable turn runner", () => {
     await startedPromise;
     expect(cancellations.cancel(runId)).toBe(1);
     await expect(execution).resolves.toMatchObject({ state: "cancelled" });
+  });
+
+  it.each(["idle", "wall"] as const)("preserves a confirmed mutation result after its %s deadline", async (deadline) => {
+    const tool = toolStep("pending", "non_idempotent_manual", false);
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    const receipt = { output: { exitCode: 0, content: "Verified workbook totals" }, summary: "Recalculation completed" };
+    const execute = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return receipt;
+    });
+    const runner = new DurableTurnRunner(repository, unusedModel(), { execute }, {
+      toolIdleTimeoutMs: deadline === "idle" ? 5 : 1_000,
+      toolMaxDurationMs: deadline === "wall" ? 5 : 1_000,
+    });
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
+      state: "completed", output: receipt.output,
+    });
+    expect(repository.current.error).toBeNull();
+    expect(repository.events.some((event) => event.kind === "error")).toBe(false);
+  });
+
+  it("still requires recovery when a mutation rejects after its deadline without a receipt", async () => {
+    const tool = toolStep("pending", "non_idempotent_manual", false);
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    const execute = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      throw new Error("Connection lost before receiving the command result");
+    });
+    const runner = new DurableTurnRunner(repository, unusedModel(), { execute }, {
+      toolIdleTimeoutMs: 5, toolMaxDurationMs: 1_000,
+    });
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "recovery_required" });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
+      state: "recovery_required", outcomeCertainty: "unknown",
+    });
+  });
+
+  it("does not accept a late mutation receipt after losing its lease", async () => {
+    const tool = toolStep("pending", "non_idempotent_manual", false);
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    vi.spyOn(repository, "heartbeat").mockResolvedValue(false);
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return { output: { accepted: true }, summary: "Late receipt" };
+      },
+    }, { heartbeatMs: 5, toolIdleTimeoutMs: 10, toolMaxDurationMs: 1_000 });
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "recovery_required" });
+    expect(repository.current.steps.find((step) => step.id === tool.id)?.state).toBe("recovery_required");
   });
 
   it("moves an ignored cancellation during mutation to recovery without replaying it", async () => {
@@ -830,6 +1791,65 @@ describe("durable turn runner", () => {
       outcomeCertainty: "unknown",
     });
     expect(repository.current.error).toBe("ambiguous_external_operation");
+  });
+
+  // H-003: a lost response is not a failure the model may repair, however the run was interrupted.
+  it.each(["was cancelled", "lost its lease"] as const)("moves a mutation that %s and then lost its response to recovery", async (interruption) => {
+    const tool = toolStep("pending", "non_idempotent_manual", false);
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    if (interruption === "lost its lease") vi.spyOn(repository, "heartbeat").mockResolvedValue(false);
+    const cancellations = new ActiveTurnCancellationRegistry();
+    let started!: () => void;
+    let lose!: () => void;
+    let calls = 0;
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        calls += 1;
+        started();
+        return new Promise<TurnToolResult>((_resolve, reject) => { lose = () => reject(new Error("socket hang up")); });
+      },
+    }, { owner: "worker-mutation-interrupted", cancellations, heartbeatMs: 5 });
+    const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+
+    const execution = runner.execute({ tenantId, runId, reason: "continue" });
+    await startedPromise;
+    if (interruption === "was cancelled") expect(cancellations.cancel(runId)).toBe(1);
+    else await new Promise((resolve) => setTimeout(resolve, 30));
+    lose();
+
+    await expect(execution).resolves.toMatchObject({ state: "recovery_required" });
+    expect(calls).toBe(1);
+    expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
+      state: "recovery_required",
+      outcomeCertainty: "unknown",
+    });
+    expect(repository.mutations.some((mutation) => mutation.steps?.some((step) => step.id === tool.id && step.state === "failed"))).toBe(false);
+  });
+
+  it.each(["was cancelled", "lost its lease"] as const)("moves a command that %s and then failed to recovery, never to a failure the model repairs", async (interruption) => {
+    const tool = toolStep("pending", "non_idempotent_manual", false);
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    if (interruption === "lost its lease") vi.spyOn(repository, "heartbeat").mockResolvedValue(false);
+    const cancellations = new ActiveTurnCancellationRegistry();
+    let started!: () => void;
+    let fail!: () => void;
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        started();
+        return new Promise<TurnToolResult>((_resolve, reject) => { fail = () => reject(new Error("created\n\nCommand exited with code 1")); });
+      },
+    }, { owner: "worker-command-interrupted", cancellations, heartbeatMs: 5 });
+    const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+
+    const execution = runner.execute({ tenantId, runId, reason: "continue" });
+    await startedPromise;
+    if (interruption === "was cancelled") expect(cancellations.cancel(runId)).toBe(1);
+    else await new Promise((resolve) => setTimeout(resolve, 30));
+    fail();
+
+    await expect(execution).resolves.toMatchObject({ state: "recovery_required" });
+    expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({ state: "recovery_required", outcomeCertainty: "unknown" });
+    expect(repository.mutations.some((mutation) => mutation.steps?.some((step) => step.id === tool.id && step.state === "failed"))).toBe(false);
   });
 
   it("caps the model output allowance to the remaining context capacity", async () => {
@@ -910,6 +1930,30 @@ describe("durable turn runner", () => {
     expect(String(toolMessage?.content).length).toBeLessThanOrEqual((32_000 - 16_384 - 1_024) * 4);
     expect(String(toolMessage?.content)).toContain("[durable-result:huge-tool-entry]");
     expect(String(toolMessage?.content)).toContain("[result content bounded]");
+  });
+
+  it("marks results past the shared tool budget as omitted instead of sending them empty (H-036)", () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest.contextWindowTokens = 32_000;
+    for (const index of [1, 2]) {
+      current.entries.push({
+        entryId: `large-tool-entry-${index}`,
+        parentEntryId: current.entries.at(-1)?.entryId ?? null,
+        entryType: "message",
+        sequence: current.entries.length + 1,
+        payload: {
+          type: "message",
+          id: `large-tool-entry-${index}`,
+          message: { role: "toolResult", toolCallId: `large-tool-call-${index}`, toolName: "connector_search", content: [{ type: "text", text: "y".repeat(200_000) }] },
+        },
+      });
+    }
+
+    const [first, second] = modelMessages(current).messages.filter((message) => message.role === "tool");
+    expect(String(first?.content)).toContain("[result content bounded]");
+    // The first result used the whole budget; the second used to be "".
+    expect(String(second?.content)).toContain("[durable-result:large-tool-entry-2]");
+    expect(String(second?.content)).toContain("omitted here to stay within the model's context limit");
   });
 
   it("reclaims an expired lease from the persisted pending model step", async () => {
@@ -1793,13 +2837,16 @@ describe("durable turn runner", () => {
       },
     });
 
+    // Tool use stops and the model is asked for a final answer; the task does not fail (H-004).
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
-      .resolves.toMatchObject({ state: "failed" });
+      .resolves.toMatchObject({ state: "calling_model" });
     expect(executions).toBe(0);
-    expect(repository.current.error).toContain("failed 5 times with identical arguments and error");
-    expect(repository.current.error).toContain("before attempt 6");
-    expect(repository.current.steps.find((step) => step.id === pending.id)?.state).toBe("failed");
-    expect(repository.current.steps.find((step) => step.id === laterPending.id)?.state).toBe("failed");
+    expect(repository.current.error).toBeNull();
+    expectFinalAnswerRequested(repository, "failed 5 times with the same input and the same error");
+    expect(repository.current.steps.find((step) => step.id === pending.id))
+      .toMatchObject({ state: "failed", error: "identical_tool_failure_limit" });
+    expect(repository.current.steps.find((step) => step.id === laterPending.id))
+      .toMatchObject({ state: "cancelled", error: "tool_use_stopped" });
     const terminalMutation = repository.mutations.at(-1)!;
     expect(terminalMutation.toolResultMessages?.map((result) => result.toolCallId)).toEqual([
       pending.input.toolCallId,
@@ -1860,9 +2907,1481 @@ describe("durable turn runner", () => {
     });
 
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
-      .resolves.toMatchObject({ state: "failed" });
+      .resolves.toMatchObject({ state: "calling_model" });
     expect(executions).toBe(0);
-    expect(repository.current.error).toContain("failed 5 times with identical arguments and error");
+    expectFinalAnswerRequested(repository, "write failed 5 times with the same input and the same error");
+  });
+
+  describe("recoverable preparation failures (H-077)", () => {
+    const job = () => ({ tenantId, runId, reason: "continue" as const });
+    const recordingModel = () => {
+      const seen: Array<{ tools: string[]; extra: string }> = [];
+      const model: DurableTurnModel = {
+        call: vi.fn(async (...args: Parameters<DurableTurnModel["call"]>) => {
+          const context = args[2];
+          seen.push({
+            tools: context.tools.map((tool) => tool.function.name),
+            extra: JSON.stringify(context.additionalUserContent ?? []),
+          });
+          return { text: "Recovered", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+        }),
+      };
+      return { model, seen };
+    };
+    const sandboxed = (current: MutableSnapshot) => {
+      current.sandboxId = "prep-sandbox";
+      current.sandboxProvider = "e2b";
+      current.sandboxState = "running";
+      return current;
+    };
+
+    it("keeps healthy connectors and plain writing usable when an unused connector's credentials cannot be opened", async () => {
+      const current = providerSnapshot("openai-responses");
+      const server = (id: string, name: string, credentialRef?: string) => ({
+        id, name, transport: "streamable-http" as const, command: null, args: [], url: `https://${id}.invalid/mcp`, env: {},
+        enabled: true, trusted: true, ...(credentialRef ? { credentialRef } : {}),
+        cachedTools: [{ name: "search", description: `Search ${name}`, inputSchema: { type: "object", properties: { query: { type: "string" } } } }],
+      });
+      current.runtimeRequest = {
+        ...current.runtimeRequest,
+        input: "Polish this sentence: I can attend.",
+        mcpServers: [server("broken", "Broken", "env:BERRY_TEST_MISSING_CONNECTOR_SECRET"), server("healthy", "Healthy")],
+      };
+      const tools = new DurableMcpToolExecutor(noTools(), [], undefined, 100, {});
+      const repository = new FakeTurnRepository(current);
+      const { model, seen } = recordingModel();
+
+      await expect(new DurableTurnRunner(repository, model, tools).execute(job())).resolves.toMatchObject({ state: "finalizing" });
+      expect(seen[0]!.tools).toEqual(expect.arrayContaining(["tool_search", "use_tool"]));
+      const context = JSON.stringify(repository.current.entries.filter((entry) => entry.entryType === "context"));
+      expect(context).toContain("healthy (Healthy)");
+      expect(context).toContain("broken (Broken): its credentials could not be opened");
+      // The broken connector stays blocked; it is not opened without credentials.
+      await expect(tools.execute(repository.current, {
+        ...readOnlyToolStep("read", 9, "/workspace/a.txt"),
+        type: "tool.mcp__Broken__search",
+        input: { toolName: "mcp__Broken__search", arguments: { query: "x" } },
+      })).rejects.toThrow("The Broken connector is unavailable for this message");
+      await tools.close();
+    });
+
+    it("turns memory off for the request when its settings cannot be read, never assuming consent", async () => {
+      const remember = vi.fn();
+      const tools = new DurablePersonalMemoryToolExecutor(
+        noTools(),
+        { settings: async () => { throw new Error("settings temporarily unavailable"); } } as never,
+        { remember } as never,
+        true,
+      );
+      const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      const { model, seen } = recordingModel();
+
+      await expect(new DurableTurnRunner(repository, model, tools).execute(job())).resolves.toMatchObject({ state: "finalizing" });
+      // The declared tools do not change with a failed read (H-032); using one does nothing.
+      expect(seen[0]!.tools).toEqual(expect.arrayContaining(["remember_memory", "forget_memory"]));
+      expect(seen[0]!.extra).toContain("Personal memory is unavailable for this message");
+      await expect(tools.execute(repository.current, {
+        ...readOnlyToolStep("read", 9, "/workspace/a.txt"),
+        type: "tool.remember_memory",
+        input: { toolName: "remember_memory", arguments: { kind: "profile", content: "A fact" } },
+      })).rejects.toThrow("Personal memory is unavailable right now");
+      expect(remember).not.toHaveBeenCalled();
+    });
+
+    it("continues with a notice when optional context enrichment fails", async () => {
+      const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      const { model } = recordingModel();
+      const tools = { ...noTools(), turnContext: async () => { throw new Error("connector catalog unavailable"); } };
+
+      await expect(new DurableTurnRunner(repository, model, tools).execute(job())).resolves.toMatchObject({ state: "finalizing" });
+      expect(JSON.stringify(repository.current.entries)).toContain("Some task context could not be prepared for this message (connector catalog unavailable)");
+    });
+
+    it("still stops on cancellation raised while enriching the context", async () => {
+      const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      const { model } = recordingModel();
+      const tools = { ...noTools(), turnContext: async () => { throw new DurableTurnRetryableError("lease lost"); } };
+
+      await expect(new DurableTurnRunner(repository, model, tools).execute(job())).rejects.toThrow("lease lost");
+      expect(model.call).not.toHaveBeenCalled();
+    });
+
+    it("retries a failed attachment download once, then tells the model the file was not reviewed", async () => {
+      const current = sandboxed(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      const getSource = vi.fn(async () => { throw new Error("source download connection reset"); });
+      const write = vi.fn();
+      const manager = new SandboxContinuityManager(
+        { kind: "e2b", resume: async () => ({ sandbox_id: "prep-sandbox", provider: "e2b", status: "running" }), files: { write, read: vi.fn(), list: vi.fn() } } as never,
+        {
+          inputFiles: async () => [{ fileId: "00000000-0000-7000-8000-000000000090", name: "brief.pdf", mediaType: "application/pdf", sizeBytes: 5, objectKey: "prep/brief.pdf" }],
+          recordSandbox: async () => undefined,
+        } as never,
+        { getSource } as never,
+        { image: "berry-sandbox", preparationRetryDelayMs: 1 },
+      );
+      const repository = new FakeTurnRepository(current);
+      const { model, seen } = recordingModel();
+
+      await expect(new DurableTurnRunner(repository, model, manager).execute(job())).resolves.toMatchObject({ state: "finalizing" });
+      expect(getSource).toHaveBeenCalledTimes(2);
+      expect(write).not.toHaveBeenCalled();
+      expect(seen[0]!.extra).toContain('Attached file not available: \\"brief.pdf\\" could not be prepared');
+      expect(seen[0]!.extra).toContain("has not been reviewed");
+    });
+
+    it("leaves an earlier image out with a notice after a network error, retrying once", async () => {
+      const current = sandboxed(snapshot("calling_model", [
+        admittedStep(),
+        { ...readOnlyToolStep("read", 1, "/workspace/old.png"), state: "completed", output: { path: "/workspace/old.png", binary: true, mediaType: "image/png", visionPath: "/workspace/old.png" } },
+        modelStep("pending", 2),
+      ]));
+      const read = vi.fn(async () => { throw Object.assign(new Error("fetch failed: ECONNRESET"), { code: "ECONNRESET" }); });
+      const manager = new SandboxContinuityManager(
+        { kind: "e2b", resume: async () => ({ sandbox_id: "prep-sandbox", provider: "e2b", status: "running" }), files: { read, list: async () => ({ entries: [] }), write: async () => ({}) } } as never,
+        { inputFiles: async () => [], recordSandbox: async () => undefined, latest: async () => null, continuity: async () => null } as never,
+        null,
+        { image: "berry-sandbox", preparationRetryDelayMs: 1 },
+      );
+      const repository = new FakeTurnRepository(current);
+      const { model, seen } = recordingModel();
+
+      await expect(new DurableTurnRunner(repository, model, manager).execute(job())).resolves.toMatchObject({ state: "finalizing" });
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(seen[0]!.extra).toContain("could not be loaded right now (fetch failed: ECONNRESET)");
+    });
+  });
+
+  describe("partial publication after the answer (H-014)", () => {
+    const job = () => ({ tenantId, runId, reason: "continue" as const });
+    const receipt: TurnToolResult = {
+      output: { text: "Published artifact: a.txt", artifact: { kind: "file", path: "/v1/files/f1/content", name: "a.txt", mediaType: "text/plain", size: 5, fileId: "f1" } },
+      summary: "Published a.txt",
+    };
+    const failure = (extra: Record<string, unknown> = {}): TurnToolResult => ({
+      output: { publication: "failed", path: "/workspace/outputs/b.txt", name: "b.txt", reason: "access denied by storage policy", ...extra },
+      summary: "Not published: b.txt (access denied by storage policy)",
+    });
+    const answered = () => {
+      const current = snapshot("finalizing", [admittedStep()]);
+      current.entries.push({
+        entryId: "finished-answer",
+        parentEntryId: null,
+        entryType: "message",
+        sequence: 2,
+        payload: { type: "message", message: { role: "assistant", content: [{ type: "text", text: "Both files are ready." }] } } as never,
+      });
+      return current;
+    };
+
+    it("keeps the answer and receipts, asks the model once to repair, then lists what was not published", async () => {
+      const repository = new FakeTurnRepository(answered());
+      const finalize = vi.fn(async () => [receipt, failure()]);
+      let instruction = "";
+      const model: DurableTurnModel = {
+        call: vi.fn(async (current: DurableTurnSnapshot) => {
+          instruction = String((modelMessages(current).messages.at(-1) as { content: unknown }).content);
+          return { text: "a.txt is ready; b.txt could not be published.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+        }),
+      };
+      const runner = new DurableTurnRunner(repository, model, { ...noTools(), finalize });
+
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "calling_model" });
+      expect(repository.mutations.at(-1)?.toolResultMessages).toEqual([expect.objectContaining({ status: "completed", summary: "Published a.txt" })]);
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "finalizing" });
+      expect(instruction).toContain("Berry could not publish these output files");
+      expect(instruction).toContain("- b.txt (/workspace/outputs/b.txt): access denied by storage policy");
+      expect(instruction).toContain("Do not say a file was delivered unless it was published");
+
+      // Still failing after the repair turn: the run completes with it listed.
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "completed" });
+      expect(model.call).toHaveBeenCalledTimes(1);
+      expect(repository.mutations.at(-1)?.toolResultMessages).toEqual([
+        expect.objectContaining({ status: "completed", summary: "Published a.txt" }),
+        expect.objectContaining({ status: "failed", summary: "Not published: b.txt (access denied by storage policy)" }),
+      ]);
+      expect(repository.current.error).toBeNull();
+      expect(JSON.stringify(repository.current.entries)).toContain("Both files are ready.");
+      expect(repository.current.steps.filter((step) => step.type === "turn.finalize").at(-1)?.output)
+        .toMatchObject({ completed: true, unpublished: [expect.objectContaining({ name: "b.txt" })] });
+    });
+
+    it("offers the repair turn when a final beside a draft image fails to upload (H-065)", async () => {
+      const current = answered();
+      current.sandboxId = "publish-sandbox";
+      current.sandboxProvider = "e2b";
+      current.sandboxState = "running";
+      current.steps = [
+        ...current.steps,
+        { ...runCommandStep("completed", 1, "make final"), id: randomUUID(), output: { exitCode: 0 } },
+        {
+          ...toolStep("completed", "non_idempotent_manual", false), id: randomUUID(), sequence: 2, type: "tool.create_image",
+          input: { toolCallId: randomUUID(), toolName: "create_image", arguments: { prompt: "background", purpose: "draft" } },
+          output: { visionPath: "/workspace/drafts/background.png", draft: { path: "/workspace/drafts/background.png" } },
+        },
+      ];
+      const final = "/workspace/outputs/final.txt";
+      const manager = new SandboxContinuityManager(
+        {
+          kind: "e2b",
+          resume: async () => ({ sandbox_id: "publish-sandbox", provider: "e2b", status: "running" }),
+          files: {
+            read: async () => ({ path: final, content: Buffer.from("final").toString("base64"), size_bytes: 5, mtime: null }),
+            list: async () => ({ path: "/workspace/outputs", entries: [{ path: final, type: "file", size_bytes: 5, mtime: null }] }),
+            write: async () => ({}),
+          },
+        } as never,
+        {
+          latest: async () => null, continuity: async () => null, recordSandbox: async () => undefined, publishedOutputs: async () => [],
+          recordArtifactOperationStart: async () => undefined, failArtifactOperation: async () => undefined,
+        } as never,
+        { putArtifact: async () => { throw new Error("access denied by storage policy"); } } as never,
+        { image: "berry-sandbox", preparationRetryDelayMs: 1 },
+      );
+      const repository = new FakeTurnRepository(current);
+
+      await expect(new DurableTurnRunner(repository, unusedModel(), manager).execute(job())).resolves.toMatchObject({ state: "calling_model" });
+      expect(repository.current.steps.filter((step) => step.type === "turn.finalize").at(-1)?.output).toMatchObject({
+        completed: false,
+        unpublished: [expect.objectContaining({ name: "final.txt", reason: expect.stringContaining("access denied") })],
+      });
+    });
+
+    it("offers exactly one repair turn when the database fails while publishing, and the next scan publishes", async () => {
+      const current = answered();
+      current.sandboxId = "publish-sandbox";
+      current.sandboxProvider = "e2b";
+      current.sandboxState = "running";
+      current.steps = [...current.steps, { ...runCommandStep("completed", 1, "make report"), id: randomUUID(), output: { exitCode: 0 } }];
+      const report = "/workspace/outputs/report.txt";
+      const putArtifact = vi.fn(async (key: string) => ({ bucket: "berry", key, etag: "etag" }));
+      const manager = new SandboxContinuityManager(
+        {
+          kind: "e2b",
+          resume: async () => ({ sandbox_id: "publish-sandbox", provider: "e2b", status: "running" }),
+          files: {
+            read: async () => ({ path: report, content: Buffer.from("finished report").toString("base64"), size_bytes: 15, mtime: null }),
+            list: async () => ({ path: "/workspace/outputs", entries: [{ path: report, type: "file", size_bytes: 15, mtime: null }] }),
+            write: async () => ({}),
+          },
+        } as never,
+        {
+          latest: async () => null, continuity: async () => null, recordSandbox: async () => undefined, inputFiles: async () => [],
+          publishedOutputs: vi.fn().mockRejectedValueOnce(new Error("read ECONNRESET")).mockResolvedValue([]),
+          recordArtifactOperationStart: async () => undefined, recordArtifactOperationStorage: async () => undefined,
+          persistOutput: async (input: Record<string, unknown>) => ({ ...input }),
+          completeArtifactOperation: async () => undefined, failArtifactOperation: async () => undefined,
+        } as never,
+        { putArtifact } as never,
+        { image: "berry-sandbox", preparationRetryDelayMs: 1 },
+      );
+      const repository = new FakeTurnRepository(current);
+      const model: DurableTurnModel = { call: vi.fn(async () => ({ text: "report.txt is published.", inputTokens: 1, outputTokens: 1, toolCalls: [] })) };
+      const runner = new DurableTurnRunner(repository, model, manager);
+
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "calling_model" });
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "finalizing" });
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "completed" });
+      expect(model.call).toHaveBeenCalledTimes(1);
+      expect(putArtifact).toHaveBeenCalledTimes(1);
+      expect(repository.mutations.at(-1)?.toolResultMessages).toEqual([expect.objectContaining({ status: "completed", summary: "Published report.txt" })]);
+    });
+
+    it("completes without a repair turn when the workspace itself could not be reached", async () => {
+      const repository = new FakeTurnRepository(answered());
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        ...noTools(),
+        finalize: async () => [failure({ workspaceUnavailable: true })],
+      });
+
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "completed" });
+      expect(repository.mutations.at(-1)?.toolResultMessages).toEqual([expect.objectContaining({ status: "failed" })]);
+    });
+
+    it("keeps the answer when publication fails outright, and still retries a timeout", async () => {
+      const repository = new FakeTurnRepository(answered());
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        ...noTools(),
+        finalize: async () => { throw new Error("upload connection reset"); },
+      });
+
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "completed" });
+      expect(repository.mutations.at(-1)?.toolResultMessages).toEqual([
+        expect.objectContaining({ status: "failed", output: expect.objectContaining({ reason: "upload connection reset" }) }),
+      ]);
+      expect(JSON.stringify(repository.current.entries)).toContain("Both files are ready.");
+
+      const retrying = new FakeTurnRepository(answered());
+      await expect(new DurableTurnRunner(retrying, unusedModel(), {
+        ...noTools(),
+        finalize: async () => { throw new DurableTurnRetryableError("lease lost"); },
+      }).execute(job())).rejects.toThrow("lease lost");
+      expect(retrying.current.state).toBe("finalizing");
+    });
+
+    it("completes normally when every file was published", async () => {
+      const repository = new FakeTurnRepository(answered());
+      const runner = new DurableTurnRunner(repository, unusedModel(), { ...noTools(), finalize: async () => [receipt] });
+
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "completed" });
+      expect(repository.current.steps.find((step) => step.type === "turn.finalize")?.output).toEqual({ completed: true });
+    });
+  });
+
+  describe("parallel read deadline (H-078)", () => {
+    const job = () => ({ tenantId, runId, reason: "continue" as const });
+    const fastAndSlow = () => {
+      const fast = readOnlyToolStep("read", 1, "/workspace/fast.txt");
+      const slow = readOnlyToolStep("read", 2, "/workspace/slow.txt");
+      return { fast, slow, repository: new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), fast, slow])) };
+    };
+    const reads = () => {
+      const executed: string[] = [];
+      return {
+        executed,
+        execute: async (_snapshot: DurableTurnSnapshot, step: DurableTurnStep) => {
+          const path = String((step.input.arguments as { path: string }).path);
+          executed.push(path);
+          if (path.endsWith("slow.txt")) await new Promise((resolve) => setTimeout(resolve, 40));
+          return { output: { text: path.endsWith("fast.txt") ? "preserve fast result" : "late slow result" }, summary: "read" };
+        },
+      };
+    };
+
+    it("keeps the read that finished in time and reports the slow one as timed out", async () => {
+      const { fast, slow, repository } = fastAndSlow();
+      const tools = reads();
+      const runner = new DurableTurnRunner(repository, unusedModel(), tools, { toolIdleTimeoutMs: 5, toolMaxDurationMs: 10 });
+
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "calling_model" });
+      expect(tools.executed).toEqual(["/workspace/fast.txt", "/workspace/slow.txt"]);
+      expect(repository.current.steps.find((step) => step.id === fast.id)).toMatchObject({ state: "completed", output: { text: "preserve fast result" } });
+      expect(repository.current.steps.find((step) => step.id === slow.id)).toMatchObject({ state: "failed", timedOut: true, outcomeCertainty: "known" });
+      const journal = JSON.stringify(repository.current.entries);
+      expect(journal.split("preserve fast result")).toHaveLength(2);
+      expect(journal).not.toContain("late slow result");
+      expect(repository.events).toContainEqual(expect.objectContaining({ kind: "phase.deadline_exceeded", phase: "tool" }));
+      expect(repository.mutations.filter((mutation) => mutation.toolResultMessages?.length)).toHaveLength(1);
+    });
+
+    it("still records one success and one ordinary failure without a deadline", async () => {
+      const { fast, slow, repository } = fastAndSlow();
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        execute: async (_snapshot, step) => {
+          if (step.id === slow.id) throw new Error("File not found: /workspace/slow.txt");
+          return { output: { text: "ok" }, summary: "read" };
+        },
+      });
+
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "calling_model" });
+      expect(repository.current.steps.find((step) => step.id === fast.id)?.state).toBe("completed");
+      expect(repository.current.steps.find((step) => step.id === slow.id)).toMatchObject({ state: "failed", timedOut: false });
+    });
+
+    it("keeps a fast read and times out an abort-aware read that does not stop in time", async () => {
+      const { fast, slow, repository } = fastAndSlow();
+      let lateSettled = false;
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        supportsAbort: () => true,
+        execute: async (_snapshot, step) => {
+          if (step.id === fast.id) return { output: { text: "preserve fast result" }, summary: "read" };
+          // Ignores the abort and settles only after cleanup gave up waiting.
+          await new Promise((resolve) => setTimeout(resolve, 60));
+          lateSettled = true;
+          return { output: { text: "late slow result" }, summary: "read" };
+        },
+      }, { toolIdleTimeoutMs: 5, toolMaxDurationMs: 10, abortCleanupTimeoutMs: 5 });
+
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "calling_model" });
+      const commits = repository.mutations.length;
+      expect(repository.current.steps.find((step) => step.id === slow.id)).toMatchObject({ state: "failed", timedOut: true, abortAcknowledged: false });
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      expect(lateSettled).toBe(true);
+      expect(repository.mutations).toHaveLength(commits);
+      expect(JSON.stringify(repository.current.entries)).not.toContain("late slow result");
+    });
+
+    it("saves nothing when ownership is lost before the deadline", async () => {
+      const { repository } = fastAndSlow();
+      repository.heartbeat = async () => false;
+      const runner = new DurableTurnRunner(repository, unusedModel(), reads(), { toolIdleTimeoutMs: 5, toolMaxDurationMs: 20, heartbeatMs: 1 });
+
+      await expect(runner.execute(job())).rejects.toBeInstanceOf(DurableToolTimeoutError);
+      expect(repository.mutations.some((mutation) => mutation.toolResultMessages?.length)).toBe(false);
+      expect(JSON.stringify(repository.current.entries)).not.toContain("preserve fast result");
+    });
+
+    it("keeps a user cancellation during the batch a cancellation", async () => {
+      const { repository } = fastAndSlow();
+      const cancellations = new ActiveTurnCancellationRegistry();
+      let started!: () => void;
+      const slowStarted = new Promise<void>((resolve) => { started = resolve; });
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        supportsAbort: () => true,
+        execute: async (_snapshot, step, signal) => {
+          if (String((step.input.arguments as { path: string }).path).endsWith("fast.txt")) return { output: { text: "preserve fast result" }, summary: "read" };
+          started();
+          return new Promise<never>((_resolve, reject) => signal?.addEventListener("abort", () => reject(signal.reason), { once: true }));
+        },
+      }, { cancellations, toolIdleTimeoutMs: 1_000, toolMaxDurationMs: 1_000 });
+
+      const execution = runner.execute(job());
+      await slowStarted;
+      cancellations.cancel(runId);
+      await expect(execution).resolves.toMatchObject({ state: "cancelled" });
+      expect(JSON.stringify(repository.current.entries)).not.toContain("preserve fast result");
+    });
+  });
+
+  describe("stalled model streams (H-021)", () => {
+    // Persists retry diagnostics on the model step, as the SQL repository does.
+    class ReleasingTurnRepository extends FakeTurnRepository {
+      override async release(snapshotValue: DurableTurnSnapshot, error?: string, retryDiagnostics?: DurableTurnRetryDiagnostics): Promise<void> {
+        await super.release(snapshotValue, error, retryDiagnostics);
+        const step = retryDiagnostics ? this.current.steps.find((candidate) => candidate.id === retryDiagnostics.stepId) : undefined;
+        if (step && retryDiagnostics) {
+          step.output = { ...((step.output ?? {}) as Record<string, unknown>), providerDiagnostics: retryDiagnostics.providerDiagnostics } as never;
+        }
+      }
+    }
+    // An earlier image the run already saved (task f1bb2668's pattern).
+    const savedImage: DurableTurnStep = {
+      ...toolStep("completed", "idempotent", false),
+      sequence: 1,
+      type: "tool.create_image",
+      input: { toolCallId: "image-call", toolName: "create_image", arguments: { prompt: "hero" }, requiresApproval: false, approvalKind: "file-edit" },
+      output: { text: "Generated hero.png (1536x1024, 3:2)", artifact: { kind: "file", fileId: "00000000-0000-7000-8000-0000000000aa", name: "hero.png", path: "/v1/files/x/content" } },
+    };
+
+    // The provider accepts the request, sends a little reasoning, then goes silent.
+    function stallingModel(onStart: () => void) {
+      return {
+        call: async (_snapshot: DurableTurnSnapshot, _step: DurableTurnStep, context: Parameters<DurableTurnModel["call"]>[2]) => {
+          onStart();
+          await context.emitDelta("Planning the table", "reasoning");
+          return new Promise<never>((_resolve, reject) => {
+            context.signal?.addEventListener("abort", () => {
+              context.onProviderAttempt?.({ physicalAttempt: 1, model: "kimi", status: 200, statusClass: "2xx", category: "aborted", retryDecision: "cancelled", latencyMs: 240_000 });
+              reject(new DOMException("This operation was aborted", "AbortError"));
+            }, { once: true });
+          });
+        },
+      } satisfies DurableTurnModel;
+    }
+
+    it("keeps the idle-timeout cause through retry exhaustion and names the saved work", async () => {
+      vi.useFakeTimers();
+      try {
+        const repository = new ReleasingTurnRepository(snapshot("calling_model", [admittedStep(), savedImage, modelStep("pending", 2)]));
+        let modelCalls = 0;
+        const tools = { execute: vi.fn(async () => ({ output: {}, summary: "unexpected" })) };
+        const runner = new DurableTurnRunner(repository, stallingModel(() => { modelCalls += 1; }), tools, { owner: "worker-stall" });
+
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          const pending = runner.execute({ tenantId, runId, reason: "continue" });
+          const settled = expect(pending).rejects.toBeInstanceOf(DurableToolTimeoutError);
+          await vi.advanceTimersByTimeAsync(240_000);
+          await settled;
+        }
+        const final = await runner.execute({ tenantId, runId, reason: "continue" });
+
+        expect(modelCalls).toBe(3);
+        expect(tools.execute).not.toHaveBeenCalled();
+        const attempts = repository.events.filter((event) => event.kind === "provider.attempt");
+        expect(attempts.map((event) => [event.kind === "provider.attempt" && event.category, event.kind === "provider.attempt" && event.retryDecision]))
+          .toEqual([["timeout", "retry"], ["timeout", "retry"], ["timeout", "terminal"]]);
+        const diagnostics = (repository.current.steps.find((step) => step.type === "model.call")?.output as { providerDiagnostics?: { failureCause?: string; attemptCauses?: Array<{ cause: string }> } }).providerDiagnostics;
+        expect(diagnostics?.failureCause).toBe("idle_timeout");
+        expect(diagnostics?.attemptCauses?.map((entry) => entry.cause)).toEqual(["idle_timeout", "idle_timeout", "idle_timeout"]);
+        expect(final.state).toBe("failed");
+        expect(repository.current.error).toContain("Model request failed after 3 attempts: the model stopped sending output, and Berry ended each of 3 attempts after 240 seconds without progress (idle timeout).");
+        expect(repository.current.error).toContain("Work saved before the failure is kept: hero.png.");
+        expect(repository.current.error).toContain("Use Continue to resume from what is already saved.");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("keeps a user cancellation distinct from a timeout and does not retry it", async () => {
+      const repository = new ReleasingTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      const cancellations = new ActiveTurnCancellationRegistry();
+      let modelCalls = 0;
+      let started!: () => void;
+      const providerStarted = new Promise<void>((resolve) => { started = resolve; });
+      const runner = new DurableTurnRunner(repository, stallingModel(() => { modelCalls += 1; started(); }), noTools(), {
+        owner: "worker-cancel", cancellations,
+      });
+
+      const execution = runner.execute({ tenantId, runId, reason: "continue" });
+      await providerStarted;
+      cancellations.cancel(runId);
+
+      await expect(execution).resolves.toMatchObject({ state: "cancelled" });
+      expect(modelCalls).toBe(1);
+      const attempts = repository.events.filter((event) => event.kind === "provider.attempt");
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]).toMatchObject({ category: "aborted", retryDecision: "cancelled" });
+    });
+  });
+
+  describe("typed tool failures (H-003, H-006)", () => {
+    type ScriptedCall = { name: string; args: Record<string, unknown>; retryClass?: "read_only" | "idempotent" | "non_idempotent_manual" };
+    // Each entry is one model turn issuing one or more tool calls; the tool
+    // executor decides per call whether it fails.
+    async function driveCalls(
+      turns: ScriptedCall[][],
+      execute: (call: { name: string; args: Record<string, unknown> }) => unknown,
+      argumentSchema?: (name: string) => unknown,
+    ) {
+      const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      let modelCalls = 0;
+      const executed: Array<{ name: string; args: Record<string, unknown> }> = [];
+      const runner = new DurableTurnRunner(repository, {
+        call: async () => {
+          const turn = turns[modelCalls];
+          modelCalls += 1;
+          if (!turn) return { text: "Done.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+          return {
+            text: "",
+            inputTokens: 1,
+            outputTokens: 1,
+            toolCalls: turn.map((call, index) => ({
+              id: `call-${modelCalls}-${index}`,
+              name: call.name,
+              input: call.args as never,
+              retryClass: call.retryClass ?? "read_only",
+              repeatPolicy: call.retryClass === "non_idempotent_manual" ? "block_after_success" as const : "compare_result" as const,
+              idempotencyKey: null,
+              requiresApproval: false,
+              approvalKind: call.name.startsWith("mcp__") ? "mcp" as const : "file-edit" as const,
+            })),
+          };
+        },
+      }, {
+        execute: async (_snapshot, step) => {
+          const call = { name: String(step.input.toolName), args: (step.input.arguments ?? {}) as Record<string, unknown> };
+          executed.push(call);
+          return { output: (await execute(call)) as never ?? { ok: true }, summary: "ok" };
+        },
+        ...(argumentSchema ? { argumentSchema: (_snapshot: DurableTurnSnapshot, name: string) => argumentSchema(name) } : {}),
+      });
+      let state: string = "calling_model";
+      for (let turn = 0; turn < turns.length * 4 + 4 && (state === "calling_model" || state === "executing_tool"); turn += 1) {
+        state = (await runner.execute({ tenantId, runId, reason: "continue" })).state;
+      }
+      const toolSteps = repository.current.steps.filter((step) => step.type.startsWith("tool."));
+      const failure = (index: number) => (toolSteps[index]?.output as { failure?: Record<string, unknown> } | null)?.failure;
+      // What the model reads back for each tool step.
+      const modelText = (index: number) => {
+        const entry = repository.mutations.flatMap((mutation) => mutation.entries ?? [])
+          .find((candidate) => (candidate as { stepId?: string }).stepId === toolSteps[index]?.id);
+        const content = ((entry?.payload as { message?: { content?: Array<{ text?: string }> } } | undefined)?.message?.content ?? []);
+        return content.map((part) => part.text ?? "").join("\n");
+      };
+      return { state, executed, toolSteps, failure, modelText, repository };
+    }
+    const countOf = (executed: Array<{ name: string }>, name: string) => executed.filter((call) => call.name === name).length;
+
+    it("refuses an unchanged repeat of an invalid-input failure and runs the corrected call", async () => {
+      const bad = { name: "read", args: { path: "notes.md", offset: -1 } };
+      const result = await driveCalls([[bad], [bad], [{ name: "read", args: { path: "notes.md", offset: 0 } }]], ({ args }) => {
+        if (Number(args.offset) < 0) throw new Error("offset must be a non-negative integer");
+        return { content: "notes" };
+      });
+
+      expect(countOf(result.executed, "read")).toBe(2);
+      expect(result.failure(0)).toMatchObject({ category: "invalid_input", deterministic: true });
+      expect(result.modelText(0)).toContain("Failure class: invalid_input");
+      expect(String(result.toolSteps[0]?.error)).not.toContain("Failure class");
+      expect(result.toolSteps[1]?.state).toBe("failed");
+      expect(result.failure(1)).toMatchObject({ category: "invalid_input", refusedUnchangedRetry: true, previousError: "offset must be a non-negative integer" });
+      expect(result.modelText(1)).toContain("Not run: this exact call already failed");
+      expect(result.toolSteps[2]?.state).toBe("completed");
+    });
+
+    it("re-runs a missing-resource call only after a change-making step", async () => {
+      let built = false;
+      const read = { name: "read", args: { path: "out/report.md" } };
+      const result = await driveCalls([
+        [read],
+        [{ name: "ls", args: { path: "out" } }],
+        [read],
+        [{ name: "bash", args: { command: "make report" }, retryClass: "idempotent" }],
+        [read],
+      ], ({ name }) => {
+        if (name === "bash") built = true;
+        if (name === "read" && !built) throw new Error("ENOENT: no such file or directory, open '/workspace/out/report.md'");
+        return { content: "ok" };
+      });
+
+      expect(countOf(result.executed, "read")).toBe(2);
+      expect(result.failure(0)).toMatchObject({ category: "missing_resource" });
+      expect(result.failure(2)).toMatchObject({ refusedUnchangedRetry: true });
+      expect(result.toolSteps[4]?.state).toBe("completed");
+    });
+
+    it("keeps refusing a credential failure for the rest of the run", async () => {
+      const drive = { name: "mcp__Google_Workspace__drive_read_file", args: { fileId: "drive-1" } };
+      const result = await driveCalls([[drive], [{ name: "bash", args: { command: "echo hi" }, retryClass: "idempotent" }], [drive]], ({ name }) => {
+        if (name === drive.name) throw new Error("Connector token is invalid or expired");
+        return { ok: true };
+      });
+
+      expect(countOf(result.executed, drive.name)).toBe(1);
+      expect(result.failure(0)).toMatchObject({ category: "credentials" });
+      expect(String(result.failure(0)?.action)).toContain("Settings → Connectors");
+      expect(result.failure(2)).toMatchObject({ category: "credentials", refusedUnchangedRetry: true });
+    });
+
+    it("lets a transient read failure be retried within the existing limit", async () => {
+      let attempts = 0;
+      const read = { name: "read", args: { path: "remote.csv" } };
+      const result = await driveCalls([[read], [read]], () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("socket hang up");
+        return { content: "a,b" };
+      });
+
+      expect(countOf(result.executed, "read")).toBe(2);
+      expect(result.failure(0)).toMatchObject({ category: "transient", deterministic: false });
+      expect(result.toolSteps[1]?.state).toBe("completed");
+    });
+
+    describe("a change-making call whose outcome is unknown", () => {
+      const create = { name: "mcp__Connect_Aesg_MCP__create_record", args: { title: "Tender A" }, retryClass: "non_idempotent_manual" as const };
+      // The target applies the first write, then Berry loses its response.
+      const acceptThenLose = (lose: () => unknown) => {
+        const writes: Array<Record<string, unknown>> = [];
+        const execute = ({ name, args }: { name: string; args: Record<string, unknown> }) => {
+          if (name === "read") throw new Error("ENOENT: no such file or directory, open '/workspace/missing.md'");
+          if (name !== create.name) return { ok: true };
+          writes.push(args);
+          if (writes.length === 1) throw lose();
+          return { id: `record-${writes.length}` };
+        };
+        return { writes, execute };
+      };
+      const expectRecoveryRequired = (result: Awaited<ReturnType<typeof driveCalls>>) => {
+        expect(result.state).toBe("recovery_required");
+        expect(result.toolSteps).toHaveLength(1);
+        expect(result.toolSteps[0]).toMatchObject({ state: "recovery_required", outcomeCertainty: "unknown" });
+        expect(result.failure(0)).toMatchObject({ category: "unknown_outcome", outcome: "unknown" });
+        expect(result.repository.current.error).toBe("ambiguous_external_operation");
+      };
+
+      // Running a read is not reconciliation: it cannot show that the write failed.
+      it.each([
+        ["an unrelated workspace listing", { name: "ls", args: { path: "/workspace" } }],
+        ["a listing of the target's records", { name: "mcp__Connect_Aesg_MCP__list_records", args: { title: "Tender A" } }],
+        ["a read that fails", { name: "read", args: { path: "missing.md" } }],
+      ])("stops for recovery after a lost response; %s cannot unlock a replay", async (_label, between) => {
+        const target = acceptThenLose(() => new Error("socket hang up"));
+        const result = await driveCalls([[create], [between], [create]], target.execute);
+
+        expect(target.writes).toHaveLength(1);
+        expectRecoveryRequired(result);
+      });
+
+      it("cannot be cleared by changing the call's arguments", async () => {
+        const target = acceptThenLose(() => new Error("socket hang up"));
+        const result = await driveCalls([[create], [{ ...create, args: { title: "Tender A", note: "second attempt" } }]], target.execute);
+
+        expect(target.writes).toHaveLength(1);
+        expectRecoveryRequired(result);
+      });
+
+      it.each([
+        ["a connection reset", () => Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" })],
+        ["a gateway error", () => Object.assign(new Error("Bad Gateway"), { status: 502 })],
+        ["a server error the connector reports", () => new McpToolError("The record service failed", { error: { status: 500, message: "internal error" } })],
+      ])("treats %s as an unknown outcome", async (_label, lose) => {
+        const target = acceptThenLose(lose);
+        const result = await driveCalls([[create], [create]], target.execute);
+
+        expect(target.writes).toHaveLength(1);
+        expectRecoveryRequired(result);
+      });
+
+      it("is not replayed by a restarted worker or a later wake-up", async () => {
+        const target = acceptThenLose(() => new Error("socket hang up"));
+        const result = await driveCalls([[create], [create]], target.execute);
+        expect(result.state).toBe("recovery_required");
+
+        for (const reason of ["continue", "lease-recovery"] as const) {
+          const restarted = new DurableTurnRunner(result.repository, unusedModel(), {
+            execute: async () => {
+              target.writes.push({ replayed: true });
+              return { output: {}, summary: "replayed" };
+            },
+          }, { owner: `restarted-${reason}` });
+          await expect(restarted.execute({ tenantId, runId, reason })).resolves.toMatchObject({ noOp: true });
+        }
+        expect(target.writes).toHaveLength(1);
+        expect(result.repository.current.state).toBe("recovery_required");
+      });
+
+      it("keeps the usage a failed call already incurred", async () => {
+        const usage = { kind: "usage" as const, inputTokens: 40, outputTokens: 8, totalTokens: 48, costRawMicros: "900", pricingSource: "measured" as const };
+        const result = await driveCalls([[create]], () => {
+          throw Object.assign(new DurableToolExecutionError("socket hang up", usage), { code: "ECONNRESET" });
+        });
+
+        expect(result.state).toBe("recovery_required");
+        expect(result.repository.events).toContainEqual(expect.objectContaining({ kind: "usage", costRawMicros: "900" }));
+      });
+
+      // A command that finished does not show that its change was not made (H-003).
+      describe("a shell command whose request may have been applied", () => {
+        const post = (command: string) => ({ name: "bash", args: { command }, retryClass: "non_idempotent_manual" as const });
+
+        it("stops for recovery when curl gave up waiting for a POST the server accepted", async () => {
+          const call = post("curl --max-time 0.1 -X POST https://records.example.test/create -d title=TenderA");
+          let accepted = 0;
+          const result = await driveCalls([[call], [call]], () => {
+            accepted += 1;
+            if (accepted === 1) throw new Error("curl: (28) Operation timed out after 100 milliseconds with 0 bytes received\n\nCommand exited with code 28");
+            return { exitCode: 0, output: "created" };
+          });
+
+          expect(accepted).toBe(1);
+          expect(result.state).toBe("recovery_required");
+          expect(result.failure(0)).toMatchObject({ category: "unknown_outcome", outcome: "unknown" });
+        });
+
+        it("holds the next shell call after a network hint replaced the output of a command that posted", async () => {
+          const create = "curl -X POST https://records.example.test/create -d title=TenderA";
+          let accepted = 0;
+          const manager = new SandboxContinuityManager({
+            kind: "e2b",
+            supportsResume: false,
+            exec: async function* (input: { command: string[] }) {
+              const command = input.command[4] ?? "";
+              if (command.includes("records.example.test/create")) accepted += 1;
+              yield { kind: "stdout", data: "create" };
+              if (command.includes("blocked.example.test")) {
+                yield { kind: "stderr", data: "curl: (35) SSL_connect: SSL_ERROR_SYSCALL in connection to blocked.example.test:443" };
+                yield { kind: "exit", exit_code: 35, signal: null };
+              } else {
+                yield { kind: "exit", exit_code: 0, signal: null };
+              }
+            },
+            files: { list: async (input: { path: string }) => ({ path: input.path, entries: [] }) },
+          } as never, { recordSandbox: async () => undefined, recordTiming: async () => undefined } as never, null, { image: "berry-sandbox" });
+          const sandboxed = {
+            ...snapshot("executing_tool", []),
+            sandboxId: "sandbox-shell",
+            sandboxProvider: "e2b",
+            sandboxState: "running",
+            runtimeRequest: { networkPolicy: { egress: "on", allowedDomains: ["records.example.test"] } },
+          } as DurableTurnSnapshot;
+          const shell = async ({ args }: { args: Record<string, unknown> }) => (await manager.execute(sandboxed, {
+            ...toolStep("running", "non_idempotent_manual", false),
+            type: "tool.bash",
+            input: { toolCallId: randomUUID(), toolName: "bash", arguments: args },
+          })).output;
+
+          const result = await driveCalls([[post(`${create} && curl https://blocked.example.test/notify`)], [post(create)]], shell);
+
+          expect(accepted).toBe(1);
+          expect(result.state).toBe("recovery_required");
+          expect(result.failure(0)).toMatchObject({ outcome: "unknown" });
+          expect(result.toolSteps[0]?.error).toMatch(/Network access to blocked\.example\.test is blocked[\s\S]*Command exited with code 35$/);
+        });
+
+        it("stops for recovery when a later part of a compound command loses its response after an earlier write", async () => {
+          const call = post("curl -X POST https://records.example.test/create -d title=TenderA && curl --max-time 0.1 -X POST https://records.example.test/notify");
+          let created = 0;
+          const result = await driveCalls([[call], [call]], () => {
+            created += 1;
+            if (created === 1) throw new Error("created\ncurl: (28) Operation timed out after 100 milliseconds with 0 bytes received\n\nCommand exited with code 28");
+            return { exitCode: 0, output: "created\nnotified" };
+          });
+
+          expect(created).toBe(1);
+          expect(result.state).toBe("recovery_required");
+        });
+
+        // The command ran: its exit status and output say nothing about whether
+        // the POST before the failing part took effect.
+        it.each([
+          ["false", "created"],
+          ["a local exception", "created\nTraceback (most recent call last):\n  File \"/workspace/import.py\", line 4, in <module>\nValueError: bad row"],
+          ["a missing file", "created\ncat: /workspace/receipt.json: No such file or directory"],
+        ])("holds the next shell call after an accepted POST followed by %s", async (_label, output) => {
+          const first = post("curl -X POST https://records.example.test/create -d title=TenderA && ./after-create.sh");
+          let accepted = 0;
+          const result = await driveCalls([[first], [post("curl -X POST https://records.example.test/create -d title=TenderA")]], () => {
+            accepted += 1;
+            if (accepted === 1) throw new Error(`${output}\n\nCommand exited with code 1`);
+            return { exitCode: 0, output: "created" };
+          });
+
+          expect(accepted).toBe(1);
+          expect(result.state).toBe("recovery_required");
+          expect(result.failure(0)).toMatchObject({ outcome: "unknown" });
+          expect(result.modelText(0)).toContain("waits for the user to review it");
+          expect(result.toolSteps[1]?.state).toBe("recovery_required");
+        });
+
+        it.each([
+          ["an unreachable workspace", () => new Error("The workspace is temporarily unreachable (connect ETIMEDOUT 10.0.0.1:443). Nothing was run and no files were changed; retry this step.")],
+          ["invalid arguments", () => new ToolArgumentError("bash was not run: command must be a non-empty string")],
+        ])("runs the next shell call after %s stopped the first before it started", async (_label, refuse) => {
+          let runs = 0;
+          const result = await driveCalls([[post("python report.py")], [post("python scripts/report.py")]], () => {
+            runs += 1;
+            if (runs === 1) throw refuse();
+            return { exitCode: 0, output: "Report written" };
+          });
+
+          expect(runs).toBe(2);
+          expect(result.failure(0)).toMatchObject({ outcome: "not_applied" });
+          expect(result.toolSteps[1]?.state).toBe("completed");
+          expect(result.repository.current.error).toBeNull();
+        });
+      });
+
+      // The MCP SDK checks a result against the tool's output schema after the
+      // tool ran on its server, so the create may already exist (H-003).
+      describe("a connector result the MCP SDK rejected after the tool ran", () => {
+        const recordsServer = join(dirname(fileURLToPath(import.meta.url)), "../../../packages/local-agent/test/fixtures/mcp-records-server.mjs");
+        const createRecord = (args: Record<string, unknown>) => ({ name: create.name, args, retryClass: "non_idempotent_manual" as const });
+        // Runs the calls through the real SDK against a server that records every create it accepts.
+        async function driveRecords(env: Record<string, string>, turns: ScriptedCall[][], argumentSchema?: (name: string) => unknown) {
+          const directory = mkdtempSync(join(tmpdir(), "berry-records-"));
+          const writes = join(directory, "writes.jsonl");
+          const source = new McpToolSource({ servers: [{
+            id: "records", name: "Connect_Aesg_MCP", transport: "stdio", command: process.execPath, args: [recordsServer], url: null,
+            env: { ...env, RECORD_WRITES: writes }, enabled: true, trusted: true,
+          }] });
+          try {
+            await source.connect();
+            const tools = new Map(source.listTools().map((tool) => [tool.name, tool]));
+            const result = await driveCalls(turns, async ({ name, args }) => {
+              const tool = tools.get(name);
+              if (!tool) return { entries: ["records"] };
+              return { content: (await tool.execute(randomUUID(), args as never, undefined, undefined)).content };
+            }, argumentSchema);
+            return { result, accepted: readFileSync(writes, "utf8").trim().split("\n").filter(Boolean) };
+          } finally {
+            await source.close();
+            rmSync(directory, { recursive: true, force: true });
+          }
+        }
+
+        it.each(["malformed", "missing"])("holds the next create after a %s structured result, whatever changed or ran since", async (output) => {
+          const { result, accepted } = await driveRecords({ RECORD_OUTPUT: output }, [
+            [createRecord({ title: "Tender A" })],
+            [{ name: "ls", args: { path: "/workspace" } }],
+            [createRecord({ title: "Tender A", note: "with the expected output" })],
+          ]);
+
+          expect(accepted).toEqual([JSON.stringify({ title: "Tender A" })]);
+          expect(result.state).toBe("recovery_required");
+          expect(result.failure(0)).toMatchObject({ outcome: "unknown" });
+          expect(result.toolSteps.at(-1)?.state).toBe("recovery_required");
+        });
+
+        // The server saved the record, then a dependency failed; the code in its
+        // error result describes that dependency, not the create (H-003).
+        it.each([
+          ["RATE_LIMIT", "", ""], ["ECONNREFUSED", "", ""],
+          ["RATE_LIMIT", "429", ""], ["CONFLICT", "409", ""], ["CONFLICT", "", "409"],
+        ])("holds the next create after an error with code %s, status %s and RPC code %s from a server that saved the record", async (code, status, rpcCode) => {
+          const { result, accepted } = await driveRecords({ RECORD_ERROR_CODE: code, RECORD_ERROR_STATUS: status, RECORD_RPC_CODE: rpcCode }, [
+            [createRecord({ title: "Tender A" })],
+            [{ name: "ls", args: { path: "/workspace" } }],
+            [createRecord({ title: "Tender A", note: "retry after indexing error" })],
+          ]);
+
+          expect(accepted).toEqual([JSON.stringify({ title: "Tender A" })]);
+          expect(result.state).toBe("recovery_required");
+          expect(result.failure(0)).toMatchObject({ outcome: "unknown", ...(!rpcCode ? { code } : {}) });
+        });
+
+        it("runs the corrected create after the reviewed schema refused the first before it was sent", async () => {
+          const inputSchema = { type: "object", properties: { title: { type: "string" }, note: { type: "string" } }, required: ["title"] };
+          const { result, accepted } = await driveRecords({}, [
+            [createRecord({ title: 5 })],
+            [createRecord({ title: "Tender A" })],
+          ], (name) => name === create.name ? inputSchema : undefined);
+
+          expect(accepted).toEqual([JSON.stringify({ title: "Tender A" })]);
+          expect(result.failure(0)).toMatchObject({ category: "invalid_input", outcome: "not_applied" });
+          expect(result.toolSteps[1]?.state).toBe("completed");
+          expect(result.repository.current.error).toBeNull();
+        });
+      });
+
+      // A rejection says the change was not made, so it stays repairable.
+      it.each([
+        ["an invalid argument", () => Object.assign(new Error("A record with this title already exists"), { status: 409 }), "invalid_input"],
+        ["a rate limit", () => Object.assign(new Error("Too Many Requests"), { status: 429 }), "transient"],
+      ])("lets the model repair %s", async (_label, refuse, category) => {
+        let calls = 0;
+        const result = await driveCalls([[create], [{ ...create, args: { title: "Tender A (2)" } }]], ({ name }) => {
+          if (name !== create.name) return { ok: true };
+          calls += 1;
+          if (calls === 1) throw refuse();
+          return { id: "record-1" };
+        });
+
+        expect(calls).toBe(2);
+        expect(result.failure(0)).toMatchObject({ category, outcome: "not_applied" });
+        expect(result.toolSteps[1]?.state).toBe("completed");
+        expect(result.repository.current.error).toBeNull();
+      });
+
+      // Steps written before runs stopped for recovery: older workers stored a
+      // plain failed step, without a failure class (H-003, H-014).
+      describe("a failed change recorded by an older worker", () => {
+        const legacyFailure = (error: string, overrides: Partial<DurableTurnStep> = {}) => ({
+          ...toolStep("failed", "non_idempotent_manual", false),
+          id: "legacy-create",
+          sequence: 2,
+          type: `tool.${create.name}`,
+          input: { toolCallId: "legacy-call", toolName: create.name, arguments: create.args },
+          error: `Tool failed (repair attempt 1/5). ${error}`,
+          output: null,
+          outcomeCertainty: null,
+          attempt: 1,
+          ...overrides,
+        } as DurableTurnStep);
+        const pendingCreate = (sequence: number, args: Record<string, unknown> = create.args) => ({
+          ...toolStep("pending", "non_idempotent_manual", false),
+          id: `create-${sequence}`,
+          sequence,
+          type: `tool.${create.name}`,
+          input: { toolCallId: `call-${sequence}`, toolName: create.name, arguments: args, repeatPolicy: "block_after_success" },
+        } as DurableTurnStep);
+        const resume = async (steps: DurableTurnStep[], repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), ...steps]))) => {
+          const execute = vi.fn(async () => ({ output: { id: "record-2" }, summary: "Created" }));
+          const result = await new DurableTurnRunner(repository, unusedModel(), { execute }).execute({ tenantId, runId, reason: "continue" });
+          return { repository, execute, result };
+        };
+        const expectHeld = (outcome: Awaited<ReturnType<typeof resume>>, heldId: string) => {
+          expect(outcome.execute).not.toHaveBeenCalled();
+          expect(outcome.result.state).toBe("recovery_required");
+          expect(outcome.repository.current.steps.find((step) => step.id === heldId)).toMatchObject({ state: "recovery_required" });
+          expect(outcome.repository.current.error).toBe("ambiguous_external_operation");
+        };
+
+        it.each([
+          ["a lost connection", "socket hang up"],
+          ["a reset", "read ECONNRESET"],
+          ["a timeout", "Request timed out after 30000ms"],
+          ["a gateway error", "502 Bad Gateway"],
+          ["a server error", "500 Internal Server Error"],
+          ["an unrecognised error", "The record service returned an unexpected response"],
+        ])("holds the next call for recovery after %s", async (_label, error) => {
+          expectHeld(await resume([legacyFailure(error), pendingCreate(3)]), "create-3");
+        });
+
+        it("holds a call with changed arguments after an intervening read, and a restarted worker does not run it", async () => {
+          const listed = { ...readOnlyToolStep("ls", 3, "/workspace"), state: "completed" } as DurableTurnStep;
+          const held = await resume([legacyFailure("socket hang up"), listed, pendingCreate(4, { title: "Tender A", note: "again" })]);
+          expectHeld(held, "create-4");
+
+          const restarted = await resume([], held.repository);
+          expect(restarted.execute).not.toHaveBeenCalled();
+          expect(restarted.result).toMatchObject({ noOp: true });
+        });
+
+        it("holds a call after a failure recorded with its class by the earlier version of this fix", async () => {
+          const typed = legacyFailure("socket hang up", {
+            output: { failure: { category: "unknown_outcome", outcome: "unknown", deterministic: false, action: "Check first." } },
+          });
+          expectHeld(await resume([typed, pendingCreate(3, { title: "Tender A", note: "again" })]), "create-3");
+        });
+
+        it.each([
+          ["an argument Berry refused", legacyFailure(`${create.name} was not run: title must not be empty`)],
+          ["a refused approval", legacyFailure("", { error: "Tool approval was denied", attempt: 0 })],
+        ])("keeps %s repairable", async (_label, failure) => {
+          const { execute, repository } = await resume([failure, pendingCreate(3)]);
+          expect(execute).toHaveBeenCalledTimes(1);
+          expect(repository.current.steps.find((step) => step.id === "create-3")?.state).toBe("completed");
+        });
+
+        it("runs the held call once after an explicit retry, and does not hold the next one", async () => {
+          const held = await resume([legacyFailure("socket hang up"), pendingCreate(3)]);
+          expectHeld(held, "create-3");
+          // What the operator's retry does (DurableTurnService.recover).
+          held.repository.current.state = "executing_tool";
+          held.repository.current.error = null;
+          held.repository.current.steps = held.repository.current.steps.map((step) =>
+            step.id === "create-3" ? { ...step, state: "pending", error: null } : step);
+
+          const retried = await resume([], held.repository);
+          expect(retried.execute).toHaveBeenCalledTimes(1);
+          expect(held.repository.current.steps.find((step) => step.id === "create-3")?.state).toBe("completed");
+
+          held.repository.current.state = "executing_tool";
+          held.repository.current.steps = [...held.repository.current.steps, pendingCreate(9, { title: "Tender B" })];
+          const next = await resume([], held.repository);
+          expect(next.execute).toHaveBeenCalledTimes(1);
+        });
+
+        // Only a decision about the uncertain call clears it (H-003, H-014).
+        const completedCreate = (sequence: number, args: Record<string, unknown>) => ({
+          ...pendingCreate(sequence, args), state: "completed", attempt: 1, output: { ok: true },
+        } as DurableTurnStep);
+        // What the operator's recovery actions do to the held call (DurableTurnService.recover).
+        const operator = (repository: FakeTurnRepository, heldId: string, action: "retry" | "mark-complete") => {
+          repository.current.state = action === "retry" ? "executing_tool" : "calling_model";
+          repository.current.error = null;
+          repository.current.steps = repository.current.steps.map((step) => step.id !== heldId ? step
+            : action === "retry"
+              ? { ...step, state: "pending", error: null }
+              : { ...step, state: "completed", error: null, output: { confirmedByOperator: true, summary: "Operator confirmed that the external tool completed." } });
+        };
+        const nextCall = async (repository: FakeTurnRepository, step: DurableTurnStep) => {
+          repository.current.state = "executing_tool";
+          repository.current.steps = [...repository.current.steps, step];
+          return resume([], repository);
+        };
+
+        // Classifiers before this one stored some executed changes as "not
+        // applied" (9f0139f wrote these exact records): they are assessed again.
+        const historicalCall = (type: string, error: string, failure: Record<string, unknown>, overrides: Partial<DurableTurnStep> = {}) => ({
+          ...legacyFailure(error, { output: { failure } as JsonValue, ...overrides }),
+          type,
+          input: { toolCallId: "historical-call", toolName: type.slice(5), arguments: type === "tool.bash" ? { command: "curl -X POST https://records.example.test/create && false" } : create.args },
+        } as DurableTurnStep);
+        const pendingCall = (type: string, sequence: number) => ({
+          ...pendingCreate(sequence),
+          type,
+          input: { toolCallId: `call-${sequence}`, toolName: type.slice(5), arguments: type === "tool.bash" ? { command: "curl -X POST https://records.example.test/create" } : { title: "Tender A", note: "again" } },
+        } as DurableTurnStep);
+        const old = (category: string, deterministic: boolean) => ({ category, deterministic, outcome: "not_applied", action: "Read the error, change the approach or the arguments, and do not repeat the same call unchanged." });
+
+        it.each([
+          ["a command whose later part failed", "tool.bash", "created\n\nCommand exited with code 1", old("unknown", false)],
+          ["a command that mentions a missing file", "tool.bash", "created\ncat: /workspace/receipt.json: No such file or directory\n\nCommand exited with code 1", old("missing_resource", true)],
+          ["a command that mentions validation", "tool.bash", "created\nValueError: title must be unique\n\nCommand exited with code 1", old("invalid_input", true)],
+          ["a connector result rejected after the tool ran", `tool.${create.name}`, "MCP error -32602: Structured content does not match the tool's output schema: data/id must be string", old("invalid_input", true)],
+        ])("holds the next call after %s that an older classifier stored as not applied", async (_label, type, error, failure) => {
+          expectHeld(await resume([historicalCall(type, error, failure), pendingCall(type, 3)]), "create-3");
+        });
+
+        // Workers keep at most 4,000 characters of an error; a long command
+        // output loses the "Command exited with code 1" that showed it ran.
+        const cut = `create\ninvalid schema in post-processing: ${"0".repeat(5_000)}\n\nCommand exited with code 1`.slice(0, 4_000);
+        it.each([
+          ["a class an older classifier stored", `Tool failed (repair attempt 1/5). ${cut}`, { output: { failure: old("invalid_input", true) } as JsonValue }],
+          ["no class", `Tool failed (repair attempt 1/5). ${cut}`, { output: null }],
+          ["no class, before the repair prefix", cut, { output: null }],
+        ])("holds the next shell call after a cut command error stored with %s", async (_label, error, overrides) => {
+          const stored = { ...historicalCall("tool.bash", "", old("invalid_input", true)), error, ...overrides } as DurableTurnStep;
+          expectHeld(await resume([stored, pendingCall("tool.bash", 3)]), "create-3");
+        });
+
+        // The previous version of this classifier read codes a target returned
+        // after dispatch, and a network hint without its exit status, as not applied.
+        it.each([
+          ["a connector error result with a code", `tool.${create.name}`, "The record was saved, but updating its search index failed", { category: "transient", code: "RATE_LIMIT" }],
+          ["a network hint", "tool.bash", "Network access to blocked.example.test is blocked by this task's sandbox policy. An organization admin must allow the hostname in Execution & network, then retry in a new turn.", { category: "invalid_input" }],
+        ])("holds the next call after %s that the previous classifier stored as not applied", async (_label, type, error, failure) => {
+          const stored = historicalCall(type, error, { ...old(failure.category, false), ...failure, outcomeVersion: 2 });
+          expectHeld(await resume([stored, pendingCall(type, 3)]), "create-3");
+        });
+
+        it.each([
+          ["its arguments were refused", "bash was not run: command must be a non-empty string. Correct the arguments and call it again."],
+          ["the workspace could not be reached", "The workspace is temporarily unreachable (connect ETIMEDOUT 10.0.0.1:443). Nothing was run and no files were changed; retry this step."],
+        ])("keeps a shell call repairable when an older worker reported it was not run because %s", async (_label, error) => {
+          const { execute, repository } = await resume([historicalCall("tool.bash", error, old("invalid_input", true)), pendingCall("tool.bash", 3)]);
+          expect(execute).toHaveBeenCalledTimes(1);
+          expect(repository.current.steps.find((step) => step.id === "create-3")?.state).toBe("completed");
+        });
+
+        it.each([
+          ["a nested rate limit", `tool.${create.name}`, "Index update failed", { status: 429 }],
+          ["a nested conflict", `tool.${create.name}`, "A record with this title already exists", { status: 409 }],
+          ["validation wording without provenance", `tool.${create.name}`, "title must not be empty", {}],
+          ["missing-resource wording without provenance", `tool.${create.name}`, "404 Not Found: the record collection does not exist", {}],
+          ["image delivery after generation", "tool.create_image", "The workspace is temporarily unreachable (read ECONNRESET). Nothing was run and no files were changed; retry this step.", {}],
+        ])("holds %s stored by version 3 or without a class", async (_label, type, error, details) => {
+          for (const output of [{ failure: { ...old("invalid_input", true), ...details, outcomeVersion: 3 } }, null]) {
+            const earlier = historicalCall(type, error, {}, { output: output as JsonValue });
+            expectHeld(await resume([earlier, pendingCall(type, 3)]), "create-3");
+          }
+        });
+
+        it("does not let a stored classification override an unknown outcome recorded on the step", async () => {
+          const recorded = historicalCall(`tool.${create.name}`, "A record with this title already exists", { ...old("invalid_input", true), status: 409, outcomeVersion: 2 }, { outcomeCertainty: "unknown" });
+          expectHeld(await resume([recorded, pendingCall(`tool.${create.name}`, 3)]), "create-3");
+        });
+
+        it.each([
+          ["arguments refused before the call ran", `${create.name} was not run: title must be a string`, old("invalid_input", true)],
+          ["a not-applied outcome recorded with current evidence", "Connectors are unavailable for this message: Connector setup failed for this message.", { ...old("configuration", true), outcomeVersion: TOOL_FAILURE_OUTCOME_VERSION }],
+        ])("keeps %s, stored by an older classifier, repairable", async (_label, error, failure) => {
+          const { execute, repository } = await resume([historicalCall(`tool.${create.name}`, error, failure), pendingCall(`tool.${create.name}`, 3)]);
+          expect(execute).toHaveBeenCalledTimes(1);
+          expect(repository.current.steps.find((step) => step.id === "create-3")?.state).toBe("completed");
+        });
+
+        it("is not cleared by an unrelated completed call of the same tool", async () => {
+          const held = await resume([legacyFailure("socket hang up"), completedCreate(3, { title: "Tender B" }), pendingCreate(4)]);
+          expectHeld(held, "create-4");
+        });
+
+        it("is not cleared by an unrelated successful shell command", async () => {
+          const command = (id: string, sequence: number, state: "failed" | "completed" | "pending", command: string) => ({
+            ...toolStep(state, "non_idempotent_manual", false), id, sequence, type: "tool.bash", attempt: state === "pending" ? 0 : 1,
+            input: { toolCallId: `call-${id}`, toolName: "bash", arguments: { command } },
+            ...(state === "failed" ? { error: "Tool failed (repair attempt 1/5). created\n\nCommand exited with code 1", output: null } : {}),
+          } as DurableTurnStep);
+          const held = await resume([
+            command("post", 2, "failed", "curl -X POST https://records.example.test/create && false"),
+            command("listing", 3, "completed", "ls -la"),
+            command("again", 4, "pending", "curl -X POST https://records.example.test/create"),
+          ]);
+          expectHeld(held, "again");
+        });
+
+        it("holds for every unresolved call at once, and one explicit decision resolves them all", async () => {
+          const other = { ...legacyFailure("socket hang up"), id: "legacy-create-c", sequence: 3, input: { toolCallId: "legacy-call-c", toolName: create.name, arguments: { title: "Tender C" } } } as DurableTurnStep;
+          const held = await resume([legacyFailure("socket hang up"), other, pendingCreate(4)]);
+          expectHeld(held, "create-4");
+          expect(held.repository.current.steps.find((step) => step.id === "create-4")?.input.heldBy).toEqual(["legacy-create-c", "legacy-create"]);
+
+          operator(held.repository, "create-4", "retry");
+          expect((await resume([], held.repository)).execute).toHaveBeenCalledTimes(1);
+          expect((await nextCall(held.repository, pendingCreate(9, { title: "Tender D" }))).execute).toHaveBeenCalledTimes(1);
+        });
+
+        it("is resolved when the operator marks the held call complete, after a restart", async () => {
+          const held = await resume([legacyFailure("socket hang up"), pendingCreate(3)]);
+          operator(held.repository, "create-3", "mark-complete");
+
+          expect((await nextCall(held.repository, pendingCreate(9, { title: "Tender D" }))).execute).toHaveBeenCalledTimes(1);
+        });
+
+        it("stays unresolved when the call the operator released is rejected", async () => {
+          const held = await resume([legacyFailure("socket hang up"), pendingCreate(3)]);
+          operator(held.repository, "create-3", "retry");
+          const rejected = vi.fn(async () => { throw Object.assign(new Error("A record with this title already exists"), { status: 409 }); });
+          await new DurableTurnRunner(held.repository, unusedModel(), { execute: rejected }).execute({ tenantId, runId, reason: "continue" });
+          expect(rejected).toHaveBeenCalledTimes(1);
+          expect(held.repository.current.steps.find((step) => step.id === "create-3")?.state).toBe("failed");
+
+          expectHeld(await nextCall(held.repository, pendingCreate(9, { title: "Tender A" })), "create-9");
+        });
+      });
+    });
+
+    it("refuses an unchanged deterministic repeat inside a parallel read batch", async () => {
+      const missing = { name: "read", args: { path: "missing.md" } };
+      const result = await driveCalls([
+        [missing, { name: "read", args: { path: "present.md" } }],
+        [missing, { name: "read", args: { path: "other.md" } }],
+      ], ({ args }) => {
+        if (args.path === "missing.md") throw new Error("[not_found] file not found: lstat /workspace/missing.md no such file or directory");
+        return { content: String(args.path) };
+      });
+
+      expect(result.executed.filter((call) => call.args.path === "missing.md")).toHaveLength(1);
+      expect(result.executed.some((call) => call.args.path === "other.md")).toBe(true);
+      const refused = result.toolSteps.filter((step) => (step.output as { failure?: { refusedUnchangedRetry?: boolean } } | null)?.failure?.refusedUnchangedRetry);
+      expect(refused).toHaveLength(1);
+      expect(refused[0]?.input.arguments).toEqual({ path: "missing.md" });
+    });
+  });
+
+  describe("repair loops across changed arguments (H-004)", () => {
+    // A scripted model keeps calling read with a new path each turn; the tool
+    // fails every time, naming the path it was given.
+    async function driveFailingRead(pathFor: (attempt: number) => string, errorFor: (path: string) => string, attempts: number) {
+      const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      let modelCalls = 0;
+      const executed: string[] = [];
+      const runner = new DurableTurnRunner(repository, {
+        call: async () => {
+          modelCalls += 1;
+          if (modelCalls > attempts) return { text: "I could not open the file.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+          return {
+            text: "",
+            inputTokens: 1,
+            outputTokens: 1,
+            toolCalls: [{
+              id: `call-${modelCalls}`,
+              name: "read",
+              input: { path: pathFor(modelCalls) },
+              retryClass: "read_only",
+              repeatPolicy: "compare_result",
+              idempotencyKey: null,
+              requiresApproval: false,
+              approvalKind: "file-edit",
+            }],
+          };
+        },
+      }, {
+        execute: async (_snapshot, step) => {
+          const path = String((step.input.arguments as { path?: unknown } | null)?.path);
+          executed.push(path);
+          throw new Error(errorFor(path));
+        },
+      });
+      let state: string = "calling_model";
+      for (let turn = 0; turn < attempts * 3 && (state === "calling_model" || state === "executing_tool"); turn += 1) {
+        state = (await runner.execute({ tenantId, runId, reason: "continue" })).state;
+      }
+      const failures = repository.current.steps.filter((step) => step.type === "tool.read").map((step) => String(step.error ?? ""));
+      const answer = repository.mutations.flatMap((mutation) => mutation.assistantMessage ? [mutation.assistantMessage.text] : []).at(-1);
+      return { state, executed, failures, error: repository.current.error, answer };
+    }
+    const missing = (path: string) => `ENOENT: no such file or directory, open '${path}'`;
+
+    it("treats re-spelt paths to the same file as the same call and stops the loop (H-003 refuses them unrun)", async () => {
+      const spellings = [
+        "outputs/Q3-report.docx",
+        "./outputs/Q3-report.docx",
+        "/workspace/outputs/Q3-report.docx",
+        "outputs//Q3-report.docx",
+        "/workspace/./outputs/Q3-report.docx",
+        "outputs/Q3-report.docx/",
+      ];
+      const result = await driveFailingRead((attempt) => spellings[(attempt - 1) % spellings.length]!, missing, 12);
+
+      // The first spelling runs and fails as a missing resource; every re-spelling
+      // is refused without running, and the identical refusals end tool use.
+      // The model's last response still asks for a read, so Berry answers.
+      expect(result.executed).toHaveLength(1);
+      expect(result.state).toBe("finalizing");
+      expect(result.error).toBeNull();
+      expect(result.failures[0]).toMatch(/repair attempt 1\/5/);
+      const refused = result.failures.slice(1, -1);
+      expect(refused).toHaveLength(5);
+      expect(refused.every((failure) => failure.startsWith("Not run: this exact call already failed"))).toBe(true);
+      expect(result.failures.at(-1)).toBe("identical_tool_failure_limit");
+      expect(result.answer).toContain("I stopped working on this because read failed 5 times with the same input and the same error.");
+    });
+
+    it("tells the model when different arguments keep producing the same error", async () => {
+      const ids = ["8f3a1c", "8f3a1e", "8f3b1c", "8e3a1c", "9f3a1c", "8f3a2c"];
+      const result = await driveFailingRead((attempt) => `/workspace/attachments/cv-${ids[attempt - 1]}.pdf`, missing, ids.length);
+
+      expect(result.executed).toHaveLength(ids.length);
+      expect(result.failures[1]).not.toContain("same error");
+      expect(result.failures[2]).toContain("same error 3 times in a row with changed arguments");
+      expect(result.failures[5]).toContain("same error 6 times in a row with changed arguments");
+      // Guidance only: distinct guesses are not stopped by this counter.
+      expect(result.state).toBe("finalizing");
+    });
+
+    describe("final answer after tool use stops", () => {
+      const reason = "read failed 5 times with the same input and the same error. Last error: ENOENT";
+      const fallback = `I stopped working on this because ${reason}\n\nTell me how you would like to continue, or correct the input and ask again.`;
+      const lateCall = {
+        id: "call-late",
+        name: "read",
+        input: { path: "/workspace/a.txt" },
+        retryClass: "read_only" as const,
+        repeatPolicy: "compare_result" as const,
+        idempotencyKey: null,
+        requiresApproval: false,
+        approvalKind: "file-edit" as const,
+      };
+      const publishCall = {
+        id: "call-publish",
+        name: "persist_artifact",
+        input: { path: "/workspace/outputs/report.docx" },
+        retryClass: "idempotent_with_key" as const,
+        repeatPolicy: "block_after_success" as const,
+        idempotencyKey: "publish-report",
+        requiresApproval: false,
+        approvalKind: "file-edit" as const,
+      };
+      const answerWith = async (text: string, toolCalls: TurnModelToolIntent[] = [lateCall]) => {
+        const repository = new FakeTurnRepository(snapshot("calling_model", [
+          admittedStep(),
+          { ...modelStep("pending", 1), input: { iteration: 1, wrapUp: reason } },
+        ]));
+        let lastMessage: unknown;
+        const execute = vi.fn(async (): Promise<TurnToolResult> => { throw new Error("no tool may run after tool use stopped"); });
+        const runner = new DurableTurnRunner(repository, {
+          call: async (current) => {
+            lastMessage = modelMessages(current).messages.at(-1);
+            return { text, inputTokens: 1, outputTokens: 1, toolCalls };
+          },
+        }, { execute });
+        const result = await runner.execute({ tenantId, runId, reason: "continue" });
+        const assistant = repository.mutations.flatMap((mutation) => mutation.assistantMessage ? [mutation.assistantMessage] : []).at(-1);
+        const modelCall = repository.current.steps.find((step) => step.type === "model.call");
+        return { result, repository, lastMessage, assistant, execute, modelCall };
+      };
+
+      it("asks last for an answer without tools and keeps a text-only answer", async () => {
+        const { result, repository, lastMessage, assistant } = await answerWith("I could not open a.txt because it does not exist.", []);
+
+        expect(result.state).toBe("finalizing");
+        expect(lastMessage).toEqual({ role: "user", content: expect.stringContaining(`Berry has stopped tool use for this task: ${reason}`) });
+        expect(String((lastMessage as { content: string }).content)).toContain("Do not call any tools");
+        expect(repository.current.steps.some((step) => step.type.startsWith("tool."))).toBe(false);
+        expect(assistant).toMatchObject({ text: "I could not open a.txt because it does not exist.", toolCalls: [] });
+      });
+
+      it("does not save a claim about a publication it discarded", async () => {
+        const { result, repository, assistant, execute, modelCall } = await answerWith("I have published the finished report.docx.", [publishCall]);
+
+        expect(result.state).toBe("finalizing");
+        expect(execute).not.toHaveBeenCalled();
+        expect(repository.current.steps.some((step) => step.type.startsWith("tool."))).toBe(false);
+        expect(assistant).toMatchObject({ text: fallback, toolCalls: [] });
+        expect(JSON.stringify(repository.mutations)).not.toContain("I have published");
+        expect(modelCall?.output).toMatchObject({ text: fallback, toolCallIds: [] });
+      });
+
+      it("does not keep text that came with any discarded call", async () => {
+        const { assistant, execute } = await answerWith("Let me read a.txt once more.");
+
+        expect(execute).not.toHaveBeenCalled();
+        expect(assistant).toMatchObject({ text: fallback, toolCalls: [] });
+      });
+
+      it("answers for the model when it returns only tool calls", async () => {
+        const { result, assistant } = await answerWith("");
+
+        expect(result.state).toBe("finalizing");
+        expect(assistant?.text).toBe(fallback);
+      });
+
+      it("answers for the model when it returns nothing", async () => {
+        const { result, assistant, repository } = await answerWith("", []);
+
+        expect(result.state).toBe("finalizing");
+        expect(assistant).toMatchObject({ text: fallback, toolCalls: [] });
+        // The wrap-up answer is final: no empty-response retry is queued.
+        expect(repository.current.steps.filter((step) => step.type === "model.call")).toHaveLength(1);
+      });
+
+      describe("what the user sees streamed", () => {
+        const claim = "I have published the finished report.docx.";
+        const wrapUpSnapshot = () => snapshot("calling_model", [
+          admittedStep(),
+          { ...modelStep("pending", 1), input: { iteration: 1, wrapUp: reason } },
+        ]);
+        const textDeltas = (events: readonly AgentStreamEvent[]) => events.flatMap((event) =>
+          event.kind === "message.delta" && event.channel !== "reasoning" ? [event.delta] : []);
+        /** Streams each chunk as the provider would, then returns the response. */
+        const streamingModel = (chunks: readonly string[], response: { text: string; toolCalls: TurnModelToolIntent[] }): DurableTurnModel => ({
+          call: async (_snapshot, _step, context) => {
+            for (const chunk of chunks) await context.emitDelta(chunk, "text");
+            await context.emitDelta("Thinking about the report.", "reasoning");
+            return { ...response, inputTokens: 1, outputTokens: 1 };
+          },
+        });
+
+        it.each([
+          ["a discarded publication", ["I have published ", "the finished report.docx."], claim, [publishCall]],
+          ["only tool calls", [], "", [lateCall]],
+          ["nothing", [], "", []],
+        ] as const)("streams Berry's answer, not the model's, for a wrap-up that returned %s", async (_label, chunks, text, toolCalls) => {
+          const repository = new FakeTurnRepository(wrapUpSnapshot());
+          const execute = vi.fn(async (): Promise<TurnToolResult> => { throw new Error("no tool may run after tool use stopped"); });
+
+          const result = await new DurableTurnRunner(repository, streamingModel(chunks, { text, toolCalls: [...toolCalls] }), { execute })
+            .execute({ tenantId, runId, reason: "continue" });
+
+          expect(result.state).toBe("finalizing");
+          expect(execute).not.toHaveBeenCalled();
+          expect(textDeltas(repository.events).join("")).not.toContain("I have published");
+          expect(latestAssistantStreamDraft(repository.events)).toMatchObject({ text: fallback, reasoning: "Thinking about the report.", open: false });
+          const assistant = repository.mutations.flatMap((mutation) => mutation.assistantMessage ? [mutation.assistantMessage] : []).at(-1);
+          expect(assistant).toMatchObject({ text: fallback, toolCalls: [] });
+        });
+
+        it("streams a valid text-only wrap-up answer exactly once", async () => {
+          const answer = "I could not open a.txt because it does not exist.";
+          const repository = new FakeTurnRepository(wrapUpSnapshot());
+
+          await new DurableTurnRunner(repository, streamingModel(["I could not open a.txt ", "because it does not exist."], { text: answer, toolCalls: [] }), noTools())
+            .execute({ tenantId, runId, reason: "continue" });
+
+          expect(textDeltas(repository.events).join("")).toBe(answer);
+          expect(latestAssistantStreamDraft(repository.events)).toMatchObject({ text: answer, open: false });
+          const assistant = repository.mutations.flatMap((mutation) => mutation.assistantMessage ? [mutation.assistantMessage] : []).at(-1);
+          expect(assistant?.text).toBe(answer);
+        });
+
+        it("still streams an ordinary answer as it arrives", async () => {
+          const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+
+          await new DurableTurnRunner(repository, streamingModel(["Here is ", "the summary."], { text: "Here is the summary.", toolCalls: [] }), noTools())
+            .execute({ tenantId, runId, reason: "continue" });
+
+          const deltas = textDeltas(repository.events);
+          expect(deltas.join("")).toBe("Here is the summary.");
+          // Streamed before the response was committed, not added by the commit.
+          const committed = repository.mutations.flatMap((mutation) => mutation.events ?? []);
+          expect(textDeltas(committed)).toEqual([]);
+        });
+
+        it("shows nothing of a withheld claim when the provider fails after streaming it", async () => {
+          const repository = new FakeTurnRepository(wrapUpSnapshot());
+          const runner = new DurableTurnRunner(repository, {
+            call: async (_snapshot, _step, context) => {
+              await context.emitDelta(claim, "text");
+              throw new Error("upstream connection reset");
+            },
+          }, noTools());
+
+          await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ state: "failed" });
+          expect(textDeltas(repository.events).join("")).not.toContain("I have published");
+          expect(latestAssistantStreamDraft(repository.events)?.text).toBe("");
+          expect(repository.mutations.some((mutation) => mutation.assistantMessage?.text)).toBe(false);
+        });
+
+        it("shows nothing of a withheld claim and commits nothing when ownership is lost", async () => {
+          const repository = new FakeTurnRepository(wrapUpSnapshot());
+          repository.heartbeat = async () => false;
+          const runner = new DurableTurnRunner(repository, {
+            call: async (_snapshot, _step, context) => {
+              await context.emitDelta(claim, "text");
+              await new Promise((resolve) => setTimeout(resolve, 15));
+              return { text: claim, inputTokens: 1, outputTokens: 1, toolCalls: [publishCall] };
+            },
+          }, noTools(), { owner: "worker-wrap-up-lease", heartbeatMs: 1, leaseSeconds: 1 });
+
+          await expect(runner.execute({ tenantId, runId, reason: "continue" })).rejects.toBeInstanceOf(DurableTurnRetryableError);
+          expect(textDeltas(repository.events).join("")).not.toContain("I have published");
+          expect(repository.mutations.some((mutation) => mutation.assistantMessage)).toBe(false);
+          expect(repository.current.state).toBe("calling_model");
+        });
+
+        it("shows nothing of a withheld claim when the turn is cancelled", async () => {
+          const repository = new FakeTurnRepository(wrapUpSnapshot());
+          const cancellations = new ActiveTurnCancellationRegistry();
+          let streamed!: () => void;
+          const claimStreamed = new Promise<void>((resolve) => { streamed = resolve; });
+          const runner = new DurableTurnRunner(repository, {
+            call: async (_snapshot, _step, context) => {
+              await context.emitDelta(claim, "text");
+              streamed();
+              return new Promise<never>((_resolve, reject) => {
+                context.signal?.addEventListener("abort", () => reject(context.signal?.reason), { once: true });
+              });
+            },
+          }, noTools(), { owner: "worker-wrap-up-cancel", cancellations });
+
+          const execution = runner.execute({ tenantId, runId, reason: "continue" });
+          await claimStreamed;
+          expect(cancellations.cancel(runId)).toBe(1);
+          await expect(execution).resolves.toMatchObject({ state: "cancelled" });
+          expect(textDeltas(repository.events).join("")).not.toContain("I have published");
+          expect(repository.mutations.some((mutation) => mutation.assistantMessage?.text)).toBe(false);
+        });
+      });
+    });
+
+    it("does not add guidance while each attempt fails differently", async () => {
+      const errors = ["SyntaxError: invalid syntax", "NameError: name 'total' is not defined", "TypeError: unsupported operand type"];
+      const result = await driveFailingRead((attempt) => `/workspace/scripts/build-${attempt}.py`, (path) => `${errors[Number(/build-(\d)/.exec(path)?.[1]) - 1]}`, 3);
+
+      expect(result.executed).toHaveLength(3);
+      expect(result.failures.some((failure) => failure.includes("same error"))).toBe(false);
+    });
   });
 
   it("stops repeated unknown skill resources even when other activations succeed between failures", async () => {
@@ -1923,9 +4442,10 @@ describe("durable turn runner", () => {
     });
 
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
-      .resolves.toMatchObject({ state: "failed" });
+      .resolves.toMatchObject({ state: "calling_model" });
     expect(executions).toBe(0);
-    expect(repository.current.error).toContain("activate_skill exhausted its 3-attempt repair budget");
+    expectFinalAnswerRequested(repository, "activate_skill failed 3 times in a row and its repair attempts are used up");
+    expect(repository.current.steps.find((step) => step.id === pending.id)?.error).toBe("repair_budget_exhausted");
   });
 
   it("does not count changed tool arguments as a repeated failure", async () => {
@@ -2073,11 +4593,179 @@ describe("durable turn runner", () => {
     const fourth = bashStep(7, 4);
     queueToolForExecution(repository, fourth);
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
-      .resolves.toMatchObject({ state: "failed" });
+      .resolves.toMatchObject({ state: "calling_model" });
     expect(executions).toBe(2);
-    expect(repository.current.error).toBe("duplicate_tool_call_loop");
+    expect(repository.current.error).toBeNull();
+    expectFinalAnswerRequested(repository, "the same tool call kept being repeated");
+    expect(repository.current.progress?.budgetReason).toBe("duplicate_tool_call_loop");
     expect(repository.current.steps.find((step) => step.id === fourth.id))
       .toMatchObject({ state: "failed", error: "duplicate_tool_call_loop" });
+  });
+
+  describe("asynchronous job polling (task 917)", () => {
+    const poll = (sequence: number): DurableTurnStep => ({
+      ...toolStep("pending", "read_only", false),
+      sequence,
+      type: "tool.mcp__BerryCrawl__get_extract_status",
+      input: {
+        toolCallId: randomUUID(),
+        toolName: "mcp__BerryCrawl__get_extract_status",
+        arguments: { id: "extract-job-1" },
+        requiresApproval: false,
+        approvalKind: "mcp",
+        repeatPolicy: "compare_result",
+      },
+    });
+    const runPolls = async (results: string[], maxPolls: number) => {
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), poll(1)]));
+      let executions = 0;
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        execute: async () => {
+          const status = results[Math.min(executions, results.length - 1)]!;
+          executions += 1;
+          return { output: { content: JSON.stringify({ success: true, status, data: status === "COMPLETED" ? { title: "Spec" } : null }) }, summary: "Job status" };
+        },
+      });
+      let result = await runner.execute({ tenantId, runId, reason: "continue" });
+      // Tool steps are spaced by the model-call step the runner adds after each.
+      for (let polls = 2; polls <= maxPolls && result.state !== "failed" && !finalAnswerRequested(repository); polls += 1) {
+        queueToolForExecution(repository, poll(polls * 2 - 1));
+        result = await runner.execute({ tenantId, runId, reason: "continue" });
+      }
+      return { repository, executions, result };
+    };
+
+    it("keeps polling a job that reports RUNNING until it completes", async () => {
+      const { repository, executions } = await runPolls(["RUNNING", "RUNNING", "RUNNING", "COMPLETED"], 4);
+      expect(executions).toBe(4);
+      expect(repository.current.error).toBeNull();
+      expect(repository.current.steps.some((step) => step.error === "duplicate_tool_call_suppressed")).toBe(false);
+    });
+
+    it("still stops a job that never leaves RUNNING on the no-progress budget", async () => {
+      const { repository, executions } = await runPolls(["RUNNING"], 12);
+      expect(repository.current.progress?.budgetReason).toBe("no_progress_budget");
+      expectFinalAnswerRequested(repository, "tool results made no progress");
+      expect(executions).toBeLessThanOrEqual(6);
+    });
+  });
+
+  describe("binary tool output (H-011)", () => {
+    it("journals a tool result containing NUL characters instead of failing the run", async () => {
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), readOnlyToolStep("read", 1, "/workspace/inputs/bundle.skill")]));
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        execute: async () => ({ output: { path: "/workspace/inputs/bundle.skill", content: "PK\u0003\u0004\u0000\u0000SKILL.md", meta: { "ke\u0000y": ["a\u0000"] } }, summary: "Read bundle.skill" }),
+      });
+      await runner.execute({ tenantId, runId, reason: "continue" });
+      const read = repository.current.steps.find((step) => step.type === "tool.read");
+      expect(read?.state).toBe("completed");
+      expect(read?.output).toEqual({ path: "/workspace/inputs/bundle.skill", content: "PK\u0003\u0004\uFFFD\uFFFDSKILL.md", meta: { "ke\uFFFDy": ["a\uFFFD"] } });
+      expect(JSON.stringify(repository.mutations)).not.toContain("\\u0000");
+    });
+
+    it("journals a tool failure whose message contains NUL characters", async () => {
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), readOnlyToolStep("read", 1, "/workspace/inputs/data.bin")]));
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        execute: async () => { throw new Error("Unexpected bytes PK\u0003\u0004\u0000"); },
+      });
+      await runner.execute({ tenantId, runId, reason: "continue" });
+      expect(repository.current.steps.find((step) => step.type === "tool.read")?.error).toContain("PK\u0003\u0004\uFFFD");
+      expect(JSON.stringify(repository.mutations)).not.toContain("\\u0000");
+    });
+
+    it("returns clean results unchanged", () => {
+      const result: TurnToolResult = { output: { content: "Name,Total\nAlpha,12", bytes: [0, 1] }, summary: "Read export.csv" };
+      expect(journalSafeToolResult(result)).toBe(result);
+    });
+  });
+
+  describe("repeat guard after file edits (task 718)", () => {
+    const render = (sequence: number) => runCommandStep("pending", sequence, "cd /workspace/tmp && python diagram.py");
+    const edit = (sequence: number, path: string): DurableTurnStep => ({
+      ...toolStep("completed", "idempotent", false),
+      sequence,
+      type: "tool.edit",
+      input: { toolCallId: randomUUID(), toolName: "edit", arguments: { path, edits: [{ oldText: "a", newText: "b" }] }, requiresApproval: false, approvalKind: "file-edit" },
+      output: { path, applied: 1 },
+    });
+    const runRenders = async (editPath: string) => {
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), render(1)]));
+      let executions = 0;
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        execute: async () => {
+          executions += 1;
+          // The renderer prints the same acknowledgement whatever it drew.
+          return { output: { exitCode: 0, output: "saved /workspace/outputs/diagram.png" }, summary: "Command completed" };
+        },
+      });
+      await runner.execute({ tenantId, runId, reason: "continue" });
+      let sequence = 2;
+      for (let round = 0; round < 3; round += 1) {
+        repository.current.steps.push(edit(sequence++, editPath));
+        queueToolForExecution(repository, render(sequence++));
+        await runner.execute({ tenantId, runId, reason: "continue" });
+      }
+      return { repository, executions };
+    };
+
+    it("re-runs a renderer after its source file was edited, even with identical output", async () => {
+      const { repository, executions } = await runRenders("/workspace/tmp/diagram.py");
+      expect(executions).toBe(4);
+      expect(repository.current.error).toBeNull();
+      expect(repository.current.steps.some((step) => step.error === "duplicate_tool_call_suppressed" || step.error === "duplicate_tool_call_loop")).toBe(false);
+    });
+
+    it("still bounds identical renders when only an unrelated file changed", async () => {
+      const { repository, executions } = await runRenders("/workspace/notes/todo.md");
+      expect(executions).toBe(2);
+      expect(repository.current.steps.some((step) => step.error === "duplicate_tool_call_loop")).toBe(true);
+      expect(repository.current.error).toBeNull();
+    });
+  });
+
+  describe("republishing a rebuilt file (H-028)", () => {
+    const publish = (state: DurableTurnStep["state"], sequence: number): DurableTurnStep => ({
+      ...toolStep(state, "idempotent", false),
+      sequence,
+      type: "tool.persist_artifact",
+      input: {
+        toolCallId: randomUUID(),
+        toolName: "persist_artifact",
+        arguments: { path: "/workspace/outputs/schedule.docx" },
+        requiresApproval: false,
+        approvalKind: "file-edit",
+        repeatPolicy: "block_after_success",
+      },
+      ...(state === "completed" ? { output: { text: "Persisted artifact: schedule.docx", sha256: "a".repeat(64) } } : {}),
+    });
+    const republish = async (between: DurableTurnStep[]) => {
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), publish("completed", 1), ...between, publish("pending", 9)]));
+      let executions = 0;
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        execute: async () => {
+          executions += 1;
+          return { output: { text: "Persisted artifact: schedule.docx", sha256: "b".repeat(64) }, summary: "Persisted schedule.docx" };
+        },
+      });
+      await runner.execute({ tenantId, runId, reason: "continue" });
+      return { repository, executions };
+    };
+
+    it("publishes again after a command rebuilt the file", async () => {
+      const rebuild = { ...runCommandStep("completed", 3, "python build_schedule.py --output /workspace/outputs/schedule.docx"), output: { exitCode: 0 } };
+      const { repository, executions } = await republish([rebuild]);
+      expect(executions).toBe(1);
+      expect(repository.current.steps.find((step) => step.sequence === 9)?.state).toBe("completed");
+    });
+
+    it("still suppresses a repeat with no change in between, and says nothing new was published", async () => {
+      const unrelated = { ...runCommandStep("completed", 3, "ls /workspace/tmp"), output: { exitCode: 0 } };
+      const { repository, executions } = await republish([unrelated]);
+      expect(executions).toBe(0);
+      const suppressed = repository.current.steps.find((step) => step.sequence === 9);
+      expect(suppressed?.error).toBe("duplicate_tool_call_suppressed");
+      expect(JSON.stringify(repository.mutations)).toContain("no new version was created");
+    });
   });
 
   it("finishes the remaining sequential tools before giving the model a correction turn", async () => {
@@ -2334,7 +5022,8 @@ describe("durable turn runner", () => {
     }, { noProgressHardThreshold: 5 });
 
     await expect(alternatingRunner.execute({ tenantId, runId, reason: "continue" }))
-      .resolves.toMatchObject({ state: "failed" });
+      .resolves.toMatchObject({ state: "calling_model" });
+    expectFinalAnswerRequested(alternatingRepository, "the last 5 tool results made no progress");
     expect(alternatingRepository.events).toContainEqual(expect.objectContaining({
       kind: "turn.progress",
       progressKind: "alternating_no_progress",
@@ -2356,7 +5045,7 @@ describe("durable turn runner", () => {
     }, { noProgressHardThreshold: 5 });
 
     await expect(pollingRunner.execute({ tenantId, runId, reason: "continue" }))
-      .resolves.toMatchObject({ state: "failed" });
+      .resolves.toMatchObject({ state: "calling_model" });
     expect(pollingRepository.current.progress).toMatchObject({
       consecutiveNoProgress: 5,
       progressKind: "declared_polling",
@@ -2483,6 +5172,64 @@ describe("durable turn runner", () => {
     expect(toolCalls).toBe(0);
     expect(repository.current.error).toContain("duplicate tool-call id");
     expect(repository.current.steps.some((step) => step.type.startsWith("tool."))).toBe(false);
+  });
+
+  describe("malformed question batches (H-057)", () => {
+    const askStep = (argumentsValue: Record<string, unknown>) => ({
+      ...toolStep("pending", "read_only", false),
+      type: "tool.ask_user_question",
+      input: {
+        toolCallId: "question_call_h057",
+        toolName: "ask_user_question",
+        arguments: argumentsValue,
+        requiresApproval: false,
+        approvalKind: "file-edit",
+      },
+    }) satisfies DurableTurnStep;
+    const run = async (argumentsValue: Record<string, unknown>) => {
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), askStep(argumentsValue)]));
+      const runner = new DurableTurnRunner(repository, unusedModel(), noTools(), { owner: "worker-question-h057" });
+      const result = await runner.execute({ tenantId, runId, reason: "continue" });
+      return { repository, result };
+    };
+
+    it("returns a repair error instead of a reduced question for task 1105's label-only batch", async () => {
+      const { repository, result } = await run({
+        question: "Tell me about the event",
+        questions: [
+          { label: "Which slide format?", options: [{ label: "Single slide" }, { label: "Poster" }] },
+          { label: "Which style?", options: [{ label: "Spooky" }, { label: "Playful" }] },
+          { label: "Which event details?", options: [{ label: "Costume competition" }] },
+        ],
+      });
+      expect(result.state).not.toBe("waiting");
+      expect(repository.events.some((event) => event.kind === "question.request")).toBe(false);
+      const failed = repository.current.steps.find((step) => step.type === "tool.ask_user_question");
+      expect(failed?.state).toBe("failed");
+      expect(failed?.error).toContain('questions[0] needs a non-empty "question" string (received: label, options)');
+    });
+
+    it("rejects a batch with one invalid entry rather than dropping it", async () => {
+      const { repository } = await run({
+        questions: [
+          { question: "Which tone?", options: [{ label: "Formal" }, { description: "missing label" }] },
+          { question: "When?" },
+        ],
+      });
+      expect(repository.events.some((event) => event.kind === "question.request")).toBe(false);
+      expect(repository.current.steps.find((step) => step.type === "tool.ask_user_question")?.error)
+        .toContain('questions[0].options[1] needs a non-empty "label" string');
+    });
+
+    it("still accepts a legacy single question with options", async () => {
+      const { repository, result } = await run({ question: "Which tone?", options: [{ label: "Formal" }, { label: "Warm" }] });
+      expect(result.state).toBe("waiting");
+      expect(repository.events).toContainEqual(expect.objectContaining({
+        kind: "question.request",
+        question: "Which tone?",
+        options: [{ label: "Formal" }, { label: "Warm" }],
+      }));
+    });
   });
 
   it("persists requested question batches and emits the popup event before waiting", async () => {
@@ -2752,6 +5499,30 @@ describe("durable turn runner", () => {
     }));
   });
 
+  it("fails an inactive budget reservation honestly instead of completing with allowance advice", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest = { ...current.runtimeRequest, requestId: "turn_settled", budgetReservationRequired: true };
+    const repository = new FakeTurnRepository(current);
+    repository.budgetDecision = {
+      allowed: false,
+      reason: "The budget reservation for this turn is no longer active.",
+      code: "reservation_inactive",
+    };
+    let calls = 0;
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        calls += 1;
+        return { text: "unexpected", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+      },
+    }, noTools());
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "failed" });
+    expect(calls).toBe(0);
+    expect(repository.current.error).toContain("no longer active");
+    expect(repository.current.error).not.toContain("Increase the applicable allowance");
+  });
+
   it("delivers read image pixels after tool results without rewriting the original user message", async () => {
     let request: ChatCompletionOptions | undefined;
     const model = new RouterDurableTurnModel({
@@ -2783,6 +5554,27 @@ describe("durable turn runner", () => {
     expect(JSON.stringify(current.entries)).not.toContain("base64");
   });
 
+  it("records the router-attributed serving backend on the usage event", async () => {
+    const model = new RouterDurableTurnModel({
+      stream: async function* (): AsyncGenerator<ChatCompletionChunk> {
+        yield {
+          id: "served", model: "deepseek-v4-flash", delta: "ok", finishReason: "stop", raw: {},
+          attribution: { requestedModel: "deepseek-v4-flash", servedProvider: "canopywave", servedModel: "deepseek/deepseek-v4-flash" },
+          usage: { inputTokens: 100, outputTokens: 2, totalTokens: 102, cacheReadTokens: 64, cacheReadReported: true },
+        };
+      },
+    }, "deepseek-v4-flash", {
+      provider: "router", route: "/chat/completions",
+      capabilityForModel: () => ({ supported: false, cacheKey: false, cacheControl: false, retention: [], minimumTokens: 1024 }),
+    });
+    const result = await model.call(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]), modelStep("pending", 1), {
+      messageId: randomUUID(), tools: [], emitDelta: async () => {},
+      policyForTool: () => ({ retryClass: "read_only", repeatPolicy: "compare_result", requiresApproval: false, approvalKind: "file-edit" }),
+    });
+
+    expect(result.usage).toMatchObject({ servedProvider: "canopywave", servedModel: "deepseek/deepseek-v4-flash", cacheReadTokens: 64, cacheEligible: false });
+  });
+
   it("appends text-only tool context without changing the original user prefix", () => {
     const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
     current.entries.push({ entryId: "image-read", parentEntryId: current.entries[0]!.entryId, entryType: "message", sequence: 2,
@@ -2792,6 +5584,106 @@ describe("durable turn runner", () => {
     const changed = modelMessages(current, supplemental).messages;
     expect(changed.slice(0, original.length)).toEqual(original);
     expect(changed.at(-1)).toMatchObject({ role: "user", content: expect.arrayContaining(supplemental) });
+  });
+
+  it("keeps tool calls separate when a gateway restarts the index for each event (H-038)", async () => {
+    const events: ChatCompletionChunk[] = [
+      // Task fe764378: activate_skill and read arrived as "activate_skillread".
+      { id: "gemini-1", model: "gemini", delta: "", finishReason: null, raw: {},
+        toolCalls: [{ index: 0, id: "call_a", function: { name: "activate_skill", arguments: "{\"name\":\"docx\"}" } }] },
+      { id: "gemini-1", model: "gemini", delta: "", finishReason: null, raw: {},
+        toolCalls: [{ index: 0, id: "call_b", function: { name: "read", arguments: "{\"path\":\"/workspace/inputs/brief.docx\"}" } }] },
+      // A provider that repeats the same id on every fragment of one call.
+      { id: "gemini-1", model: "gemini", delta: "", finishReason: null, raw: {},
+        toolCalls: [{ index: 0, id: "call_c", function: { name: "ls", arguments: "{\"pa" } }] },
+      { id: "gemini-1", model: "gemini", delta: "", finishReason: "tool_calls", raw: {},
+        toolCalls: [{ index: 0, id: "call_c", function: { arguments: "th\":\"/workspace\"}" } }] },
+    ];
+    const client = {
+      stream: async function* (): AsyncGenerator<ChatCompletionChunk> { yield* events; },
+    } as unknown as OpenAIChatCompletionsClient;
+    const model = new RouterDurableTurnModel(client, "gemini", {
+      provider: "router",
+      route: "/chat/completions",
+      capabilityForModel: () => ({ supported: false, cacheKey: false, cacheControl: false, retention: [], minimumTokens: 1_024 }),
+    });
+    const result = await model.call(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]), modelStep("pending", 1), {
+      messageId: randomUUID(),
+      tools: ["activate_skill", "read", "ls"].map((name) => ({ type: "function" as const, function: { name, description: name, parameters: { type: "object" } } })),
+      emitDelta: async () => undefined,
+      policyForTool: () => ({ retryClass: "read_only", repeatPolicy: "compare_result", requiresApproval: false, approvalKind: "file-edit" }),
+    });
+    expect(result.toolCalls.map((call) => [call.providerCallId, call.name, call.input])).toEqual([
+      ["call_a", "activate_skill", { name: "docx" }],
+      ["call_b", "read", { path: "/workspace/inputs/brief.docx" }],
+      ["call_c", "ls", { path: "/workspace" }],
+    ]);
+  });
+
+  it("explains a 402 as the AI provider being out of credit and points the user to support (H-005)", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => { throw new RouterClientError("Payment Required", 402, "PAYMENT_REQUIRED", { code: "payment_required" }); },
+    }, noTools(), { owner: "worker-credit" });
+    await runner.execute({ tenantId, runId, reason: "continue" });
+    expect(repository.current.state).toBe("failed");
+    const text = JSON.stringify([repository.current.error, repository.events, repository.mutations]);
+    expect(text).toContain("The AI provider is out of credit");
+    expect(text).toContain("Please contact support or your administrator.");
+    expect(text).toContain("choosing another model from the same provider won't help");
+    // Nothing the user cannot act on, and no blame.
+    expect(text).not.toContain("change the provider route");
+    expect(text).not.toContain("your account");
+  });
+
+  it("raises an administrator credit alert for a 402 without waiting for it (H-005)", async () => {
+    const raised: ProviderCreditAlert[] = [];
+    const repository = new FakeTurnRepository(providerSnapshot("openai-responses"));
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => { throw new RouterClientError("Payment Required", 402, "PAYMENT_REQUIRED", { code: "payment_required" }); },
+    }, noTools(), {
+      owner: "worker-credit-alert",
+      // Never settles: the run must not wait for the alert.
+      providerCreditAlerts: { raise: (alert) => { raised.push(alert); return new Promise<void>(() => undefined); } },
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ runId, state: "failed" });
+    expect(JSON.stringify(repository.current.error)).toContain("The AI provider is out of credit");
+    expect(raised).toEqual([{
+      tenantId,
+      event: "exhausted",
+      surface: "chat",
+      providerId: "provider-openai-responses",
+      providerName: "openai-responses",
+      providerHost: "provider.example.test",
+      detectedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+      status: 402,
+    }]);
+  });
+
+  it("fails a 402 run the same way when raising the alert fails (H-005)", async () => {
+    const failingSinks: ProviderCreditAlertSink[] = [
+      { raise: async () => { throw new Error("database unavailable"); } },
+      { raise: () => { throw new Error("synchronous failure"); } },
+    ];
+    for (const providerCreditAlerts of failingSinks) {
+      const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      const runner = new DurableTurnRunner(repository, {
+        call: async () => { throw new RouterClientError("Payment Required", 402, "PAYMENT_REQUIRED", { code: "payment_required" }); },
+      }, noTools(), { owner: "worker-credit-alert-failure", providerCreditAlerts });
+      await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ runId, state: "failed" });
+      expect(JSON.stringify(repository.current.error)).toContain("Please contact support or your administrator.");
+    }
+  });
+
+  it("raises no credit alert for other provider rejections (H-005)", async () => {
+    const raise = vi.fn(async () => undefined);
+    const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => { throw new RouterClientError("Bad Request", 400, "INVALID_ARGUMENT", { code: "invalid_request" }); },
+    }, noTools(), { owner: "worker-credit-alert-400", providerCreditAlerts: { raise } });
+    await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ state: "failed" });
+    expect(raise).not.toHaveBeenCalled();
   });
 
   it("uses the router streaming transport and assembles streamed tool calls", async () => {
@@ -2935,12 +5827,12 @@ describe("durable turn runner", () => {
       "Never JSON-stringify the entire argument object inside raw",
     );
     const userContent = request?.messages.find((message) => message.role === "user")?.content;
-    expect(Array.isArray(userContent)).toBe(true);
     expect(JSON.stringify(userContent)).toContain(
       "Sandbox path: /home/user/workspace/inputs/00000000-0000-7000-8000-000000000099/candidate.pdf",
     );
     expect(JSON.stringify(userContent)).toContain("page-numbered text");
-    expect(userContent).toContainEqual({
+    // Supplied images go in their own message; the request is never rewritten (H-032).
+    expect(request?.messages.at(-1)?.content).toContainEqual({
       type: "image_url",
       image_url: { url: "data:image/png;base64,AQID" },
     });
@@ -3114,6 +6006,185 @@ describe("durable turn runner", () => {
     } finally {
       now.mockRestore();
     }
+  });
+
+  describe("provider attempt identity (H-033)", () => {
+    const uuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    const attemptEvents = (events: readonly AgentStreamEvent[]) =>
+      events.filter((event): event is Extract<AgentStreamEvent, { kind: "provider.attempt" }> => event.kind === "provider.attempt");
+
+    it("identifies every physical request across a buffered fallback and a runner retry", async () => {
+      const current = providerSnapshot("openai-chat-completions");
+      (current.runtimeRequest.provider as Record<string, unknown>).completionFallback = "buffered";
+      const modelStepId = current.steps.find((step) => step.type === "model.call")!.id;
+      const sentAttemptIds: Array<string | null> = [];
+      const responses = [
+        () => new Response(JSON.stringify({ error: { message: "stream lane stalled" } }), { status: 504 }),
+        () => new Response(JSON.stringify({ error: { message: "buffered lane unavailable" } }), { status: 503 }),
+        () => new Response([
+          `data: ${JSON.stringify({ id: "completion-1", model: "test-model", choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] })}`,
+          `data: ${JSON.stringify({ id: "completion-1", model: "test-model", choices: [], usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 } })}`,
+          "data: [DONE]",
+          "",
+        ].join("\n\n"), { status: 200, headers: { "content-type": "text/event-stream" } }),
+      ];
+      vi.stubGlobal("fetch", vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        sentAttemptIds.push(new Headers(init?.headers).get("x-client-request-id"));
+        return responses[sentAttemptIds.length - 1]!();
+      }) as typeof fetch);
+      const repository = new FakeTurnRepository(current);
+      const runner = new DurableTurnRunner(repository, new SnapshotProviderDurableTurnModel({}, null), noTools(), {
+        owner: "worker-attempt-identity",
+      });
+
+      await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+        .rejects.toBeInstanceOf(DurableTurnRetryableError);
+      await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+        .resolves.toMatchObject({ state: "finalizing" });
+
+      const attempts = attemptEvents(repository.events);
+      expect(attempts.map((attempt) => [attempt.physicalAttempt, attempt.transport, attempt.retryLayer, attempt.category, attempt.retryDecision]))
+        .toEqual([
+          [1, "stream", "initial", "server", "fallback"],
+          [2, "buffer", "stream_buffer_fallback", "server", "retry"],
+          [1, "stream", "runner_retry", "success", "none"],
+        ]);
+      // One logical model step throughout: its ordinal repeats, the attempt ID does not.
+      expect(new Set(attempts.map((attempt) => attempt.logicalStepId))).toEqual(new Set([modelStepId]));
+      expect(new Set(attempts.map((attempt) => attempt.attemptId)).size).toBe(3);
+      for (const attempt of attempts) {
+        expect(attempt.attemptId).toMatch(uuidV4);
+        expect(attempt).toMatchObject({ provider: "provider-openai-chat-completions", route: "/chat/completions" });
+      }
+      expect(sentAttemptIds).toEqual(attempts.map((attempt) => attempt.attemptId));
+      expect(repository.events.filter((event) => event.kind === "usage")).toEqual([
+        expect.objectContaining({ inputTokens: 5, outputTokens: 1, providerAttemptId: attempts[2]!.attemptId }),
+      ]);
+    });
+
+    it("credits the empty-response recovery request and fills an ID the transport did not send", async () => {
+      const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      const runner = new DurableTurnRunner(repository, {
+        call: async (_snapshot, step, context) => {
+          const recovering = step.input.recoveryReason === "empty_response";
+          context.onProviderAttempt?.({
+            physicalAttempt: 1,
+            model: "provider/model",
+            status: 200,
+            statusClass: "2xx",
+            category: "success",
+            retryDecision: "none",
+            latencyMs: 5,
+            retryLayer: "initial",
+            transport: "stream",
+          });
+          if (recovering) await context.emitDelta("Done.", "text");
+          return { text: recovering ? "Done." : "", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+        },
+      }, noTools(), { owner: "worker-empty-recovery-identity" });
+
+      await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+        .resolves.toMatchObject({ state: "calling_model" });
+      await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+        .resolves.toMatchObject({ state: "finalizing" });
+
+      const modelSteps = repository.current.steps.filter((step) => step.type === "model.call");
+      const attempts = attemptEvents(repository.events);
+      expect(attempts.map((attempt) => [attempt.logicalStepId, attempt.retryLayer, attempt.transport])).toEqual([
+        [modelSteps[0]!.id, "initial", "stream"],
+        [modelSteps[1]!.id, "empty_response_recovery", "stream"],
+      ]);
+      expect(attempts[0]!.attemptId).toMatch(uuidV4);
+      expect(attempts[1]!.attemptId).toMatch(uuidV4);
+      expect(attempts[1]!.attemptId).not.toBe(attempts[0]!.attemptId);
+    });
+
+    it("gives a request no transport reported a unique ID in its event and failure log", async () => {
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(
+        JSON.stringify({ error: { message: "temporarily unavailable" } }),
+        { status: 503, headers: { "content-type": "application/json" } },
+      )) as typeof fetch);
+      const logs = vi.spyOn(console, "info").mockImplementation(() => undefined);
+      const repository = new FakeTurnRepository(providerSnapshot("openai-responses"));
+      const runner = new DurableTurnRunner(repository, new SnapshotProviderDurableTurnModel({}, null), noTools(), {
+        owner: "worker-unreported-attempt",
+      });
+
+      try {
+        await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+          .rejects.toBeInstanceOf(DurableTurnRetryableError);
+        const attempts = attemptEvents(repository.events);
+        expect(attempts).toEqual([expect.objectContaining({
+          attemptId: expect.stringMatching(uuidV4),
+          retryLayer: "initial",
+          transport: "stream",
+          provider: "provider-openai-responses",
+          route: "/responses",
+          category: "server",
+        })]);
+        const failureLog = logs.mock.calls
+          .map(([line]) => String(line))
+          .filter((line) => line.startsWith("{"))
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+          .find((entry) => entry.event === "berry.provider.attempt");
+        expect(failureLog).toMatchObject({ attemptId: attempts[0]!.attemptId, retryLayer: "initial", transport: "stream" });
+      } finally {
+        logs.mockRestore();
+      }
+    });
+
+    it("keeps compaction attempt IDs and credits a retried compaction to the runner", async () => {
+      const compactStep: DurableTurnStep = {
+        id: randomUUID(),
+        sequence: 2,
+        type: "session.compact",
+        state: "pending",
+        input: { reason: "token-threshold" },
+        output: null,
+        retryClass: "idempotent_with_key",
+        idempotencyKey: `${runId}:compact:entry`,
+        attempt: 1,
+        error: null,
+      };
+      const repository = new FakeTurnRepository(snapshot("compacting", [admittedStep(), modelStep("pending", 1), compactStep]));
+      const firstAttemptId = randomUUID();
+      const repairAttemptId = randomUUID();
+      const report = {
+        model: "checkpoint-model",
+        status: 200,
+        statusClass: "2xx",
+        category: "success",
+        retryDecision: "none",
+        latencyMs: 5,
+        transport: "buffer",
+        provider: "router",
+        route: "/chat/completions",
+      } as const;
+      const runner = new DurableTurnRunner(repository, unusedModel(), noTools(), {
+        owner: "worker-compaction-identity",
+        compactor: {
+          compactSession: async () => ({
+            sessionId: repository.current.sessionId,
+            summary: "Checkpointed.",
+            tokensBefore: 2_000,
+            tokensAfter: 100,
+            providerAttempts: [
+              { ...report, physicalAttempt: 1, attemptId: firstAttemptId, retryLayer: "initial" },
+              { ...report, physicalAttempt: 2, attemptId: repairAttemptId, retryLayer: "other" },
+            ],
+          }),
+        },
+      });
+
+      await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+        .resolves.toMatchObject({ state: "calling_model" });
+
+      expect(attemptEvents(repository.events).map((attempt) => [attempt.logicalStepId, attempt.attemptId, attempt.retryLayer]))
+        .toEqual([
+          [compactStep.id, firstAttemptId, "runner_retry"],
+          [compactStep.id, repairAttemptId, "other"],
+        ]);
+    });
   });
 
   it("persists and replays reasoning plus provider continuation metadata with tool calls", async () => {
@@ -3614,7 +6685,36 @@ describe("durable turn runner", () => {
       .resolves.toEqual({
         allowed: false,
         reason: "The budget reservation for this turn is no longer active.",
+        code: "reservation_inactive",
       });
+  });
+
+  it("extends a recovery generation's reservation without re-reserving settled usage", async () => {
+    const updates: Array<readonly unknown[]> = [];
+    const executor: SqlExecutor = {
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM budget_reservations")) {
+          return [{ id: randomUUID(), user_id: null, department_id: null, reserved_micros: "0", status: "reserved" }] as T[];
+        }
+        if (sql.includes("pg_advisory_xact_lock") || sql.includes("allowance_cycle_settings") || sql.includes("FROM budget_limits")) {
+          return [] as T[];
+        }
+        throw new Error(`Unexpected query: ${sql}`);
+      },
+      execute: async (sql, params = []) => {
+        if (sql.includes("UPDATE budget_reservations")) updates.push(params);
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.usageTotals = { ...current.usageTotals, costMicros: "5000" };
+    current.runtimeRequest.requestId = "turn_request:recovery:1";
+    current.runtimeRequest.budgetBaselineCostMicros = "5000";
+
+    await expect(new SqlDurableTurnRepository(executor).reserveNextModelCall(current, "100"))
+      .resolves.toEqual({ allowed: true, reason: null });
+    // Only the next call's estimate is added; the 5000 settled earlier is not reserved again.
+    expect(updates).toEqual([[tenantId, "turn_request:recovery:1", "100"]]);
   });
 
   it("persists retry diagnostics in the same statement that releases the lease", async () => {
@@ -3671,7 +6771,7 @@ class FakeTurnRepository implements DurableTurnRepository {
   events: AgentStreamEvent[] = [];
   outbox: Array<{ eventType: string; dedupeKey: string }> = [];
   mutations: DurableTurnMutation[] = [];
-  budgetDecision = { allowed: true, reason: null as string | null };
+  budgetDecision: BudgetReservationDecision = { allowed: true, reason: null };
   lastBudgetEstimate = "0";
   releasedError: string | undefined;
   releasedRetryDiagnostics: DurableTurnRetryDiagnostics | undefined;
@@ -3835,7 +6935,7 @@ function snapshot(state: TurnRunState, steps: DurableTurnStep[]): MutableSnapsho
   };
 }
 
-function providerSnapshot(apiType: "openai-responses" | "anthropic-messages"): MutableSnapshot {
+function providerSnapshot(apiType: "openai-responses" | "anthropic-messages" | "openai-chat-completions"): MutableSnapshot {
   const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
   current.runtimeRequest = {
     capabilityVersion: 1,
@@ -3848,7 +6948,7 @@ function providerSnapshot(apiType: "openai-responses" | "anthropic-messages"): M
       baseUrl: "https://provider.example.test/v1",
       defaultModel: "test-model",
       apiType,
-      endpointPath: apiType === "openai-responses" ? "/responses" : "/messages",
+      endpointPath: apiType === "openai-responses" ? "/responses" : apiType === "anthropic-messages" ? "/messages" : "/chat/completions",
       authType: "none",
       models: [],
     },
@@ -3978,6 +7078,22 @@ function noTools(): DurableTurnToolExecutor {
   return { execute: async () => ({ output: {}, summary: "" }) };
 }
 
+function finalAnswerRequested(repository: FakeTurnRepository): boolean {
+  const modelCall = repository.current.steps
+    .filter((step) => step.type === "model.call")
+    .sort((left, right) => right.sequence - left.sequence)[0];
+  return modelCall?.state === "pending" && typeof modelCall.input.wrapUp === "string";
+}
+
+function expectFinalAnswerRequested(repository: FakeTurnRepository, reason: string): void {
+  const modelCall = repository.current.steps
+    .filter((step) => step.type === "model.call")
+    .sort((left, right) => right.sequence - left.sequence)[0];
+  expect(repository.current.state).toBe("calling_model");
+  expect(modelCall).toMatchObject({ state: "pending" });
+  expect(String(modelCall?.input.wrapUp)).toContain(reason);
+}
+
 function queueToolForExecution(repository: FakeTurnRepository, step: DurableTurnStep): void {
   repository.current.steps = repository.current.steps.map((candidate) =>
     candidate.type === "model.call" && candidate.state === "pending"
@@ -3999,3 +7115,159 @@ function unusedModel(): DurableTurnModel {
 function safeBigIntForTest(value: string): bigint {
   return BigInt(value || "0");
 }
+
+describe("admitted runtime metadata", () => {
+  const providerContext = () => ({
+    messageId: randomUUID(),
+    tools: [],
+    additionalUserContent: [],
+    emitDelta: async () => undefined,
+    policyForTool: () => ({
+      retryClass: "read_only" as const,
+      repeatPolicy: "compare_result" as const,
+      requiresApproval: false,
+      approvalKind: "mcp" as const,
+    }),
+  });
+  const providerResponse = () => new Response([
+    'data: {"type":"response.output_text.delta","delta":"ok"}',
+    'data: {"type":"response.completed","response":{"id":"resp-admitted","model":"test-model","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}',
+    "data: [DONE]",
+    "",
+  ].join("\n\n"), { status: 200, headers: { "content-type": "text/event-stream" } });
+
+  /** The runtime JSON each API write path leaves on a run, from one admitted snapshot. */
+  function writtenRuntime(path: "queued" | "continued" | "recovered"): Record<string, unknown> {
+    const admitted = {
+      ...providerSnapshot("openai-responses").runtimeRequest,
+      requestId: "request_1",
+      budgetReservationRequired: true,
+      workflowCategory: "documents",
+      workflowCategoryVersion: "workflow-v1",
+      builtInTools: [...DURABLE_BASE_BUILT_IN_TOOLS, "create_image"],
+      imageGeneration: { providerId: "image-provider", model: "image-model", costMicros: "40000" },
+    };
+    if (path === "queued") {
+      // queued-follow-up.service.ts stores the active run's runtime plus the
+      // queue budget identity; delivery turns it into the new run's runtime.
+      return queuedFollowUpRuntimeRequest(
+        { ...admitted, queuedBudgetRequestId: "queued:browser-key", budgetReservationRequired: true },
+        { id: "queue-id", attempt_count: 0, input: "Follow up", intent: null, attachments: [] },
+      );
+    }
+    if (path === "continued") {
+      return {
+        ...admitted,
+        continueInterruptedTurn: true,
+        continuationSourceRunId: "00000000-0000-7000-8000-000000000099",
+        continuationHeadEntryId: "entry-user",
+        input: "",
+      };
+    }
+    // renewRecoveryBudget merges this patch with runtime_request || patch.
+    return {
+      ...admitted,
+      requestId: "request_1:recovery:1",
+      budgetBaseRequestId: "request_1",
+      budgetGeneration: 1,
+      budgetUsageAfterSequence: 12,
+      budgetBaselineCostMicros: "5000",
+      budgetReservationRequired: true,
+    };
+  }
+
+  it.each(["queued", "continued", "recovered"] as const)(
+    "calls the admitted provider for a %s run, with or without a global router",
+    async (path) => {
+      const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>) => providerResponse());
+      vi.stubGlobal("fetch", fetchMock);
+      const legacy = { call: vi.fn(async () => ({ text: "global provider", inputTokens: 0, outputTokens: 0, toolCalls: [] })) };
+      for (const fallback of [legacy, null]) {
+        const current = providerSnapshot("openai-responses");
+        current.runtimeRequest = writtenRuntime(path);
+        const result = await new SnapshotProviderDurableTurnModel({}, fallback).call(current, modelStep("pending", 1), providerContext());
+        expect(result.text).toBe("ok");
+      }
+      expect(legacy.call).not.toHaveBeenCalled();
+      expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+        "https://provider.example.test/v1/responses",
+        "https://provider.example.test/v1/responses",
+      ]);
+    },
+  );
+
+  it.each(["queued", "continued", "recovered"] as const)("keeps the admitted tools for a %s run", (path) => {
+    const current = providerSnapshot("openai-responses");
+    current.runtimeRequest = writtenRuntime(path);
+    expect(durableBuiltInToolDefinitions(current).map((tool) => tool.function.name)).toContain("create_image");
+  });
+
+  it("never sends a malformed version-1 request to the global router", async () => {
+    const fetchMock = vi.fn(async () => providerResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    const legacy = { call: vi.fn(async () => ({ text: "global provider", inputTokens: 0, outputTokens: 0, toolCalls: [] })) };
+    const admitted = providerSnapshot("openai-responses").runtimeRequest;
+    const { baseUrl: _baseUrl, ...providerWithoutUrl } = admitted.provider as Record<string, unknown>;
+    for (const runtimeRequest of [
+      { ...admitted, unexpectedSetting: true },
+      { ...admitted, provider: providerWithoutUrl },
+      { ...admitted, capabilityVersion: 2 },
+    ]) {
+      const current = providerSnapshot("openai-responses");
+      current.runtimeRequest = runtimeRequest;
+      await expect(new SnapshotProviderDurableTurnModel({}, legacy).call(current, modelStep("pending", 1), providerContext()))
+        .rejects.toThrow("admitted model configuration");
+      expect(() => durableBuiltInToolDefinitions(current)).toThrow("admitted model configuration");
+    }
+    expect(legacy.call).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("calls the admitted provider for a run stored by the previous API release", async () => {
+    const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>) => providerResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    const current = providerSnapshot("openai-responses");
+    // The previous release stored its parsed request plus the admission fields,
+    // without workflow routing, capability notices or the new metadata.
+    current.runtimeRequest = {
+      ...current.runtimeRequest,
+      admissionFingerprint: "a".repeat(64),
+      budgetReservationRequired: false,
+      continueInterruptedTurn: false,
+      requestId: "request_previous_release",
+      input: "Say ok",
+    };
+    const legacy = { call: vi.fn() };
+    await expect(new SnapshotProviderDurableTurnModel({}, legacy).call(current, modelStep("pending", 1), providerContext()))
+      .resolves.toMatchObject({ text: "ok" });
+    expect(legacy.call).not.toHaveBeenCalled();
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://provider.example.test/v1/responses");
+  });
+
+  it("still sends a run admitted before capability snapshots to the global router", async () => {
+    const legacy = { call: vi.fn(async () => ({ text: "global provider", inputTokens: 0, outputTokens: 0, toolCalls: [] })) };
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    const result = await new SnapshotProviderDurableTurnModel({}, legacy).call(current, modelStep("pending", 1), providerContext());
+    expect(result.text).toBe("global provider");
+    await expect(new SnapshotProviderDurableTurnModel({}, null).call(current, modelStep("pending", 1), providerContext()))
+      .rejects.toThrow("Legacy durable turns require the global Berry Router configuration");
+  });
+
+  it("starts a queued run with its own budget generation and no inherited continuation", () => {
+    const runtime = queuedFollowUpRuntimeRequest({
+      ...writtenRuntime("recovered"),
+      continueInterruptedTurn: true,
+      continuationSourceRunId: "00000000-0000-7000-8000-000000000099",
+      continuationHeadEntryId: "entry-user",
+      queuedBudgetRequestId: "queued:browser-key",
+    }, { id: "queue-id", attempt_count: 2, input: "Next", intent: null, attachments: [] });
+
+    expect(runtime).toMatchObject({ requestId: "queued:browser-key", budgetReservationRequired: true, continueInterruptedTurn: false });
+    for (const key of [
+      "queuedBudgetRequestId", "continuationSourceRunId", "continuationHeadEntryId",
+      "budgetBaseRequestId", "budgetGeneration", "budgetUsageAfterSequence", "budgetBaselineCostMicros",
+    ]) expect(runtime).not.toHaveProperty(key);
+    // The new run's own usage events start at sequence 1; none may be skipped.
+    expect(budgetUsageAfterSequence(runtime)).toBe(0);
+  });
+});

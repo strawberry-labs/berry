@@ -114,21 +114,136 @@ describe("DurablePersonalMemoryToolExecutor", () => {
     });
   });
 
-  it("does not expose or execute memory tools when the user disabled memory", async () => {
+  it("never stores a secret, even when asked explicitly (H-040)", async () => {
+    let stored = false;
     const executor = new DurablePersonalMemoryToolExecutor(
       baseTools(),
-      repository({ memoryEnabled: false, implicitMemoryEnabled: true }),
-      personalMemory(),
+      repository({ memoryEnabled: true, implicitMemoryEnabled: true }),
+      personalMemory({ remember: async () => { stored = true; return { operation: "ADD", reason: "x", item: null }; } }),
     );
 
-    await expect(executor.definitions(snapshot())).resolves.toHaveLength(1);
-    await expect(executor.execute(
-      snapshot(),
-      memoryStep("remember_memory", {
-        kind: "profile",
-        content: "Do not store this.",
-      }),
-    )).rejects.toThrow("Personal memory is disabled for this user");
+    await expect(executor.execute(snapshot(), memoryStep("remember_memory", {
+      kind: "preference",
+      content: "My api key: abcdefghijklmnop",
+    }))).rejects.toThrow("Not stored: credentials and secrets are not memory.");
+    expect(stored).toBe(false);
+  });
+
+  describe("declared memory tools (H-032, H-077)", () => {
+    const unavailable = "Personal memory is unavailable for this message";
+    const turnedOff = "Personal memory is turned off for this user";
+    /** Settings answers in order; records each lookup's tenant and user. */
+    const settingsSequence = (results: Array<{ memoryEnabled: boolean } | Error>) => {
+      const lookups: Array<[string, string]> = [];
+      const repository = {
+        async settings(tenantId: string, userId: string) {
+          const result = results[Math.min(lookups.length, results.length - 1)]!;
+          lookups.push([tenantId, userId]);
+          if (result instanceof Error) throw result;
+          return { ...result, implicitMemoryEnabled: true };
+        },
+      } as unknown as SqlWorkerMemoryRepository;
+      return { repository, lookups };
+    };
+    const executorFor = (repository: SqlWorkerMemoryRepository, provider: PersonalMemoryProvider | null = personalMemory(), globallyEnabled = true) =>
+      new DurablePersonalMemoryToolExecutor(baseTools(), repository, provider, globallyEnabled);
+    /** One model request's preparation, as the runner does it: a fresh snapshot, definitions and content together. */
+    const prepare = async (executor: DurablePersonalMemoryToolExecutor) => {
+      const current = snapshot();
+      const [definitions, content] = await Promise.all([executor.definitions(current), executor.modelContent(current)]);
+      return {
+        tools: definitions.map((tool) => tool.function.name),
+        notice: content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n"),
+      };
+    };
+    const connectionReset = () => new Error("database connection reset");
+
+    it.each([
+      ["has memory on", true, ""],
+      ["turned memory off", false, turnedOff],
+    ] as const)("declares the same tools through a healthy, failed and recovered lookup when the user %s", async (_label, memoryEnabled, settledNotice) => {
+      const { repository, lookups } = settingsSequence([{ memoryEnabled }, connectionReset(), { memoryEnabled }]);
+      const executor = executorFor(repository);
+
+      const healthy = await prepare(executor);
+      const failed = await prepare(executor);
+      const recovered = await prepare(executor);
+
+      expect(healthy.tools).toEqual(["base_tool", "remember_memory", "forget_memory"]);
+      expect(failed.tools).toEqual(healthy.tools);
+      expect(recovered.tools).toEqual(healthy.tools);
+      // Each request read the settings once, so the failure was really met.
+      expect(lookups).toHaveLength(3);
+      expect(failed.notice).toContain(unavailable);
+      expect(healthy.notice).toEqual(settledNotice ? expect.stringContaining(settledNotice) : "");
+      expect(recovered.notice).toBe(healthy.notice);
+    });
+
+    it("declares the same tools when a disabled user's first lookup fails and the next succeeds", async () => {
+      const { repository, lookups } = settingsSequence([connectionReset(), { memoryEnabled: false }]);
+      const executor = executorFor(repository);
+
+      const unreadable = await prepare(executor);
+      const recovered = await prepare(executor);
+
+      expect(unreadable.tools).toEqual(recovered.tools);
+      expect(lookups).toHaveLength(2);
+      expect(unreadable.notice).toContain(unavailable);
+      expect(recovered.notice).toContain(turnedOff);
+    });
+
+    it.each([
+      ["has memory on", true],
+      ["turned memory off", false],
+    ] as const)("declares the same tools on another worker or after a restart when the user %s", async (_label, memoryEnabled) => {
+      const before = await prepare(executorFor(settingsSequence([{ memoryEnabled }]).repository));
+      const failing = settingsSequence([connectionReset()]);
+      const afterRestart = await prepare(executorFor(failing.repository));
+      const recovered = await prepare(executorFor(settingsSequence([{ memoryEnabled }]).repository));
+
+      expect(afterRestart.tools).toEqual(before.tools);
+      expect(recovered.tools).toEqual(before.tools);
+      expect(failing.lookups).toHaveLength(1);
+      expect(afterRestart.notice).toContain(unavailable);
+    });
+
+    it("reads the settings of the request's own tenant and user", async () => {
+      const { repository, lookups } = settingsSequence([{ memoryEnabled: true }]);
+      await prepare(executorFor(repository));
+      expect(lookups).toEqual([["00000000-0000-7000-8000-000000000001", "00000000-0000-7000-8000-000000000002"]]);
+    });
+
+    it.each([
+      ["unreadable", [connectionReset()], "Personal memory is unavailable right now"],
+      ["off", [{ memoryEnabled: false }], "Personal memory is disabled for this user"],
+    ] as const)("saves and forgets nothing when the settings are %s, reading them again for each use", async (_label, results, refusal) => {
+      const mutations: string[] = [];
+      const { repository, lookups } = settingsSequence([...results]);
+      const executor = executorFor(repository, personalMemory({
+        remember: async () => { mutations.push("remember"); return { operation: "ADD", reason: "x", item: null }; },
+        forget: async () => { mutations.push("forget"); return null; },
+      }));
+      const current = snapshot();
+
+      await executor.modelContent(current);
+      await expect(executor.execute(current, memoryStep("remember_memory", { kind: "profile", content: "A fact" }))).rejects.toThrow(refusal);
+      await expect(executor.execute(current, memoryStep("forget_memory", { stable_key: "profile:role" }))).rejects.toThrow(refusal);
+      expect(mutations).toEqual([]);
+      // One lookup to prepare the request, then a fresh one for each use.
+      expect(lookups).toHaveLength(3);
+    });
+
+    it.each([
+      ["memory is switched off for the deployment", personalMemory(), false],
+      ["no memory provider is configured", null, true],
+    ] as const)("declares no memory tools and reads no settings when %s", async (_label, provider, globallyEnabled) => {
+      const { repository, lookups } = settingsSequence([connectionReset()]);
+      const executor = executorFor(repository, provider, globallyEnabled);
+
+      expect(await prepare(executor)).toEqual({ tools: ["base_tool"], notice: "" });
+      expect(await prepare(executor)).toEqual({ tools: ["base_tool"], notice: "" });
+      expect(lookups).toHaveLength(0);
+    });
   });
 });
 

@@ -114,6 +114,43 @@ describe("AgentStreamEventSchema", () => {
     }
   });
 
+  it("accepts provider attempts and usage recorded before and after attempt IDs (H-033)", () => {
+    const recorded = {
+      kind: "provider.attempt",
+      logicalStepId: "step_1",
+      physicalAttempt: 1,
+      model: "provider/model",
+      statusClass: "2xx",
+      category: "aborted",
+      retryDecision: "cancelled",
+      latencyMs: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      finishReason: null,
+    } as const;
+    const attemptId = "6f9619ff-8b86-4d01-b42d-00cf4fc964ff";
+    const identified = {
+      ...recorded,
+      attemptId,
+      retryLayer: "stream_buffer_fallback",
+      transport: "buffer",
+      provider: "org-router",
+      route: "/chat/completions",
+    } as const;
+
+    expect(AgentStreamEventSchema.parse(recorded)).toEqual(recorded);
+    expect(AgentStreamEventSchema.parse(identified)).toEqual(identified);
+    expect(() => AgentStreamEventSchema.parse({ ...recorded, attemptId: "attempt-1" })).toThrow();
+    expect(() => AgentStreamEventSchema.parse({ ...recorded, retryLayer: "fallback" })).toThrow();
+    expect(() => AgentStreamEventSchema.parse({ ...recorded, transport: "sse" })).toThrow();
+    expect(AgentStreamEventSchema.parse({ kind: "usage", inputTokens: 3, outputTokens: 1 }))
+      .toEqual({ kind: "usage", inputTokens: 3, outputTokens: 1 });
+    expect(AgentStreamEventSchema.parse({ kind: "usage", inputTokens: 3, outputTokens: 1, providerAttemptId: attemptId }))
+      .toEqual({ kind: "usage", inputTokens: 3, outputTokens: 1, providerAttemptId: attemptId });
+  });
+
   it("defaults message.delta channel to text", () => {
     const parsed = AgentStreamEventSchema.parse({
       kind: "message.delta",

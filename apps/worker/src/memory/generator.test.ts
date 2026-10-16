@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { OpenAIChatCompletionsClient, RouterClientError } from "@berry/router-client";
+import { OpenAIChatCompletionsClient, RouterClientError, type ChatCompletionOptions } from "@berry/router-client";
 import type { MemoryExtractJobPayload } from "../jobs.js";
 import { WorkerRuntimeMetrics } from "../runtime-metrics.js";
 import {
@@ -109,6 +109,36 @@ describe("memory operation generator model selection", () => {
       retryDecision: "not_retryable",
     });
     expect(event).not.toHaveProperty("requestId");
+  });
+
+  it("names the failed physical request in the extractor's failure log (H-033)", async () => {
+    const operationalEvent = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const attemptId = "6f9619ff-8b86-4d01-b42d-00cf4fc964ff";
+    const failure = new RouterClientError("upstream unavailable", 400);
+    const client = {
+      complete: vi.fn(async (options: ChatCompletionOptions) => {
+        options.onProviderAttempt?.({
+          attemptId,
+          retryLayer: options.providerAttemptLayer ?? "initial",
+          transport: "buffer",
+          category: "permanent_client",
+          retryDecision: "terminal",
+          latencyMs: 10,
+        });
+        throw failure;
+      }),
+    } as unknown as OpenAIChatCompletionsClient;
+    const generator = new RouterMemoryOperationGenerator(client, "memory-model", new WorkerRuntimeMetrics(), sequenceClock(0, 10));
+
+    await expect(generator.generate(payload())).rejects.toBe(failure);
+    const event = JSON.parse(String(operationalEvent.mock.calls.at(-1)?.[0])) as Record<string, unknown>;
+    expect(event).toMatchObject({
+      event: "berry.provider.attempt",
+      phase: "memory_extract",
+      attemptId,
+      retryLayer: "initial",
+      transport: "buffer",
+    });
   });
 });
 

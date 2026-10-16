@@ -1,7 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { getRequestHeaders, getRequestHost, getResponseHeader, removeResponseHeader, setResponseHeader } from "@tanstack/react-start/server";
 import { getWebConfig } from "./env.server";
-import { buildSiteContentSecurityPolicy, CSP_NONCE_RESPONSE_HEADER } from "./site-csp";
+import { buildSiteContentSecurityPolicy, CSP_NONCE_RESPONSE_HEADER, storageConnectOrigins } from "./site-csp";
 
 export const loadWebConfig = createServerFn({ method: "GET" }).handler(() => getWebConfig());
 
@@ -19,7 +19,7 @@ export const loadWebBootstrap = createServerFn({ method: "GET" }).handler(async 
     const extraFrames = splitCspSources(process.env.BERRY_CSP_EXTRA_FRAME_SOURCES);
     setResponseHeader("Content-Security-Policy", buildSiteContentSecurityPolicy({
       nonce,
-      connectOrigins: [apiOrigin, ...extraConnect].filter((value): value is string => Boolean(value)),
+      connectOrigins: [apiOrigin, ...extraConnect, ...storageConnectOrigins({ endpoint: process.env.BERRY_ARTIFACT_S3_PUBLIC_ENDPOINT || process.env.BERRY_ARTIFACT_S3_ENDPOINT, bucket: process.env.BERRY_ARTIFACT_S3_BUCKET, region: process.env.BERRY_ARTIFACT_S3_REGION, accelerate: process.env.BERRY_ARTIFACT_S3_ACCELERATE === "true" })].filter((value): value is string => Boolean(value)),
       imageOrigins: [apiOrigin, ...extraImages].filter((value): value is string => Boolean(value)),
       ...(extraFrames.length > 0 ? { frameSources: extraFrames } : {}),
     }));

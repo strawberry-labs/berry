@@ -50,3 +50,20 @@ export function buildSiteContentSecurityPolicy(options: {
 function normalizeSources(sources: readonly string[] | undefined): string {
   return [...new Set((sources ?? []).map((source) => source.trim()).filter(Boolean))].join(" ");
 }
+
+/** Match the public S3 signer without granting browser access to every S3 bucket. */
+export function storageConnectOrigins(input: { endpoint?: string | undefined; bucket?: string | undefined; region?: string | undefined; accelerate?: boolean }): string[] {
+  if (input.endpoint) {
+    try {
+      const url = new URL(input.endpoint);
+      return ["https:", "http:"].includes(url.protocol) ? [url.origin] : [];
+    } catch { return []; }
+  }
+  if (!input.bucket || !/^[a-z0-9][a-z0-9.-]+[a-z0-9]$/.test(input.bucket)) return [];
+  const region = input.region || "eu-west-1";
+  if (!/^[a-z0-9-]+$/.test(region)) return [];
+  const suffix = region.startsWith("cn-") ? "amazonaws.com.cn" : "amazonaws.com";
+  // HTTPS S3 uses path-style addressing for dotted bucket names.
+  return [`https://${input.bucket.includes(".") ? "" : `${input.bucket}.`}s3.${region}.${suffix}`,
+    ...(input.accelerate && !input.bucket.includes(".") ? [`https://${input.bucket}.s3-accelerate.amazonaws.com`] : [])];
+}

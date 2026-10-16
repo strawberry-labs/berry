@@ -13,6 +13,7 @@ import {
   sessionCheckpointMetrics,
   validateSessionCheckpoint,
   type ProviderAttemptReport,
+  type ProviderAttemptRetryLayer,
   type CheckpointDeterministicFields,
   type JsonValue,
   type ModelCostHints,
@@ -21,6 +22,7 @@ import {
 } from "@berry/shared";
 import {
   OpenAIChatCompletionsClient,
+  PROVIDER_ATTEMPT_ID_HEADER,
   type ChatCompletionUsage,
 } from "@berry/router-client";
 import type { CompactionJobPayload } from "./jobs.js";
@@ -161,6 +163,8 @@ export interface SessionCompactionRepository {
     segmentMetrics: CheckpointPersistenceMetrics;
     rollingMetrics: CheckpointPersistenceMetrics;
     physicalAttempts: number;
+    /** IDs of those physical provider requests (H-033). */
+    providerAttemptIds?: readonly string[] | undefined;
     fallbackReason: string | null;
     usage: CompactionUsage | null;
   }): Promise<{
@@ -366,6 +370,7 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
           serializedBytes: rollingCheckpointMetrics.serializedBytes,
         },
         physicalAttempts: generated.attempts,
+        providerAttemptIds: providerAttempts.flatMap((attempt) => attempt.attemptId ? [attempt.attemptId] : []),
         fallbackReason,
         usage: generated.usage ?? null,
       });
@@ -626,6 +631,7 @@ ORDER BY created_at ASC, id ASC
     segmentMetrics: CheckpointPersistenceMetrics;
     rollingMetrics: CheckpointPersistenceMetrics;
     physicalAttempts: number;
+    providerAttemptIds?: readonly string[] | undefined;
     fallbackReason: string | null;
     usage: CompactionUsage | null;
   }): Promise<{ segmentCheckpointId: string | null; rollingCheckpointId: string | null; usageEventId: string | null }> {
@@ -646,6 +652,7 @@ FOR UPDATE
             segment: input.segment,
             algorithmVersion: input.algorithmVersion,
             physicalAttempts: input.physicalAttempts,
+            providerAttemptIds: input.providerAttemptIds,
             fallbackReason: input.fallbackReason,
             usage: input.usage,
             segmentMetrics: input.segmentMetrics,
@@ -752,6 +759,7 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
         usage: compactUsage(this.provider, this.model, [first], this.pricingByModel),
       };
     }
+    // A repair request, not a transport retry: its attempt is labeled `other`.
     const repaired = await this.complete([
       ...messages,
       {
@@ -762,7 +770,7 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
           "Return one corrected checkpoint_v2 tool call only. Do not invent facts.",
         ].join("\n"),
       },
-    ], input.maxTokens, input.signal, 2, input.onProviderAttempt);
+    ], input.maxTokens, input.signal, 2, input.onProviderAttempt, "other");
     parsed = parseSessionCheckpoint(checkpointCandidateWithDeterminism(repaired.text, input.deterministic));
     candidate = parsed.checkpoint
       ? applyCheckpointDeterminism(parsed.checkpoint, input.deterministic)
@@ -791,6 +799,7 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
     signal: AbortSignal | undefined,
     physicalAttempt: number,
     onProviderAttempt: ((report: ProviderAttemptReport) => void) | undefined,
+    attemptLayer: ProviderAttemptRetryLayer = "initial",
   ): Promise<{ text: string; usage: ChatCompletionUsage; usageEstimated: boolean; model: string }> {
     const result = await this.client.complete({
       model: this.model,
@@ -800,6 +809,7 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
       ...(signal ? { signal } : {}),
       ...(onProviderAttempt ? { onProviderAttempt } : {}),
       providerAttemptOrdinal: physicalAttempt,
+      providerAttemptLayer: attemptLayer,
       tools: [{
         type: "function",
         function: {
@@ -924,6 +934,7 @@ export function createCheckpointGenerator(env: NodeJS.ProcessEnv): CheckpointGen
   return new RouterCheckpointGenerator(
     new OpenAIChatCompletionsClient({
       provider: {
+        id: provider,
         baseUrl,
         defaultModel: model,
         kind: "openai-compatible",
@@ -931,6 +942,7 @@ export function createCheckpointGenerator(env: NodeJS.ProcessEnv): CheckpointGen
         apiType: "openai-chat-completions",
       },
       apiKey,
+      attemptIdHeader: PROVIDER_ATTEMPT_ID_HEADER,
     }),
     provider,
     model,
@@ -1255,7 +1267,9 @@ function contentText(value: unknown): string {
 }
 
 function serializeEntries(entries: readonly CompactionEntryRecord[], maxCharacters: number): string {
-  const serialized = entries.map((entry) => JSON.stringify({
+  // Journaled turn context (grounding, date, guidance) is Berry-supplied and
+  // rebuilt each turn; summarising it would repeat stale grounding (H-032).
+  const serialized = entries.filter((entry) => entry.entryType !== "context").map((entry) => JSON.stringify({
     entryId: entry.entryId,
     parentEntryId: entry.parentEntryId,
     entryType: entry.entryType,
@@ -1409,6 +1423,7 @@ async function insertCompactionUsage(
     segment: SessionCheckpointV2;
     algorithmVersion: string;
     physicalAttempts: number;
+    providerAttemptIds?: readonly string[] | undefined;
     fallbackReason: string | null;
     usage: CompactionUsage;
     segmentMetrics: CheckpointPersistenceMetrics;
@@ -1422,6 +1437,7 @@ async function insertCompactionUsage(
     sessionId: input.state.sessionId,
     algorithmVersion: input.algorithmVersion,
     physicalAttempts: input.physicalAttempts,
+    ...(input.providerAttemptIds?.length ? { providerAttemptIds: input.providerAttemptIds } : {}),
     fallbackReason: input.fallbackReason,
     checkpointMetrics: {
       segment: input.segmentMetrics,

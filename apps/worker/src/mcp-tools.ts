@@ -4,7 +4,7 @@ import {
   type McpServerSpec,
 } from "@berry/local-agent/mcp";
 import {
-  DurableTurnRuntimeRequestSchema,
+  parseAdmittedRuntimeRequest,
   NetworkPolicySchema,
   normalizeWorkerRole,
   openDurableSecret,
@@ -12,12 +12,14 @@ import {
   type JsonValue,
 } from "@berry/shared";
 import type { ChatContentPart, ChatToolDefinition } from "@berry/router-client";
-import type {
-  DurableToolPolicy,
-  DurableTurnSnapshot,
-  DurableTurnStep,
-  DurableTurnToolExecutor,
-  TurnToolResult,
+import {
+  CONTEXT_ENTRY_TYPE,
+  USE_TOOL_NAME,
+  type DurableToolPolicy,
+  type DurableTurnSnapshot,
+  type DurableTurnStep,
+  type DurableTurnToolExecutor,
+  type TurnToolResult,
 } from "./turn-runner.js";
 import { emitWorkerOperationalEvent } from "./operational-telemetry.js";
 
@@ -44,27 +46,62 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     });
   }
 
+  /**
+   * The declared tools never include connector tools themselves: tool_search
+   * finds them and use_tool runs them, so revealing a tool appends to the
+   * conversation instead of rewriting the tool list, and the provider's cached
+   * prefix survives (H-032). Both stay declared while connectors are
+   * configured but unavailable for a turn (H-050).
+   */
   async definitions(snapshot: DurableTurnSnapshot): Promise<readonly ChatToolDefinition[]> {
     const context = await this.#context(snapshot);
     const inherited = await (this.base.definitions?.(snapshot) ?? Promise.resolve([]));
-    const visibleNames = this.#visibleToolNames(snapshot, context);
-    const mcpTools = context.source.listTools()
-      .filter((tool) => visibleNames.has(tool.name))
-      .map((tool): ChatToolDefinition => ({
-        type: "function",
-        function: {
-          name: tool.name,
-          description: tool.description,
-          parameters: jsonValue(tool.parameters),
-        },
-      }));
     return [
       ...inherited,
-      ...(context.servers.length > 0
-        ? [durableToolSearchDefinition(context.servers)]
+      ...(context.servers.length > 0 || context.unavailable.length > 0 || connectorsUnavailableReason(snapshot)
+        ? [durableToolSearchDefinition(), durableUseToolDefinition()]
         : []),
-      ...mcpTools,
     ];
+  }
+
+  /** The connector catalog and the connector tools ready this turn, with schemas. */
+  async turnContext(snapshot: DurableTurnSnapshot): Promise<string> {
+    const inherited = await (this.base.turnContext?.(snapshot) ?? Promise.resolve(""));
+    const context = await this.#context(snapshot);
+    const tools = context.source.listTools();
+    const catalog = context.servers
+      .filter((server) => tools.some((tool) => this.#serverForTool(tool.name, [server]) !== undefined))
+      .map((server) => `${server.id} (${server.name})`);
+    const unavailable = context.unavailable.map((server) => `- ${server.id} (${server.name}): ${server.reason}`);
+    if (catalog.length === 0) {
+      return unavailable.length > 0
+        ? [inherited, ["Connectors unavailable for this message (their tools cannot run):", ...unavailable].join("\n")].filter(Boolean).join("\n\n")
+        : inherited;
+    }
+    const visible = this.#visibleToolNames(snapshot, context);
+    const ready = tools.filter((tool) => visible.has(tool.name));
+    const lines: string[] = [];
+    let budget = CONNECTOR_CONTEXT_SCHEMA_CHARACTERS;
+    let withoutSchema = 0;
+    for (const tool of ready) {
+      if (connectorSchemaGiven(snapshot, tool.name)) continue;
+      const schema = JSON.stringify(jsonValue(tool.parameters));
+      const line = `- ${tool.name}: ${tool.description}\n  input schema: ${schema}`;
+      if (line.length <= budget) {
+        lines.push(line);
+        budget -= line.length;
+      } else {
+        lines.push(`- ${tool.name}: ${tool.description}`);
+        withoutSchema += 1;
+      }
+    }
+    const section = [
+      `Connectors available to this task: ${catalog.join(", ")}. Call tool_search to find their tools, then run a found tool with use_tool.`,
+      ...(lines.length > 0 ? ["Connector tools ready now (run with use_tool, passing the exact name and arguments that match the schema):", ...lines] : []),
+      ...(withoutSchema > 0 ? [`Call tool_search for the input schema of the ${withoutSchema} tool${withoutSchema === 1 ? "" : "s"} listed without one.`] : []),
+      ...(unavailable.length > 0 ? ["Connectors unavailable for this message (their tools cannot run):", ...unavailable] : []),
+    ].join("\n");
+    return [inherited, section].filter(Boolean).join("\n\n");
   }
 
   async modelContent(
@@ -96,7 +133,9 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     toolName: string,
     permissionMode: string,
   ): DurableToolPolicy | undefined {
-    if (toolName === "tool_search") {
+    if (toolName === "tool_search" || toolName === USE_TOOL_NAME) {
+      // A use_tool step only exists when the call could not be unwrapped; it
+      // runs nothing and fails with guidance.
       return {
         retryClass: "read_only",
         repeatPolicy: "compare_result",
@@ -123,9 +162,16 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     return durableMcpToolPolicy(server, hints, permissionMode);
   }
 
+  /** A connector tool's reviewed input schema, so malformed calls are refused before approval (H-011). */
+  argumentSchema(snapshot: DurableTurnSnapshot, toolName: string): unknown {
+    if (!toolName.startsWith("mcp__")) return this.base.argumentSchema?.(snapshot, toolName);
+    const source = this.#turnContexts.get(snapshot.id)?.source;
+    return source?.listTools().find((tool) => tool.name === toolName)?.parameters;
+  }
+
   supportsAbort(snapshot: DurableTurnSnapshot, step: DurableTurnStep): boolean {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
-    if (toolName === "tool_search") return false;
+    if (toolName === "tool_search" || toolName === USE_TOOL_NAME) return false;
     // Connector setup, lazy discovery, and artifact staging can still await
     // work that has no AbortSignal contract. Keep the whole MCP path
     // non-abortable until every one of those seams is signal-aware.
@@ -141,6 +187,13 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   ): Promise<TurnToolResult> {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName === "tool_search") return this.#searchTools(snapshot, step);
+    if (toolName === USE_TOOL_NAME) {
+      throw new Error('use_tool needs {"tool": "<exact connector tool name>", "arguments": {...}}. Call tool_search to find tool names and their input schemas.');
+    }
+    const unavailable = connectorsUnavailableReason(snapshot);
+    if (unavailable && toolName.startsWith("mcp__") && !(await this.#context(snapshot)).servers.some((server) => this.#serverForTool(toolName, [server]))) {
+      throw new Error(`Connectors are unavailable for this message: ${unavailable}`);
+    }
     if (!toolName.startsWith("mcp__")) {
       return signal || reportProgress
         ? this.base.execute(snapshot, step, signal, reportProgress)
@@ -148,6 +201,8 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     }
     const context = await this.#context(snapshot);
     if (!this.#serverForTool(toolName, context.servers)) {
+      const lost = context.unavailable.find((server) => toolName.startsWith(`mcp__${sanitizeName(server.name)}__`));
+      if (lost) throw new Error(`The ${lost.name} connector is unavailable for this message: ${lost.reason}`);
       throw new Error(`MCP tool ${toolName} is not enabled for this turn`);
     }
     if (!this.#visibleToolNames(snapshot, context).has(toolName)) {
@@ -156,22 +211,36 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     const tool = context.source.listTools().find((candidate) => candidate.name === toolName);
     if (!tool) throw new Error(`MCP tool ${toolName} is unavailable`);
     const callId = stringValue(step.input.toolCallId) ?? step.id;
-    const result = signal || reportProgress
-      ? await tool.execute(callId, (record(step.input.arguments) ?? {}) as never, signal, reportProgress)
-      : await tool.execute(callId, (record(step.input.arguments) ?? {}) as never);
-    let text = result.content.flatMap((part) =>
+    // Repeating an import whose file was not staged retries staging of the
+    // Berry file already held instead of downloading it again (H-068).
+    const resumed = this.base.stageAssociatedInputFiles ? resumableConnectorImport(snapshot, step, toolName) : null;
+    const result = resumed
+      ? { content: [], details: resumed.details }
+      : signal || reportProgress
+        ? await tool.execute(callId, (record(step.input.arguments) ?? {}) as never, signal, reportProgress)
+        : await tool.execute(callId, (record(step.input.arguments) ?? {}) as never);
+    let text = boundedMcpText(result.content.flatMap((part) =>
       part.type === "text" && typeof part.text === "string" ? [part.text] : []
-    ).join("\n").slice(0, 120_000);
+    ).join("\n"), record(result.details)?.structuredContent);
     const artifact = connectorArtifact(result.details);
-    const staged = artifact && this.base.stageAssociatedInputFiles
-      ? await this.base.stageAssociatedInputFiles(snapshot, [artifact.fileId], {
+    let staged: Awaited<ReturnType<NonNullable<DurableTurnToolExecutor["stageAssociatedInputFiles"]>>> = [];
+    let stagingError: string | undefined;
+    if (artifact && this.base.stageAssociatedInputFiles) {
+      try {
+        staged = await this.base.stageAssociatedInputFiles(snapshot, [artifact.fileId], {
           ...(signal ? { signal } : {}),
           ...(reportProgress ? { reportProgress } : {}),
-        })
-      : [];
+        });
+      } catch (error) {
+        // Cancellation ends the call. Any other staging failure leaves the
+        // import itself intact, so report it rather than discard the receipt.
+        if (signal?.aborted) throw error;
+        stagingError = (error instanceof Error ? error.message : String(error)).slice(0, 500);
+      }
+    }
+    const stagedArtifact = artifact ? staged.find((item) => item.fileId === artifact.fileId) : undefined;
     if (artifact) {
-      const stagedArtifact = staged.find((item) => item.fileId === artifact.fileId);
-      text = connectorArtifactText(artifact, stagedArtifact);
+      text = connectorArtifactText(artifact, stagedArtifact, Boolean(this.base.stageAssociatedInputFiles), stagingError);
     }
     const parts = sanitizeMcpJournalValue(result.content);
     return {
@@ -181,6 +250,13 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
         details: sanitizeMcpJournalValue(result.details),
         parts,
         ...(staged.length ? { artifacts: staged.map((item) => ({ ...item })) } : {}),
+        ...(artifact && this.base.stageAssociatedInputFiles
+          ? {
+              stagingStatus: stagedArtifact ? "ready" : stagingError ? "failed" : "pending_verification",
+              ...(stagingError && !stagedArtifact ? { stagingError } : {}),
+              ...(resumed ? { resumedFromStep: resumed.stepId } : {}),
+            }
+          : {}),
       },
       summary: text ? `${toolName} returned results` : `${toolName} completed`,
     };
@@ -205,12 +281,17 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   async #context(snapshot: DurableTurnSnapshot): Promise<DurableMcpTurnContext> {
     const existing = this.#turnContexts.get(snapshot.id);
     if (existing) return existing;
-    const runtime = DurableTurnRuntimeRequestSchema.safeParse(snapshot.runtimeRequest);
-    if (!runtime.success) {
-      return { source: this.#source, servers: this.#allowedServers(snapshot) };
+    // Only a run admitted before capability snapshots uses the deployment's
+    // connector list; an invalid snapshot throws rather than swap connectors.
+    const runtime = parseAdmittedRuntimeRequest(snapshot.runtimeRequest);
+    if (!runtime) {
+      return { source: this.#source, servers: this.#allowedServers(snapshot), unavailable: [] };
     }
-    const servers = await Promise.all(runtime.data.mcpServers
-      .filter((server) => server.enabled && server.trusted)
+    // Each connector opens its own credentials: one that cannot be opened is
+    // unavailable for this turn without blocking healthy connectors or a
+    // request that needs none (H-077).
+    const enabled = runtime.mcpServers.filter((server) => server.enabled && server.trusted);
+    const prepared = await Promise.allSettled(enabled
       .map(async (server): Promise<McpServerSpec> => {
         const credential = await durableMcpCredential(server.credential, server.credentialRef, this.env);
         const environment = await durableMcpEnvironment(server.environment, server.env, this.env);
@@ -239,7 +320,15 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
           ...(credential ? { credential } : {}),
         };
       }));
-    const policy = NetworkPolicySchema.safeParse(runtime.data.networkPolicy);
+    const servers = prepared.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+    const unavailable = prepared.flatMap((result, index) => result.status === "rejected"
+      ? [{
+          id: enabled[index]!.id,
+          name: enabled[index]!.name,
+          reason: `its credentials could not be opened (${(result.reason instanceof Error ? result.reason.message : String(result.reason)).replace(/\s+/g, " ").slice(0, 200)}). An administrator or the connection owner should reconnect it.`,
+        }]
+      : []);
+    const policy = NetworkPolicySchema.safeParse(runtime.networkPolicy);
     const source = new McpToolSource({
       servers: [...servers],
       ...(policy.success ? { networkPolicy: policy.data } : {}),
@@ -250,13 +339,20 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     });
     // Cached, administrator-reviewed schemas are enough for model preparation.
     // McpToolSource connects only when one exposed tool is actually executed.
-    const context = { source, servers };
+    const context = { source, servers, unavailable };
     this.#turnContexts.set(snapshot.id, context);
     return context;
   }
 
   async #searchTools(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
     const context = await this.#context(snapshot);
+    const unavailable = connectorsUnavailableReason(snapshot);
+    if (unavailable && context.servers.length === 0) {
+      throw new Error(`Connectors are unavailable for this message: ${unavailable}`);
+    }
+    if (context.servers.length === 0 && context.unavailable.length > 0) {
+      throw new Error(`Connectors are unavailable for this message: ${context.unavailable.map((server) => `${server.name}: ${server.reason}`).join("; ")}`);
+    }
     const input = record(step.input.arguments) ?? {};
     const query = stringValue(input.query);
     if (!query) throw new Error("tool_search requires a non-empty query describing the connector capability needed");
@@ -277,6 +373,10 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       );
     }
     const connector = exactConnector ?? aliasMatches[0];
+    const lostConnector = connectorId && !connector
+      ? context.unavailable.find((server) => server.id === connectorId || normalizeCatalogIdentity(server.name) === normalizedConnectorId)
+      : undefined;
+    if (lostConnector) throw new Error(`The ${lostConnector.name} connector is unavailable for this message: ${lostConnector.reason}`);
     if (connectorId && !connector) {
       throw new Error(`Unknown or unauthorized connector: ${connectorId}`);
     }
@@ -313,7 +413,10 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       ))
       .map((server) => ({ id: server.id, name: server.name }));
     const content = activatedTools.length > 0
-      ? `Enabled connector tools for the next model call: ${activatedTools.join(", ")}`
+      ? [
+          'Connector tools found. Run one with use_tool: {"tool": "<name>", "arguments": {...}} using arguments that match its input schema.',
+          ...matches.map((tool) => `- ${tool.name}: ${tool.description}\n  input schema: ${JSON.stringify(jsonValue(tool.parameters))}`),
+        ].join("\n")
       : `No authorized connector tools matched that capability. Retry with one connector id from: ${connectorCatalog.map((item) => `${item.id} (${item.name})`).join(", ")}.`;
     return {
       output: {
@@ -395,23 +498,24 @@ function emitMcpLog(level: "debug" | "info" | "warn" | "error", runId?: string):
 type DurableMcpTurnContext = {
   source: McpToolSource;
   servers: readonly McpServerSpec[];
+  /** Enabled connectors whose credentials or environment could not be opened this turn (H-077). */
+  unavailable: readonly { id: string; name: string; reason: string }[];
 };
 
-function durableToolSearchDefinition(servers: readonly McpServerSpec[]): ChatToolDefinition {
-  const catalog = servers.map((server) => `${server.id} (${server.name})`).join(", ");
+/** Stable across turns and tenants: the connector catalog lives in the turn context (H-032). */
+function durableToolSearchDefinition(): ChatToolDefinition {
   return {
     type: "function",
     function: {
       name: "tool_search",
-      description: `Search authorized deferred connector tools by capability. Select a connector when the request uses a paraphrase that may not occur in a tool name. Authorized connectors: ${catalog}. Matching tools become available on the next model call.`,
+      description: "Find connector tools by capability. The connectors this task may use are listed in the turn context. Select a connector when the request uses a paraphrase that may not occur in a tool name. Results give each tool's input schema; run a found tool with use_tool.",
       parameters: {
         type: "object",
         properties: {
           query: { type: "string", minLength: 1 },
           connector: {
             type: "string",
-            enum: servers.map((server) => server.id),
-            description: "Authorized connector id chosen from the catalog in this tool description.",
+            description: "Optional exact connector id from the turn context's connector list.",
           },
           limit: { type: "integer", minimum: 1, maximum: 20 },
         },
@@ -420,6 +524,54 @@ function durableToolSearchDefinition(servers: readonly McpServerSpec[]): ChatToo
       },
     },
   };
+}
+
+function durableUseToolDefinition(): ChatToolDefinition {
+  return {
+    type: "function",
+    function: {
+      name: USE_TOOL_NAME,
+      description: "Run a connector tool that tool_search returned or the turn context lists as ready. Pass its exact name and arguments that match its input schema.",
+      parameters: {
+        type: "object",
+        properties: {
+          tool: { type: "string", minLength: 1, description: "Exact connector tool name, for example mcp__drive__search." },
+          arguments: { type: "object", description: "Arguments matching that tool's input schema." },
+        },
+        required: ["tool", "arguments"],
+        additionalProperties: false,
+      },
+    },
+  };
+}
+
+/** Connector schemas the turn context lists, at most this many characters per turn. */
+const CONNECTOR_CONTEXT_SCHEMA_CHARACTERS = 16_000;
+
+/** True when this conversation already gave the tool's schema (turn context or tool_search). */
+function connectorSchemaGiven(snapshot: DurableTurnSnapshot, toolName: string): boolean {
+  const marker = `- ${toolName}: `;
+  return snapshot.entries.some((entry) => {
+    const payload = record(entry.payload);
+    if (entry.entryType === CONTEXT_ENTRY_TYPE) {
+      const text = typeof payload?.text === "string" ? payload.text : "";
+      return text.includes(marker) && text.includes("input schema");
+    }
+    const message = record(payload?.message);
+    if (message?.role !== "toolResult" || message.toolName !== "tool_search") return false;
+    const text = mcpToolNamesInContent(message.content).includes(toolName) ? JSON.stringify(message.content) : "";
+    return text.includes(marker) && text.includes("input schema");
+  });
+}
+
+/** Why configured connectors could not be prepared for this turn, if they could not (H-050). */
+function connectorsUnavailableReason(snapshot: DurableTurnSnapshot): string | null {
+  if (!Array.isArray(snapshot.runtimeRequest.capabilityNotices)) return null;
+  for (const candidate of snapshot.runtimeRequest.capabilityNotices) {
+    const notice = record(candidate);
+    if (notice?.capability === "connectors" && typeof notice.reason === "string" && notice.reason) return notice.reason;
+  }
+  return null;
 }
 
 function explicitlyMentionedMcpServerIds(
@@ -495,12 +647,13 @@ function mcpToolNamesInContent(content: unknown): string[] {
 }
 
 function deferredMcpToolError(toolName: string): string {
-  return `MCP tool ${toolName} was deferred because its connector schema was not active. The connector is now enabled for the next model call; retry the tool with the provided schema.`;
+  return `MCP tool ${toolName} has not been found in this conversation yet. Call tool_search for it to get its input schema, then run it with use_tool.`;
 }
 
 function isDeferredMcpToolFailure(step: DurableTurnStep, toolName: string): boolean {
   if (step.state !== "failed" || typeof step.error !== "string") return false;
   return step.error === deferredMcpToolError(toolName)
+    || step.error === `MCP tool ${toolName} was deferred because its connector schema was not active. The connector is now enabled for the next model call; retry the tool with the provided schema.`
     || step.error === `MCP tool ${toolName} is deferred. Call tool_search for the required connector capability first.`;
 }
 
@@ -705,6 +858,39 @@ type StagedConnectorArtifact = {
   path: string;
 };
 
+/**
+ * The latest earlier call of the same tool with the same arguments, when it
+ * imported a file that did not reach the sandbox. Its stored receipt holds the
+ * Berry file identity, so staging can be retried without the remote call.
+ */
+function resumableConnectorImport(
+  snapshot: DurableTurnSnapshot,
+  step: DurableTurnStep,
+  toolName: string,
+): { stepId: string; details: unknown } | null {
+  const argumentsKey = canonicalJson(record(step.input.arguments) ?? {});
+  const previous = snapshot.steps
+    .filter((candidate) => candidate.id !== step.id
+      && candidate.sequence < step.sequence
+      && candidate.state === "completed"
+      && (stringValue(candidate.input.toolName) ?? candidate.type.slice(5)) === toolName
+      && canonicalJson(record(candidate.input.arguments) ?? {}) === argumentsKey)
+    .sort((left, right) => left.sequence - right.sequence)
+    .at(-1);
+  const output = record(previous?.output);
+  if (!previous || (output?.stagingStatus !== "pending_verification" && output?.stagingStatus !== "failed")) return null;
+  return connectorArtifact(output.details) ? { stepId: previous.id, details: output.details } : null;
+}
+
+function canonicalJson(value: unknown): string {
+  const canonical = (item: unknown): unknown => Array.isArray(item)
+    ? item.map(canonical)
+    : item !== null && typeof item === "object"
+      ? Object.fromEntries(Object.entries(item as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right)).map(([key, entry]) => [key, canonical(entry)]))
+      : item;
+  return JSON.stringify(canonical(value)) ?? "";
+}
+
 function connectorArtifact(value: unknown): ConnectorArtifact | null {
   const details = record(value);
   const structured = record(details?.structuredContent);
@@ -719,17 +905,26 @@ function connectorArtifact(value: unknown): ConnectorArtifact | null {
 export function connectorArtifactText(
   artifact: ConnectorArtifact,
   staged: StagedConnectorArtifact | undefined,
+  stagingAvailable = true,
+  stagingError?: string,
 ): string {
   const disposition = artifact.library === true
     ? `Saved ${artifact.name} to the Berry Library.`
     : artifact.library === false
       ? `Downloaded ${artifact.name} for temporary use in this task.`
       : `Imported ${artifact.name} into Berry.`;
+  // Without a sandbox path the file is not usable yet; say so explicitly so the
+  // model neither assumes a path nor searches the filesystem for it.
+  const retry = "Call this tool again with the same arguments to stage it: Berry reuses the file it already downloaded and does not download it again.";
   const storage = staged
     ? `Sandbox path: ${staged.path}`
-    : artifact.library === false
-      ? "The file is stored as a task-scoped Berry artifact."
-      : "The file is stored as a Berry artifact.";
+    : !stagingAvailable
+      ? artifact.library === false
+        ? "The file is stored as a task-scoped Berry artifact."
+        : "The file is stored as a Berry artifact."
+      : stagingError
+        ? `Berry could not copy ${artifact.name} (Berry file ${artifact.fileId}) into the sandbox: ${stagingError}. It is not at any sandbox path. ${retry} If it fails again, tell the user the file could not be opened. Do not search the filesystem for it.`
+        : `Berry is still verifying ${artifact.name} (Berry file ${artifact.fileId}), so it is not in the sandbox yet. ${retry} Do not search the filesystem for it.`;
   const persistence = artifact.library === false
     ? "It was not added to the Berry Library or project knowledge."
     : "";
@@ -762,20 +957,89 @@ function jsonValue(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value ?? null)) as JsonValue;
 }
 
+const MCP_MODEL_TEXT_LIMIT = 120_000;
+const CURSOR_KEYS = ["nextPageToken", "nextCursor", "next_cursor", "nextPage", "cursor"] as const;
+
+/**
+ * Bound a tool result for the model without breaking it: JSON stays valid
+ * (the largest top-level list is shortened), top-level fields such as the
+ * next-page cursor are kept, and every cut is disclosed with counts (H-070).
+ */
+export function boundedMcpText(text: string, structured?: unknown, limit = MCP_MODEL_TEXT_LIMIT): string {
+  if (text.length <= limit) return text;
+  const cursor = cursorFrom(structured);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = undefined;
+  }
+  const container = Array.isArray(parsed) ? { items: parsed } : record(parsed);
+  if (container) {
+    const lists = Object.entries(container).filter((entry): entry is [string, unknown[]] => Array.isArray(entry[1]));
+    const [field, items] = lists.sort((left, right) => JSON.stringify(right[1]).length - JSON.stringify(left[1]).length)[0] ?? [];
+    if (field && items) {
+      const render = (kept: number) => JSON.stringify({
+        ...container,
+        [field]: items.slice(0, kept),
+        ...(cursor && !Object.values(container).includes(cursor) ? { nextPageToken: cursor } : {}),
+        berryTruncation: {
+          field,
+          returnedItems: kept,
+          totalItems: items.length,
+          originalCharacters: text.length,
+          note: `Only the first ${kept} of ${items.length} ${field} fit in this result. Request a smaller page or narrower query for the rest; any page cursor above is exact.`,
+        },
+      });
+      let low = 0;
+      let high = items.length;
+      while (low < high) {
+        const middle = Math.ceil((low + high) / 2);
+        if (render(middle).length <= limit) low = middle;
+        else high = middle - 1;
+      }
+      const fitted = render(low);
+      if (fitted.length <= limit) return fitted;
+    }
+  }
+  const marker = `\n[Berry truncated this tool result: showing ${limit.toLocaleString("en-US")} of ${text.length.toLocaleString("en-US")} characters. Request a narrower range or a smaller page.${cursor ? ` Exact next-page cursor: ${cursor}` : ""}]`;
+  return `${text.slice(0, Math.max(0, limit - marker.length))}${marker}`;
+}
+
+function cursorFrom(value: unknown): string | null {
+  const object = record(value);
+  if (!object) return null;
+  for (const key of CURSOR_KEYS) {
+    const cursor = object[key];
+    if (typeof cursor === "string" && cursor.trim()) return cursor;
+  }
+  return null;
+}
+
 const MCP_JOURNAL_STRING_LIMIT = 120_000;
 const MCP_JOURNAL_ARRAY_LIMIT = 256;
 const MCP_JOURNAL_OBJECT_LIMIT = 128;
 const MCP_JOURNAL_DEPTH_LIMIT = 8;
 const MCP_BINARY_FIELD = /^(?:b64_json|base64|blob|bytes|data)$/i;
 
-/** Removes binary MCP payloads and bounds structured metadata before journaling it. */
+/**
+ * Removes binary MCP payloads and bounds structured metadata before journaling
+ * it. Every cut says what was left out, so a bounded record is never read as
+ * the complete response (H-070).
+ */
 export function sanitizeMcpJournalValue(value: unknown, depth = 0): JsonValue {
   if (value === null || typeof value === "boolean" || typeof value === "number") return value;
-  if (typeof value === "string") return value.slice(0, MCP_JOURNAL_STRING_LIMIT);
+  if (typeof value === "string") {
+    return value.length > MCP_JOURNAL_STRING_LIMIT
+      ? `${value.slice(0, MCP_JOURNAL_STRING_LIMIT)}…[Berry kept ${MCP_JOURNAL_STRING_LIMIT.toLocaleString("en-US")} of ${value.length.toLocaleString("en-US")} characters]`
+      : value;
+  }
   if (depth >= MCP_JOURNAL_DEPTH_LIMIT) return "[omitted: MCP metadata nesting limit reached]";
   if (Array.isArray(value)) {
-    return value.slice(0, MCP_JOURNAL_ARRAY_LIMIT)
-      .map((item) => sanitizeMcpJournalValue(item, depth + 1));
+    const kept = value.slice(0, MCP_JOURNAL_ARRAY_LIMIT).map((item) => sanitizeMcpJournalValue(item, depth + 1));
+    return value.length > MCP_JOURNAL_ARRAY_LIMIT
+      ? [...kept, `[Berry omitted ${value.length - MCP_JOURNAL_ARRAY_LIMIT} more of ${value.length} items]`]
+      : kept;
   }
   const object = record(value);
   if (!object) return String(value).slice(0, MCP_JOURNAL_STRING_LIMIT);
@@ -789,13 +1053,19 @@ export function sanitizeMcpJournalValue(value: unknown, depth = 0): JsonValue {
       ...(stringValue(object.uri) ? { uri: stringValue(object.uri)! } : {}),
     };
   }
-  const entries = Object.entries(object).slice(0, MCP_JOURNAL_OBJECT_LIMIT);
-  return Object.fromEntries(entries.map(([key, item]) => [
-    key,
-    MCP_BINARY_FIELD.test(key)
-      ? "[omitted: binary MCP content is not stored in the journal]"
-      : sanitizeMcpJournalValue(item, depth + 1),
-  ]));
+  const allEntries = Object.entries(object);
+  const entries = allEntries.slice(0, MCP_JOURNAL_OBJECT_LIMIT);
+  return Object.fromEntries([
+    ...entries.map(([key, item]) => [
+      key,
+      MCP_BINARY_FIELD.test(key)
+        ? "[omitted: binary MCP content is not stored in the journal]"
+        : sanitizeMcpJournalValue(item, depth + 1),
+    ]),
+    ...(allEntries.length > MCP_JOURNAL_OBJECT_LIMIT
+      ? [["berryOmittedFields", `${allEntries.length - MCP_JOURNAL_OBJECT_LIMIT} more of ${allEntries.length} fields`]]
+      : []),
+  ]);
 }
 
 function compactMcpAnnotations(value: {

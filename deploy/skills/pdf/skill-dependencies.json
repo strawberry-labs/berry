@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "entryPoints": {
+    "scripts/create_aesg_pdf.py": {
+      "requires": [
+        {
+          "skill": "aesg-branding",
+          "resources": ["scripts/office_converter.py"]
+        },
+        {
+          "skill": "docx",
+          "resources": ["scripts/create_aesg_docx.py"]
+        }
+      ]
+    }
+  }
+}

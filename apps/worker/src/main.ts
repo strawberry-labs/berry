@@ -53,6 +53,14 @@ import {
   ActiveTurnCancellationRegistry,
   TurnCancellationSubscriber,
 } from "./turn-cancellation.ts";
+import { createEmailSender, emailConfigFromEnv } from "./email.ts";
+import {
+  ProviderCreditAlertProcessor,
+  SqlProviderCreditAlertSink,
+  SqlProviderCreditAlertStore,
+  providerCreditAlertDefaultsFromEnv,
+} from "./provider-credit-alerts.ts";
+import { ProviderBalanceChecker, providerBalanceConfigFromEnv } from "./provider-balance.ts";
 
 export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const configuredProcess = workerProcessConfigFromEnv(env);
@@ -86,6 +94,14 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
     ...(env.BERRY_BACKGROUND_QUEUE_NAME?.trim() ? { backgroundQueueName: env.BERRY_BACKGROUND_QUEUE_NAME.trim() } : {}),
     ...(env.BERRY_LEGACY_QUEUE_NAME?.trim() ? { legacyQueueName: env.BERRY_LEGACY_QUEUE_NAME.trim() } : {}),
   });
+  // Administrator email (H-005). With BERRY_EMAIL_PROVIDER=none nothing below is
+  // created, so runs raise no alerts and no balance checks are scheduled.
+  const emailConfig = emailConfigFromEnv(env);
+  if (emailConfig.problem) console.warn(`[berry-worker] ${emailConfig.problem}`);
+  const emailSender = createEmailSender(emailConfig.config);
+  const providerCreditDefaults = providerCreditAlertDefaultsFromEnv(env);
+  const providerCreditAlerts = emailSender ? new SqlProviderCreditAlertSink(executor, providerCreditDefaults) : undefined;
+  const providerBalanceConfig = providerBalanceConfigFromEnv(env);
   const documentExtractor = new DocumentExtractor(durableConfig.tikaUrl, {
     timeoutMs: 60_000,
     maxInputBytes: durableConfig.knowledgeMaxInputBytes,
@@ -102,6 +118,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
       maxInputBytes: durableConfig.sandboxInputMaxBytes,
       documentTextExtractor: (input) => documentExtractor.extract(input),
       enableTerminalFinalization: env.BERRY_TERMINAL_FINALIZATION_ENABLED?.trim().toLowerCase() === "true",
+      ...(providerCreditAlerts ? { providerCreditAlerts } : {}),
       ...(env.BERRY_ROUTER_INFERENCE_BASE_URL?.trim() && env.BERRY_ROUTER_IMAGE_MODEL?.trim()
         ? {
             imageGeneration: {
@@ -160,7 +177,24 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
   const dependencies: Parameters<typeof createBerryWorker>[0] = {
     titles: new SqlTaskTitleRepository(executor),
     usage: new SqlUsageRollupRepository(executor),
-    management: new SqlManagementJobRepository(executor),
+    management: new SqlManagementJobRepository(executor, { email: emailSender }),
+    ...(emailSender && providerCreditAlerts ? {
+      providerCreditAlerts: new ProviderCreditAlertProcessor({
+        store: new SqlProviderCreditAlertStore(executor),
+        sender: emailSender,
+        workerRole,
+        sourceRevision,
+      }),
+      providerBalance: new ProviderBalanceChecker({
+        executor,
+        env,
+        sink: providerCreditAlerts,
+        config: providerBalanceConfig,
+        defaults: providerCreditDefaults,
+        workerRole,
+        sourceRevision,
+      }),
+    } : {}),
     knowledge,
     memory: new MemoryProcessor(
       memoryRepository,
@@ -204,6 +238,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
         cancellations: turnCancellations,
         workerRole,
         sourceRevision,
+        ...(providerCreditAlerts ? { providerCreditAlerts } : {}),
       },
     ),
     snapshotter: sandboxContinuity,
@@ -266,6 +301,9 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
         pollMs: positiveInteger(env.BERRY_OUTBOX_POLL_MS) ?? 250,
         enableWaitExpiry: env.BERRY_WAIT_EXPIRY_ENABLED?.trim().toLowerCase() === "true",
         enableTerminalFinalization: env.BERRY_TERMINAL_FINALIZATION_ENABLED?.trim().toLowerCase() === "true",
+        ...(emailSender && providerBalanceConfig.intervalMs > 0
+          ? { providerBalanceCheckIntervalMs: providerBalanceConfig.intervalMs }
+          : {}),
       });
   await Promise.all([
     executor.query("SELECT 1"),

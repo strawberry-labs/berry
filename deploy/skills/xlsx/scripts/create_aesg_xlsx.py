@@ -26,6 +26,8 @@ PURPLE = "6D2077"
 RED = "DA291C"
 YELLOW = "FFC72C"
 FONT = "Verdana"
+MAX_COLUMN_WIDTH = 100
+MAX_ROW_HEIGHT = 409  # Excel's row height limit, in points
 
 
 def normalise_columns(spec: dict) -> list[dict]:
@@ -60,6 +62,22 @@ def add_logo(worksheet, branding_skill_dir: Path) -> None:
         logo.height = 37.5
         worksheet.add_image(logo, "A1")
     worksheet.row_dimensions[1].height = 34
+
+
+def wrapped_lines(value, width: float, characters_per_width: float) -> int:
+    """Lines a wrapped text cell needs; errs towards more lines so text is not clipped."""
+    if value is None or isinstance(value, (int, float)) or str(value).startswith("="):
+        return 1
+    per_line = max(1, int(width * characters_per_width))
+    return sum(max(1, -(-len(line) // per_line)) for line in str(value).splitlines() or [""])
+
+
+def fitted_height(lines: int, line_points: float, minimum: float, label: str, warnings: list[str]) -> float:
+    height = max(minimum, lines * line_points + 6)
+    if height > MAX_ROW_HEIGHT:
+        warnings.append(f"{label} needs about {height:.0f} points but Excel rows stop at {MAX_ROW_HEIGHT}; split the text or widen the column so it is not clipped.")
+        return MAX_ROW_HEIGHT
+    return height
 
 
 def row_value(row, column: dict, column_index: int, row_index: int):
@@ -105,7 +123,8 @@ def add_chart(worksheet, spec: dict, columns: list[dict], end_row: int):
     return max(len(columns), 8), end_row + 18
 
 
-def build_sheet(workbook: Workbook, worksheet, spec: dict, sheet_index: int, branding_skill_dir: Path) -> None:
+def build_sheet(workbook: Workbook, worksheet, spec: dict, sheet_index: int, branding_skill_dir: Path) -> list[str]:
+    warnings: list[str] = []
     columns = normalise_columns(spec)
     rows = list(spec.get("rows", []))
     worksheet.title = str(spec.get("sheet", f"Sheet {sheet_index}"))[:31]
@@ -123,19 +142,30 @@ def build_sheet(workbook: Workbook, worksheet, spec: dict, sheet_index: int, bra
     worksheet.row_dimensions[2].height = 30
 
     thin_gray = Side(style="thin", color="D9D9D9")
+    widths: list[float] = []
+    header_lines = 1
     for column_index, column in enumerate(columns, start=1):
-        cell = worksheet.cell(3, column_index, str(column.get("label", column["key"])))
+        label = str(column.get("label", column["key"]))
+        cell = worksheet.cell(3, column_index, label)
         cell.fill = PatternFill("solid", fgColor=GRAY)
         cell.font = Font(name=FONT, size=10, bold=True, color=WHITE)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = Border(bottom=thin_gray)
-        width = min(max(float(column.get("width", 18)), 8), 45)
+        requested = float(column.get("width", 18))
+        width = min(max(requested, 8), MAX_COLUMN_WIDTH)
+        if width != requested:
+            warnings.append(f"{worksheet.title}: column {label!r} width {requested:g} was set to {width:g} (allowed 8-{MAX_COLUMN_WIDTH}).")
+        widths.append(width)
         worksheet.column_dimensions[get_column_letter(column_index)].width = width
-    worksheet.row_dimensions[3].height = 24.75
+        header_lines = max(header_lines, wrapped_lines(label, width, 0.8))
+    # Rows are sized to their wrapped text; a fixed height clipped long comments (H-059).
+    worksheet.row_dimensions[3].height = fitted_height(header_lines, 13, 24.75, f"{worksheet.title}: header row", warnings)
 
     for row_index, row in enumerate(rows, start=4):
+        lines = 1
         for column_index, column in enumerate(columns, start=1):
             value = row_value(row, column, column_index, row_index)
+            lines = max(lines, wrapped_lines(value, widths[column_index - 1], 0.85))
             cell = worksheet.cell(row_index, column_index, value)
             cell.font = Font(name=FONT, size=9, color=GRAY)
             cell.alignment = Alignment(
@@ -146,7 +176,7 @@ def build_sheet(workbook: Workbook, worksheet, spec: dict, sheet_index: int, bra
             cell.border = Border(bottom=thin_gray)
             if column.get("format"):
                 cell.number_format = str(column["format"])
-        worksheet.row_dimensions[row_index].height = 19.5
+        worksheet.row_dimensions[row_index].height = fitted_height(lines, 12, 19.5, f"{worksheet.title}: row {row_index}", warnings)
 
     end_row = 3 + len(rows)
     if rows:
@@ -194,6 +224,47 @@ def build_sheet(workbook: Workbook, worksheet, spec: dict, sheet_index: int, bra
     worksheet.oddFooter.center.text = "AESG | &P of &N"
     worksheet.oddFooter.center.font = f"{FONT},Regular"
     worksheet.oddFooter.center.size = 7
+    return warnings
+
+
+def load_spec(path: Path) -> dict:
+    """Read the JSON spec, refusing a key repeated inside one object.
+
+    json.loads keeps only the last of two equal keys, so a second "paragraphs"
+    once dropped the opening of a published document without any error (H-056).
+    """
+    repeated: dict[int, tuple[dict, list[str]]] = {}
+
+    def keep_pairs(pairs: list[tuple[str, object]]) -> dict:
+        mapping: dict = {}
+        for key, value in pairs:
+            if key in mapping:
+                repeated.setdefault(id(mapping), (mapping, []))[1].append(key)
+            mapping[key] = value
+        return mapping
+
+    spec = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=keep_pairs)
+    if repeated:
+        found: list[str] = []
+
+        def visit(value: object, where: str) -> None:
+            if isinstance(value, dict):
+                found.extend(f'"{key}" in {where}' for key in repeated.get(id(value), ({}, []))[1])
+                for key, child in value.items():
+                    visit(child, f"{where}.{key}")
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    visit(child, f"{where}[{index}]")
+
+        visit(spec, "spec")
+        raise ValueError(
+            f"{path} repeats {', '.join(found)}. JSON keeps only the last value, so the "
+            "earlier content would be silently lost. Put all of it under one key, in "
+            "reading order, and run again; nothing was written."
+        )
+    if not isinstance(spec, dict):
+        raise ValueError(f"{path} must contain one JSON object")
+    return spec
 
 
 def main() -> int:
@@ -204,17 +275,18 @@ def main() -> int:
     args = parser.parse_args()
     if args.output.suffix.casefold() != ".xlsx":
         raise ValueError("--output must end in .xlsx")
-    spec = json.loads(args.spec.read_text(encoding="utf-8"))
+    spec = load_spec(args.spec)
     sheet_specs = spec.get("sheets") or [spec]
     if not isinstance(sheet_specs, list) or not sheet_specs:
         raise ValueError("spec.sheets must be a non-empty list")
 
     workbook = Workbook()
+    warnings: list[str] = []
     for index, sheet_spec in enumerate(sheet_specs, start=1):
         worksheet = workbook.active if index == 1 else workbook.create_sheet()
         combined = dict(sheet_spec)
         combined.setdefault("title", spec.get("title", combined.get("sheet", "AESG workbook")))
-        build_sheet(workbook, worksheet, combined, index, args.branding_skill_dir)
+        warnings.extend(build_sheet(workbook, worksheet, combined, index, args.branding_skill_dir))
     workbook.calculation.fullCalcOnLoad = True
     workbook.calculation.forceFullCalc = True
     workbook.calculation.calcMode = "auto"
@@ -231,6 +303,7 @@ def main() -> int:
                 "output": str(args.output.resolve()),
                 "bytes": args.output.stat().st_size,
                 "sheets": workbook.sheetnames,
+                **({"warnings": warnings} if warnings else {}),
             }
         )
     )

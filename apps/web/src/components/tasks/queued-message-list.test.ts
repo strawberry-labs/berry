@@ -1,10 +1,15 @@
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import type { QueuedFollowUp } from "@/lib/queued-follow-ups";
+import type { ServerQueuedFollowUp } from "@berry/shared";
+import { nextQueuedFollowUp, serverQueuedFollowUpToClient, type QueuedFollowUp } from "@/lib/queued-follow-ups";
 import {
   QUEUE_ROW_PRESENCE_MS,
+  QueuedMessageList,
   mergeQueuePresentationRows,
   queuedActionLabel,
   reorderQueuedFollowUps,
+  reorderableFollowUps,
 } from "./queued-message-list.tsx";
 
 function followUp(id: string): QueuedFollowUp {
@@ -45,5 +50,58 @@ describe("queued message presentation", () => {
     expect(queuedActionLabel({ active: true, failed: false })).toBe("Steer");
     expect(queuedActionLabel({ active: false, failed: false })).toBe("Send now");
     expect(queuedActionLabel({ active: true, failed: true })).toBe("Retry");
+  });
+
+  it("shows expired text as not sent, with Copy and Remove but no send, edit or reorder (H-015)", () => {
+    const expired = { ...followUp("item-1"), status: "expired" as const, error: "This queued follow-up expired" };
+    const pending = followUp("item-2");
+    const noop = async () => undefined;
+    const html = renderToStaticMarkup(createElement(QueuedMessageList, {
+      followUps: [expired, pending],
+      active: false,
+      onRemove: noop,
+      onRetry: noop,
+      onReorder: () => undefined,
+      onSendNow: noop,
+      onEdit: () => undefined,
+      onResume: noop,
+    }));
+    const [expiredRow, pendingRow] = html.split('role="listitem"').slice(1);
+
+    expect(expiredRow).toContain("Expired, not sent");
+    expect(expiredRow).toContain("Copy");
+    expect(expiredRow).toContain("Remove expired message Queued message item-1");
+    expect(expiredRow).not.toContain("Send now");
+    expect(expiredRow).not.toContain("draggable");
+    expect(pendingRow).toContain("Send now");
+    expect(reorderableFollowUps([expired, pending]).map((item) => item.id)).toEqual(["item-2"]);
+  });
+
+  it("keeps expired server items expired and never delivers them (H-015)", () => {
+    const server: ServerQueuedFollowUp = {
+      id: "00000000-0000-7000-8000-000000000011",
+      workspaceId: "00000000-0000-7000-8000-000000000012",
+      taskId: "00000000-0000-7000-8000-000000000013",
+      sessionId: "00000000-0000-7000-8000-000000000014",
+      creatorUserId: "00000000-0000-7000-8000-000000000015",
+      ownerUserId: "00000000-0000-7000-8000-000000000015",
+      ordinal: 0,
+      input: "Send the revised schedule",
+      attachments: [],
+      status: "expired",
+      idempotencyKey: "queue-1",
+      deliveryKey: null,
+      attemptCount: 0,
+      error: "This queued follow-up expired",
+      expiresAt: "2026-10-14T00:00:00.000Z",
+      createdAt: "2026-10-13T00:00:00.000Z",
+      updatedAt: "2026-10-14T00:00:00.000Z",
+      deliveredAt: null,
+    };
+    const expired = serverQueuedFollowUpToClient(server);
+    expect(expired.status).toBe("expired");
+    const pending = followUp("item-2");
+    expect(nextQueuedFollowUp([expired])).toBeNull();
+    expect(nextQueuedFollowUp([expired, pending])?.id).toBe("item-2");
   });
 });

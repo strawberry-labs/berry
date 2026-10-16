@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
 import re
 import sys
 import tempfile
@@ -20,8 +21,33 @@ from pathlib import Path
 from lxml import etree
 
 
-BRANDING_SCRIPTS = Path(__file__).resolve().parents[2] / "aesg-branding" / "scripts"
+def branding_scripts_dir() -> Path:
+    """Resolve the activated aesg-branding scripts directory.
+
+    Runtime skills are mounted as unrelated sibling directories, so prefer an
+    explicit --branding-skill-dir (or AESG_BRANDING_SKILL_DIR) and fall back to
+    the repository layout.
+    """
+
+    candidates = []
+    if "--branding-skill-dir" in sys.argv:
+        index = sys.argv.index("--branding-skill-dir")
+        if index + 1 < len(sys.argv):
+            candidates.append(Path(sys.argv[index + 1]) / "scripts")
+    if os.environ.get("AESG_BRANDING_SKILL_DIR"):
+        candidates.append(Path(os.environ["AESG_BRANDING_SKILL_DIR"]) / "scripts")
+    candidates.append(Path(__file__).resolve().parents[2] / "aesg-branding" / "scripts")
+    for candidate in candidates:
+        if (candidate / "report_structure.py").is_file():
+            return candidate
+    raise FileNotFoundError(
+        "aesg-branding scripts were not found; pass --branding-skill-dir <aesg-branding-skill-directory>"
+    )
+
+
+BRANDING_SCRIPTS = branding_scripts_dir()
 sys.path.insert(0, str(BRANDING_SCRIPTS))
+from report_structure import transform_numbering, transform_settings  # noqa: E402
 from normalise_office_templates import (  # noqa: E402
     normalise_document_part,
     normalise_docx_styles,
@@ -163,6 +189,8 @@ def set_paragraph_contract(
     elif not keep_next and keep is not None:
         ppr.remove(keep)
     if keep_next:
+        # A direct numPr can point at a legacy list; headings take numbering
+        # from their Heading style and captions are never numbered lists.
         numbering = ppr.find(W("numPr"))
         if numbering is not None:
             ppr.remove(numbering)
@@ -186,6 +214,16 @@ def suppress_style_numbering(paragraph) -> None:
     ilvl.set(W("val"), "0")
     num_id = ensure_child(numbering, "numId")
     num_id.set(W("val"), "0")
+    # Without a number the heading style's hanging indent would wrap the
+    # label's second line under an empty number column.
+    indent = ensure_child(ppr, "ind")
+    for attribute in list(indent.attrib):
+        indent.attrib.pop(attribute)
+    indent.set(W("left"), "0")
+    indent.set(W("firstLine"), "0")
+    from report_structure import PPR_ORDER, reorder  # noqa: PLC0415
+
+    reorder(ppr, PPR_ORDER)
 
 
 def clean_source_tokens(root) -> None:
@@ -384,12 +422,15 @@ def normalise_report_content(root) -> None:
         if has_textbox_ancestor(paragraph) or has_table_ancestor(paragraph):
             continue
         sid = style_id(paragraph).casefold()
-        if "mainheading" in sid or sid in {"heading1", "title", "reporttitlecoverpage"}:
+        line = 276
+        if sid in {"title", "reporttitlecoverpage"}:
             size, before, after = 44, 200, 0
+        elif "mainheading" in sid or sid == "heading1":
+            size, before, after, line = 28, 280, 280, 240
         elif "subh1" in sid or sid == "heading2":
-            size, before, after = 32, 80, 0
+            size, before, after, line = 24, 240, 240, 240
         elif any(token in sid for token in ("h2", "subh2", "subh3", "heading3")):
-            size, before, after = 28, 80, 0
+            size, before, after, line = 22, 220, 220, 240
         elif "tablecaption" in sid:
             size, before, after = 18, 0, 0
         elif "figurecaptions" in sid or sid == "caption":
@@ -404,7 +445,7 @@ def normalise_report_content(root) -> None:
             else BODY_COLOR,
             before=before,
             after=after,
-            line=276,
+            line=line,
             keep_next=size > BODY_SIZE or "caption" in sid,
             bold=None,
         )
@@ -478,6 +519,8 @@ def repair_report(path: Path) -> None:
     transforms: dict[str, callable] = {
         "word/document.xml": transform_document,
         "word/styles.xml": lambda data: normalise_docx_styles(data, report=True),
+        "word/numbering.xml": transform_numbering,
+        "word/settings.xml": transform_settings,
         "word/theme/theme1.xml": normalise_theme_fonts,
     }
     for name in stories:
@@ -485,16 +528,127 @@ def repair_report(path: Path) -> None:
     replace_zip_members(path, transforms)
 
 
+def add_missing_table_of_contents(path: Path, *, paginate: bool = True) -> bool:
+    """Insert a native TOC for existing headings when the report has none."""
+
+    from docx import Document  # noqa: PLC0415
+
+    scripts_dir = str(Path(__file__).resolve().parent)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import create_aesg_docx as generator  # noqa: PLC0415
+
+    document = Document(path)
+    has_toc = bool(document.element.xpath('.//w:instrText[contains(., "TOC ")]'))
+
+    def heading_level(paragraph) -> int | None:
+        style = paragraph.style
+        while style is not None:
+            if style.style_id in {"Heading1", "Heading2", "Heading3"}:
+                return int(style.style_id[-1])
+            style = style.base_style
+        return None
+
+    headings = [
+        (paragraph, heading_level(paragraph))
+        for paragraph in document.paragraphs
+        if paragraph.text.strip() and heading_level(paragraph)
+    ]
+    if not headings:
+        return False
+    # Divider titles live in text boxes, which document.paragraphs skips.
+    dividers = document.element.body.xpath(
+        './/w:p[w:pPr/w:pStyle[@w:val="AESGDividerHeading"]]'
+    )
+    structure = generator.ReportStructure(document)
+    entries_by_text: dict[str, dict] = {}
+    for paragraph, level in headings:
+        numbering = paragraph._p.find(f"{W('pPr')}/{W('numPr')}/{W('numId')}")
+        numbered = numbering is None or numbering.get(W("val")) != "0"
+        entry = structure.reserve_heading(level, numbered)
+        entry["text"] = paragraph.text.strip()
+        entries_by_text.setdefault(" ".join(entry["text"].split()).casefold(), entry)
+    # Legacy dividers counted on their own list (chapter 6 read "2.").
+    for divider in dividers:
+        title = " ".join(paragraph_text(divider).split())
+        title = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", title).casefold()
+        entry = entries_by_text.get(title)
+        if entry is None:
+            continue
+        entry["divider"] = True
+        for node in divider.xpath('./w:r[w:t]'):
+            text = node.find(W("t"))
+            if text is not None and re.fullmatch(r"\s*\d+(?:\.\d+)*\.?\s*", text.text or ""):
+                divider.remove(node)
+        generator.number_divider([divider.getparent()], entry)
+    if has_toc or len(headings) < 2:
+        document.save(path)
+        return False
+    for paragraph, _level in headings:
+        entry = next(item for item in structure.headings if item.get("text") == paragraph.text.strip() and "placed" not in item)
+        entry["placed"] = True
+        start = etree.Element(W("bookmarkStart"))
+        start.set(W("id"), entry["bookmarkId"])
+        start.set(W("name"), entry["bookmark"])
+        properties = paragraph._p.find(W("pPr"))
+        if properties is not None:
+            properties.addnext(start)
+        else:
+            paragraph._p.insert(0, start)
+        end = etree.Element(W("bookmarkEnd"))
+        end.set(W("id"), entry["bookmarkId"])
+        paragraph._p.append(end)
+
+    # Put the TOC at the start of the content section, after any cover or
+    # approval section break, so it never lands between a divider and its
+    # heading.
+    body = document.element.body
+    first = headings[0][0]._p
+    anchor = first
+    node = first.getprevious()
+    while node is not None:
+        if node.find(f"{W('pPr')}/{W('sectPr')}") is not None:
+            anchor = node.getnext()
+            break
+        anchor = node
+        node = node.getprevious()
+    placeholder = etree.Element(W("p"))
+    anchor.addprevious(placeholder)
+    page_break = etree.Element(W("p"))
+    run = etree.SubElement(page_break, W("r"))
+    etree.SubElement(run, W("br")).set(W("type"), "page")
+    anchor.addprevious(page_break)
+    structure.toc_placeholder = placeholder
+    generator.insert_table_of_contents(document, structure, generator.TOC_TITLE)
+    if body.sectPr is None:
+        return False
+    document.save(path)
+    paginated = paginate and generator.paginate_table_of_contents(
+        path, structure.headings, generator.TOC_TITLE
+    )
+    if not paginated:
+        from report_structure import enable_field_update_in_package  # noqa: PLC0415
+
+        enable_field_update_in_package(path)
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--branding-skill-dir",
+        type=Path,
+        help="activated aesg-branding skill directory (resolved before import)",
+    )
     args = parser.parse_args()
     if args.input.suffix.casefold() != ".docx" or args.output.suffix.casefold() != ".docx":
         raise ValueError("--input and --output must be .docx files")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(args.input.read_bytes())
     repair_report(args.output)
+    add_missing_table_of_contents(args.output)
     print(f"repaired AESG report: {args.output.resolve()}")
     return 0
 

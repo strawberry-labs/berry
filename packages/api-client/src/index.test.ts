@@ -328,6 +328,134 @@ describe("BerryApiClient", () => {
     expect(fetchImpl).toHaveBeenNthCalledWith(2, "https://api.berry.test/v1/tasks/page?workspaceKind=general&limit=100&taskIds=task_1%2Ctask_2", expect.objectContaining({ method: "GET" }));
   });
 
+  it("sends each task creation once and lets the caller resubmit with the same key (H-035)", async () => {
+    const key = "8a7b6c5d-4e3f-4a2b-9c1d-0e9f8a7b6c5d";
+    const request = { workspaceKind: "general", title: "General task" } as const;
+    const fetchImpl = vi.fn()
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce(new Response("Bad gateway", { status: 502, headers: { "content-type": "text/plain" } }))
+      .mockResolvedValueOnce(json(createdTaskBody()));
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl });
+
+    // An unknown outcome is reported, not repeated: the client cannot know
+    // that the API receiving a repeat stores keys.
+    await expect(client.createTask(request, { idempotencyKey: key })).rejects.toThrow("Failed to fetch");
+    await expect(client.createTask(request, { idempotencyKey: key })).rejects.toMatchObject({ status: 502 });
+    // Sending the same submission again reuses its key, so an API that stores
+    // keys returns the task the first request created.
+    await expect(client.createTask(request, { idempotencyKey: key })).resolves.toMatchObject({ task: { id: "task_1" }, session: { id: "session_1" } });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(fetchImpl.mock.calls.map(([, init]) => idempotencyKeyOf(init))).toEqual([key, key, key]);
+    expect(fetchImpl.mock.calls.map(([, init]) => init.body)).toEqual(Array(3).fill(JSON.stringify(request)));
+  });
+
+  it("sends a cancelled task creation once", async () => {
+    const controller = new AbortController();
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      controller.abort();
+      throw init?.signal?.reason ?? new DOMException("Request aborted", "AbortError");
+    });
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(client.createTask({ title: "Cancelled" }, { signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not repeat a lost task creation to an older API", async () => {
+    vi.useFakeTimers();
+    try {
+      // An older API ignores Idempotency-Key: it commits the task and the
+      // response is lost; a repeat would create a second task.
+      let creations = 0;
+      const fetchImpl = vi.fn(async () => {
+        creations += 1;
+        throw new TypeError("Failed to fetch");
+      });
+      const client = new BerryApiClient({ baseUrl: "https://old-api.invalid", fetchImpl: fetchImpl as unknown as typeof fetch });
+      const result = client.createTask({ title: "Same task" }, { idempotencyKey: "8a7b6c5d-4e3f-4a2b-9c1d-0e9f8a7b6c5d" });
+      const settled = expect(result).rejects.toThrow("Failed to fetch");
+      await vi.advanceTimersByTimeAsync(5_000);
+      await settled;
+      expect(creations).toBe(1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  describe("a lost task creation after an API advertised idempotency", () => {
+    const key = "8a7b6c5d-4e3f-4a2b-9c1d-0e9f8a7b6c5d";
+    /** What one createTask call reports after its first response is lost. */
+    const createAndLoseResponse = async (fetchImpl: typeof fetch): Promise<string> => {
+      vi.useFakeTimers();
+      try {
+        const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl });
+        await client.listTaskPage();
+        const result = client.createTask({ title: "Same task" }, { idempotencyKey: key }).then(
+          () => "created",
+          (error: unknown) => error instanceof TypeError ? error.message : String(error),
+        );
+        await vi.advanceTimersByTimeAsync(5_000);
+        return await result;
+      } finally { vi.useRealTimers(); }
+    };
+
+    it("creates at most one task when the API was rolled back after advertising it", async () => {
+      let accepted = 0;
+      const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method !== "POST") return json({ items: [], nextCursor: null, hasMore: false }, IDEMPOTENT_API);
+        // The API is now an older release that ignores Idempotency-Key. It
+        // stores the task, and the first response is lost.
+        accepted += 1;
+        if (accepted === 1) throw new TypeError("Failed to fetch");
+        return json(createdTaskBody());
+      }) as unknown as typeof fetch;
+
+      const reported = await createAndLoseResponse(fetchImpl);
+      expect({ accepted, reported }).toEqual({ accepted: 1, reported: "Failed to fetch" });
+    });
+
+    it("creates at most one task when instances of different versions answer", async () => {
+      // The advertisement and any repeat reach an instance that stores keys;
+      // the first creation reaches an older instance that does not.
+      let accepted = 0;
+      const storedKeys = new Set<string>();
+      const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method !== "POST") return json({ items: [], nextCursor: null, hasMore: false }, IDEMPOTENT_API);
+        const posted = idempotencyKeyOf(init);
+        if (accepted === 0) {
+          accepted += 1;
+          throw new TypeError("Failed to fetch");
+        }
+        if (!posted || !storedKeys.has(posted)) {
+          accepted += 1;
+          if (posted) storedKeys.add(posted);
+        }
+        return json(createdTaskBody(), IDEMPOTENT_API);
+      }) as unknown as typeof fetch;
+
+      const reported = await createAndLoseResponse(fetchImpl);
+      expect({ accepted, reported }).toEqual({ accepted: 1, reported: "Failed to fetch" });
+    });
+  });
+
+  it("gives each new submission its own key and does not retry definitive rejections (H-035)", async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(json(createdTaskBody()))
+      .mockResolvedValueOnce(json(createdTaskBody()))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: "idempotency_key_reused" }), { status: 409, headers: { "content-type": "application/json" } }));
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl });
+
+    await client.createTask({ title: "Same prompt" });
+    await client.createTask({ title: "Same prompt" });
+    await expect(client.createTask({ title: "Same prompt" }, { idempotencyKey: "8a7b6c5d-4e3f-4a2b-9c1d-0e9f8a7b6c5d" }))
+      .rejects.toMatchObject({ status: 409, body: { code: "idempotency_key_reused" } });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    const [first, second] = fetchImpl.mock.calls.map(([, init]) => idempotencyKeyOf(init));
+    expect(first).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(second).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(second).not.toBe(first);
+  });
+
   it("supports cancellable cursor pages for enterprise management collections", async () => {
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
       if (String(input).includes("/members/page")) {
@@ -941,6 +1069,7 @@ describe("BerryApiClient", () => {
     const fileId = "00000000-0000-7000-8000-000000000101";
     const uploadId = "00000000-0000-7000-8000-000000000102";
     const taskId = "00000000-0000-7000-8000-000000000103";
+    let firstPartAttempts = 0;
     const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/v1/files/uploads")) return json({ fileId, uploadId, partSize: 3, partCount: 2, expiresAt: "2026-07-22T10:00:00.000Z" });
@@ -948,6 +1077,7 @@ describe("BerryApiClient", () => {
         return json({ parts: [{ partNumber: 1, url: "https://files.berry.test/part-1" }, { partNumber: 2, url: "https://files.berry.test/part-2" }] });
       }
       if (url.startsWith("https://files.berry.test/part-")) {
+        if (url.endsWith("1") && firstPartAttempts++ === 0) return new Response(null, { status: 503 });
         const part = url.endsWith("1") ? "1" : "2";
         return new Response(null, { status: 200, headers: { etag: `\"etag-${part}\"` } });
       }
@@ -971,7 +1101,8 @@ describe("BerryApiClient", () => {
     const initiate = fetchImpl.mock.calls.find(([url]) => String(url).endsWith("/v1/files/uploads"));
     expect(initiate?.[1]).toMatchObject({ method: "POST", body: JSON.stringify({ name: "report.pdf", mediaType: "application/pdf", size: 6, taskId }) });
     const partPuts = fetchImpl.mock.calls.filter(([url]) => String(url).startsWith("https://files.berry.test/part-"));
-    expect(partPuts).toHaveLength(2);
+    expect(partPuts).toHaveLength(3);
+    expect(partPuts.filter(([url]) => String(url).endsWith("part-2"))).toHaveLength(1);
     expect(partPuts.every(([, init]) => init?.body instanceof Blob)).toBe(true);
     expect(Math.max(...progress)).toBe(6);
     expect(JSON.stringify(fetchImpl.mock.calls.filter(([url]) => String(url).startsWith("https://api.berry.test")))).not.toContain("data:");
@@ -1061,8 +1192,46 @@ describe("BerryApiClient", () => {
   });
 });
 
-function json(body: unknown): Response {
-  return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
+it("does not initiate an already cancelled upload", async () => {
+  const fetchImpl = vi.fn(); const controller = new AbortController(); controller.abort();
+  const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl });
+  await expect(client.uploadFile(new File(["abc"], "file.txt"), { signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
+  expect(fetchImpl).not.toHaveBeenCalled();
+});
+it("cleans up when signing fails before any parts are sent", async () => {
+  const fileId = "00000000-0000-7000-8000-000000000101", uploadId = "00000000-0000-7000-8000-000000000102";
+  const fetchImpl = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+    if (String(url).endsWith("/uploads")) return json({ fileId, uploadId, partSize: 3, partCount: 1, expiresAt: "2026-07-22T10:00:00.000Z" });
+    if (init?.method === "DELETE") return json({ ok: true });
+    return new Response(null, { status: 503 });
+  });
+  const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl });
+  await expect(client.uploadFile(new File(["abc"], "file.txt"))).rejects.toMatchObject({ status: 503 });
+  expect(fetchImpl).toHaveBeenLastCalledWith(expect.stringContaining(uploadId), expect.objectContaining({ method: "DELETE" }));
+});
+
+function json(body: unknown, headers: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(body), { headers: { "content-type": "application/json", ...headers } });
+}
+
+/** A capability advertisement on an earlier response. It cannot show that the API receiving a later request stores keys. */
+const IDEMPOTENT_API = { "Berry-Capabilities": "task-creation-idempotency" };
+
+function createdTaskBody() {
+  const createdAt = "2026-07-20T00:00:00.000Z";
+  return {
+    task: {
+      id: "task_1", workspaceId: "general_1", title: "General task", status: "queued", activeSessionId: "session_1",
+      conversationKind: "chat", pinned: false, archived: false,
+      deletedAt: null, unreadAt: null, lastReadAt: null, worktreePath: null, worktreeBranch: null, worktreeBaseRef: null,
+      worktreeBaseSha: null, pullRequestUrl: null, pullRequestNumber: null, createdAt, updatedAt: createdAt,
+    },
+    session: { id: "session_1", taskId: "task_1", parentSessionId: null, status: "active", modelProviderId: null, model: null, permissionMode: "full-access", createdAt, updatedAt: createdAt },
+  };
+}
+
+function idempotencyKeyOf(init: RequestInit | undefined): string | null {
+  return new Headers(init?.headers).get("Idempotency-Key");
 }
 
 function auditIngest() {

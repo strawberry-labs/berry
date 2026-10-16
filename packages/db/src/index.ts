@@ -428,12 +428,19 @@ export const tasks = pgTable("tasks", {
   pullRequestNumber: integer("pull_request_number"),
   unreadAt: timestamp("unread_at", { withTimezone: true }),
   lastReadAt: timestamp("last_read_at", { withTimezone: true }),
+  // Client key for one submit intent and a hash of the creation request, so a
+  // retried POST /v1/tasks returns this task instead of creating another (H-035).
+  creationIdempotencyKey: text("creation_idempotency_key"),
+  creationFingerprint: text("creation_fingerprint"),
   createdAt,
   updatedAt,
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
 }, (table) => [
   index("tasks_tenant_workspace_updated_idx").on(table.tenantId, table.workspaceId, table.updatedAt),
   index("tasks_tenant_status_idx").on(table.tenantId, table.status),
+  uniqueIndex("tasks_creation_idempotency_unique")
+    .on(table.tenantId, table.userId, table.creationIdempotencyKey)
+    .where(sql`${table.creationIdempotencyKey} IS NOT NULL`),
 ]);
 
 export const sessions = pgTable("sessions", {
@@ -5504,6 +5511,22 @@ COMMENT ON COLUMN memory_item_versions.source_message_id IS
   'Immutable provenance identifier retained after an edited source message is removed.';
 `.trim();
 
+/**
+ * Server-side idempotency for task creation (H-035). Both columns are nullable
+ * without a default, so adding them rewrites no rows. Existing rows keep a NULL
+ * key, which the partial unique index excludes, so building it cannot fail on
+ * existing data; it is built CONCURRENTLY so task writes are not blocked.
+ */
+export const TASK_CREATION_IDEMPOTENCY_STATEMENTS = [
+  `ALTER TABLE tasks
+     ADD COLUMN IF NOT EXISTS creation_idempotency_key text,
+     ADD COLUMN IF NOT EXISTS creation_fingerprint text`,
+  `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS tasks_creation_idempotency_unique
+     ON tasks (tenant_id, user_id, creation_idempotency_key)
+     WHERE creation_idempotency_key IS NOT NULL`,
+] as const;
+export const TASK_CREATION_IDEMPOTENCY_MIGRATION = TASK_CREATION_IDEMPOTENCY_STATEMENTS.join(";\n");
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -5697,5 +5720,14 @@ export const cloudMigrations = [
     transactional: false,
     onlineIndexNames: ["usage_events_tenant_task_idx", "turn_runs_tenant_task_idx"],
     onlineSql: TASK_TOKEN_USAGE_INDEX_STATEMENTS,
+  },
+  {
+    // 73 remains reserved for work in progress; never reuse migration ids.
+    id: 74,
+    name: "task_creation_idempotency_v1",
+    sql: TASK_CREATION_IDEMPOTENCY_MIGRATION,
+    transactional: false,
+    onlineIndexName: "tasks_creation_idempotency_unique",
+    onlineSql: TASK_CREATION_IDEMPOTENCY_STATEMENTS,
   },
 ] as const;

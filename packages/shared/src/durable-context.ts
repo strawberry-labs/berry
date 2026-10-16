@@ -1,4 +1,3 @@
-import { ScheduleTimezoneSchema } from "./scheduled-tasks.ts";
 import { z } from "zod";
 import { WorkflowCategorySchema, WORKFLOW_CATEGORY_VERSION } from "./workflow-routing.ts";
 
@@ -8,7 +7,8 @@ const JsonObjectSchema = z.record(z.unknown());
 
 // Keep admission estimates and the worker's overview request on the same
 // bounded output ceiling. Focused inspections use a smaller worker-only cap.
-export const VISION_ADAPTER_MAX_OUTPUT_TOKENS = 1_536;
+// Reasoning vision models spend part of it before the answer (H-039).
+export const VISION_ADAPTER_MAX_OUTPUT_TOKENS = 3_072;
 // The adapter retries once when a provider returns reasoning without final
 // content. Admission must reserve enough budget for both provider calls.
 export const VISION_ADAPTER_MAX_ATTEMPTS = 2;
@@ -649,7 +649,8 @@ export const DurableTurnRuntimeRequestSchema = z.object({
   provider: DurableProviderTransportSchema,
   model: z.string().min(1).nullable(),
   conversationKind: z.enum(["chat", "code"]).default("chat"),
-  timezone: ScheduleTimezoneSchema.optional(),
+  /** Stored turns may have an old/invalid zone; date rendering falls back to UTC. Schedule inputs are validated separately. */
+  timezone: z.string().min(1).max(100).optional(),
   workspacePath: z.string().min(1),
   workspaceId: z.string().min(1),
   permissionMode: z.string().min(1),
@@ -674,7 +675,30 @@ export const DurableTurnRuntimeRequestSchema = z.object({
     sourceKind: z.string().nullable().optional(),
   }).strict()).default([]),
   portableCheckpoint: SessionCheckpointV2Schema.optional(),
+  /**
+   * Optional capabilities declared for this turn that could not be prepared,
+   * with the reason the model and the user see. The tool stays declared so the
+   * tool list does not change between turns (H-032, H-050).
+   */
+  capabilityNotices: z.array(z.object({
+    capability: z.enum(["connectors", "vision", "image_generation"]),
+    reason: z.string().min(1).max(500),
+  }).strict()).max(10).optional(),
+  /** Queued prompts: the budget identity reserved when the prompt was queued (H-001). */
+  queuedBudgetRequestId: z.string().min(1).optional(),
+  /** Continue: the interrupted run and the journal head admitted for it (H-051, H-072). */
+  continuationSourceRunId: z.string().min(1).optional(),
+  continuationHeadEntryId: z.string().min(1).optional(),
+  /**
+   * Operator recovery: the budget generation this run now bills under, and the
+   * event sequence and cost already settled by earlier generations (H-066).
+   */
+  budgetBaseRequestId: z.string().min(1).optional(),
+  budgetGeneration: z.number().int().positive().optional(),
+  budgetUsageAfterSequence: z.number().int().nonnegative().optional(),
+  budgetBaselineCostMicros: z.string().regex(/^\d+$/).optional(),
 }).strict().superRefine((request, context) => {
+  const noticed = new Set((request.capabilityNotices ?? []).map((notice) => notice.capability));
   const hasImageTool = request.builtInTools.includes("create_image");
   if (request.intent === "image_generation" && !hasImageTool) {
     context.addIssue({ code: z.ZodIssueCode.custom, path: ["builtInTools"], message: "Image intent requires the create_image tool" });
@@ -682,11 +706,11 @@ export const DurableTurnRuntimeRequestSchema = z.object({
   if (request.intent === "image_generation" && !request.imageGeneration) {
     context.addIssue({ code: z.ZodIssueCode.custom, path: ["imageGeneration"], message: "Image intent requires admitted image generation configuration" });
   }
-  if (hasImageTool && !request.imageGeneration) {
+  if (hasImageTool && !request.imageGeneration && !noticed.has("image_generation")) {
     context.addIssue({ code: z.ZodIssueCode.custom, path: ["imageGeneration"], message: "The create_image tool requires admitted image generation configuration" });
   }
   const hasVisionTool = request.builtInTools.includes("inspect_images");
-  if (hasVisionTool && !request.vision) {
+  if (hasVisionTool && !request.vision && !noticed.has("vision")) {
     context.addIssue({ code: z.ZodIssueCode.custom, path: ["vision"], message: "The inspect_images tool requires admitted vision configuration" });
   }
   if (request.vision && !hasVisionTool) {
@@ -697,6 +721,36 @@ export const DurableTurnRuntimeRequestSchema = z.object({
   }
 });
 export type DurableTurnRuntimeRequest = z.infer<typeof DurableTurnRuntimeRequestSchema>;
+
+/** A stored runtime request that declares a capability version but does not match it. */
+export class InvalidRuntimeRequestError extends Error {
+  readonly fields: readonly string[];
+
+  constructor(issues: readonly z.ZodIssue[]) {
+    // Field paths only: values can include provider settings and headers.
+    const fields = [...new Set(issues.flatMap((issue) => issue.code === z.ZodIssueCode.unrecognized_keys
+      ? issue.keys.map((key) => [...issue.path, key].join("."))
+      : [issue.path.join(".") || "(request)"]))];
+    super(`This turn's admitted model configuration is invalid (${fields.slice(0, 5).join(", ")}${fields.length > 5 ? ", ..." : ""}). Berry stopped instead of sending the task to a different provider or with different tools.`);
+    this.name = "InvalidRuntimeRequestError";
+    this.fields = fields;
+  }
+}
+
+/**
+ * Reads a run's stored runtime request. Runs admitted before capability
+ * snapshots carry no capabilityVersion and return null; only those may use a
+ * deployment-wide fallback. A versioned request that fails validation throws:
+ * treating it as legacy would silently change the admitted provider, model or
+ * tools.
+ */
+export function parseAdmittedRuntimeRequest(value: unknown): DurableTurnRuntimeRequest | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if ((value as Record<string, unknown>).capabilityVersion === undefined) return null;
+  const parsed = DurableTurnRuntimeRequestSchema.safeParse(value);
+  if (!parsed.success) throw new InvalidRuntimeRequestError(parsed.error.issues);
+  return parsed.data;
+}
 
 export const TurnRunStateSchema = z.enum([
   "queued",
@@ -788,6 +842,11 @@ export const DurableContextConfigSchema = z.object({
   knowledgeChunkTokens: EnvPositiveIntegerSchema.default(300),
   knowledgeChunkOverlapTokens: EnvPositiveIntegerSchema.default(50),
   retrievalTokenBudget: EnvPositiveIntegerSchema.default(5000),
+  // Cosine similarity floors for vector hits (all-mpnet-base-v2 scores
+  // unrelated text below about 0.2). Earlier task answers need a closer match
+  // because they are Berry's own output, not source material (H-040).
+  retrievalMinSimilarity: z.coerce.number().min(0).max(1).default(0.15),
+  retrievalTaskOutcomeMinSimilarity: z.coerce.number().min(0).max(1).default(0.45),
   runLeaseSeconds: EnvPositiveIntegerSchema.default(90),
   sandboxSnapshotIntervalSeconds: EnvPositiveIntegerSchema.default(900),
   knowledgeMaxInputBytes: EnvPositiveIntegerSchema.default(104857600),
@@ -837,6 +896,8 @@ export function durableContextConfigFromEnv(env: Record<string, string | undefin
     knowledgeChunkTokens: env.BERRY_KNOWLEDGE_CHUNK_TOKENS,
     knowledgeChunkOverlapTokens: env.BERRY_KNOWLEDGE_CHUNK_OVERLAP_TOKENS,
     retrievalTokenBudget: env.BERRY_RETRIEVAL_TOKEN_BUDGET,
+    retrievalMinSimilarity: env.BERRY_RETRIEVAL_MIN_SIMILARITY,
+    retrievalTaskOutcomeMinSimilarity: env.BERRY_RETRIEVAL_TASK_OUTCOME_MIN_SIMILARITY,
     runLeaseSeconds: env.BERRY_RUN_LEASE_SECONDS,
     sandboxSnapshotIntervalSeconds: env.BERRY_SANDBOX_SNAPSHOT_INTERVAL_SECONDS,
     knowledgeMaxInputBytes: env.BERRY_KNOWLEDGE_MAX_INPUT_BYTES,

@@ -6,7 +6,7 @@ import {
 } from "@berry/shared";
 import { describe, expect, it, vi } from "vitest";
 import type { DurableTurnSnapshot, DurableTurnToolExecutor } from "../turn-runner.js";
-import { DurablePersonalSkillToolExecutor } from "./tools.js";
+import { ASSISTANT_SAVED_SKILL_NOTE, DurablePersonalSkillToolExecutor } from "./tools.js";
 
 describe("DurablePersonalSkillToolExecutor", () => {
   it("declares activation abort support, keeps saving non-abortable, and delegates other tools", () => {
@@ -97,6 +97,48 @@ describe("DurablePersonalSkillToolExecutor", () => {
     );
   });
 
+  describe("assistant-saved skills carry an unverified-rules status (H-045)", () => {
+    it("records the status when saving and says so in the receipt", async () => {
+      const execute = vi.fn(async () => undefined);
+      const tools = new DurablePersonalSkillToolExecutor({ execute: vi.fn(async () => ({ output: {}, summary: "" })) }, { execute, query: vi.fn(async () => []) });
+      // Task 756: a Singapore redundancy calculator saved after a self-test, with rules that contradict CPF and MOM guidance.
+      const content = "---\nname: sg-redundancy\ndescription: Calculate Singapore redundancy payments\n---\n\nCompensation in lieu of notice attracts CPF.";
+      const result = await tools.execute({ tenantId: "00000000-0000-7000-8000-000000000001", userId: "user_1" } as DurableTurnSnapshot, {
+        id: "save-1", type: "tool.save_personal_skill", input: { toolName: "save_personal_skill", arguments: { content } },
+      } as never);
+      expect(execute).toHaveBeenCalledWith(expect.stringContaining("diagnostics=EXCLUDED.diagnostics"), expect.arrayContaining([JSON.stringify([ASSISTANT_SAVED_SKILL_NOTE])]));
+      expect(result.output).toMatchObject({ skill: { name: "sg-redundancy", enabled: true, domainVerification: "unverified" } });
+      expect(JSON.stringify(result.output)).toContain("primary source");
+      expect(result.summary).toContain("not independently verified");
+    });
+
+    const personalSkillSnapshot = () => {
+      const snapshot = storedSkillSnapshot();
+      const runtime = snapshot.runtimeRequest as { extraSkills: Array<Record<string, unknown>> };
+      runtime.extraSkills = [{ ...runtime.extraSkills[0], name: "sg-redundancy", filePath: "/personal-skills/skill_sg/SKILL.md", resources: [] }];
+      return snapshot;
+    };
+    const activate = async (diagnostics: unknown[]) => {
+      const query = vi.fn(async (sql: string) => sql.includes("SELECT diagnostics FROM personal_skills") ? [{ diagnostics }] : []);
+      const tools = new DurablePersonalSkillToolExecutor({ execute: vi.fn(async () => ({ output: {}, summary: "" })) }, { execute: vi.fn(), query: query as never });
+      return tools.execute(personalSkillSnapshot(), {
+        id: "activate-sg", type: "tool.activate_skill", input: { toolName: "activate_skill", arguments: { name: "sg-redundancy" } },
+      } as never);
+    };
+
+    it("shows the caution whenever such a skill is activated", async () => {
+      const activated = await activate([ASSISTANT_SAVED_SKILL_NOTE]);
+      expect(activated.output).toMatchObject({ skill: "sg-redundancy", domainVerification: "unverified" });
+      expect(JSON.stringify(activated.output)).toContain("<skill_caution>");
+    });
+
+    it("shows no caution once a reviewed package replaced the status", async () => {
+      const activated = await activate([]);
+      expect(activated.output).not.toHaveProperty("domainVerification");
+      expect(JSON.stringify(activated.output)).not.toContain("<skill_caution>");
+    });
+  });
+
   it("rejects invalid SKILL.md before writing", async () => {
     const execute = vi.fn(async () => undefined);
     const tools = new DurablePersonalSkillToolExecutor({
@@ -172,6 +214,47 @@ describe("DurablePersonalSkillToolExecutor", () => {
         [0o755, 0o644],
       ]),
     );
+  });
+
+  it("activates admitted skills on queued, Continue and recovered runs", async () => {
+    const resources = [
+      { path: "scripts/build.py", content: Buffer.from("print('ok')\n"), mode: 0o755 },
+      { path: "assets/template.docx", content: Buffer.from("template-bytes"), mode: 0o644 },
+    ].map((resource) => ({
+      path: resource.path,
+      mode: resource.mode,
+      size_bytes: resource.content.byteLength,
+      sha256: createHash("sha256").update(resource.content).digest("hex"),
+    }));
+    const tools = new DurablePersonalSkillToolExecutor({ execute: vi.fn(async () => ({ output: {}, summary: "base" })) }, {
+      execute: vi.fn(),
+      query: vi.fn(async (sql: string) => sql.includes("SELECT path,size_bytes,sha256,mode") ? resources : []) as never,
+    });
+    const snapshot = storedSkillSnapshot();
+    snapshot.runtimeRequest = {
+      ...snapshot.runtimeRequest,
+      requestId: "request_1:recovery:1",
+      queuedBudgetRequestId: "queued:browser-key",
+      continuationSourceRunId: "00000000-0000-7000-8000-000000000099",
+      continuationHeadEntryId: "entry-head",
+      budgetBaseRequestId: "request_1",
+      budgetGeneration: 1,
+      budgetUsageAfterSequence: 12,
+      budgetBaselineCostMicros: "5000",
+    };
+
+    await expect(tools.execute(snapshot, {
+      id: "activate-1",
+      type: "tool.activate_skill",
+      input: { toolName: "activate_skill", arguments: { name: "branding" } },
+    } as never)).resolves.toMatchObject({ output: { skill: "branding", availableResources: ["scripts/build.py", "assets/template.docx"] } });
+
+    snapshot.runtimeRequest = { ...snapshot.runtimeRequest, unexpectedSetting: true };
+    await expect(tools.execute(snapshot, {
+      id: "activate-2",
+      type: "tool.activate_skill",
+      input: { toolName: "activate_skill", arguments: { name: "branding" } },
+    } as never)).rejects.toThrow("admitted model configuration is invalid (unexpectedSetting)");
   });
 
   it("activates instructions without sandbox calls, then bulk-loads only requested files", async () => {
@@ -288,11 +371,11 @@ describe("DurablePersonalSkillToolExecutor", () => {
       reportProgress: activationProgress,
     });
     expect(stageSkillPackage).toHaveBeenCalledTimes(1);
-    expect(query.mock.calls.filter(([sql]) => String(sql).includes("SELECT path,content"))).toHaveLength(1);
-    expect(query).toHaveBeenCalledWith(
-      expect.stringContaining("path=ANY($2::text[])"),
-      ["org-capability", ["scripts/build.py", "assets/template.docx"]],
-    );
+    // Requested scripts are read first to resolve their sibling imports; the
+    // stager then loads only the files still missing. Nothing unrequested loads.
+    const contentLoads = query.mock.calls.filter(([sql]) => String(sql).includes("SELECT path,content"));
+    expect(contentLoads.map(([, params]) => (params as unknown[])[1])).toEqual([["scripts/build.py"], ["assets/template.docx"]]);
+    expect(contentLoads.every(([, params]) => (params as unknown[])[0] === "org-capability")).toBe(true);
 
     snapshot.steps = [
       ...snapshot.steps,

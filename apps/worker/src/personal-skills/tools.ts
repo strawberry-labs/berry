@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { formatSkillInvocation } from "@berry/harness";
 import {
   DEFERRED_SKILL_RESOURCE_INSTRUCTIONS,
-  DurableTurnRuntimeRequestSchema,
+  parseAdmittedRuntimeRequest,
   parseAgentSkillMarkdown,
 } from "@berry/shared";
 import type { ChatContentPart, ChatToolDefinition } from "@berry/router-client";
@@ -14,8 +14,22 @@ import type {
   DurableTurnStep,
   DurableTurnToolExecutor,
   DurableSkillPackageFile,
+  SkillStagingTransfer,
   TurnToolResult,
 } from "../turn-runner.js";
+import { SKILL_DEPENDENCY_MANIFEST_PATH, parseSkillDependencyManifest, siblingImportPaths } from "./dependencies.js";
+
+type StoredSkill = { name: string; description: string; content: string; filePath: string; resources?: string[] };
+type StoredPackage = {
+  skill: StoredSkill;
+  recordId: string;
+  table: "personal_skill_files" | "organization_skill_files";
+  foreignKey: "skill_id" | "organization_capability_id";
+  rows: ReadonlyArray<{ path: string; size_bytes: number; sha256: string; mode: number }>;
+};
+type StagedDependency = { skill: string; location: string; directory: string; stagedResources: string[]; resources: string[] };
+
+const MAX_DEPENDENCY_DEPTH = 3;
 
 const SavePersonalSkillInputSchema = z.union([
   z.object({ content: z.string().min(1).max(262_144) }).strict(),
@@ -140,10 +154,12 @@ export class DurablePersonalSkillToolExecutor implements DurableTurnToolExecutor
           name: metadata.name,
           description: metadata.description,
           enabled: true,
+          domainVerification: "unverified",
           resources: packageFiles.filter((file) => file.path !== "SKILL.md").map((file) => file.path),
         },
+        note: `${ASSISTANT_SAVED_SKILL_NOTE} Tell the user, and for legal, tax, payroll or safety rules state the jurisdiction, effective date and primary source in SKILL.md.`,
       },
-      summary: `Saved $${metadata.name} to the current user's Skills library with ${packageFiles.length - 1} resource file${packageFiles.length === 2 ? "" : "s"}`,
+      summary: `Saved $${metadata.name} to the current user's Skills library with ${packageFiles.length - 1} resource file${packageFiles.length === 2 ? "" : "s"}; its domain rules are not independently verified`,
     };
   }
 
@@ -160,7 +176,7 @@ export class DurablePersonalSkillToolExecutor implements DurableTurnToolExecutor
       `
 INSERT INTO personal_skills (
   id,tenant_id,user_id,name,description,content,enabled,trusted,source,source_url,version,hash,diagnostics,created_at,updated_at
-) VALUES ($1,$2::uuid,$3,$4,$5,$6,true,true,'text',NULL,$7,$8,'[]'::jsonb,now(),now())
+) VALUES ($1,$2::uuid,$3,$4,$5,$6,true,true,'text',NULL,$7,$8,$9::jsonb,now(),now())
 ON CONFLICT (id) DO UPDATE SET
   name=EXCLUDED.name,
   description=EXCLUDED.description,
@@ -171,11 +187,11 @@ ON CONFLICT (id) DO UPDATE SET
   source_url=NULL,
   version=EXCLUDED.version,
   hash=EXCLUDED.hash,
-  diagnostics='[]'::jsonb,
+  diagnostics=EXCLUDED.diagnostics,
   updated_at=now()
 WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=EXCLUDED.user_id
       `.trim(),
-      [id, snapshot.tenantId, snapshot.userId, metadata.name, metadata.description, content, metadata.version, hash],
+      [id, snapshot.tenantId, snapshot.userId, metadata.name, metadata.description, content, metadata.version, hash, JSON.stringify([ASSISTANT_SAVED_SKILL_NOTE])],
     );
     await executor.execute("DELETE FROM personal_skill_files WHERE skill_id=$1", [id]);
     const resources = packageFiles.filter((candidate) => candidate.path !== "SKILL.md").map((file) => {
@@ -226,7 +242,8 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
     step: DurableTurnStep,
     options: { signal?: AbortSignal | undefined; reportProgress?: (() => void) | undefined } = {},
   ): Promise<TurnToolResult> {
-    const runtime = DurableTurnRuntimeRequestSchema.parse(snapshot.runtimeRequest);
+    const runtime = parseAdmittedRuntimeRequest(snapshot.runtimeRequest);
+    if (!runtime) throw new Error("Stored skills are available only to turns admitted with a capability snapshot");
     const parsedInput = ActivateStoredSkillInputSchema.safeParse(step.input.arguments ?? {});
     if (!parsedInput.success) {
       throw new Error("activate_skill requires a valid skill name and, when loading files, an optional resources array of exact relative paths");
@@ -234,7 +251,12 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
     const requestedName = parsedInput.data.name;
     const requestedResources = [...new Set(parsedInput.data.resources ?? [])];
     const skill = runtime.extraSkills.find((candidate) => candidate.name === requestedName);
-    if (!skill || !/^\/(personal|organization)-skills\//.test(skill.filePath)) throw new Error(`Unknown stored skill: ${requestedName ?? "(missing)"}`);
+    if (!skill || !/^\/(personal|organization)-skills\//.test(skill.filePath)) {
+      const available = runtime.extraSkills
+        .filter((candidate) => !candidate.disableModelInvocation && /^\/(personal|organization)-skills\//.test(candidate.filePath))
+        .map((candidate) => candidate.name);
+      throw new Error(`Unknown stored skill: ${requestedName ?? "(missing)"}. Use one exact name from: ${available.join(", ") || "(no skills are installed)"}.`);
+    }
     const previousActivation = [...snapshot.steps].reverse().find((candidate) => candidate.id !== step.id
       && candidate.state === "completed"
       && (stringValue(candidate.input.toolName) ?? candidate.type.slice(5)) === "activate_skill"
@@ -255,6 +277,7 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
     const personalId = /^\/personal-skills\/([^/]+)\/SKILL\.md$/.exec(skill.filePath)?.[1];
     const organizationId = /^\/organization-skills\/([^/]+)\/SKILL\.md$/.exec(skill.filePath)?.[1];
     options.signal?.throwIfAborted();
+    const caution = personalId ? await this.unverifiedSkillCaution(snapshot.tenantId, personalId) : undefined;
     const rows = await this.inTenant(snapshot.tenantId, (executor) => personalId
       ? executor.query<{ path: string; size_bytes: number; sha256: string; mode: number }>("SELECT path,size_bytes,sha256,mode FROM personal_skill_files WHERE skill_id=$1 ORDER BY path", [personalId])
       : executor.query<{ path: string; size_bytes: number; sha256: string; mode: number }>("SELECT path,size_bytes,sha256,mode FROM organization_skill_files WHERE organization_capability_id=$1 ORDER BY path", [organizationId]));
@@ -280,42 +303,18 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
         deferredResources: availableResources,
         stagedRelativeResources: [],
         stagedResourcePaths: [],
+        caution,
       });
     }
 
-    const files: DurableSkillPackageFile[] = [
-      { path: "SKILL.md", contentBytes: Buffer.from(skill.content, "utf8"), mode: 0o644 },
-      ...rows.map((row) => ({
-        path: row.path,
-        sizeBytes: Number(row.size_bytes),
-        sha256: row.sha256,
-        mode: row.mode,
-      })),
-    ];
-    if (!this.base.stageSkillPackage) throw new Error("Skill package workspace access is unavailable");
-    const loadContentBytes = async (paths: readonly string[]): Promise<ReadonlyMap<string, Uint8Array>> => {
-      if (paths.length === 0) return new Map();
-      const loaded = await this.inTenant(snapshot.tenantId, (executor) => executor.query<{ path: string; content: Buffer }>(
-        `SELECT path,content FROM ${packageTable} WHERE ${packageForeignKey}=$1 AND path=ANY($2::text[])`,
-        [packageRecordId, [...paths]],
-      ));
-      options.signal?.throwIfAborted();
-      const byPath = new Map<string, Uint8Array>(loaded.map((row) => [row.path, row.content]));
-      const missing = paths.filter((path) => !byPath.has(path));
-      if (missing.length > 0) throw new Error(`Stored skill resource is missing: ${missing.join(", ")}`);
-      return byPath;
-    };
-    const staged = await this.base.stageSkillPackage(
-      snapshot,
-      personalId ?? organizationId ?? skill.name,
-      files,
-      {
-        resourcePaths: requestedResources,
-        loadContentBytes,
-        signal: options.signal,
-        reportProgress: options.reportProgress,
-      },
-    );
+    const stagedPackage = await this.stageStoredSkill(snapshot, runtime.extraSkills, {
+      skill,
+      recordId: packageRecordId,
+      table: packageTable,
+      foreignKey: packageForeignKey,
+      rows,
+    }, requestedResources, options, new Set([skill.name]), 0);
+    const staged = stagedPackage.staged;
     const skillDirectory = staged.filePath.slice(0, -"/SKILL.md".length);
     const stagedResourcePaths = staged.stagedResources;
     const stagedPathSet = new Set(stagedResourcePaths);
@@ -333,7 +332,155 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
       stagedRelativeResources,
       stagedResourcePaths,
       stagingSandboxId: staged.stagingSandboxId,
+      addedResources: stagedPackage.addedResources,
+      dependencies: stagedPackage.dependencies,
+      transfer: stagedPackage.transfer,
+      caution,
     });
+  }
+
+  /** The save-time caution for an assistant-saved personal skill, while it is still recorded (H-045). */
+  private async unverifiedSkillCaution(tenantId: string, skillId: string): Promise<string | undefined> {
+    const rows = await this.inTenant(tenantId, (executor) => executor.query<{ diagnostics: unknown }>(
+      "SELECT diagnostics FROM personal_skills WHERE id=$1",
+      [skillId],
+    ));
+    const diagnostics = rows[0]?.diagnostics;
+    return Array.isArray(diagnostics) && diagnostics.includes(ASSISTANT_SAVED_SKILL_NOTE) ? ASSISTANT_SAVED_SKILL_NOTE : undefined;
+  }
+
+  /**
+   * Stage the requested resources of one stored package together with what
+   * those entry points need to run: Python sibling imports (transitively) and
+   * resources declared in skill-dependencies.json, including resources of other
+   * skills admitted to this run. Large optional assets are never added unless
+   * an entry point declares them required.
+   */
+  private async stageStoredSkill(
+    snapshot: DurableTurnSnapshot,
+    admittedSkills: readonly StoredSkill[],
+    pkg: StoredPackage,
+    requestedResources: readonly string[],
+    options: { signal?: AbortSignal | undefined; reportProgress?: (() => void) | undefined },
+    visited: Set<string>,
+    depth: number,
+  ): Promise<{
+    staged: Awaited<ReturnType<NonNullable<DurableTurnToolExecutor["stageSkillPackage"]>>>;
+    addedResources: string[];
+    dependencies: StagedDependency[];
+    transfer: SkillStagingTransfer;
+  }> {
+    if (!this.base.stageSkillPackage) throw new Error("Skill package workspace access is unavailable");
+    const loadedBytes = new Map<string, Uint8Array>();
+    const loadContentBytes = async (paths: readonly string[]): Promise<ReadonlyMap<string, Uint8Array>> => {
+      const needed = paths.filter((path) => !loadedBytes.has(path));
+      if (needed.length > 0) {
+        const loaded = await this.inTenant(snapshot.tenantId, (executor) => executor.query<{ path: string; content: Buffer }>(
+          `SELECT path,content FROM ${pkg.table} WHERE ${pkg.foreignKey}=$1 AND path=ANY($2::text[])`,
+          [pkg.recordId, [...needed]],
+        ));
+        options.signal?.throwIfAborted();
+        for (const row of loaded) loadedBytes.set(row.path, row.content);
+      }
+      const missing = paths.filter((path) => !loadedBytes.has(path));
+      if (missing.length > 0) throw new Error(`Stored skill resource is missing: ${missing.join(", ")}`);
+      return new Map(paths.map((path) => [path, loadedBytes.get(path)!]));
+    };
+
+    const available = new Set(pkg.rows.map((row) => row.path));
+    const manifest = available.has(SKILL_DEPENDENCY_MANIFEST_PATH)
+      ? parseSkillDependencyManifest((await loadContentBytes([SKILL_DEPENDENCY_MANIFEST_PATH])).get(SKILL_DEPENDENCY_MANIFEST_PATH)!)
+      : null;
+    const selected = new Set(requestedResources);
+    const crossSkill = new Map<string, Set<string>>();
+    let frontier = [...requestedResources];
+    while (frontier.length > 0) {
+      const scripts = frontier.filter((path) => path.endsWith(".py"));
+      const sources = scripts.length > 0 ? await loadContentBytes(scripts) : new Map<string, Uint8Array>();
+      const next: string[] = [];
+      const add = (path: string) => {
+        if (selected.has(path)) return;
+        selected.add(path);
+        next.push(path);
+      };
+      for (const path of frontier) {
+        for (const requirement of manifest?.entryPoints[path]?.requires ?? []) {
+          if (!requirement.skill || requirement.skill === pkg.skill.name) {
+            const missing = requirement.resources.filter((resource) => !available.has(resource));
+            if (missing.length > 0) {
+              throw new Error(`${pkg.skill.name} declares ${missing.join(", ")} as required by ${path}, but the published package does not contain ${missing.length === 1 ? "it" : "them"}. Republish the skill package; do not create the file yourself.`);
+            }
+            requirement.resources.forEach(add);
+          } else {
+            const resources = crossSkill.get(requirement.skill) ?? new Set<string>();
+            requirement.resources.forEach((resource) => resources.add(resource));
+            crossSkill.set(requirement.skill, resources);
+          }
+        }
+        const source = sources.get(path);
+        if (source) siblingImportPaths(path, Buffer.from(source).toString("utf8"), available).forEach(add);
+      }
+      frontier = next;
+    }
+
+    const staged = await this.base.stageSkillPackage(
+      snapshot,
+      pkg.recordId,
+      [
+        { path: "SKILL.md", contentBytes: Buffer.from(pkg.skill.content, "utf8"), mode: 0o644 },
+        ...pkg.rows.map((row) => ({ path: row.path, sizeBytes: Number(row.size_bytes), sha256: row.sha256, mode: row.mode })),
+      ],
+      { resourcePaths: [...selected], loadContentBytes, signal: options.signal, reportProgress: options.reportProgress },
+    );
+    const transfer: SkillStagingTransfer = { ...(staged.transfer ?? { files: 0, bytes: 0, reusedFiles: 0, reusedBytes: 0 }) };
+    const dependencies: StagedDependency[] = [];
+    for (const [name, resources] of crossSkill) {
+      if (visited.has(name) || depth >= MAX_DEPENDENCY_DEPTH) {
+        throw new Error(`Skill dependencies form a cycle or exceed ${MAX_DEPENDENCY_DEPTH} levels at ${name}. Republish the skill packages with a direct dependency.`);
+      }
+      const dependency = admittedSkills.find((candidate) => candidate.name === name
+        && /^\/(personal|organization)-skills\//.test(candidate.filePath));
+      if (!dependency) {
+        throw new Error(`${pkg.skill.name} requires the ${name} skill (${[...resources].join(", ")}), which is not available to this task. Ask an administrator to enable ${name}; retrying will not help.`);
+      }
+      const dependencyPackage = await this.loadStoredPackage(snapshot, dependency, options.signal);
+      const unknown = [...resources].filter((resource) => !dependencyPackage.rows.some((row) => row.path === resource));
+      if (unknown.length > 0) {
+        throw new Error(`${pkg.skill.name} requires ${unknown.join(", ")} from ${name}, but that package does not contain ${unknown.length === 1 ? "it" : "them"}. Republish the skill packages.`);
+      }
+      const result = await this.stageStoredSkill(snapshot, admittedSkills, dependencyPackage, [...resources], options, new Set([...visited, name]), depth + 1);
+      const directory = result.staged.filePath.slice(0, -"/SKILL.md".length);
+      dependencies.push({
+        skill: name,
+        location: result.staged.filePath,
+        directory,
+        stagedResources: result.staged.stagedResources,
+        resources: [...resources, ...result.addedResources],
+      }, ...result.dependencies);
+      transfer.files += result.transfer.files;
+      transfer.bytes += result.transfer.bytes;
+      transfer.reusedFiles += result.transfer.reusedFiles;
+      transfer.reusedBytes += result.transfer.reusedBytes;
+    }
+    return {
+      staged,
+      addedResources: [...selected].filter((path) => !requestedResources.includes(path)),
+      dependencies,
+      transfer,
+    };
+  }
+
+  private async loadStoredPackage(snapshot: DurableTurnSnapshot, skill: StoredSkill, signal?: AbortSignal): Promise<StoredPackage> {
+    const personalId = /^\/personal-skills\/([^/]+)\/SKILL\.md$/.exec(skill.filePath)?.[1];
+    const organizationId = /^\/organization-skills\/([^/]+)\/SKILL\.md$/.exec(skill.filePath)?.[1];
+    if (!personalId && !organizationId) throw new Error(`Unknown stored skill: ${skill.name}`);
+    const rows = await this.inTenant(snapshot.tenantId, (executor) => personalId
+      ? executor.query<{ path: string; size_bytes: number; sha256: string; mode: number }>("SELECT path,size_bytes,sha256,mode FROM personal_skill_files WHERE skill_id=$1 ORDER BY path", [personalId])
+      : executor.query<{ path: string; size_bytes: number; sha256: string; mode: number }>("SELECT path,size_bytes,sha256,mode FROM organization_skill_files WHERE organization_capability_id=$1 ORDER BY path", [organizationId]));
+    signal?.throwIfAborted();
+    return personalId
+      ? { skill, recordId: personalId, table: "personal_skill_files", foreignKey: "skill_id", rows }
+      : { skill, recordId: organizationId!, table: "organization_skill_files", foreignKey: "organization_capability_id", rows };
   }
 
   private rejectKnownDeferredResourceForDirectFileTool(
@@ -358,6 +505,13 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
   }
 }
 
+/**
+ * Recorded in personal_skills.diagnostics when the assistant saves a skill:
+ * the package is valid and trusted to run, but nobody has checked its domain
+ * rules (H-045). A user re-uploading a reviewed package replaces it.
+ */
+export const ASSISTANT_SAVED_SKILL_NOTE = "Saved by the assistant: its domain rules (laws, rates, thresholds, formulas) have not been independently verified. Check them against primary sources before relying on its results.";
+
 export class ResourceNotStagedError extends Error {
   readonly code = "RESOURCE_NOT_STAGED";
 
@@ -376,6 +530,13 @@ interface SkillActivationState {
   stagedRelativeResources: string[];
   stagedResourcePaths: string[];
   stagingSandboxId?: string | undefined;
+  /** Same-package files staged because a requested entry point needs them. */
+  addedResources?: string[] | undefined;
+  /** Other skill packages staged because a requested entry point declares them. */
+  dependencies?: StagedDependency[] | undefined;
+  transfer?: SkillStagingTransfer | undefined;
+  /** Shown before the instructions when the skill's domain rules are unverified (H-045). */
+  caution?: string | undefined;
 }
 
 function renderActivationResult(skill: {
@@ -401,7 +562,9 @@ function renderActivationResult(skill: {
     : formatSkillInvocation(activeSkill, state.requestedResources.length > 0
         ? `The requested resource files are materialized under ${directory}. Use only the exact paths needed for this task.`
         : "Load only resources required for the current task.");
-  const content = `${invocation}\n${resourceState}\n${DEFERRED_SKILL_RESOURCE_INSTRUCTIONS}`;
+  const dependencyState = formatResolvedDependencies(state.addedResources ?? [], state.dependencies ?? []);
+  const caution = state.caution ? `<skill_caution>${state.caution}</skill_caution>\n` : "";
+  const content = `${caution}${invocation}\n${resourceState}\n${dependencyState ? `${dependencyState}\n` : ""}${DEFERRED_SKILL_RESOURCE_INSTRUCTIONS}`;
   const summary = state.requestedResources.length > 0
     ? `Loaded ${state.requestedResources.length} ${skill.name} resource file${state.requestedResources.length === 1 ? "" : "s"}`
     : `Activated ${skill.name}; ${state.availableResources.length} resource file${state.availableResources.length === 1 ? "" : "s"} available on demand`;
@@ -417,10 +580,32 @@ function renderActivationResult(skill: {
       stagedResources: state.stagedResourcePaths,
       stagedResourcePaths: state.stagedResourcePaths,
       ...(state.stagingSandboxId === undefined ? {} : { stagingSandboxId: state.stagingSandboxId }),
+      ...(state.addedResources?.length ? { addedResources: state.addedResources } : {}),
+      ...(state.caution ? { domainVerification: "unverified" } : {}),
+      ...(state.dependencies?.length ? { dependencies: state.dependencies } : {}),
+      ...(state.requestedResources.length > 0 ? { readiness: "ready" } : {}),
+      ...(state.transfer ? { transfer: state.transfer } : {}),
       content,
     },
     summary,
   };
+}
+
+/** Tell the model exactly which extra files are ready and where, so it never has to guess. */
+function formatResolvedDependencies(addedResources: readonly string[], dependencies: readonly StagedDependency[]): string {
+  if (addedResources.length === 0 && dependencies.length === 0) return "";
+  return [
+    "<resolved_dependencies ready=\"true\">",
+    ...(addedResources.length > 0
+      ? [`  Also staged in this skill because the requested entry points import or require them: ${addedResources.join(", ")}`]
+      : []),
+    ...dependencies.map((dependency) =>
+      `  <skill name=${JSON.stringify(dependency.skill)} directory=${JSON.stringify(dependency.directory)} resources=${JSON.stringify(dependency.resources.join(", "))} />`),
+    ...(dependencies.length > 0
+      ? ["  Use each listed directory as that skill's directory (for example a --<skill>-skill-dir argument). Do not copy these files or search for them."]
+      : []),
+    "</resolved_dependencies>",
+  ].join("\n");
 }
 
 function reusableActivationState(

@@ -309,6 +309,17 @@ export interface CreateTaskRequest {
   model?: string | null | undefined;
 }
 
+export interface CreateTaskOptions {
+  /**
+   * UUID for one submit intent. Pass the same key when the user retries the
+   * same submission so the API returns the task it already created; a new
+   * submission, even with identical content, needs a new key. When omitted,
+   * one key is generated for this call.
+   */
+  idempotencyKey?: string | undefined;
+  signal?: AbortSignal | undefined;
+}
+
 export interface UpdateTaskRequest {
   title?: string | undefined;
   status?: "queued" | "running" | "blocked" | "completed" | "failed" | "cancelled" | undefined;
@@ -727,11 +738,20 @@ export class BerryApiClient {
     });
   }
 
-  async createTask(input: CreateTaskRequest): Promise<CreateTaskResponse> {
+  async createTask(input: CreateTaskRequest, options: CreateTaskOptions = {}): Promise<CreateTaskResponse> {
     PermissionModeSchema.optional().parse(input.permissionMode);
+    // One request per call, never repeated here (H-035). A caller that sends
+    // the same submission again after an unknown outcome reuses the key, and
+    // an API that stores keys returns the first task. Repeating automatically
+    // is unsafe: nothing shows that the API receiving the repeat stores keys
+    // (a rollback, or instances of different versions), and an older release
+    // would create a second task.
+    const idempotencyKey = options.idempotencyKey ?? globalThis.crypto?.randomUUID?.();
     return this.#request("/v1/tasks", CreateTaskResponseSchema, {
       method: "POST",
       body: input,
+      ...(idempotencyKey ? { headers: { "Idempotency-Key": idempotencyKey } } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
     });
   }
 
@@ -1008,11 +1028,12 @@ export class BerryApiClient {
     return this.#resolveFileUrls(await this.#request(`/v1/files/${encodeURIComponent(fileId)}`, StoredFileSchema));
   }
 
-  async initiateFileUpload(input: { name: string; mediaType: string; size: number; taskId?: string; sessionId?: string; workspaceId?: string; workspaceVisibility?: "project" | "task_only"; sha256?: string; origin?: "user_upload" | "image_generation" | "browser_capture"; associationRole?: "input" | "output" | "reference" }): Promise<MultipartUploadInitiate> {
-    return this.#request("/v1/files/uploads", MultipartUploadInitiateSchema, { method: "POST", body: input });
+  async initiateFileUpload(input: { name: string; mediaType: string; size: number; taskId?: string; sessionId?: string; workspaceId?: string; workspaceVisibility?: "project" | "task_only"; sha256?: string; origin?: "user_upload" | "image_generation" | "browser_capture"; associationRole?: "input" | "output" | "reference" }, signal?: AbortSignal): Promise<MultipartUploadInitiate> {
+    return this.#request("/v1/files/uploads", MultipartUploadInitiateSchema, { method: "POST", body: input, ...(signal ? { signal } : {}) });
   }
 
   async uploadFile(file: File, input: { taskId?: string; sessionId?: string; workspaceId?: string; workspaceVisibility?: "project" | "task_only"; origin?: "user_upload" | "image_generation" | "browser_capture"; associationRole?: "input" | "output" | "reference"; concurrency?: number; partTimeoutMs?: number; onProgress?: (progress: { uploadedBytes: number; totalBytes: number; ratio: number }) => void; signal?: AbortSignal } = {}): Promise<StoredFile> {
+    input.signal?.throwIfAborted();
     const upload = await this.initiateFileUpload({
       name: file.name,
       mediaType: file.type || "application/octet-stream",
@@ -1023,14 +1044,9 @@ export class BerryApiClient {
       ...(input.workspaceVisibility ? { workspaceVisibility: input.workspaceVisibility } : {}),
       ...(input.origin ? { origin: input.origin } : {}),
       ...(input.associationRole ? { associationRole: input.associationRole } : {}),
-    });
+    }, input.signal);
     const partNumbers = Array.from({ length: upload.partCount }, (_, index) => index + 1);
-    const signedBatches = await Promise.all(chunk(partNumbers, 100).map((batch) => this.#request(
-      `/v1/files/${encodeURIComponent(upload.fileId)}/uploads/${encodeURIComponent(upload.uploadId)}/parts`,
-      MultipartUploadPartUrlsSchema,
-      { method: "POST", body: { partNumbers: batch } },
-    )));
-    const urls = new Map(signedBatches.flatMap((signed) => signed.parts).map((part) => [part.partNumber, part.url]));
+    const urls = new Map<number, string>();
     const completed: Array<{ partNumber: number; etag: string }> = [];
     const partProgress = new Map<number, number>();
     let cursor = 0;
@@ -1059,59 +1075,79 @@ export class BerryApiClient {
         if (controller.signal.aborted) throw new DOMException("Upload aborted", "AbortError");
         const start = (partNumber - 1) * upload.partSize;
         const end = Math.min(file.size, start + upload.partSize);
-        const partController = new AbortController();
-        const abortPart = () => partController.abort(controller.signal.reason);
-        const timeoutError = new Error("File upload timed out. Check your connection and try again.");
-        controller.signal.addEventListener("abort", abortPart, { once: true });
-        const timeout = globalThis.setTimeout(() => partController.abort(timeoutError), partTimeoutMs);
-        let response: { ok: boolean; status: number; etag: string | null; body: string };
-        try {
-          const body = file.slice(start, end);
-          if (this.#useXhrUploads) {
-            response = await uploadBlobWithXhr(
-              urls.get(partNumber)!,
-              body,
-              partController.signal,
-              partTimeoutMs,
-              (bytes) => reportPartProgress(partNumber, bytes),
-            );
-          } else {
-            const fetched = await this.#fetch(urls.get(partNumber)!, {
-              method: "PUT",
-              body,
-              signal: partController.signal,
-            });
-            response = {
-              ok: fetched.ok,
-              status: fetched.status,
-              etag: fetched.headers.get("etag"),
-              body: fetched.ok ? "" : await fetched.text(),
-            };
+        for (let attempt = 0; ; attempt++) {
+          controller.signal.throwIfAborted();
+          const partController = new AbortController();
+          const abortPart = () => partController.abort(controller.signal.reason);
+          const timeoutError = new Error("File upload timed out. Check your connection and try again.");
+          controller.signal.addEventListener("abort", abortPart, { once: true });
+          const timeout = globalThis.setTimeout(() => partController.abort(timeoutError), partTimeoutMs);
+          let response: { ok: boolean; status: number; etag: string | null; body: string };
+          try {
+            const body = file.slice(start, end);
+            if (this.#useXhrUploads) {
+              response = await uploadBlobWithXhr(
+                urls.get(partNumber)!,
+                body,
+                partController.signal,
+                partTimeoutMs,
+                (bytes) => reportPartProgress(partNumber, bytes),
+              );
+            } else {
+              const fetched = await this.#fetch(urls.get(partNumber)!, {
+                method: "PUT",
+                body,
+                signal: partController.signal,
+              });
+              response = {
+                ok: fetched.ok,
+                status: fetched.status,
+                etag: fetched.headers.get("etag"),
+                body: fetched.ok ? "" : await fetched.text(),
+              };
+            }
+            if (!response.ok) throw new BerryApiError(`File part ${partNumber} failed with ${response.status}`, response.status, response.body);
+            if (!response.etag) throw new Error("Object storage did not expose the ETag response header");
+            completed.push({ partNumber, etag: response.etag });
+            reportPartProgress(partNumber, end - start);
+            break;
+          } catch (error) {
+            const cause = partController.signal.reason === timeoutError ? timeoutError : error;
+            const retryable = cause === timeoutError || (cause instanceof BerryApiError
+              ? [408, 429, 500, 502, 503, 504].includes(cause.status)
+              : cause instanceof TypeError || (cause instanceof Error && cause.message === "File upload failed while sending data to object storage."));
+            if (controller.signal.aborted || !retryable || attempt >= 2) throw cause;
+            // Only resend the failed part; completed parts stay in S3.
+            reportPartProgress(partNumber, 0);
+            globalThis.clearTimeout(timeout);
+            controller.signal.removeEventListener("abort", abortPart);
+            await waitForUploadRetry(500 * 2 ** attempt, controller.signal);
+          } finally {
+            globalThis.clearTimeout(timeout);
+            controller.signal.removeEventListener("abort", abortPart);
           }
-        } catch (error) {
-          if (partController.signal.reason === timeoutError) throw timeoutError;
-          throw error;
-        } finally {
-          globalThis.clearTimeout(timeout);
-          controller.signal.removeEventListener("abort", abortPart);
         }
-        if (!response.ok) throw new BerryApiError(`File part ${partNumber} failed with ${response.status}`, response.status, response.body);
-        const etag = response.etag;
-        if (!etag) throw new Error("Object storage did not expose the ETag response header");
-        completed.push({ partNumber, etag });
-        reportPartProgress(partNumber, end - start);
       }
     };
     try {
+      controller.signal.throwIfAborted();
+      const signedBatches = await Promise.all(chunk(partNumbers, 100).map((batch) => this.#request(
+        `/v1/files/${encodeURIComponent(upload.fileId)}/uploads/${encodeURIComponent(upload.uploadId)}/parts`,
+        MultipartUploadPartUrlsSchema,
+        { method: "POST", body: { partNumbers: batch }, signal: controller.signal },
+      )));
+      for (const part of signedBatches.flatMap((signed) => signed.parts)) urls.set(part.partNumber, part.url);
+      controller.signal.throwIfAborted();
       await Promise.all(Array.from({ length: Math.min(Math.max(1, input.concurrency ?? 4), upload.partCount) }, worker));
+      controller.signal.throwIfAborted();
       return this.#resolveFileUrls(await this.#request(
         `/v1/files/${encodeURIComponent(upload.fileId)}/uploads/${encodeURIComponent(upload.uploadId)}/complete`,
         StoredFileSchema,
-        { method: "POST", body: { parts: completed.sort((left, right) => left.partNumber - right.partNumber) } },
+        { method: "POST", body: { parts: completed.sort((left, right) => left.partNumber - right.partNumber) }, signal: controller.signal },
       ));
     } catch (error) {
       controller.abort(error);
-      await this.#rawRequest(`/v1/files/${encodeURIComponent(upload.fileId)}/uploads/${encodeURIComponent(upload.uploadId)}`, { method: "DELETE" }).catch(() => undefined);
+      await this.#rawRequest(`/v1/files/${encodeURIComponent(upload.fileId)}/uploads/${encodeURIComponent(upload.uploadId)}`, { method: "DELETE", signal: AbortSignal.timeout(10_000) }).catch(() => undefined);
       throw error;
     } finally {
       input.signal?.removeEventListener("abort", abortFromCaller);
@@ -1909,7 +1945,7 @@ export class BerryApiClient {
     }
   }
 
-  async #request<TSchema extends z.ZodTypeAny>(path: string, schema: TSchema, init: { method?: string | undefined; body?: unknown; signal?: AbortSignal } = {}): Promise<z.output<TSchema>> {
+  async #request<TSchema extends z.ZodTypeAny>(path: string, schema: TSchema, init: { method?: string | undefined; body?: unknown; headers?: Record<string, string>; signal?: AbortSignal } = {}): Promise<z.output<TSchema>> {
     const { response, body } = await this.#rawRequest(path, init);
     if (!response.ok) {
       throw new BerryApiError(`Berry API request failed with ${response.status}`, response.status, body);
@@ -1963,9 +1999,10 @@ export class BerryApiClient {
     return typeof body === "string" ? body : JSON.stringify(body);
   }
 
-  async #rawRequest(path: string, init: { method?: string | undefined; body?: unknown; signal?: AbortSignal } = {}): Promise<{ response: Response; body: unknown }> {
+  async #rawRequest(path: string, init: { method?: string | undefined; body?: unknown; headers?: Record<string, string>; signal?: AbortSignal } = {}): Promise<{ response: Response; body: unknown }> {
     const method = init.method ?? "GET";
     const headers = new Headers(this.#headers);
+    for (const [name, value] of Object.entries(init.headers ?? {})) headers.set(name, value);
     headers.set("Accept", "application/json");
     const request: RequestInit = { method, headers, credentials: "include", ...(init.signal ? { signal: init.signal } : {}) };
     if (init.body !== undefined) {
@@ -2002,6 +2039,15 @@ function isSupportPath(pathname: string): boolean {
   if (pathname === "/v1/files" || pathname === "/v1/files/uploads") return true;
   if (/^\/v1\/files\/[^/]+$/.test(pathname) || /^\/v1\/files\/[^/]+\/content$/.test(pathname)) return true;
   return /^\/v1\/files\/[^/]+\/uploads\/[^/]+(?:\/parts|\/complete)?$/.test(pathname);
+}
+
+function waitForUploadRetry(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const abort = () => { clearTimeout(timer); reject(signal.reason); };
+    const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, ms);
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+  });
 }
 
 function uploadBlobWithXhr(

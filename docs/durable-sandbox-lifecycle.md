@@ -26,6 +26,10 @@ explicit resource request can trigger skill-package staging in a sandbox.
    sandbox.
 4. Terminal cleanup is marked `pause_requested` before its queue job becomes
    visible, and delayed non-terminal snapshot rows are superseded.
-5. Read-only workspace state and capture endpoints never create or resume a
+5. A follow-up turn reconnects its prior E2B sandbox even when its worker has
+   a cached handle with an unexpired lease. Another worker may have paused it
+   during terminal cleanup. Resuming a run whose persisted sandbox state is
+   inactive also bypasses the cache; active phases retain cheap handle reuse.
+6. Read-only workspace state and capture endpoints never create or resume a
    browser workspace. `POST /v1/tasks/:taskId/workspace` is the explicit start
    operation.

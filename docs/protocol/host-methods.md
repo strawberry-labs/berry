@@ -1487,6 +1487,38 @@ Result:
                         "type": "null"
                       }
                     ]
+                  },
+                  "attemptId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "retryLayer": {
+                    "type": "string",
+                    "enum": [
+                      "initial",
+                      "transport_retry",
+                      "stream_buffer_fallback",
+                      "runner_retry",
+                      "empty_response_recovery",
+                      "other"
+                    ]
+                  },
+                  "transport": {
+                    "type": "string",
+                    "enum": [
+                      "stream",
+                      "buffer"
+                    ]
+                  },
+                  "provider": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
+                  "route": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
                   }
                 },
                 "required": [
@@ -1842,6 +1874,10 @@ Result:
                   },
                   "providerResponseId": {
                     "type": "string"
+                  },
+                  "providerAttemptId": {
+                    "type": "string",
+                    "format": "uuid"
                   },
                   "model": {
                     "type": "string"

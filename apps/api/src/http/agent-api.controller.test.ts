@@ -567,6 +567,122 @@ describe("AgentApiController", () => {
     });
   });
 
+  it("creates one task per Idempotency-Key and keeps new submissions distinct (H-035)", async () => {
+    app = await createApp(fakeSessionHost());
+    const server = app.getHttpServer();
+    const key = "4f6a3c1e-8d7b-4c2a-9e5f-1a2b3c4d5e6f";
+    const body = { workspaceId: "workspace_cloud", title: "Draw five foxes" };
+    const create = (idempotencyKey: string | null, payload: object = body, token?: string) => {
+      const pending = request(server).post("/v1/tasks").set(authHeader(token));
+      return (idempotencyKey ? pending.set("Idempotency-Key", idempotencyKey) : pending).send(payload);
+    };
+
+    const first = await create(key).expect(201);
+    // A lost response or reconnect retries the same submission with the same key.
+    const retried = await create(key.toUpperCase()).expect(201);
+    expect(retried.body).toEqual(first.body);
+
+    await create(key, { ...body, title: "Draw six foxes" }).expect(409).expect(({ body: conflict }) => {
+      expect(conflict).toMatchObject({ code: "idempotency_key_reused" });
+    });
+    await create("not-a-uuid").expect(400).expect(({ body: invalid }) => {
+      expect(invalid).toMatchObject({ code: "invalid_idempotency_key" });
+    });
+
+    // An intentional rerun is a new submission with a new key: identical
+    // content still creates another task, as does a request without a key.
+    const rerun = await create("0b9a3f0e-55c4-4d1e-8f43-7f3c2a1b9d10").expect(201);
+    const unkeyed = await create(null).expect(201);
+    // Keys are scoped to the user: another member's key never returns this task.
+    const otherUser = await create(key, body, "berry-other-session").expect(201);
+    const ids = [first, rerun, unkeyed, otherUser].map((response) => response.body.task.id);
+    expect(new Set(ids).size).toBe(4);
+    await request(server).get("/v1/tasks?workspaceId=workspace_cloud").set(authHeader()).expect(200).expect(({ body: tasks }) => {
+      expect(tasks.map((task: { id: string }) => task.id).sort()).toEqual(ids.slice(0, 3).sort());
+    });
+  });
+
+  it("stores one task when duplicate deliveries of one submission arrive together (H-035)", async () => {
+    const runtimeConfig = chatRuntimeConfig();
+    const catalog = runtimeConfig.catalog.bind(runtimeConfig);
+    // Hold every request after its replay lookup until all five have arrived,
+    // so they reach the store together and only its key guard can dedupe them.
+    let arrivals = 0;
+    let releaseAll!: () => void;
+    const allArrived = new Promise<void>((resolve) => { releaseAll = resolve; });
+    vi.spyOn(runtimeConfig, "catalog").mockImplementation(async (...args) => {
+      arrivals += 1;
+      if (arrivals === 5) releaseAll();
+      await allArrived;
+      return catalog(...args);
+    });
+    app = await createApp(fakeSessionHost(), { runtimeConfig });
+    // Listen once so the concurrent requests share one server instead of each
+    // asking supertest to bind it.
+    await app.listen(0, "127.0.0.1");
+    const server = app.getHttpServer();
+    const key = "6c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f";
+
+    const responses = await Promise.all(Array.from({ length: 5 }, () => request(server)
+      .post("/v1/tasks")
+      .set(authHeader())
+      .set("Idempotency-Key", key)
+      .send({ workspaceId: "workspace_cloud", title: "Five image tasks" })));
+
+    expect(responses.map((response) => response.status)).toEqual([201, 201, 201, 201, 201]);
+    expect(new Set(responses.map((response) => response.body.task.id)).size).toBe(1);
+    expect(new Set(responses.map((response) => response.body.session.id)).size).toBe(1);
+    await request(server).get("/v1/tasks?workspaceId=workspace_cloud").set(authHeader()).expect(200).expect(({ body }) => {
+      expect(body).toHaveLength(1);
+    });
+  });
+
+  it("replays a retried submission as one task and one turn with one budget reservation (H-035)", async () => {
+    const budget = new BudgetService({
+      repository: new InMemoryBudgetRepository(),
+      hotCounters: new InMemoryBudgetHotCounters(),
+      enabled: true,
+    });
+    const reserve = vi.spyOn(budget, "reserve");
+    const runs = new Map<string, string>();
+    const admit = vi.fn(async (input: DurableTurnAdmission) => {
+      runs.set(input.requestId, `run_${runs.size + 1}`);
+      return { runId: runs.get(input.requestId)!, sessionId: input.sessionId };
+    });
+    app = await createApp(fakeSessionHost(), {
+      budget,
+      runtimeConfig: chatRuntimeConfig(),
+      durableTurns: {
+        enabled: true,
+        replayAdmission: async (input) => {
+          const runId = runs.get(input.requestId);
+          return runId ? { runId, sessionId: input.sessionId } : null;
+        },
+        admit,
+      },
+    });
+    const server = app.getHttpServer();
+    const submitIntent = "2d5e8f1a-3b4c-4d6e-9f0a-1b2c3d4e5f60";
+    const createTask = () => request(server).post("/v1/tasks").set(authHeader())
+      .set("Idempotency-Key", submitIntent)
+      .send({ workspaceId: "workspace_cloud", title: "Retried submission" })
+      .expect(201);
+
+    const created = await createTask();
+    expect((await createTask()).body.session.id).toBe(created.body.session.id);
+    const startTurn = () => request(server).post(`/v1/sessions/${created.body.session.id}/turns`).set(authHeader())
+      .send({ operationId: submitIntent, requestMessageId: submitIntent, input: "Draw five foxes", workspacePath: "/workspace" })
+      .expect(201);
+    const turn = await startTurn();
+    await startTurn().expect({ turnId: turn.body.turnId, sessionId: created.body.session.id });
+
+    expect(admit).toHaveBeenCalledOnce();
+    expect(reserve).toHaveBeenCalledOnce();
+    await request(server).get("/v1/tasks?workspaceId=workspace_cloud").set(authHeader()).expect(200).expect(({ body }) => {
+      expect(body).toHaveLength(1);
+    });
+  });
+
   it("snapshots the current organization default on each new task", async () => {
     const runtimeConfig = new CloudRuntimeConfigService({
       ...chatRuntimeEnv(),
@@ -1667,8 +1783,8 @@ describe("AgentApiController", () => {
         vision: expect.objectContaining({
           providerId: "router",
           model: "minimax-m3",
-          maxTokens: 1_536,
-          estimatedCostMicros: "5444",
+          maxTokens: 3_072,
+          estimatedCostMicros: "7287",
           modelPricing: expect.objectContaining({ input: 0.3, output: 1.2, cacheRead: 0.06 }),
         }),
       }),

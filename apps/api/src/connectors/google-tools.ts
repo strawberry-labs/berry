@@ -85,8 +85,12 @@ const workspaceTools: ToolDefinition[] = [
   tool("drive_search_files", "Search eligible Google Drive files. Results that Google marks unavailable for generative AI are omitted.", object({
     query: string("Drive files.list q expression."), pageSize: integer("Maximum results.", 1, 100), pageToken: string("Continuation token."),
     orderBy: string("Drive orderBy expression."), driveId: string("Optional shared drive ID."),
+    searchScope: string("Return the searchScope from the previous page here when continuing with pageToken."),
   }), "read", driveReadScopes, searchDriveFiles),
-  tool("drive_list_recent_files", "List recently modified eligible Drive files.", object({ pageSize: integer("Maximum results.", 1, 100), pageToken: string("Continuation token.") }), "read", driveReadScopes,
+  tool("drive_list_recent_files", "List recently modified eligible Drive files.", object({
+    pageSize: integer("Maximum results.", 1, 100), pageToken: string("Continuation token."),
+    searchScope: string("Return the searchScope from the previous page here when continuing with pageToken."),
+  }), "read", driveReadScopes,
     (token, input) => searchDriveFiles(token, { ...input, query: "trashed = false", orderBy: "modifiedTime desc" })),
   tool("drive_get_file_metadata", "Get safe metadata and current capabilities for one Drive file.", object({ fileId: string("Drive file ID.") }, ["fileId"]), "read", driveReadScopes,
     async (token, input) => driveFilePreflight(token, requiredString(input.fileId, "fileId"), "read")),
@@ -95,8 +99,12 @@ const workspaceTools: ToolDefinition[] = [
     exportMimeType: string("Optional export MIME type for Google-native files."),
     saveToLibrary: boolean("Save the file to the Berry Library and queue searchable extraction. Defaults to false. Use true only for clear durable user intent, never only because the current task needs the file."),
   }, ["fileId"]), "read", driveReadScopes, readDriveFile),
-  tool("drive_list_children", "List eligible files directly inside a Drive folder.", object({ folderId: string("Folder ID."), pageSize: integer("Maximum results.", 1, 100), pageToken: string("Continuation token.") }, ["folderId"]), "read", driveReadScopes,
-    (token, input) => searchDriveFiles(token, { query: `'${escapeDriveQuery(requiredString(input.folderId, "folderId"))}' in parents and trashed = false`, pageSize: input.pageSize, pageToken: input.pageToken })),
+  tool("drive_list_children", "List eligible files directly inside a Drive folder, including folders in shared drives.", object({
+    folderId: string("Folder ID."), pageSize: integer("Maximum results.", 1, 100), pageToken: string("Continuation token."),
+    driveId: string("Optional shared drive ID of the folder; found automatically when omitted."),
+    searchScope: string("Return the searchScope from the previous page here when continuing with pageToken."),
+  }, ["folderId"]), "read", driveReadScopes,
+    listDriveChildren),
   tool("drive_list_permissions", "List existing Drive permissions without changing sharing.", object({ fileId: string("Drive file ID."), pageSize: integer("Maximum permissions.", 1, 100), pageToken: string("Continuation token.") }, ["fileId"]), "read", driveReadScopes, async (token, input) => {
     const fileId = requiredString(input.fileId, "fileId");
     await driveFilePreflight(token, fileId, "read");
@@ -276,9 +284,70 @@ function googleError(status: number, text: string): Error { let message = `HTTP 
 
 async function searchDriveFiles(token: string, input: Record<string, unknown>): Promise<unknown> {
   const driveId = optionalString(input.driveId);
-  const result = await googleJson(token, driveUrl("files", { q: optionalString(input.query), pageSize: boundedInteger(input.pageSize, 50, 1, 100), pageToken: optionalString(input.pageToken), orderBy: optionalString(input.orderBy), spaces: "drive", corpora: driveId ? "drive" : "user", driveId, includeItemsFromAllDrives: true, supportsAllDrives: true, fields: `nextPageToken,incompleteSearch,files(${DRIVE_FIELDS})` })) as Record<string, unknown>;
-  const files = Array.isArray(result.files) ? result.files.filter((file) => eligibleDriveFile(file)) : [];
-  return { ...result, files, omittedIneligibleCount: Math.max(0, (Array.isArray(result.files) ? result.files.length : 0) - files.length) };
+  const pageToken = optionalString(input.pageToken);
+  const requestedScope = optionalString(input.searchScope) === "allDrives" ? "allDrives" : "user";
+  const search = async (corpora: "drive" | "user" | "allDrives") => {
+    const result = await googleJson(token, driveUrl("files", { q: optionalString(input.query), pageSize: boundedInteger(input.pageSize, 50, 1, 100), pageToken, orderBy: optionalString(input.orderBy), spaces: "drive", corpora, driveId: corpora === "drive" ? driveId : undefined, includeItemsFromAllDrives: true, supportsAllDrives: true, fields: `nextPageToken,incompleteSearch,files(${DRIVE_FIELDS})` })) as Record<string, unknown>;
+    const files = Array.isArray(result.files)
+      ? result.files.filter((file) => eligibleDriveFile(file)).map((file) => driveListingEntry(file as Record<string, unknown>))
+      : [];
+    return {
+      ...result,
+      files,
+      omittedIneligibleCount: Math.max(0, (Array.isArray(result.files) ? result.files.length : 0) - files.length),
+      // Pass searchScope (and driveId) back unchanged with nextPageToken.
+      searchScope: corpora === "drive" ? "drive" : corpora,
+      ...(corpora === "drive" && driveId ? { driveId } : {}),
+      incompleteSearch: result.incompleteSearch === true,
+    };
+  };
+  if (driveId) return search("drive");
+  const first = await search(requestedScope);
+  // corpora=user covers files the user created, opened or was directly shared,
+  // not every file in their shared drives. One bounded retry across the user's
+  // drives (Google still applies the user's permissions) avoids a false miss.
+  if (requestedScope === "user" && !pageToken && first.files.length === 0) return search("allDrives");
+  return first;
+}
+
+async function listDriveChildren(token: string, input: Record<string, unknown>): Promise<unknown> {
+  const folderId = requiredString(input.folderId, "folderId");
+  // A shared-drive folder's children are only listed reliably within that drive.
+  const driveId = optionalString(input.driveId)
+    ?? optionalString(record(await googleJson(token, driveUrl(`files/${encodeURIComponent(folderId)}`, { fields: "id,driveId", supportsAllDrives: true })))?.driveId);
+  return searchDriveFiles(token, { query: `'${escapeDriveQuery(folderId)}' in parents and trashed = false`, pageSize: input.pageSize, pageToken: input.pageToken, searchScope: input.searchScope, driveId });
+}
+/**
+ * A listing gives each eligible file's identity and the three permissions a
+ * next step needs, not its full capability and restriction metadata: 100 full
+ * records ran past the tool-result limit and cut off the next-page token
+ * (H-070). drive_get_file_metadata still returns one file's full metadata.
+ */
+function driveListingEntry(file: Record<string, unknown>): Record<string, unknown> {
+  const capabilities = record(file.capabilities) ?? {};
+  const owners = Array.isArray(file.owners)
+    ? file.owners.flatMap((owner) => {
+        const value = record(owner);
+        const entry = compact({ displayName: optionalString(value?.displayName), emailAddress: optionalString(value?.emailAddress) });
+        return Object.keys(entry).length > 0 ? [entry] : [];
+      })
+    : undefined;
+  return compact({
+    id: file.id,
+    name: file.name,
+    mimeType: file.mimeType,
+    size: file.size,
+    createdTime: file.createdTime,
+    modifiedTime: file.modifiedTime,
+    webViewLink: file.webViewLink,
+    parents: file.parents,
+    driveId: file.driveId,
+    resourceKey: file.resourceKey,
+    owners,
+    canEdit: typeof capabilities.canEdit === "boolean" ? capabilities.canEdit : undefined,
+    canDownload: typeof capabilities.canDownload === "boolean" ? capabilities.canDownload : undefined,
+    canCopy: typeof capabilities.canCopy === "boolean" ? capabilities.canCopy : undefined,
+  });
 }
 function eligibleDriveFile(value: unknown): boolean { if (!value || typeof value !== "object" || Array.isArray(value)) return false; const file = value as Record<string, unknown>; const capabilities = record(file.capabilities); return file.trashed !== true && capabilities?.canAccessViaGenAi !== false; }
 async function driveFilePreflight(token: string, fileId: string, operation: "read" | "download" | "edit" | "copy"): Promise<Record<string, unknown>> {

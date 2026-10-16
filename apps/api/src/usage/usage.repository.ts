@@ -540,7 +540,7 @@ function analyticsFromEvents(tenantId: string, query: UsageAnalyticsQuery, event
       cacheReadTokens: events.reduce((sum, event) => sum + event.cacheReadTokens, 0),
       cacheWriteTokens: events.reduce((sum, event) => sum + event.cacheWriteTokens, 0),
       cacheEligibleRequests: events.filter((event) => event.cacheEligible).length,
-      cacheHitRequests: events.filter((event) => event.cacheEligible && event.cacheReadTokens > 0).length,
+      cacheHitRequests: events.filter((event) => event.cacheReadTokens > 0).length,
       sandboxMinutes,
     },
     anomalies: explainAnomalies(events, query),
@@ -573,7 +573,7 @@ async function postgresAnalytics(
       COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens,
       COALESCE(SUM(cache_write_tokens), 0)::bigint AS cache_write_tokens,
       COUNT(*) FILTER (WHERE cache_eligible)::bigint AS cache_eligible_requests,
-      COUNT(*) FILTER (WHERE cache_eligible AND cache_read_tokens > 0)::bigint AS cache_hit_requests,
+      COUNT(*) FILTER (WHERE cache_read_tokens > 0)::bigint AS cache_hit_requests,
       COALESCE(SUM(
         CASE
           WHEN jsonb_typeof(sandbox_usage->'minutes') = 'number'

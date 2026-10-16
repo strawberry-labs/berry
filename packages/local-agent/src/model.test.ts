@@ -1,4 +1,5 @@
-import { OpenRouterCompatibleClient, RouterClientError } from "@berry/router-client";
+import { OpenRouterCompatibleClient, RouterClientError, type ChatCompletionChunk } from "@berry/router-client";
+import type { ProviderAttemptReport } from "@berry/shared";
 import type { AssistantMessageEvent, Context } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { BerryModelAdapter, BufferedChatCompletionClient, ContentFallbackChatCompletionClient, contextForModelCapabilities, contextToChatMessages, createBerryModel, createBerryModels } from "./model.ts";
@@ -129,6 +130,42 @@ describe("BerryModelAdapter", () => {
     expect(completed).toBe(1);
     expect(chunks).toHaveLength(1);
     expect(chunks[0]?.delta).toBe("recovered");
+  });
+
+  it("labels a same-route buffered fallback apart from the stream it replaced (H-033)", async () => {
+    const compatible = new OpenRouterCompatibleClient({
+      provider: { ...provider, endpointPath: "/chat/completions" },
+      apiKey: "secret-key",
+      fetchImpl: async (_url, init) => {
+        if ((JSON.parse(String(init?.body)) as { stream?: boolean }).stream) {
+          return new Response(JSON.stringify({ error: { message: "upstream stalled" } }), { status: 504 });
+        }
+        return new Response(JSON.stringify({
+          id: "buffered",
+          model: "test-model",
+          choices: [{ message: { content: "recovered" }, finish_reason: "stop" }],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      },
+    });
+    const client = new ContentFallbackChatCompletionClient(compatible, new BufferedChatCompletionClient(compatible));
+    const reports: ProviderAttemptReport[] = [];
+    const decisions: Array<[number, string]> = [];
+
+    for await (const _chunk of client.stream({
+      messages: [{ role: "user", content: "hello" }],
+      onProviderAttempt: (report) => reports.push(report),
+      onProviderAttemptDecision: (attempt, decision) => decisions.push([attempt, decision]),
+    })) {
+      // Consume the recovered response.
+    }
+
+    expect(reports.map((report) => [report.physicalAttempt, report.transport, report.retryLayer, report.category]))
+      .toEqual([[1, "stream", "initial", "server"], [2, "buffer", "stream_buffer_fallback", "success"]]);
+    expect(decisions).toEqual([[1, "fallback"]]);
+    expect(reports[0]?.route).toBe("/chat/completions");
+    expect(reports[1]?.route).toBe(reports[0]?.route);
+    expect(reports[1]?.provider).toBe("provider_test");
+    expect(reports[1]?.attemptId).not.toBe(reports[0]?.attemptId);
   });
 
   it("does not replay a buffered completion after streaming emitted a partial chunk", async () => {
@@ -378,6 +415,52 @@ describe("BerryModelAdapter", () => {
       },
     ]);
     expect(capture.body?.tool_choice).toBe("auto");
+  });
+
+  it("keeps tool calls separate when a gateway restarts the index for each event (H-038)", async () => {
+    const events: ChatCompletionChunk[] = [
+      // Task fe764378: activate_skill and read arrived as "activate_skillread".
+      { id: "gemini-1", model: "gemini", delta: "", finishReason: null, raw: {},
+        toolCalls: [{ index: 0, id: "call_a", function: { name: "activate_skill", arguments: "{\"name\":\"docx\"}" } }] },
+      { id: "gemini-1", model: "gemini", delta: "", finishReason: null, raw: {},
+        toolCalls: [{ index: 0, id: "call_b", function: { name: "read", arguments: "{\"path\":\"/workspace/inputs/brief.docx\"}" } }] },
+      // A provider that repeats the same id on every fragment of one call.
+      { id: "gemini-1", model: "gemini", delta: "", finishReason: null, raw: {},
+        toolCalls: [{ index: 0, id: "call_c", function: { name: "ls", arguments: "{\"pa" } }] },
+      { id: "gemini-1", model: "gemini", delta: "", finishReason: "tool_calls", raw: {},
+        toolCalls: [{ index: 0, id: "call_c", function: { arguments: "th\":\"/workspace\"}" } }] },
+    ];
+    const adapter = new BerryModelAdapter({ client: { async *stream() { yield* events; } } });
+    const streamed = await collect(adapter, { messages: [{ role: "user", content: "read the brief", timestamp: 1 }] });
+    const done = streamed.at(-1);
+    if (done?.type !== "done") throw new Error("expected done event");
+    expect(done.reason).toBe("toolUse");
+    expect(done.message.content).toEqual([
+      { type: "toolCall", id: "call_a", name: "activate_skill", arguments: { name: "docx" } },
+      { type: "toolCall", id: "call_b", name: "read", arguments: { path: "/workspace/inputs/brief.docx" } },
+      { type: "toolCall", id: "call_c", name: "ls", arguments: { path: "/workspace" } },
+    ]);
+    expect(streamed.filter((event) => event.type === "toolcall_start")).toHaveLength(3);
+  });
+
+  it("still merges interleaved fragments of parallel tool calls by index", async () => {
+    const chunk = (toolCalls: ChatCompletionChunk["toolCalls"], finishReason: string | null = null): ChatCompletionChunk =>
+      ({ id: "1", model: "m", delta: "", finishReason, raw: {}, ...(toolCalls ? { toolCalls } : {}) });
+    const adapter = new BerryModelAdapter({
+      client: {
+        async *stream() {
+          yield chunk([{ index: 0, id: "call_1", function: { name: "read", arguments: "" } }, { index: 1, id: "call_2", function: { name: "ls", arguments: "" } }]);
+          yield chunk([{ index: 1, function: { arguments: "{\"path\":" } }, { index: 0, function: { arguments: "{\"path\":\"a.txt\"}" } }]);
+          yield chunk([{ index: 1, function: { arguments: "\"/workspace\"}" } }], "tool_calls");
+        },
+      },
+    });
+    const done = (await collect(adapter, { messages: [{ role: "user", content: "look", timestamp: 1 }] })).at(-1);
+    if (done?.type !== "done") throw new Error("expected done event");
+    expect(done.message.content).toEqual([
+      { type: "toolCall", id: "call_1", name: "read", arguments: { path: "a.txt" } },
+      { type: "toolCall", id: "call_2", name: "ls", arguments: { path: "/workspace" } },
+    ]);
   });
 
   it("encodes request failures as a final error event instead of throwing", async () => {

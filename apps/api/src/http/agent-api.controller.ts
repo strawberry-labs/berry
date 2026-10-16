@@ -66,7 +66,7 @@ import { CloudRuntimeConfigService } from "../runtime/cloud-runtime-config.ts";
 import type { AuthenticatedRequest } from "../auth/auth.guard.ts";
 import { BUDGET_SERVICE, budgetEstimateFromRequest, modelCostSnapshot, usageCostMicros, type BudgetService } from "../budget/budget.service.ts";
 import { MODEL_GOVERNANCE_SERVICE, type ModelGovernanceService } from "../model-governance/model-governance.service.ts";
-import { CLOUD_TASK_STORE, InMemoryCloudTaskStore, MESSAGE_HISTORY_MAX_CURSOR, type CloudTaskStore } from "./cloud-task-store.ts";
+import { CLOUD_TASK_STORE, InMemoryCloudTaskStore, MESSAGE_HISTORY_MAX_CURSOR, type CloudTaskStore, type TaskCreationIdempotency } from "./cloud-task-store.ts";
 import { ApiEventStreamService } from "./event-stream.service.ts";
 import { CompanionPushService, MOBILE_DEVICE_REGISTRY, type MobileDeviceRegistry } from "./mobile-devices.ts";
 import { USAGE_REPOSITORY, type UsageRepository } from "../usage/usage.repository.ts";
@@ -326,10 +326,45 @@ export function turnAdmissionFingerprint(request: z.infer<typeof StartTurnReques
   return createHash("sha256").update(canonicalTurnOperation(operation)).digest("hex");
 }
 
+/** Hash of a parsed task-creation request; the idempotency key travels in a header. */
+export function taskCreationFingerprint(request: z.infer<typeof CreateTaskRequestSchema>): string {
+  return createHash("sha256").update(canonicalTurnOperation(request)).digest("hex");
+}
+
+/**
+ * Reads the optional `Idempotency-Key` header of POST /v1/tasks (H-035). The
+ * client sends one UUID per submit intent and repeats it on every retry of that
+ * submission; a header keeps older API builds compatible because they ignore it.
+ * Read from the request, not a handler parameter, so support view (which
+ * delegates with a derived request) applies the same key.
+ */
+function taskCreationIdempotency(
+  httpRequest: AuthenticatedRequest,
+  request: z.infer<typeof CreateTaskRequestSchema>,
+): TaskCreationIdempotency | undefined {
+  const header = httpRequest.headers["idempotency-key"];
+  if (header === undefined) return undefined;
+  const key = z.string().uuid().safeParse(header);
+  if (!key.success) {
+    throw new BadRequestException({
+      code: "invalid_idempotency_key",
+      message: "Idempotency-Key must be a single UUID.",
+    });
+  }
+  return { key: key.data.toLowerCase(), fingerprint: taskCreationFingerprint(request) };
+}
+
 type ObservedAdmissionPreparation<T> = Promise<
   | { status: "fulfilled"; value: T }
   | { status: "rejected"; reason: unknown }
 >;
+
+/** What the model and the user are told when an optional capability could not be prepared (H-050). */
+export function degradedCapabilityReason(what: string, status: "timeout" | "unavailable"): string {
+  return status === "timeout"
+    ? `${what} did not finish in time for this message. Sending the next message tries again.`
+    : `${what} failed for this message. Sending the next message tries again; if it keeps failing, an administrator should check it.`;
+}
 
 function observeAdmissionPreparation<T>(work: Promise<T>): ObservedAdmissionPreparation<T> {
   return work.then(
@@ -344,32 +379,36 @@ async function resolveAdmissionPreparation<T>(work: ObservedAdmissionPreparation
   return result.value;
 }
 
-async function resolveOptionalAdmissionPreparation<T>(
+export async function resolveOptionalAdmissionPreparation<T>(
   work: ObservedAdmissionPreparation<T>,
   fallback: T,
   deadlineAt: number,
   label: string,
+  onDegraded?: (status: "timeout" | "unavailable") => void,
 ): Promise<T> {
   const remainingMs = Math.max(0, deadlineAt - Date.now());
-  if (remainingMs === 0) {
-    logAdmissionPreparationDegraded(label, "timeout");
-    return fallback;
-  }
   let timeout: ReturnType<typeof setTimeout> | undefined;
+  // Work that already settled is used even when it is read after the deadline;
+  // only work still pending then falls back. `work` is raced first, so a
+  // settled result wins over the immediate timeout (H-050).
   const result = await Promise.race([
     work,
-    new Promise<{ status: "timeout" }>((resolve) => {
-      timeout = setTimeout(() => resolve({ status: "timeout" }), remainingMs);
-      timeout.unref?.();
-    }),
+    remainingMs === 0
+      ? Promise.resolve({ status: "timeout" as const })
+      : new Promise<{ status: "timeout" }>((resolve) => {
+          timeout = setTimeout(() => resolve({ status: "timeout" }), remainingMs);
+          timeout.unref?.();
+        }),
   ]);
   if (timeout) clearTimeout(timeout);
   if (result.status === "timeout") {
     logAdmissionPreparationDegraded(label, "timeout");
+    onDegraded?.("timeout");
     return fallback;
   }
   if (result.status === "rejected") {
     logAdmissionPreparationDegraded(label, "unavailable");
+    onDegraded?.("unavailable");
     return fallback;
   }
   return result.value;
@@ -1045,6 +1084,13 @@ export class AgentApiController {
     const request = parseBody(CreateTaskRequestSchema, body);
     const tenantId = tenantIdFromRequest(httpRequest);
     const userId = httpRequest.auth?.user.id ?? null;
+    const idempotency = taskCreationIdempotency(httpRequest, request);
+    if (idempotency) {
+      // A retry of a submission that already created its task gets that task
+      // back without repeating model resolution or governance (H-035).
+      const created = await this.store.findCreatedTask(userId, idempotency);
+      if (created) return created;
+    }
     // `conversationKind` is accepted only as a legacy input. Web tasks use one
     // normal assistant flow, so model routing never branches on that value.
     const mode = "chat" as const;
@@ -1057,6 +1103,7 @@ export class AgentApiController {
         ...taskRequest,
         permissionMode: "full-access",
         ownerUserId: userId,
+        idempotency,
       });
     }
     const runtime = await this.runtimeConfig.resolve(tenantId, {
@@ -1065,24 +1112,14 @@ export class AgentApiController {
     });
     await this.modelGovernance.synchronizeRuntimeCatalog(tenantId, runtime.provider);
     const departmentId = await this.#primaryDepartmentId(tenantId, userId);
-    let modelDecision = await this.modelGovernance.resolve({
+    const modelDecision = await this.modelGovernance.resolveTaskModel({
       tenantId,
       mode,
       providerId: explicitModel ? requestedProviderId ?? runtime.provider.id : null,
       model: explicitModel,
       userId,
       departmentId,
-    });
-    if (!explicitModel && modelDecision.reason === "no_model_selected") {
-      modelDecision = await this.modelGovernance.resolve({
-        tenantId,
-        mode,
-        providerId: runtime.provider.id,
-        model: runtime.provider.defaultModel,
-        userId,
-        departmentId,
-      });
-    }
+    }, runtime.provider);
     if (!modelDecision.allowed) {
       throw new ForbiddenException({
         code: "model_governance_blocked",
@@ -1102,6 +1139,7 @@ export class AgentApiController {
       modelProviderId: modelDecision.providerId,
       model: modelDecision.model,
       ownerUserId: userId,
+      idempotency,
     });
   }
 
@@ -1499,7 +1537,22 @@ export class AgentApiController {
     const attachments = parsed.attachments.length > 0
       ? await this.files.runtimeAttachments(tenantIdFromRequest(request), request.auth!.user.id, parsed.attachments, { taskId: task.id, sessionId })
       : [];
-    return this.queuedFollowUps.enqueue(tenantIdFromRequest(request), request.auth!.user.id, sessionId, { ...parsed, attachments });
+    const tenantId = tenantIdFromRequest(request);
+    const userId = request.auth!.user.id;
+    const departmentId = await this.#primaryDepartmentId(tenantId, userId);
+    return this.queuedFollowUps.enqueue(tenantId, userId, sessionId, { ...parsed, attachments }, async (runtime, requestId) => {
+      const check = await this.budgets.reserve({
+        tenantId, userId, departmentId, taskId: task.id, sessionId, requestId,
+        feature: "model", provider: typeof runtime.providerId === "string" ? runtime.providerId : null,
+        model: typeof runtime.model === "string" ? runtime.model : null,
+        // The worker reserves the actual next-call estimate before calling a
+        // provider. Queue admission still checks billing health and quotas.
+        estimatedCostMicros: 0,
+        estimatedTokens: typeof runtime.maxTokens === "number" ? runtime.maxTokens : 4000,
+        metadata: { workspaceId: task.workspaceId, queuedFollowUp: true },
+      });
+      return Boolean(check.reservation);
+    });
   }
 
   @Patch("/follow-ups/:followUpId")
@@ -1624,14 +1677,14 @@ export class AgentApiController {
     ]);
     await this.modelGovernance.synchronizeRuntimeCatalog(tenantId, baseRuntime.provider);
     const mode = "chat" as const;
-    const modelDecision = await this.modelGovernance.resolve({
+    const modelDecision = await this.modelGovernance.resolveTaskModel({
       tenantId,
       mode,
       providerId: selectedProviderId ?? null,
       model: selectedModel ?? null,
       userId,
       departmentId,
-    });
+    }, baseRuntime.provider);
     if (!modelDecision.allowed) {
       throw new ForbiddenException({
         code: "model_governance_blocked",
@@ -1879,12 +1932,15 @@ export class AgentApiController {
           resolvedRuntime.apiKey,
           resolvedRuntime.credentialRef,
         );
-        const mcpServersWork = observeAdmissionPreparation(Promise.all(governedRequest.mcpServers
-          .filter((server) => server.enabled && server.trusted)
-          .map((server) => durableMcpServer(server))));
+        const enabledMcpServers = governedRequest.mcpServers.filter((server) => server.enabled && server.trusted);
+        const mcpServersWork = observeAdmissionPreparation(Promise.all(enabledMcpServers.map((server) => durableMcpServer(server))));
         const visionWork = observeAdmissionPreparation(governedCapabilities.vision === true
           ? Promise.resolve(null)
           : this.#resolveVisionAdapter(tenantId, userId, departmentId, mode));
+        // A configured capability that could not be prepared for this turn
+        // stays declared with the reason, so the tool list does not change
+        // between turns and the model can say why (H-032, H-050).
+        const capabilityNotices: Array<{ capability: "connectors" | "vision" | "image_generation"; reason: string }> = [];
         const [provider, mcpServers, vision] = await Promise.all([
           providerWork,
           resolveOptionalAdmissionPreparation(
@@ -1892,18 +1948,34 @@ export class AgentApiController {
             [],
             optionalPreparationDeadlineAt,
             "mcp_runtime",
+            (status) => {
+              if (enabledMcpServers.length > 0) {
+                capabilityNotices.push({ capability: "connectors", reason: degradedCapabilityReason("Connector setup", status) });
+              }
+            },
           ),
           resolveOptionalAdmissionPreparation(
             visionWork,
             null,
             optionalPreparationDeadlineAt,
             "vision_runtime",
+            (status) => {
+              if (governedCapabilities.vision !== true) {
+                capabilityNotices.push({ capability: "vision", reason: degradedCapabilityReason("The image-reading service", status) });
+              }
+            },
           ),
         ]);
+        if (imageInfo && !imageDecision?.allowed) {
+          capabilityNotices.push({
+            capability: "image_generation",
+            reason: imageDecision ? modelGovernanceMessage(imageDecision.reason) : "Image generation is not allowed for this request.",
+          });
+        }
         const builtInTools = [
           ...DURABLE_BASE_BUILT_IN_TOOLS,
-          ...(imageInfo && imageDecision?.allowed ? ["create_image" as const] : []),
-          ...(vision ? ["inspect_images" as const] : []),
+          ...(imageInfo ? ["create_image" as const] : []),
+          ...(vision || capabilityNotices.some((notice) => notice.capability === "vision") ? ["inspect_images" as const] : []),
           ...(governedRequest.extraSkills.some((skill) => !skill.disableModelInvocation)
             ? ["activate_skill" as const]
             : []),
@@ -1959,6 +2031,7 @@ export class AgentApiController {
             ...(attachment.sourceKind !== undefined ? { sourceKind: attachment.sourceKind } : {}),
           })),
           ...(portableCheckpoint ? { portableCheckpoint } : {}),
+          ...(capabilityNotices.length > 0 ? { capabilityNotices } : {}),
         });
         const durableBudgetCheck = await reserveModelBudget();
         const budgetReservationRequired = Boolean(durableBudgetCheck.reservation);
@@ -2569,14 +2642,33 @@ export class AgentApiController {
     @Body() body: unknown,
   ) {
     const request = parseBody(RecoveryActionSchema, body);
-    return {
-      ok: await this.durableTurns.recover(
-        tenantIdFromRequest(httpRequest),
-        httpRequest.auth!.user.id,
-        runId,
-        request.action,
-      ),
-    };
+    const tenantId = tenantIdFromRequest(httpRequest);
+    const userId = httpRequest.auth!.user.id;
+    let renewedRequestId: string | null = null;
+    let ok = false;
+    try {
+      ok = await this.durableTurns.recover(tenantId, userId, runId, request.action, async ({ requestId, taskId, sessionId, runtimeRequest }) => {
+        // The settled reservation of the recovered generation stays settled.
+        // Admission checks billing health and limits; the worker reserves each
+        // model call's estimate before calling the provider.
+        const check = await this.budgets.reserve({
+          tenantId, userId, departmentId: await this.#primaryDepartmentId(tenantId, userId), taskId, sessionId, requestId,
+          feature: "model",
+          provider: typeof runtimeRequest.providerId === "string" ? runtimeRequest.providerId : null,
+          model: typeof runtimeRequest.model === "string" ? runtimeRequest.model : null,
+          estimatedCostMicros: 0,
+          estimatedTokens: typeof runtimeRequest.maxTokens === "number" ? runtimeRequest.maxTokens : 4000,
+          metadata: { runId, operatorRecovery: request.action },
+        });
+        renewedRequestId = check.reservation ? requestId : null;
+        return Boolean(check.reservation);
+      });
+    } finally {
+      if (!ok && renewedRequestId) {
+        await this.budgets.reconcile({ tenantId, requestId: renewedRequestId, actualCostMicros: 0n }).catch(() => undefined);
+      }
+    }
+    return { ok };
   }
 
   @Get("/devices")
@@ -3038,7 +3130,8 @@ function promptImprovementUsageEvent(input: {
     cacheWriteTokens: input.usage.cacheWriteTokens ?? 0,
     cacheCreationTokens1h: input.usage.cacheCreationTokens1h ?? 0,
     cacheCreationTokens5m: input.usage.cacheCreationTokens5m ?? 0,
-    cacheEligible: cacheReadTokens > 0,
+    // No cache plan is made for prompt improvement; a hit is not eligibility.
+    cacheEligible: false,
     cacheProvider: cacheReadTokens > 0 ? input.provider : null,
     cacheKeyHash: null,
     promptManifestHash: null,

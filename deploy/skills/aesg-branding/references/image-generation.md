@@ -54,13 +54,15 @@ the real building.
 ## 4. Place the exact logo
 
 For final branded creative, do not accept an AI approximation of the mark.
-Generate the scene and clean placement zone first, then alpha-composite the
-selected PNG:
+Generate the scene and clean placement zone first with `create_image` and
+`purpose: "draft"`. The draft is saved under `drafts/` and is not published, so
+the user never receives the unbranded base as a finished file. Then
+alpha-composite the selected PNG into a new file under `outputs/`:
 
 ```bash
 python <aesg-branding-skill-directory>/scripts/composite_logo.py \
-  <generated-image> \
-  <final-output.png> \
+  <workspace>/drafts/<generated-image>.png \
+  <workspace>/outputs/<final-output>.png \
   --logo <aesg-branding-skill-directory>/assets/logos/aesg-brandmark-rgb.png \
   --position top-right \
   --width-percent 18
@@ -86,5 +88,7 @@ View the final image at full size and confirm:
 - the image matches the selected AESG photography category;
 - the output is described as conceptual when no real-site reference was used.
 
-Publish only the final composited image for branded creative. For source-image
-requests, publish the clean unbranded generation.
+Publish only the final composited image for branded creative, with
+`persist_artifact`; the draft base stays unpublished. For source-image requests,
+generate with the default `purpose` (`final`): the clean unbranded image is
+published directly and needs no `persist_artifact` call.

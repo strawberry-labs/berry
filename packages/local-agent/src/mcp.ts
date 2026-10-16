@@ -2,7 +2,7 @@ import type { AgentTool, AgentToolResult } from "@berry/harness";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { Type, type TSchema } from "typebox";
 import { ExecPolicyEngine, type ExecPolicyRule } from "@berry/execpolicy";
 import { networkDomainAllowed, type NetworkPolicy } from "@berry/shared";
@@ -278,7 +278,44 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 
+/**
+ * Records on a failed call which side of dispatch it failed on, as
+ * `toolCallPhase`: "not_sent" before the request reached the server, so the
+ * tool did not run, or "dispatched" after it was sent, when the tool may have
+ * run. A result the SDK rejects after the tool ran (an output schema
+ * mismatch) is a dispatched failure, whatever its wording. Only a typed HTTP
+ * transport refusal is "rejected"; statuses inside a tool result are not.
+ */
+function failedCall(error: unknown, phase: "not_sent" | "dispatched" | "rejected"): unknown {
+  if (error && typeof error === "object") {
+    try {
+      Object.defineProperty(error, "toolCallPhase", { value: phase, configurable: true, enumerable: true });
+      return error;
+    } catch {
+      // A frozen error is wrapped below.
+    }
+  }
+  return Object.assign(new Error(error instanceof Error ? error.message : String(error), { cause: error }), { toolCallPhase: phase });
+}
+
 /** Connects MCP servers independently. Cached schemas are usable immediately; live startup never needs to block turn creation. */
+/**
+ * An MCP tool returned an error result. The structured content (error codes,
+ * statuses, diagnostics) stays attached so callers can classify the failure
+ * without parsing its text.
+ */
+export class McpToolError extends Error {
+  readonly structuredContent: unknown;
+  /** The tool ran on its server. */
+  readonly toolCallPhase = "dispatched";
+
+  constructor(message: string, structuredContent: unknown) {
+    super(message);
+    this.name = "McpToolError";
+    this.structuredContent = structuredContent;
+  }
+}
+
 export class McpToolSource {
   readonly #options: McpToolSourceOptions;
   readonly #servers = new Map<string, ConnectedServer>();
@@ -405,15 +442,26 @@ export class McpToolSource {
     signal?: AbortSignal,
   ): Promise<AgentToolResult<Record<string, unknown>>> {
     if (signal?.aborted) throw signal.reason;
-    const result = await client.callTool(
-      { name, arguments: args },
-      undefined,
-      signal ? { signal } : undefined,
-    );
+    let result: Awaited<ReturnType<Client["callTool"]>>;
+    try {
+      result = await client.callTool(
+        { name, arguments: args },
+        undefined,
+        signal ? { signal } : undefined,
+      );
+    } catch (error) {
+      // The SDK's transport error comes from the HTTP response to this POST.
+      // A tool's JSON-RPC error or structured result may instead describe a
+      // later, failed part of a write that the tool already applied.
+      const rejected = error instanceof StreamableHTTPError && typeof error.code === "number"
+        && error.code >= 400 && error.code < 500 && error.code !== 408;
+      throw failedCall(error, rejected ? "rejected" : "dispatched");
+    }
     if (result.isError) {
-      const failure = contentToToolResult(result.content, (result as { structuredContent?: unknown }).structuredContent);
+      const structuredContent = (result as { structuredContent?: unknown }).structuredContent;
+      const failure = contentToToolResult(result.content, structuredContent);
       const text = failure.content[0];
-      throw new Error(text && text.type === "text" ? text.text : "MCP tool failed");
+      throw new McpToolError(text && text.type === "text" ? text.text : "MCP tool failed", structuredContent);
     }
     return contentToToolResult(result.content, (result as { structuredContent?: unknown }).structuredContent);
   }
@@ -425,7 +473,12 @@ export class McpToolSource {
       const allowed = spec.allowedTools ? new Set(spec.allowedTools) : null;
       const cached = (live?.cachedTools ?? spec.cachedTools ?? []).filter((tool) => !allowed || allowed.has(tool.name));
       return cached.map((tool) => cachedTool(spec, tool, async (name, args, signal) => {
-        const server = await this.#ensureConnected(spec);
+        let server: ConnectedServer;
+        try {
+          server = await this.#ensureConnected(spec);
+        } catch (error) {
+          throw failedCall(error, "not_sent");
+        }
         if (spec.allowedTools && !server.cachedTools.some((candidate) => candidate.name === name)) {
           throw new Error(`MCP tool ${spec.name}:${name} is unavailable because its definition changed after administrator review`);
         }

@@ -1,10 +1,11 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { McpServerSpec } from "@berry/local-agent/mcp";
+import { McpToolSource, type McpServerSpec } from "@berry/local-agent/mcp";
 import type { ChatToolDefinition } from "@berry/router-client";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DurableTurnSnapshot, DurableTurnStep, DurableTurnToolExecutor } from "./turn-runner.js";
 import {
+  boundedMcpText,
   connectorArtifactText,
   DurableMcpToolExecutor,
   durableMcpToolPolicy,
@@ -35,7 +36,7 @@ describe("durable MCP tool exposure", () => {
     expect(baseSupportsAbort).toHaveBeenCalledTimes(1);
   });
 
-  it("exposes only the relevant calendar connector plus core and lazy discovery tools", async () => {
+  it("declares the same tools for every request and lists only the mentioned connector's tools as ready (H-032)", async () => {
     const inherited: ChatToolDefinition = {
       type: "function",
       function: { name: "remember_memory", description: "Remember a fact", parameters: { type: "object" } },
@@ -46,20 +47,20 @@ describe("durable MCP tool exposure", () => {
     };
     const tools = new DurableMcpToolExecutor(base, connectorServers(), undefined);
 
-    const definitions = await tools.definitions(mcpSnapshot("Show my calendar events tomorrow"));
-    const names = definitions.map((definition) => definition.function.name);
-
-    expect(names).toContain("remember_memory");
-    expect(names).toContain("tool_search");
-    expect(names).toContain("mcp__Google_Calendar__list_events");
-    expect(names.some((name) => name.startsWith("mcp__Gmail__"))).toBe(false);
-    expect(names.some((name) => name.startsWith("mcp__Google_Workspace__"))).toBe(false);
-    expect(names.some((name) => name.startsWith("mcp__BerryCrawl__"))).toBe(false);
-    expect({
-      toolCount: definitions.length,
-      serializedBytes: Buffer.byteLength(JSON.stringify(definitions), "utf8"),
-    }).toMatchObject({ toolCount: 3, serializedBytes: expect.any(Number) });
+    const calendar = mcpSnapshot("Show my calendar events tomorrow");
+    const definitions = await tools.definitions(calendar);
+    expect(definitions.map((definition) => definition.function.name)).toEqual(["remember_memory", "tool_search", "use_tool"]);
+    // Another request, another connector: the declared tools are byte-identical.
+    expect(JSON.stringify(await tools.definitions(mcpSnapshot("Search my email")))).toBe(JSON.stringify(definitions));
     expect(Buffer.byteLength(JSON.stringify(definitions), "utf8")).toBeLessThan(4_000);
+
+    const context = await tools.turnContext(calendar);
+    expect(context).toContain("Connectors available to this task: calendar (Google Calendar), gmail (Gmail)");
+    expect(context).toContain("- mcp__Google_Calendar__list_events: ");
+    expect(context).toContain("input schema: ");
+    expect(context).not.toContain("mcp__Gmail__");
+    expect(context).not.toContain("mcp__Google_Workspace__");
+    expect(context).not.toContain("mcp__BerryCrawl__");
   });
 
   it("recovers a semantically selected connector when the request is a paraphrase", async () => {
@@ -69,12 +70,10 @@ describe("durable MCP tool exposure", () => {
     const snapshot = mcpSnapshot("What appointments do I have tomorrow?");
 
     const initial = await tools.definitions(snapshot);
-    expect(initial.map((definition) => definition.function.name)).toEqual(["tool_search"]);
-    expect(initial[0]?.function.parameters).toMatchObject({
-      properties: {
-        connector: { enum: expect.arrayContaining(["calendar", "gmail", "workspace", "crawl"]) },
-      },
-    });
+    expect(initial.map((definition) => definition.function.name)).toEqual(["tool_search", "use_tool"]);
+    // The catalog lives in the turn context, not in a tool enum that changes with it.
+    expect(JSON.stringify(initial[0]?.function.parameters)).not.toContain("enum");
+    expect(await tools.turnContext(snapshot)).toMatch(/calendar \(Google Calendar\).*gmail \(Gmail\).*workspace.*crawl/);
 
     const result = await tools.execute(snapshot, {
       id: "search-appointments",
@@ -180,12 +179,11 @@ describe("durable MCP tool exposure", () => {
       execute: vi.fn(async () => ({ output: {}, summary: "base" })),
     }, [berryCrawl], undefined);
 
-    const definitions = await tools.definitions(mcpSnapshot("Answer this general question"));
+    const snapshot = mcpSnapshot("Answer this general question");
+    const definitions = await tools.definitions(snapshot);
 
-    expect(definitions.map((definition) => definition.function.name)).toEqual([
-      "tool_search",
-      "mcp__BerryCrawl__berrycrawl_search_web",
-    ]);
+    expect(definitions.map((definition) => definition.function.name)).toEqual(["tool_search", "use_tool"]);
+    expect(await tools.turnContext(snapshot)).toContain("- mcp__BerryCrawl__berrycrawl_search_web: Search the web\n  input schema: ");
   });
 
   it("discovers an initially omitted authorized tool and exposes it on the next model call", async () => {
@@ -195,7 +193,7 @@ describe("durable MCP tool exposure", () => {
     const tools = new DurableMcpToolExecutor(base, connectorServers(), undefined);
     const snapshot = mcpSnapshot("Answer the question");
     const initial = await tools.definitions(snapshot);
-    expect(initial.map((definition) => definition.function.name)).toEqual(["tool_search"]);
+    expect(initial.map((definition) => definition.function.name)).toEqual(["tool_search", "use_tool"]);
 
     const searchStep = {
       id: "search-gmail",
@@ -214,11 +212,13 @@ describe("durable MCP tool exposure", () => {
       activatedTools: ["mcp__Gmail__search_messages"],
       activatedServerIds: ["gmail"],
     });
+    // The result carries the schema and how to run it, so the declared tools never change.
+    expect(String(result.output && (result.output as { content: string }).content))
+      .toMatch(/use_tool[\s\S]*- mcp__Gmail__search_messages: [^\n]*\n  input schema: \{/);
     snapshot.steps = [{ ...searchStep, state: "completed", output: result.output }] as never;
 
-    const revealed = await tools.definitions(snapshot);
-    expect(revealed.map((definition) => definition.function.name))
-      .toContain("mcp__Gmail__search_messages");
+    expect(JSON.stringify(await tools.definitions(snapshot))).toBe(JSON.stringify(initial));
+    expect(await tools.turnContext(snapshot)).toContain("- mcp__Gmail__search_messages: ");
   });
 
   it("keeps a connector revealed across turns after a successful tool_search", async () => {
@@ -251,10 +251,7 @@ describe("durable MCP tool exposure", () => {
       payload: { type: "message", message: { role: "user", content: "d.kelly@aesg.com" } },
     }] as never;
 
-    const definitions = await tools.definitions(snapshot);
-
-    expect(definitions.map((definition) => definition.function.name))
-      .toContain("mcp__Gmail__search_messages");
+    expect(await tools.turnContext(snapshot)).toContain("- mcp__Gmail__search_messages: ");
   });
 
   it("reveals an admitted connector after its first deferred call fails", async () => {
@@ -284,12 +281,10 @@ describe("durable MCP tool exposure", () => {
     } catch (error) {
       failure = error instanceof Error ? error.message : String(error);
     }
-    expect(failure).toContain("connector is now enabled for the next model call");
+    expect(failure).toContain("Call tool_search for it to get its input schema, then run it with use_tool");
     snapshot.steps = [{ ...deferredStep, state: "failed", error: failure }] as never;
 
-    const definitions = await tools.definitions(snapshot);
-    expect(definitions.map((definition) => definition.function.name))
-      .toContain("mcp__Gmail__search_messages");
+    expect(await tools.turnContext(snapshot)).toContain("- mcp__Gmail__search_messages: ");
   });
 
   it("keeps unauthorized connector schemas unavailable to exposure and discovery", async () => {
@@ -368,8 +363,7 @@ describe("durable MCP tool exposure", () => {
     }, [server], undefined);
     const snapshot = mcpSnapshot("Echo this message");
 
-    expect((await tools.definitions(snapshot)).map((definition) => definition.function.name))
-      .toContain("mcp__echo__echo");
+    expect(await tools.turnContext(snapshot)).toContain("- mcp__echo__echo: Echo a message");
     expect(tools.policy(snapshot, "mcp__echo__echo", "ask"))
       .toMatchObject({ requiresApproval: true, approvalKind: "mcp" });
     await expect(tools.execute(snapshot, {
@@ -408,7 +402,7 @@ describe("durable MCP tool exposure", () => {
     const snapshot = mcpSnapshot("Find an echo capability");
 
     expect((await tools.definitions(snapshot)).map((definition) => definition.function.name))
-      .toEqual(["tool_search"]);
+      .toEqual(["tool_search", "use_tool"]);
     await expect(tools.execute(snapshot, {
       id: "search-live-echo",
       type: "tool.tool_search",
@@ -449,8 +443,7 @@ describe("durable MCP tool exposure", () => {
       firstDrive,
     );
 
-    expect((await tools.definitions(snapshot)).map((definition) => definition.function.name))
-      .toContain("mcp__First_Drive__search_first");
+    expect(await tools.turnContext(snapshot)).toContain("- mcp__First_Drive__search_first: ");
 
     await tools.release(snapshot);
     expect(release).toHaveBeenCalledOnce();
@@ -465,15 +458,59 @@ describe("durable MCP tool exposure", () => {
     );
     secondDrive.defaultTools = ["search_second"];
     snapshot.runtimeRequest = admittedRuntimeRequest(snapshot, secondDrive);
-    const refreshed = (await tools.definitions(snapshot)).map((definition) => definition.function.name);
-    expect(refreshed).toContain("mcp__Second_Drive__search_second");
+    const refreshed = await tools.turnContext(snapshot);
+    expect(refreshed).toContain("- mcp__Second_Drive__search_second: ");
     expect(refreshed).not.toContain("mcp__First_Drive__search_first");
 
     await tools.close();
   });
 });
 
+describe("admitted connectors on runs with stored metadata", () => {
+  it("keeps the admitted connector for queued, Continue and recovered runs and refuses an invalid snapshot", async () => {
+    const tools = new DurableMcpToolExecutor({ execute: vi.fn(async () => ({ output: {}, summary: "base" })) }, [], undefined);
+    const drive = connectorServer("org-drive", "Org Drive", true, "search_files", "Search the organization drive");
+    drive.defaultTools = ["search_files"];
+    const snapshot = mcpSnapshot("Search my workspace");
+    snapshot.runtimeRequest = {
+      ...admittedRuntimeRequest(snapshot, drive),
+      queuedBudgetRequestId: "queued:browser-key",
+      continuationSourceRunId: "00000000-0000-7000-8000-000000000099",
+      continuationHeadEntryId: "entry-head",
+      budgetBaseRequestId: "request_1",
+      budgetGeneration: 1,
+      budgetUsageAfterSequence: 12,
+      budgetBaselineCostMicros: "5000",
+    };
+    expect(await tools.turnContext(snapshot)).toContain("- mcp__Org_Drive__search_files: ");
+    await tools.release(snapshot);
+
+    snapshot.runtimeRequest = { ...snapshot.runtimeRequest, unexpectedSetting: true };
+    await expect(tools.turnContext(snapshot)).rejects.toThrow("admitted model configuration is invalid (unexpectedSetting)");
+    await tools.close();
+  });
+});
+
 describe("durable MCP journal serialization", () => {
+  it("says what it left out when a value exceeds the journal limits (H-070)", () => {
+    const fields = Object.fromEntries(Array.from({ length: 130 }, (_, index) => [`field${index}`, index]));
+    const value = sanitizeMcpJournalValue({
+      text: "x".repeat(120_005),
+      files: Array.from({ length: 260 }, (_, index) => ({ id: `file-${index}` })),
+      fields,
+    }) as { text: string; files: unknown[]; fields: Record<string, unknown> };
+
+    expect(value.text).toHaveLength(120_000 + "…[Berry kept 120,000 of 120,005 characters]".length);
+    expect(value.text.endsWith("…[Berry kept 120,000 of 120,005 characters]")).toBe(true);
+    expect(value.files).toHaveLength(257);
+    expect(value.files.at(-1)).toBe("[Berry omitted 4 more of 260 items]");
+    expect(Object.keys(value.fields)).toHaveLength(129);
+    expect(value.fields.berryOmittedFields).toBe("2 more of 130 fields");
+
+    const small = { text: "ok", files: [{ id: "a" }], fields: { a: 1 } };
+    expect(sanitizeMcpJournalValue(small)).toEqual(small);
+  });
+
   it("redacts binary content from both parts and raw result details", () => {
     const binary = "a".repeat(32_000);
 
@@ -587,6 +624,25 @@ describe("connector artifact staging", () => {
     expect(text).not.toContain("Searchable extraction is queued");
   });
 
+  it("says a just-imported file is still verifying instead of implying a usable path", () => {
+    const text = connectorArtifactText(
+      { fileId: "file-1", name: "rfp.pdf", mediaType: "application/pdf", library: false },
+      undefined,
+    );
+
+    expect(text).toContain("Berry is still verifying rfp.pdf (Berry file file-1), so it is not in the sandbox yet");
+    expect(text).toContain("Call this tool again with the same arguments");
+    expect(text).toContain("does not download it again");
+    expect(text).toContain("Do not search the filesystem");
+    expect(text).not.toContain("Sandbox path");
+  });
+
+  it("keeps the artifact wording where sandbox staging is not available", () => {
+    const text = connectorArtifactText({ fileId: "file-1", name: "rfp.pdf", mediaType: "application/pdf", library: false }, undefined, false);
+    expect(text).toContain("The file is stored as a task-scoped Berry artifact.");
+    expect(text).not.toContain("still verifying");
+  });
+
   it("labels intentionally persisted Drive downloads as Library files", () => {
     const text = connectorArtifactText(
       { fileId: "file-1", name: "brief.pdf", mediaType: "application/pdf", library: true },
@@ -597,6 +653,167 @@ describe("connector artifact staging", () => {
     expect(text).toContain("searchable extraction is queued through Tika");
   });
 });
+
+describe("connector import readiness receipts (H-068)", () => {
+  const toolName = "mcp__Google_Workspace__drive_read_file";
+  const fileId = "e18d2b46-19de-8e63-9d14-13045a8abb6f";
+  const path = `/workspace/inputs/${fileId}/site photo.png`;
+  const artifact = {
+    fileId, name: "site photo.png", mediaType: "image/png", size: 425382, origin: "connector_import",
+    reused: false, status: "available", library: false, sourceFileId: "drive-source-1",
+  };
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // One Drive tool whose remote call returns a connector receipt like task
+  // 2743dd77's: a Berry file id and metadata, but no sandbox path.
+  function readinessExecutor(stage: NonNullable<DurableTurnToolExecutor["stageAssociatedInputFiles"]>) {
+    const remote = vi.fn(async () => ({
+      content: [{ type: "text" as const, text: JSON.stringify({ artifact }) }],
+      details: { structuredContent: { artifact } },
+    }));
+    const listTools = McpToolSource.prototype.listTools;
+    vi.spyOn(McpToolSource.prototype, "listTools").mockImplementation(function (this: McpToolSource) {
+      return listTools.call(this).map((tool) => (tool.name === toolName ? { ...tool, execute: remote } : tool));
+    });
+    const stageAssociatedInputFiles = vi.fn(stage);
+    const tools = new DurableMcpToolExecutor({
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+      stageAssociatedInputFiles,
+    }, [connectorServer("workspace", "Google Workspace", true, "drive_read_file", "Read a Google Drive file and download it")], undefined);
+    return { tools, remote, stageAssociatedInputFiles };
+  }
+
+  function driveStep(sequence: number, args: Record<string, unknown> = { fileId: "drive-source-1" }) {
+    return {
+      id: `drive-read-${sequence}`,
+      sequence,
+      type: `tool.${toolName}`,
+      state: "running",
+      input: { toolName, toolCallId: `call-${sequence}`, arguments: args },
+    } as unknown as DurableTurnStep;
+  }
+
+  function driveSnapshot() {
+    return mcpSnapshot("Open the Google Drive file site photo.png and read it");
+  }
+
+  it("returns a readable path with the original file identity once staging succeeds", async () => {
+    const { tools, remote } = readinessExecutor(async () => [{ fileId, name: artifact.name, mediaType: artifact.mediaType, path }]);
+    const snapshot = driveSnapshot();
+    const step = driveStep(1);
+    snapshot.steps.push(step);
+
+    const result = await tools.execute(snapshot, step);
+
+    expect(remote).toHaveBeenCalledTimes(1);
+    expect(result.output).toMatchObject({
+      stagingStatus: "ready",
+      artifacts: [{ fileId, name: "site photo.png", mediaType: "image/png", path }],
+    });
+    expect(String(record(result.output)?.content)).toContain(`Sandbox path: ${path}`);
+  });
+
+  it("reports pending verification, then resumes staging without a second remote download", async () => {
+    let verified = false;
+    const { tools, remote, stageAssociatedInputFiles } = readinessExecutor(async () => (
+      verified ? [{ fileId, name: artifact.name, mediaType: artifact.mediaType, path }] : []
+    ));
+    const snapshot = driveSnapshot();
+    const first = driveStep(1);
+    snapshot.steps.push(first);
+
+    const pending = await tools.execute(snapshot, first);
+
+    expect(pending.output).toMatchObject({ stagingStatus: "pending_verification" });
+    expect(record(pending.output)?.artifacts).toBeUndefined();
+    const pendingText = String(record(pending.output)?.content);
+    expect(pendingText).toContain(`Berry file ${fileId}`);
+    expect(pendingText).toContain("does not download it again");
+    expect(pendingText).not.toContain("Sandbox path");
+
+    Object.assign(first, { state: "completed", output: pending.output });
+    verified = true;
+    const retry = driveStep(2);
+    snapshot.steps.push(retry);
+    const resumed = await tools.execute(snapshot, retry);
+
+    expect(remote).toHaveBeenCalledTimes(1);
+    expect(stageAssociatedInputFiles).toHaveBeenCalledTimes(2);
+    expect(stageAssociatedInputFiles.mock.calls[1]?.[1]).toEqual([fileId]);
+    expect(resumed.output).toMatchObject({ stagingStatus: "ready", resumedFromStep: first.id, artifacts: [{ fileId, path }] });
+    expect(String(record(resumed.output)?.content)).toContain("It was not added to the Berry Library");
+  });
+
+  it("turns a staging failure of a verified file into an actionable receipt and retries without downloading", async () => {
+    let attempts = 0;
+    const { tools, remote } = readinessExecutor(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("NoSuchKey: The specified key does not exist.");
+      return [{ fileId, name: artifact.name, mediaType: artifact.mediaType, path }];
+    });
+    const snapshot = driveSnapshot();
+    const first = driveStep(1);
+    snapshot.steps.push(first);
+
+    const failed = await tools.execute(snapshot, first);
+
+    expect(failed.output).toMatchObject({ stagingStatus: "failed", stagingError: "NoSuchKey: The specified key does not exist." });
+    const failedText = String(record(failed.output)?.content);
+    expect(failedText).toContain("could not copy site photo.png");
+    expect(failedText).toContain("It is not at any sandbox path");
+    expect(failedText).not.toContain("Sandbox path:");
+
+    Object.assign(first, { state: "completed", output: failed.output });
+    const retry = driveStep(2);
+    snapshot.steps.push(retry);
+    const recovered = await tools.execute(snapshot, retry);
+
+    expect(remote).toHaveBeenCalledTimes(1);
+    expect(recovered.output).toMatchObject({ stagingStatus: "ready", resumedFromStep: first.id });
+  });
+
+  it("calls the remote tool again when the arguments name a different file", async () => {
+    const { tools, remote } = readinessExecutor(async () => []);
+    const snapshot = driveSnapshot();
+    const first = driveStep(1);
+    snapshot.steps.push(first);
+    const pending = await tools.execute(snapshot, first);
+    Object.assign(first, { state: "completed", output: pending.output });
+
+    const other = driveStep(2, { fileId: "drive-source-2" });
+    snapshot.steps.push(other);
+    await tools.execute(snapshot, other);
+
+    expect(remote).toHaveBeenCalledTimes(2);
+  });
+
+  it("propagates cancellation instead of returning a receipt", async () => {
+    let staging!: () => void;
+    const stagingStarted = new Promise<void>((resolve) => { staging = resolve; });
+    // Like the manager's wait: settles only through the signal.
+    const { tools } = readinessExecutor(async (_snapshot, _fileIds, options) => new Promise((_resolve, reject) => {
+      options?.signal?.addEventListener("abort", () => reject(options.signal?.reason), { once: true });
+      staging();
+    }));
+    const snapshot = driveSnapshot();
+    const step = driveStep(1);
+    snapshot.steps.push(step);
+    const controller = new AbortController();
+
+    const pending = tools.execute(snapshot, step, controller.signal);
+    await stagingStarted;
+    controller.abort(new Error("Task cancelled"));
+
+    await expect(pending).rejects.toThrow("Task cancelled");
+  });
+});
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
 
 function connectorServers(): McpServerSpec[] {
   return [
@@ -686,3 +903,44 @@ function admittedRuntimeRequest(
     attachments: [],
   } as DurableTurnSnapshot["runtimeRequest"];
 }
+
+describe("bounded MCP results", () => {
+  const cursor = `~!!~${"A".repeat(440)}`;
+  const files = Array.from({ length: 100 }, (_, index) => ({
+    id: `file-${index}`,
+    name: `Tender appendix ${index}.pdf`,
+    mimeType: "application/pdf",
+    capabilities: Object.fromEntries(Array.from({ length: 40 }, (_unused, key) => [`canDoThing${key}`, key % 2 === 0])),
+    contentRestrictions: [{ readOnly: false, reason: "x".repeat(1_300) }],
+    owners: [{ displayName: "Owner", emailAddress: "owner@example.com" }],
+  }));
+  const listing = JSON.stringify({ files, nextPageToken: cursor, incompleteSearch: false });
+
+  it("keeps a metadata-heavy Drive page valid JSON with its exact cursor and a disclosed cut", () => {
+    expect(listing.length).toBeGreaterThan(200_000);
+    const bounded = boundedMcpText(listing, { files, nextPageToken: cursor });
+    expect(bounded.length).toBeLessThanOrEqual(120_000);
+    const parsed = JSON.parse(bounded) as { files: Array<{ id: string }>; nextPageToken: string; berryTruncation: { returnedItems: number; totalItems: number; field: string } };
+    expect(parsed.nextPageToken).toBe(cursor);
+    expect(parsed.berryTruncation).toMatchObject({ field: "files", totalItems: 100 });
+    expect(parsed.berryTruncation.returnedItems).toBe(parsed.files.length);
+    expect(parsed.files.map((file) => file.id)).toEqual(files.slice(0, parsed.files.length).map((file) => file.id));
+  });
+
+  it("restores a cursor that exists only in structured metadata", () => {
+    const withoutCursor = JSON.stringify({ files });
+    const parsed = JSON.parse(boundedMcpText(withoutCursor, { files, nextPageToken: cursor })) as { nextPageToken: string };
+    expect(parsed.nextPageToken).toBe(cursor);
+  });
+
+  it("marks a cut in non-JSON text with counts and the exact cursor", () => {
+    const bounded = boundedMcpText("line\n".repeat(40_000), { nextCursor: "cursor-2" });
+    expect(bounded.length).toBeLessThanOrEqual(120_000);
+    expect(bounded).toContain("[Berry truncated this tool result: showing 120,000 of 200,000 characters.");
+    expect(bounded).toContain("Exact next-page cursor: cursor-2]");
+  });
+
+  it("leaves results within the limit unchanged", () => {
+    expect(boundedMcpText(JSON.stringify({ files: files.slice(0, 2), nextPageToken: cursor }))).toBe(JSON.stringify({ files: files.slice(0, 2), nextPageToken: cursor }));
+  });
+});

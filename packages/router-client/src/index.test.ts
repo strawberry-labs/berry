@@ -14,6 +14,7 @@ import {
   OpenRouterCompatibleClient,
   parseKimiToolCalls,
   parseSse,
+  PROVIDER_ATTEMPT_ID_HEADER,
   RouterClientError,
   type ChatCompletionChunk,
   listProviderModels,
@@ -109,6 +110,93 @@ describe("router client", () => {
       outputTokens: 0,
     })]);
     expect(JSON.stringify(reports)).not.toContain("provider body must not enter telemetry");
+  });
+
+  it("gives every physical request its own attempt ID and sends it only when configured (H-033)", async () => {
+    const received: Array<string | undefined> = [];
+    const baseUrl = await withServer((request, response) => {
+      let raw = "";
+      request.on("data", (chunk) => { raw += String(chunk); });
+      request.on("end", () => {
+        received.push(request.headers["x-client-request-id"] as string | undefined);
+        if ((JSON.parse(raw) as { stream?: boolean }).stream) {
+          response.writeHead(200, { "Content-Type": "text/event-stream" });
+          response.end(`data: ${JSON.stringify({ id: "s1", model: "served", choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+          return;
+        }
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ id: "c1", model: "served", choices: [{ message: { content: "ok" }, finish_reason: "stop" }] }));
+      });
+    });
+    const provider = {
+      id: "org-router",
+      baseUrl,
+      defaultModel: "m",
+      kind: "openai-compatible",
+      name: "Test provider",
+      endpointPath: "/chat/completions?api-version=1",
+    };
+    const reports: ProviderAttemptReport[] = [];
+    const options = {
+      messages: [{ role: "user" as const, content: "hello" }],
+      onProviderAttempt: (report: ProviderAttemptReport) => reports.push(report),
+    };
+    const client = new OpenAIChatCompletionsClient({ provider, apiKey: "key", attemptIdHeader: PROVIDER_ATTEMPT_ID_HEADER });
+
+    await client.complete(options);
+    await client.complete({ ...options, providerAttemptLayer: "runner_retry" });
+    for await (const _chunk of client.stream(options)) {
+      // Drain the stream so the attempt is reported.
+    }
+    await new OpenAIChatCompletionsClient({ provider, apiKey: "key" }).complete(options);
+
+    const ids = reports.map((report) => report.attemptId);
+    expect(new Set(ids).size).toBe(4);
+    for (const id of ids) expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(received).toEqual([ids[0], ids[1], ids[2], undefined]);
+    expect(reports.map((report) => [report.transport, report.retryLayer, report.provider, report.route])).toEqual([
+      ["buffer", "initial", "org-router", "/chat/completions"],
+      ["buffer", "runner_retry", "org-router", "/chat/completions"],
+      ["stream", "initial", "org-router", "/chat/completions"],
+      ["buffer", "initial", "org-router", "/chat/completions"],
+    ]);
+  });
+
+  it("reports a stream the consumer abandoned once, under its attempt ID (H-033)", async () => {
+    const reports: ProviderAttemptReport[] = [];
+    const client = new OpenAIChatCompletionsClient({
+      provider: { baseUrl: "http://localhost/v1", defaultModel: "m", kind: "openai-compatible", name: "Test provider" },
+      apiKey: "key",
+      fetchImpl: async () => new Response(
+        [
+          `data: ${JSON.stringify({ id: "s1", model: "served", choices: [{ delta: { content: "first" }, finish_reason: null }] })}`,
+          `data: ${JSON.stringify({ id: "s1", model: "served", choices: [{ delta: { content: "second" }, finish_reason: "stop" }] })}`,
+          "data: [DONE]",
+          "",
+        ].join("\n\n"),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } },
+      ),
+    });
+
+    for await (const chunk of client.stream({
+      messages: [{ role: "user", content: "hello" }],
+      onProviderAttempt: (report) => reports.push(report),
+    })) {
+      expect(chunk.delta).toBe("first");
+      break;
+    }
+
+    expect(reports).toEqual([expect.objectContaining({
+      attemptId: expect.any(String),
+      transport: "stream",
+      retryLayer: "initial",
+      provider: "openai-compatible",
+      route: "openai-chat-completions",
+      model: "served",
+      status: 200,
+      category: "aborted",
+      retryDecision: "cancelled",
+    })]);
   });
 
   it("cancels an SSE response body when the consumer stops early", async () => {

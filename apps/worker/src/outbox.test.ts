@@ -574,4 +574,54 @@ describe("RuntimeOutboxDispatcher", () => {
     expect(execute.mock.calls[0]?.[0]).toContain("lease_epoch=$4::bigint");
     expect(execute.mock.calls[0]?.[1]).toEqual([tenantId, outboxId, runId, 42]);
   });
+
+  it("schedules one provider balance check per tenant and interval when enabled (H-005)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-15T09:44:00.000Z"));
+    try {
+      const scheduled: Array<readonly unknown[]> = [];
+      const executor: SqlExecutor = {
+        execute: async (sql, params = []) => {
+          if (sql.includes("'alerts.provider-balance'")) scheduled.push(params);
+        },
+        query: async <T>(sql: string) => (sql.includes("FROM tenants") ? [{ id: tenantId }] : []) as T[],
+        transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+      };
+      const queue = { enqueue: vi.fn() as BerryQueueClient["enqueue"], close: async () => undefined };
+      const dispatcher = new RuntimeOutboxDispatcher(executor, queue, {
+        workerId: "worker-balance",
+        providerBalanceCheckIntervalMs: 30 * 60_000,
+      });
+
+      await dispatcher.dispatchDue();
+      await dispatcher.dispatchDue();
+      expect(scheduled).toEqual([[
+        tenantId,
+        "provider-balance/2026-10-15T09:30:00.000Z",
+        JSON.stringify({ tenantId, scheduledFor: "2026-10-15T09:30:00.000Z" }),
+      ]]);
+
+      vi.setSystemTime(new Date("2026-10-15T10:00:05.000Z"));
+      await dispatcher.dispatchDue();
+      expect(scheduled.map((params) => params[1])).toEqual([
+        "provider-balance/2026-10-15T09:30:00.000Z",
+        "provider-balance/2026-10-15T10:00:00.000Z",
+      ]);
+
+      const statements: string[] = [];
+      const recording: SqlExecutor = {
+        execute: async (sql) => { statements.push(sql); },
+        query: async <T>(sql: string) => {
+          statements.push(sql);
+          return (sql.includes("FROM tenants") ? [{ id: tenantId }] : []) as T[];
+        },
+        transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(recording),
+      };
+      await new RuntimeOutboxDispatcher(recording, queue, { workerId: "worker-off" }).dispatchDue();
+      expect(statements.some((sql) => sql.includes("FROM tenants"))).toBe(true);
+      expect(statements.some((sql) => sql.includes("alerts.provider-balance"))).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

@@ -23,8 +23,17 @@ describe("usage analytics controls", () => {
     });
   });
 
-  it("uses request eligibility for the true cache hit rate", () => {
-    expect(calculateCacheMetric({ inputTokens: 1_000, cacheReadTokens: 400, cacheEligibleRequests: 10, cacheHitRequests: 3 })).toMatchObject({
+  it("reports cached input-token share even when most requests had some cache hit", () => {
+    // Audit baseline shape: 87% of calls read some cache, 17.8% of input tokens.
+    expect(calculateCacheMetric({ inputTokens: 755_271_315, cacheReadTokens: 134_479_572, cacheEligibleRequests: 4_392, cacheHitRequests: 3_839 })).toMatchObject({
+      label: "Cached input-token share",
+      value: 134_479_572 / 755_271_315,
+      hint: expect.stringContaining("3,839 requests read some cached input"),
+    });
+  });
+
+  it("falls back to request hit rate only without token totals", () => {
+    expect(calculateCacheMetric({ inputTokens: 0, cacheReadTokens: 0, cacheEligibleRequests: 10, cacheHitRequests: 3 })).toMatchObject({
       label: "Cache hit rate",
       value: 0.3,
     });

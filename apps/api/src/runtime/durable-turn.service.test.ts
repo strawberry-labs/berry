@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { DURABLE_BASE_BUILT_IN_TOOLS, DurableTurnRuntimeRequestSchema, parseAdmittedRuntimeRequest } from "@berry/shared";
 import { CloudDatabaseService, type SqlExecutor } from "../db/cloud-database.service.js";
 import { compactReplayEvents, DurableTurnService } from "./durable-turn.service.js";
 
@@ -956,8 +957,8 @@ describe("DurableTurnService", () => {
       execute: async (sql, params = []) => { executions.push({ sql, params }); },
       query: async <T>(sql: string) => {
         if (sql.includes("FROM sessions s")) return [{ session_id: sessionId }] as T[];
-        if (sql.includes("SELECT request_message_id") && sql.includes("state IN ('failed','cancelled')")) {
-          return [{ request_message_id: userId }] as T[];
+        if (sql.includes("SELECT source.id,source.request_message_id") && sql.includes("state IN ('failed','cancelled')")) {
+          return [{ id: "interrupted-run", request_message_id: userId, head_entry_id: "interrupted-leaf" }] as T[];
         }
         return [] as T[];
       },
@@ -981,7 +982,11 @@ describe("DurableTurnService", () => {
     });
 
     const runInsert = executions.find(({ sql }) => sql.startsWith("INSERT INTO turn_runs"));
-    expect(JSON.parse(String(runInsert?.params[8]))).toMatchObject({ continueInterruptedTurn: true });
+    expect(JSON.parse(String(runInsert?.params[8]))).toMatchObject({
+      continueInterruptedTurn: true,
+      continuationSourceRunId: "interrupted-run",
+      continuationHeadEntryId: "interrupted-leaf",
+    });
     const startEvent = executions.find(({ sql }) => sql.includes("'turn.start'"));
     expect(JSON.parse(String(startEvent?.params[3]))).toEqual({
       kind: "turn.start",
@@ -1601,5 +1606,103 @@ describe("DurableTurnService", () => {
     await expect(service.recover(tenantId, userId, runId, "retry"))
       .rejects.toThrow("no exact failed tool reference");
     expect(executions.filter(({ sql }) => !sql.startsWith("SELECT berry_set_tenant_id"))).toHaveLength(0);
+  });
+
+  describe("runtime metadata stored for the worker", () => {
+    // What agent-api.controller.ts admits before the service adds its fields.
+    const admittedRuntime = () => DurableTurnRuntimeRequestSchema.parse({
+      capabilityVersion: 1,
+      admissionFingerprint: operationFingerprint,
+      providerId: "org-provider",
+      provider: { id: "org-provider", name: "Organization provider", kind: "openai-compatible", baseUrl: "https://org-provider.example/v1", defaultModel: "org-model" },
+      model: "org-model",
+      workflowCategory: "documents",
+      workflowCategoryVersion: "workflow-v1",
+      workspacePath: "/workspace",
+      workspaceId,
+      permissionMode: "full-access",
+      reasoning: "off",
+      maxTokens: 8_000,
+      contextWindowTokens: 128_000,
+      builtInTools: DURABLE_BASE_BUILT_IN_TOOLS,
+    });
+
+    it("stores a Continue run the worker accepts with its admitted provider", async () => {
+      const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+      const executor: SqlExecutor = {
+        execute: async (sql, params = []) => { executions.push({ sql, params }); },
+        query: async <T>(sql: string) => {
+          if (sql.includes("FROM sessions s")) return [{ session_id: sessionId }] as T[];
+          if (sql.includes("FROM budget_reservations")) return [{ status: "reserved" }] as T[];
+          if (sql.includes("SELECT source.id,source.request_message_id") && sql.includes("state IN ('failed','cancelled')")) {
+            return [{ id: "interrupted-run", request_message_id: userId, head_entry_id: "interrupted-leaf" }] as T[];
+          }
+          return [] as T[];
+        },
+        transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+      };
+      await new DurableTurnService(new CloudDatabaseService(executor), true).admit({
+        tenantId, userId, workspaceId, taskId, sessionId,
+        requestId: "request_continuation",
+        operationFingerprint,
+        budgetReservationRequired: true,
+        continueInterruptedTurn: true,
+        input: "",
+        runtimeRequest: { ...admittedRuntime(), budgetReservationRequired: true },
+        groundingContext: {},
+      });
+
+      const stored = JSON.parse(String(executions.find(({ sql }) => sql.startsWith("INSERT INTO turn_runs"))?.params[8]));
+      expect(parseAdmittedRuntimeRequest(stored)).toMatchObject({
+        provider: { id: "org-provider" },
+        model: "org-model",
+        requestId: "request_continuation",
+        continueInterruptedTurn: true,
+        continuationSourceRunId: "interrupted-run",
+        continuationHeadEntryId: "interrupted-leaf",
+      });
+    });
+
+    it("stores an operator-recovery budget generation the worker accepts", async () => {
+      const stored = { ...admittedRuntime(), requestId: "request_1", budgetReservationRequired: true, input: "Send the report" };
+      const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+      const executor: SqlExecutor = {
+        execute: async (sql, params = []) => { executions.push({ sql, params }); },
+        query: async <T>(sql: string) => {
+          if (sql.includes("FROM turn_runs r JOIN tasks")) {
+            return [{
+              id: runId, session_id: sessionId, task_id: taskId,
+              tool_call_id: questionId, tool_call_step_id: stepId, tool_call_name: "mcp__Mail__send", tool_call_input: {},
+              sandbox_id: null, completed_at: "2026-08-01T00:00:00.000Z", version: 3,
+            }] as T[];
+          }
+          if (sql.includes("AS reservation_status")) {
+            return [{ runtime_request: stored, reservation_status: "reconciled", after_sequence: 12, settled_cost_micros: "5000" }] as T[];
+          }
+          return [] as T[];
+        },
+        transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+      };
+      const reservations: string[] = [];
+      await expect(new DurableTurnService(new CloudDatabaseService(executor), true).recover(
+        tenantId, userId, runId, "retry",
+        async ({ requestId }) => { reservations.push(requestId); return true; },
+      )).resolves.toBe(true);
+
+      const patch = executions.find(({ sql }) => sql.includes("runtime_request=runtime_request || $3::jsonb"));
+      // runtime_request || patch is a shallow top-level merge.
+      const merged = { ...stored, ...JSON.parse(String(patch?.params[2])) };
+      expect(reservations).toEqual(["request_1:recovery:1"]);
+      expect(parseAdmittedRuntimeRequest(merged)).toMatchObject({
+        provider: { id: "org-provider" },
+        model: "org-model",
+        requestId: "request_1:recovery:1",
+        budgetBaseRequestId: "request_1",
+        budgetGeneration: 1,
+        budgetUsageAfterSequence: 12,
+        budgetBaselineCostMicros: "5000",
+        budgetReservationRequired: true,
+      });
+    });
   });
 });

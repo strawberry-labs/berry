@@ -14,7 +14,7 @@ class FakeExecutor implements SqlExecutor {
 
   async execute(sql: string, params: readonly unknown[] = []): Promise<void> {
     this.calls.push({ sql, params });
-    for (const match of sql.matchAll(/CREATE INDEX CONCURRENTLY IF NOT EXISTS ([a-z0-9_]+)/g)) this.indexValidByName.set(match[1]!, true);
+    for (const match of sql.matchAll(/CREATE (?:UNIQUE )?INDEX CONCURRENTLY IF NOT EXISTS ([a-z0-9_]+)/g)) this.indexValidByName.set(match[1]!, true);
     for (const match of sql.matchAll(/DROP INDEX CONCURRENTLY IF EXISTS ([a-z0-9_]+)/g)) this.indexValidByName.set(match[1]!, false);
     if (sql.includes("CREATE INDEX CONCURRENTLY")) this.indexValid = true;
     if (sql.includes("DROP INDEX CONCURRENTLY")) this.indexValid = false;

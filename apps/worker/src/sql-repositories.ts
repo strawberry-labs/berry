@@ -3,6 +3,15 @@ import type { UsageEventRecord, UsageRollupRecord, UsageRollupRepository } from 
 import { AlertRuleSchema, type AlertRule } from "@berry/shared";
 import type { ReportRunJobPayload } from "./jobs.js";
 import type { ManagementJobRepository } from "./reporting-alerts.js";
+import type { EmailSender } from "./email.js";
+import {
+  SqlProviderCreditAlertStore,
+  administratorDestinationId,
+  deliverAlertEmail,
+  emailList,
+  providerCreditRuleId,
+  ruleAlertEmail,
+} from "./provider-credit-alerts.js";
 
 export interface SqlExecutor {
   execute(sql: string, params?: readonly unknown[]): Promise<unknown>;
@@ -147,12 +156,30 @@ DO UPDATE SET
 }
 
 export class SqlManagementJobRepository implements ManagementJobRepository {
-  constructor(private readonly executor:SqlExecutor){}
+  constructor(private readonly executor:SqlExecutor,private readonly options:{email?:EmailSender|null}={}){}
   async runReport(input:ReportRunJobPayload){const existing=await this.executor.query<{id:string;status:string}>("SELECT id,status FROM report_runs WHERE tenant_id=$1::uuid AND schedule_id=$2::uuid AND window_key=$3",[input.tenantId,input.scheduleId,input.windowKey]);if(existing[0])return{...existing[0],duplicate:true};const rows=await this.executor.query<{id:string;status:string}>(`INSERT INTO report_runs(tenant_id,schedule_id,window_key,status,started_at) VALUES($1::uuid,$2::uuid,$3,'running',now()) ON CONFLICT(tenant_id,schedule_id,window_key) DO UPDATE SET window_key=excluded.window_key RETURNING id,status`,[input.tenantId,input.scheduleId,input.windowKey]);const id=rows[0]!.id;await this.executor.execute("UPDATE report_runs SET status='delivered',artifact_ref=$3,completed_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid",[input.tenantId,id,`report://${input.tenantId}/${id}.html`]);await this.executor.execute("UPDATE report_schedules SET last_run_at=now(),next_run_at=CASE cadence WHEN 'daily' THEN now()+interval '1 day' WHEN 'weekly' THEN now()+interval '1 week' ELSE now()+interval '1 month' END,updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid",[input.tenantId,input.scheduleId]);return{id,status:"delivered",duplicate:false};}
-  async listAlertRules(t:string){const rows=await this.executor.query<any>("SELECT * FROM alert_rules WHERE tenant_id=$1::uuid AND enabled=true",[t]);return rows.map((r:any)=>AlertRuleSchema.parse({id:r.id,tenantId:r.tenant_id,name:r.name,signal:r.signal,enabled:r.enabled,scopeType:r.scope_type??undefined,scopeId:r.scope_id??undefined,threshold:Number(r.threshold),windowMinutes:r.window_minutes,destinationIds:r.destination_ids,createdAt:isoDate(r.created_at),updatedAt:isoDate(r.updated_at)}));}
+  // The automatic provider credit rule is raised by runs and the balance check, not evaluated here (H-005).
+  async listAlertRules(t:string){const rows=await this.executor.query<any>("SELECT * FROM alert_rules WHERE tenant_id=$1::uuid AND enabled=true AND id<>$2::uuid",[t,providerCreditRuleId(t)]);return rows.map((r:any)=>AlertRuleSchema.parse({id:r.id,tenantId:r.tenant_id,name:r.name,signal:r.signal,enabled:r.enabled,scopeType:r.scope_type??undefined,scopeId:r.scope_id??undefined,threshold:Number(r.threshold),windowMinutes:r.window_minutes,destinationIds:r.destination_ids,createdAt:isoDate(r.created_at),updatedAt:isoDate(r.updated_at)}));}
   async observedValue(t:string,rule:AlertRule,from:Date,to:Date){const expression=rule.signal==="error_rate"?"count(*) FILTER(WHERE status NOT IN ('completed','success','succeeded'))::float/NULLIF(count(*),0)":rule.signal==="latency"?"avg(latency_ms)":rule.signal==="request_volume"||rule.signal==="blocked_requests"?"count(*)":"COALESCE(sum(cost_billed_micros),0)::float";const table=rule.signal==="blocked_requests"?"budget_reservations":"usage_events";const timestamp=table==="usage_events"?"ts":"created_at";const rows=await this.executor.query<{observed:number|null}>(`SELECT ${expression} observed FROM ${table} WHERE tenant_id=$1::uuid AND ${timestamp}>=$2 AND ${timestamp}<$3`,[t,from.toISOString(),to.toISOString()]);return{observed:Number(rows[0]?.observed??0),baseline:null};}
   async createAlertEvent(i:{tenantId:string;ruleId:string;windowKey:string;observed:number;baseline:number|null}){const existing=await this.executor.query<{id:string}>("SELECT id FROM alert_events WHERE tenant_id=$1::uuid AND rule_id=$2::uuid AND window_key=$3",[i.tenantId,i.ruleId,i.windowKey]);if(existing[0])return{id:existing[0].id,duplicate:true};const rows=await this.executor.query<{id:string}>("INSERT INTO alert_events(tenant_id,rule_id,window_key,observed,baseline) VALUES($1::uuid,$2::uuid,$3,$4,$5) ON CONFLICT(tenant_id,rule_id,window_key) DO UPDATE SET observed=excluded.observed RETURNING id",[i.tenantId,i.ruleId,i.windowKey,i.observed,i.baseline]);return{id:rows[0]!.id,duplicate:false};}
-  async deliverAlert(i:{tenantId:string;eventId:string;destinationId:string}){const existing=await this.executor.query<{status:"delivered"|"failed"}>("SELECT status FROM delivery_attempts WHERE tenant_id=$1::uuid AND alert_event_id=$2::uuid AND destination_id=$3::uuid ORDER BY attempt DESC LIMIT 1",[i.tenantId,i.eventId,i.destinationId]);if(existing[0]?.status==="delivered")return{status:"delivered" as const,duplicate:true};const destinations=await this.executor.query<{configured:boolean}>("SELECT configured FROM alert_destinations WHERE tenant_id=$1::uuid AND id=$2::uuid",[i.tenantId,i.destinationId]);const status=destinations[0]?.configured?"delivered" as const:"failed" as const;await this.executor.execute("INSERT INTO delivery_attempts(tenant_id,alert_event_id,destination_id,attempt,status,error) VALUES($1::uuid,$2::uuid,$3::uuid,COALESCE((SELECT max(attempt)+1 FROM delivery_attempts WHERE tenant_id=$1::uuid AND alert_event_id=$2::uuid AND destination_id=$3::uuid),1),$4,$5)",[i.tenantId,i.eventId,i.destinationId,status,status==="failed"?"Destination is not configured":null]);return{status,duplicate:false};}
+  async deliverAlert(i:{tenantId:string;eventId:string;destinationId:string}){
+    if(this.options.email){const emailed=await this.deliverAlertByEmail(i,this.options.email);if(emailed)return emailed;}
+    const existing=await this.executor.query<{status:"delivered"|"failed"}>("SELECT status FROM delivery_attempts WHERE tenant_id=$1::uuid AND alert_event_id=$2::uuid AND destination_id=$3::uuid ORDER BY attempt DESC LIMIT 1",[i.tenantId,i.eventId,i.destinationId]);if(existing[0]?.status==="delivered")return{status:"delivered" as const,duplicate:true};const destinations=await this.executor.query<{configured:boolean}>("SELECT configured FROM alert_destinations WHERE tenant_id=$1::uuid AND id=$2::uuid",[i.tenantId,i.destinationId]);const status=destinations[0]?.configured?"delivered" as const:"failed" as const;await this.executor.execute("INSERT INTO delivery_attempts(tenant_id,alert_event_id,destination_id,attempt,status,error) VALUES($1::uuid,$2::uuid,$3::uuid,COALESCE((SELECT max(attempt)+1 FROM delivery_attempts WHERE tenant_id=$1::uuid AND alert_event_id=$2::uuid AND destination_id=$3::uuid),1),$4,$5)",[i.tenantId,i.eventId,i.destinationId,status,status==="failed"?"Destination is not configured":null]);return{status,duplicate:false};}
+  /** Sends a configured email destination's alert and records the attempt; other destinations keep the existing handling. */
+  private async deliverAlertByEmail(i:{tenantId:string;eventId:string;destinationId:string},sender:EmailSender):Promise<{status:"delivered"|"failed"|"pending";duplicate:boolean}|null>{
+    const destination=(await this.executor.query<{kind:string;email_recipients:unknown;configured:boolean}>("SELECT kind,email_recipients,configured FROM alert_destinations WHERE tenant_id=$1::uuid AND id=$2::uuid",[i.tenantId,i.destinationId]))[0];
+    if(!destination||destination.kind!=="email"||!destination.configured)return null;
+    const event=(await this.executor.query<{window_key:string;observed:string|number;created_at:Date|string;name:string;signal:string;threshold:string|number}>("SELECT e.window_key,e.observed,e.created_at,r.name,r.signal,r.threshold FROM alert_events e JOIN alert_rules r ON r.tenant_id=e.tenant_id AND r.id=e.rule_id WHERE e.tenant_id=$1::uuid AND e.id=$2::uuid",[i.tenantId,i.eventId]))[0];
+    if(!event)return null;
+    const store=new SqlProviderCreditAlertStore(this.executor);
+    const recipients=i.destinationId===administratorDestinationId(i.tenantId)?await store.administratorEmails(i.tenantId):emailList(destination.email_recipients);
+    const message=ruleAlertEmail({ruleName:event.name,signal:event.signal,observed:Number(event.observed),threshold:Number(event.threshold),windowKey:event.window_key,raisedAt:isoDate(event.created_at),organizationName:await store.organizationName(i.tenantId)});
+    const outcome=await deliverAlertEmail(store,sender,{tenantId:i.tenantId,eventId:i.eventId,destinationId:i.destinationId,recipients,message});
+    if(outcome==="sent")return{status:"delivered",duplicate:false};
+    if(outcome==="already_delivered")return{status:"delivered",duplicate:true};
+    if(outcome==="in_flight")return{status:"pending",duplicate:true};
+    return{status:"failed",duplicate:outcome==="attempts_exhausted"};
+  }
 }
 function isoDate(value:Date|string){return value instanceof Date?value.toISOString():new Date(value).toISOString();}
 

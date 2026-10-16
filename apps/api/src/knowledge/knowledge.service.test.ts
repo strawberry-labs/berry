@@ -109,4 +109,48 @@ describe("KnowledgeService", () => {
     const vectorQuery = executor.calls.find((call) => call.kind === "query" && call.sql.includes("<=>"));
     expect(vectorQuery?.sql).toContain("ORDER BY kc.embedding <=> $5::vector\n      LIMIT 60");
   });
+
+  it("gates earlier task answers by relevance, labels them and keeps them below files (H-040)", async () => {
+    const row = (id: string, sourceType: "file" | "task_outcome", rank: string, title: string) => ({
+      chunk_id: `00000000-0000-7000-8000-0000000001${id}`,
+      source_id: `00000000-0000-7000-8000-0000000002${id}`,
+      source_original_id: `00000000-0000-7000-8000-0000000003${id}`,
+      source_type: sourceType,
+      title,
+      text_content: `${title} content`,
+      token_estimate: 10,
+      metadata: {},
+      authority: sourceType === "task_outcome" ? "0.8" : "0.5",
+      created_at: "2026-10-01T00:00:00.000Z",
+      rank,
+    });
+    const closeFile = row("01", "file", "0.52", "Spec.pdf");
+    const unrelatedFile = row("02", "file", "0.08", "Menu.pdf");
+    const closeAnswer = row("03", "task_outcome", "0.61", "Earlier spec review");
+    const looseAnswer = row("04", "task_outcome", "0.31", "Unrelated CV task");
+    class VectorExecutor extends RetrievalExecutor {
+      override async query<T>(sql: string, params: readonly unknown[] = []): Promise<readonly T[]> {
+        if (sql.includes("FROM workspaces w")) return [{ id: workspaceId }] as T[];
+        this.calls.push({ kind: "query", sql, params });
+        if (sql.includes("<=> $5::vector")) return [closeFile, unrelatedFile, closeAnswer, looseAnswer] as T[];
+        if (sql.includes("search_document @@")) return [{ ...looseAnswer, rank: "0.9" }] as T[];
+        return [];
+      }
+    }
+    const executor = new VectorExecutor();
+    const embeddings = { profile: { id: "profile" }, embed: async () => [[0.1, 0.2]] };
+    const service = new KnowledgeService(new CloudDatabaseService(executor), embeddings as never);
+
+    const grounding = await service.retrieve({ tenantId, userId, workspaceId, taskId, request: "Review the spec" });
+
+    const labels = grounding.projectFacts.map((fact) => fact.citationLabel);
+    expect(labels).toContain("Spec.pdf");
+    expect(labels).toContain("Earlier Berry answer (not confirmed by the user): Earlier spec review, 2026-10-01");
+    expect(labels.some((label) => label.includes("Menu.pdf") || label.includes("Unrelated CV task"))).toBe(false);
+    const sql = executor.calls.filter((call) => call.sql.includes("knowledge_chunks")).map((call) => call.sql);
+    for (const lane of sql) expect(lane).toContain("ks.source_id = $4 OR NOT EXISTS");
+    const snapshot = executor.calls.find((call) => call.sql.includes("INSERT INTO retrieval_snapshots"));
+    const candidates = JSON.parse(String(snapshot?.params[8])) as Array<{ authority: number; similarity: number | null; sourceType: string }>;
+    expect(candidates.find((candidate) => candidate.sourceType === "task_outcome")).toMatchObject({ authority: 0.3, similarity: 0.61 });
+  });
 });

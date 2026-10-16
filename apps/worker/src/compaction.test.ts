@@ -340,6 +340,7 @@ describe("durable session compactor", () => {
     });
     expect(complete).toHaveBeenCalledTimes(2);
     expect(complete.mock.calls.map((call) => call[0].providerAttemptOrdinal)).toEqual([1, 2]);
+    expect(complete.mock.calls.map((call) => call[0].providerAttemptLayer)).toEqual(["initial", "other"]);
   });
 
   it("checks governance against the compaction provider and model actually selected", async () => {
@@ -605,6 +606,44 @@ describe("durable session compactor", () => {
     });
   });
 
+  it("leaves journaled turn context out of the compaction model's input (H-032)", async () => {
+    const state = compactionState();
+    state.entries = [
+      state.entries[0]!,
+      {
+        entryId: "context-1",
+        parentEntryId: "entry-1",
+        entryType: "context",
+        sequence: 2,
+        payload: { type: "context", runId: "run-1", scope: "turn", text: "<berry_turn_context>STALE-GROUNDING-MARKER</berry_turn_context>" },
+        isLeafMarker: false,
+        createdAt: "2026-07-28T12:00:30.000Z",
+      },
+      { ...state.entries[1]!, parentEntryId: "context-1", sequence: 3 },
+    ];
+    const conversations: string[] = [];
+    const repository: SessionCompactionRepository = {
+      claim: async () => true,
+      load: async () => state,
+      persist: async () => ({ segmentCheckpointId: "segment", rollingCheckpointId: "rolling", usageEventId: null }),
+      release: async () => {},
+    };
+    const generator: CheckpointGenerator = {
+      provider: "test",
+      model: "checkpoint-test",
+      generate: async (input) => {
+        conversations.push(input.conversation);
+        return { checkpoint: null, validationStatus: "fallback", attempts: 1, fallbackReason: "checkpoint_validation_failed" };
+      },
+    };
+
+    await new DurableSessionCompactor(repository, generator, { leaseOwner: "test-worker", keepRecentTokens: 1 }).compactSession(job);
+
+    expect(conversations.length).toBeGreaterThan(0);
+    expect(conversations.join("\n")).toContain("Implement durable compaction.");
+    expect(conversations.join("\n")).not.toContain("STALE-GROUNDING-MARKER");
+  });
+
   it("rejects a final rolling checkpoint whose protected identity exceeds the serialized byte limit", async () => {
     const releasedErrors: Array<string | undefined> = [];
     const persist = vi.fn();
@@ -705,5 +744,55 @@ describe("durable session compactor", () => {
     expect(inserts[1]?.params.slice(9, 12)).toEqual([240, 40, rollingSerialized]);
     expect(queries.some((query) => query.sql.includes("INSERT INTO usage_events"))).toBe(false);
     expect(result.usageEventId).toBeNull();
+  });
+
+  it("records the physical attempt IDs on a background compaction's usage record (H-033)", async () => {
+    const queries: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const repository = new SqlSessionCompactionRepository({
+      execute: async () => undefined,
+      query: async <T>(sql: string, params: readonly unknown[] = []) => {
+        queries.push({ sql, params });
+        if (sql.includes("SELECT lease_owner FROM session_compaction_leases")) return [{ lease_owner: "lease-owner" }] as T[];
+        if (sql.includes("INSERT INTO usage_events")) return [{ id: "usage-1" }] as T[];
+        if (sql.includes("INSERT INTO session_checkpoints")) return [{ id: "checkpoint-1" }] as T[];
+        return [] as T[];
+      },
+    });
+    const checkpoint = checkpointOutput();
+    const metrics = { tokensBefore: 80, tokensAfter: 20, serializedBytes: sessionCheckpointMetrics(checkpoint).serializedBytes };
+    const attemptIds = ["6f9619ff-8b86-4d01-b42d-00cf4fc964ff", "0b1f3c3e-56a1-4f7e-9d2a-3c1e5f6a7b8c"];
+
+    await repository.persist({
+      state: compactionState(),
+      leaseOwner: "lease-owner",
+      segment: checkpoint,
+      rolling: checkpoint,
+      validationStatus: "repaired",
+      provider: "router",
+      model: "checkpoint-test",
+      rebased: false,
+      algorithmVersion: "checkpoint-v2-bounded",
+      segmentMetrics: metrics,
+      rollingMetrics: metrics,
+      physicalAttempts: 2,
+      providerAttemptIds: attemptIds,
+      fallbackReason: null,
+      usage: {
+        provider: "router",
+        model: "checkpoint-test",
+        inputTokens: 12,
+        outputTokens: 8,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costRawMicros: "28",
+        pricingSource: "measured",
+      },
+    });
+
+    const usageInsert = queries.find((query) => query.sql.includes("INSERT INTO usage_events"));
+    expect(JSON.parse(String(usageInsert?.params.at(-1)))).toMatchObject({
+      physicalAttempts: 2,
+      providerAttemptIds: attemptIds,
+    });
   });
 });

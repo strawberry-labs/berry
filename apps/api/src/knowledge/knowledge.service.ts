@@ -155,8 +155,19 @@ export class KnowledgeService {
       const fullTextRows = await this.fullText(executor, input, query);
       if (queryVector) await executor.execute("SET LOCAL hnsw.iterative_scan = 'strict_order'");
       const vectorRows = queryVector ? await this.vector(executor, input, queryVector) : [];
-      const fullText = uniqueRows([...exactRows, ...fullTextRows]).map(rowToRanked);
-      const vector = vectorRows.map(rowToRanked);
+      // Relevance gates (H-040). Vector hits below the similarity floor are
+      // dropped; an earlier task answer needs a closer match, and when vectors
+      // are available a keyword-only hit on one is dropped too, because it
+      // is Berry's own output rather than source material.
+      const similarity = new Map(vectorRows.map((row) => [row.chunk_id, Number(row.rank)]));
+      const relevantVector = vectorRows.filter((row) => Number(row.rank) >= (row.source_type === "task_outcome"
+        ? this.#config.retrievalTaskOutcomeMinSimilarity
+        : this.#config.retrievalMinSimilarity));
+      const relevantVectorIds = new Set(relevantVector.map((row) => row.chunk_id));
+      const fullText = uniqueRows([...exactRows, ...fullTextRows])
+        .filter((row) => row.source_type !== "task_outcome" || !queryVector || relevantVectorIds.has(row.chunk_id))
+        .map(rowToRanked);
+      const vector = relevantVector.map(rowToRanked);
       const fused = reciprocalRankFusion(fullText, vector);
       const selection = selectRetrievalCandidates(fused, { tokenBudget, maxPerSource: 3 });
       const candidates: RetrievalCandidate[] = fused.map((candidate) => {
@@ -187,6 +198,7 @@ export class KnowledgeService {
         vectorRank: candidate.vectorRank,
         fusedScore: candidate.fusedScore,
         authority: candidate.authority,
+        similarity: similarity.get(candidate.chunkId) ?? null,
         selected: candidate.selected,
         selectionReason: candidate.selectionReason,
         contentHash: sha256(candidate.text),
@@ -265,6 +277,7 @@ export class KnowledgeService {
       WHERE kc.tenant_id = $1::uuid AND kc.workspace_id = $2::uuid
         AND ks.tenant_id = $1::uuid AND ks.workspace_id = $2::uuid
         AND ks.tombstoned_at IS NULL AND ks.index_status = 'indexed'
+        ${EARLIER_TASK_OUTCOMES_ONLY}
         AND (
           ks.visibility = 'project' OR
           (ks.visibility = 'private' AND ks.user_id = $3::uuid) OR
@@ -305,6 +318,7 @@ export class KnowledgeService {
       WHERE kc.tenant_id = $1::uuid AND kc.workspace_id = $2::uuid
         AND ks.tenant_id = $1::uuid AND ks.workspace_id = $2::uuid
         AND ks.tombstoned_at IS NULL AND ks.index_status = 'indexed'
+        ${EARLIER_TASK_OUTCOMES_ONLY}
         AND (
           ks.visibility = 'project' OR
           (ks.visibility = 'private' AND ks.user_id = $3::uuid) OR
@@ -340,6 +354,7 @@ export class KnowledgeService {
       WHERE kc.tenant_id = $1::uuid AND kc.workspace_id = $2::uuid
         AND ks.tenant_id = $1::uuid AND ks.workspace_id = $2::uuid
         AND ks.tombstoned_at IS NULL AND ks.index_status = 'indexed'
+        ${EARLIER_TASK_OUTCOMES_ONLY}
         AND kc.vector_ready = true AND kc.embedding IS NOT NULL
         AND (
           ks.visibility = 'project' OR
@@ -360,6 +375,21 @@ export class KnowledgeService {
   }
 }
 
+const TASK_OUTCOME_AUTHORITY = 0.3;
+
+/**
+ * Earlier task answers are retrieved only from other tasks that still exist:
+ * never the current task's own answer (already in its history) and never one
+ * of a deleted task. Read time, so restoring a task restores its answers (H-040).
+ */
+const EARLIER_TASK_OUTCOMES_ONLY = `AND NOT (ks.source_type = 'task_outcome' AND (
+          ks.source_id = $4 OR NOT EXISTS (
+            SELECT 1 FROM tasks outcome_task
+            WHERE outcome_task.tenant_id = ks.tenant_id AND outcome_task.id::text = ks.source_id
+              AND outcome_task.deleted_at IS NULL
+          )
+        ))`;
+
 function rowToRanked(row: RetrievalRow) {
   const metadata = row.metadata && typeof row.metadata === "object" && !Array.isArray(row.metadata)
     ? row.metadata as Record<string, unknown>
@@ -368,10 +398,13 @@ function rowToRanked(row: RetrievalRow) {
   const sourceOriginalId = typeof metadata.fileId === "string" ? metadata.fileId : row.source_original_id;
   const sourceDate = new Date(row.created_at);
   const timestamp = Number.isNaN(sourceDate.getTime()) ? "" : sourceDate.toISOString().slice(0, 10);
+  // An earlier task answer is Berry's own output, so it is labelled as such
+  // and ranks below files and memories of equal relevance (H-040).
+  const earlierAnswer = row.source_type === "task_outcome";
   const citationLabel = page
     ? `${row.title}, page ${page}`
-    : row.source_type === "task_outcome" && timestamp
-      ? `${row.title}, ${timestamp}`
+    : earlierAnswer
+      ? `Earlier Berry answer (not confirmed by the user): ${row.title}${timestamp ? `, ${timestamp}` : ""}`
       : row.title;
   return {
     chunkId: row.chunk_id,
@@ -381,7 +414,7 @@ function rowToRanked(row: RetrievalRow) {
     title: row.title,
     text: row.text_content,
     tokenEstimate: row.token_estimate,
-    authority: Number(row.authority),
+    authority: earlierAnswer ? Math.min(Number(row.authority), TASK_OUTCOME_AUTHORITY) : Number(row.authority),
     createdAt: new Date(row.created_at).toISOString(),
     citationLabel,
     metadata: {

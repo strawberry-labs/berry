@@ -38,6 +38,7 @@ const SAFE_FIELDS = new Set([
   "idleDeadlineMs",
   "wallDeadlineMs",
   "durationMs",
+  "firstTokenMs",
   "outcome",
   "progressKind",
   "consecutiveNoProgress",
@@ -47,6 +48,8 @@ const SAFE_FIELDS = new Set([
   "statusClass",
   "category",
   "retryDecision",
+  "retryLayer",
+  "transport",
   "inputTokens",
   "outputTokens",
   "cacheReadTokens",
@@ -60,6 +63,7 @@ const SAFE_FIELDS = new Set([
   "approvalClass",
   "outcomeCertainty",
   "itemCount",
+  "byteCount",
   "completedCount",
   "failedCount",
   "retry",
@@ -81,7 +85,13 @@ const SAFE_FIELDS = new Set([
   "sourceRevision",
 ]);
 
-const DURABLE_REFERENCE_FIELDS = new Set(["runId", "stepId", "outboxId"]);
+// `+` carries build metadata such as `<sha>+production-hotfixes`; rejecting it
+// made every production run report an unknown revision.
+const SOURCE_REVISION_PATTERN = /^[A-Za-z0-9._/+-]+$/;
+
+// `attemptId` is the Berry-generated ID of one physical provider request, as
+// recorded on its provider.attempt event; provider request IDs stay excluded.
+const DURABLE_REFERENCE_FIELDS = new Set(["runId", "stepId", "outboxId", "attemptId"]);
 
 export type OperationalScalar = string | number | boolean | null;
 
@@ -100,7 +110,7 @@ export function safeOperationalFields(fields: Record<string, unknown>): Record<s
       if (key === "workerRole") {
         result[key] = normalizeWorkerRole(bounded);
       } else if (key === "sourceRevision") {
-        result[key] = /^[A-Za-z0-9._/-]+$/.test(bounded) ? bounded : "unknown";
+        result[key] = SOURCE_REVISION_PATTERN.test(bounded) ? bounded : "unknown";
       } else {
         result[key] = bounded;
       }
@@ -139,7 +149,7 @@ export function sourceRevisionFromEnv(env: Record<string, string | undefined>): 
   ].find((value) => typeof value === "string" && value.trim());
   if (!candidate) return "unknown";
   const normalized = candidate.trim().slice(0, 128);
-  return /^[A-Za-z0-9._/-]+$/.test(normalized) ? normalized : "unknown";
+  return SOURCE_REVISION_PATTERN.test(normalized) ? normalized : "unknown";
 }
 
 export type OperationalLogPolicy = {
