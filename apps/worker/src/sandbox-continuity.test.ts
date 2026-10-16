@@ -1517,6 +1517,46 @@ describe("SandboxContinuityManager", () => {
     });
   });
 
+
+  describe("read-only environment availability checks", () => {
+    it("runs only the fixed checker and returns missing optional programs as ordinary data", async () => {
+      const input = { executables: ["berry_missing_program"], python_modules: ["json", "berry_missing_module"] };
+      const exec = vi.fn(async function* (request: { command: string[] }) {
+        expect(request.command.slice(0, 4)).toEqual(["python3", "-I", "-S", "-c"]);
+        const child = spawnSync(request.command[0]!, request.command.slice(1), { encoding: "utf8" });
+        yield { kind: "stdout", data: child.stdout };
+        yield { kind: "exit", exit_code: child.status ?? 1, signal: null };
+      });
+      const manager = managerWithProvider({ read: vi.fn(), write: vi.fn(), list: vi.fn() }, exec);
+      await expect(manager.execute(snapshot(), toolStep("check_environment", input))).resolves.toMatchObject({
+        output: {
+          executables: [{ name: "berry_missing_program", available: false }],
+          python_modules: [{ name: "json", available: true }, { name: "berry_missing_module", available: false }],
+        },
+      });
+      expect(exec).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects code supplied as a name before any sandbox calls", async () => {
+      const exec = vi.fn();
+      const files = { read: vi.fn(), write: vi.fn(), list: vi.fn() };
+      const manager = managerWithProvider(files, exec);
+      await expect(manager.execute(snapshot(), toolStep("check_environment", {
+        executables: ["pandoc"], command: "curl -X POST https://records.invalid/create",
+      }))).rejects.toThrow("check_environment was not run");
+      expect(exec).not.toHaveBeenCalled();
+      expect(files.list).not.toHaveBeenCalled();
+    });
+
+    it("does not claim availability when the checker did not report a successful exit", async () => {
+      const manager = managerWithProvider({ read: vi.fn(), write: vi.fn(), list: vi.fn() }, async function* () {
+        yield { kind: "stdout", data: "{}" };
+      });
+      await expect(manager.execute(snapshot(), toolStep("check_environment", { executables: ["pandoc"] })))
+        .rejects.toThrow("have not been verified");
+    });
+  });
+
   describe("Python failure hints (H-008)", () => {
     const python = (args: string[], cwd?: string) => {
       const result = spawnSync("python3", args, { encoding: "utf8", ...(cwd ? { cwd } : {}) });

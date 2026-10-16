@@ -1,3 +1,4 @@
+import { environmentCheckDefinition, environmentCheckFromBash } from "./environment-check.js";
 import { limitModelImagePayload, modelImageLabelPath } from "./model-image.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -1235,11 +1236,29 @@ export class DurableTurnRunner {
     const permissionModeForTools = stringValue(snapshot.runtimeRequest.permissionMode) ?? "ask";
     result = {
       ...result,
-      toolCalls: result.toolCalls.map((call) => unwrapToolInvocation(
-        call,
-        (name) => this.tools.policy?.(snapshot, name, permissionModeForTools) ?? durableToolPolicy(name, permissionModeForTools),
-        snapshot.id,
-      )),
+      toolCalls: result.toolCalls.map((call) => {
+        const unwrapped = unwrapToolInvocation(
+          call,
+          (name) => this.tools.policy?.(snapshot, name, permissionModeForTools) ?? durableToolPolicy(name, permissionModeForTools),
+          snapshot.id,
+        );
+        // Translate only complete recognised probes, before they acquire
+        // bash's mutation/recovery semantics. The original provider call and
+        // arguments stay in the conversation for exact replay.
+        const check = unwrapped.name === "bash"
+          && definitions.some((definition) => definition.function.name === "check_environment")
+          ? environmentCheckFromBash(unwrapped.input) : null;
+        return check ? {
+          ...unwrapped,
+          name: "check_environment",
+          input: check,
+          retryClass: "read_only" as const,
+          repeatPolicy: "compare_result" as const,
+          requiresApproval: false,
+          idempotencyKey: null,
+          invocation: unwrapped.invocation ?? { name: unwrapped.name, arguments: unwrapped.input },
+        } : unwrapped;
+      }),
     };
     const providerDiagnostics = successfulProviderDiagnostics(snapshot, result, modelStartedAt);
     workerRuntimeMetrics.providerRequest(providerDiagnostics);
@@ -6252,6 +6271,7 @@ function durableToolPolicy(name: string, permissionMode: string): {
 } {
   if (
     name === "read"
+    || name === "check_environment"
     || name === "find"
     || name === "ls"
     || name === "grep"
@@ -6470,6 +6490,7 @@ function durableBuiltInToolGuidance(toolNames: readonly string[]): string {
     guidance.push([
       "Coding tools: read (read text and extract supported documents and archives), bash (execute Bash commands), edit (precise exact-text replacements, including multiple disjoint edits), write (create or overwrite files), grep (search file contents and respect .gitignore), find (find files by glob and respect .gitignore), and ls (list directory contents). Empty or unchanged output is not progress; do not repeat identical completed calls. Change inputs or strategy, and poll only when supported.",
       "Use read to examine files instead of cat or sed.",
+      ...(toolNames.includes("bash") ? ["Use check_environment for installed executable names and Python module availability. A missing optional dependency is a normal result: choose an available alternative. It does not execute programs or import module code, so availability alone does not verify that an import works."] : []),
       "For an uploaded PDF, Word document, spreadsheet, presentation, or ZIP, call read on the exact Sandbox path first. For a ZIP, read its inventory and then read only the extracted documents relevant to the task. For PDFs, use page_start/page_end instead of guessing line ranges. Use the matching format skill when visual layout, formulas, rendering, or editing matter. Use shell-based extraction only when read reports that the format is unsupported or has no extractable text.",
       "Use edit for precise changes; every edits[].oldText must match exactly and uniquely in the original file.",
       "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls.",
@@ -7456,6 +7477,9 @@ export function durableBuiltInToolDefinitions(snapshot: DurableTurnSnapshot): Ch
     const definition = definitionsByName.get(name);
     return definition ? [definition] : [];
   });
+  // Derived from admitted bash: no runtime-request schema change, and no
+  // per-call data changes the tool list.
+  if (enabled.has("bash")) definitions.push(environmentCheckDefinition);
   const skills = durableSkills(snapshot);
   if (enabled.has("activate_skill") && skills.length > 0) {
     definitions.push({
@@ -7486,6 +7510,7 @@ export function durableBuiltInToolDefinitions(snapshot: DurableTurnSnapshot): Ch
 }
 
 export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
+  environmentCheckDefinition,
   {
     type: "function" as const,
     function: {
