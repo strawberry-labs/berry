@@ -27,6 +27,8 @@ const ArchivedTasksScreen = React.lazy(async () => ({
   default: (await import("./archived-chats-screen")).ArchivedTasksScreen,
 }));
 
+const ScheduledTasksScreen = React.lazy(async () => ({ default: (await import("../schedules/scheduled-tasks-screen")).ScheduledTasksScreen }));
+
 export function PersonalSettingsScreen({ tab, ...props }: ManagementScreenProps & { tab: string }) {
   let screen: React.ReactNode;
   if (tab === "general") screen = <GeneralSettingsScreen />;
@@ -35,6 +37,7 @@ export function PersonalSettingsScreen({ tab, ...props }: ManagementScreenProps 
   else if (tab === "connectors") screen = <PersonalConnectorsScreen {...props} />;
   else if (tab === "skills") screen = <PersonalSkillsScreen {...props} />;
   else if (tab === "mcp") screen = <PersonalMcpScreen {...props} />;
+  else if (tab === "schedules") screen = <ScheduledTasksScreen {...props} />;
   else if (tab === "usage") screen = <PersonalUsageScreen {...props} />;
   else if (tab === "archived") screen = <ArchivedTasksScreen {...props} />;
   else screen = <GeneralSettingsScreen />;

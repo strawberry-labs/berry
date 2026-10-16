@@ -1,5 +1,5 @@
 import * as React from "react";
-import { DollarSign, LogOut } from "lucide-react";
+import { CalendarClock, DollarSign, LogOut } from "lucide-react";
 import type { AllowanceBalance, OrgPermission, Task, Workspace } from "@berry/shared";
 import { BerryConversationSidebarContent, taskHasUnreadActivity, taskIsInProgress } from "@berry/desktop-ui/components/berry-conversation-sidebar";
 import { Button } from "@berry/desktop-ui/components/ui/button";
@@ -38,7 +38,7 @@ import { DeploymentBrandLogo, useDeploymentBrand } from "./deployment-brand";
 
 const ProjectUploadDialog = React.lazy(() => import("../projects/project-upload-dialog").then((module) => ({ default: module.ProjectUploadDialog })));
 
-export type SettingsTab = "general" | "account" | "personalization" | "connectors" | "mcp" | "skills" | "usage" | "archived";
+export type SettingsTab = "general" | "account" | "personalization" | "connectors" | "mcp" | "skills" | "schedules" | "usage" | "archived";
 
 export { taskHasUnreadActivity, taskIsInProgress };
 
@@ -49,6 +49,7 @@ export const WEB_SETTINGS_NAV: Array<{ id: SettingsTab; label: string }> = [
   { id: "connectors", label: "Connectors" },
   { id: "skills", label: "Skills" },
   { id: "mcp", label: "MCP servers" },
+  { id: "schedules", label: "Scheduled tasks" },
   { id: "usage", label: "Usage" },
   { id: "archived", label: "Archived tasks" },
 ];
@@ -88,7 +89,7 @@ export function WebWindowChrome({ onHome, onSearch }: {
   );
 }
 
-export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeWorkspaceId, activeTaskId, tasksSelected, librarySelected, management, loadError, user, allowance, allowanceLoading, onRefreshAllowance, onNewTask, onCreateProject, onSelectWorkspace, onSelectTasks, onOpenTask, onToggleTaskPinned, onArchiveTask, onDeleteTask, onRenameTask, onShareTask, onToggleProjectPinned, onRenameProject, onArchiveProjectTasks, onRemoveProject, onRevealProject, onUploadToProject, onSkills, onLibrary, onUsage, onSettings, onSignOut, readOnly = false }: {
+export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeWorkspaceId, activeTaskId, tasksSelected, librarySelected, management, loadError, user, allowance, allowanceLoading, onRefreshAllowance, onNewTask, onCreateProject, onSelectWorkspace, onSelectTasks, onOpenTask, onToggleTaskPinned, onArchiveTask, onDeleteTask, onRenameTask, onShareTask, onToggleProjectPinned, onRenameProject, onArchiveProjectTasks, onRemoveProject, onRevealProject, onUploadToProject, onSkills, onLibrary, onSchedules, onUsage, onSettings, onSignOut, readOnly = false }: {
   workspaces: Workspace[];
   tasksByWorkspace: Record<string, Task[]>;
   generalTasks: Task[];
@@ -127,6 +128,7 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
   onUploadToProject: (workspace: Workspace, file: File, onProgress: (ratio: number) => void) => Promise<void>;
   onSkills: () => void;
   onLibrary: () => void;
+  onSchedules: () => void;
   onUsage: () => void;
   onSettings: () => void;
   onSignOut: () => void;
@@ -175,6 +177,7 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
               {!readOnly ? <SidebarMenuItem><SidebarMenuButton onClick={onNewTask} className="berry-sidebar-command berry-sidebar-command-primary font-medium"><PencilEdit02Icon /><span>New task</span><Kbd className="ml-auto" aria-hidden>⌘⇧O</Kbd></SidebarMenuButton></SidebarMenuItem> : null}
               {!readOnly ? <SidebarMenuItem><SidebarMenuButton aria-label="Open capabilities" onClick={onSkills} className="berry-sidebar-command"><Wand2 /><span>Skills</span></SidebarMenuButton></SidebarMenuItem> : null}
               {!readOnly ? <SidebarMenuItem><SidebarMenuButton isActive={librarySelected} aria-label="Open library" onClick={onLibrary} className="berry-sidebar-command"><FolderOpen /><span>Library</span></SidebarMenuButton></SidebarMenuItem> : null}
+              {!readOnly ? <SidebarMenuItem><SidebarMenuButton aria-label="Open scheduled tasks" onClick={onSchedules} className="berry-sidebar-command"><CalendarClock /><span>Scheduled</span></SidebarMenuButton></SidebarMenuItem> : null}
             </SidebarMenu>
           </>
         )}

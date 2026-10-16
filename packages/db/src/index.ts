@@ -1,3 +1,7 @@
+import { SCHEDULED_TASKS_MIGRATION } from "./scheduled-tasks-migration.ts";
+export { SCHEDULED_TASKS_MIGRATION } from "./scheduled-tasks-migration.ts";
+export * from "./task-schedule.ts";
+export * from "./scheduled-tasks.ts";
 import { sql } from "drizzle-orm";
 import {
   bigint,
@@ -905,6 +909,7 @@ export const turnRuns = pgTable("turn_runs", {
 }, (table) => [
   index("turn_runs_claim_idx").on(table.tenantId, table.state, table.leaseExpiresAt),
   index("turn_runs_session_idx").on(table.tenantId, table.sessionId, table.createdAt),
+  index("turn_runs_tenant_task_idx").on(table.tenantId, table.taskId),
   uniqueIndex("turn_runs_tenant_request_unique").on(table.tenantId, table.requestId),
   index("turn_runs_terminal_sandbox_cleanup_idx")
     .on(table.tenantId, table.updatedAt)
@@ -1303,6 +1308,7 @@ export const usageEvents = pgTable("usage_events", {
 }, (table) => [
   uniqueIndex("usage_events_tenant_request_unique").on(table.tenantId, table.requestId),
   index("usage_events_tenant_ts_idx").on(table.tenantId, table.ts),
+  index("usage_events_tenant_task_idx").on(table.tenantId, table.taskId),
   index("usage_events_tenant_feature_ts_idx").on(table.tenantId, table.feature, table.ts),
   index("usage_events_tenant_user_ts_idx").on(table.tenantId, table.userId, table.ts),
   index("usage_events_tenant_department_ts_idx").on(table.tenantId, table.departmentId, table.ts),
@@ -3145,6 +3151,15 @@ export const ENTERPRISE_COLLECTION_PAGINATION_STATEMENTS = [
      WHERE deleted_at IS NULL`,
 ] as const;
 export const ENTERPRISE_COLLECTION_PAGINATION_MIGRATION = ENTERPRISE_COLLECTION_PAGINATION_STATEMENTS.join(";\n");
+
+/** Keep task token reads scoped to the task as tenant usage history grows. */
+export const TASK_TOKEN_USAGE_INDEX_STATEMENTS = [
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS usage_events_tenant_task_idx
+     ON usage_events (tenant_id, task_id)`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS turn_runs_tenant_task_idx
+     ON turn_runs (tenant_id, task_id)`,
+] as const;
+export const TASK_TOKEN_USAGE_INDEX_MIGRATION = TASK_TOKEN_USAGE_INDEX_STATEMENTS.join(";\n");
 
 export const SANDBOX_WORKSPACES_MIGRATION = `
 CREATE TABLE IF NOT EXISTS sandbox_workspaces (
@@ -5697,9 +5712,17 @@ export const cloudMigrations = [
     sql: MEMORY_ITEM_VERSION_SOURCE_MESSAGE_PROVENANCE_MIGRATION,
     transactional: false,
   },
+  { id: 71, name: "scheduled_agent_tasks_v1", sql: SCHEDULED_TASKS_MIGRATION },
   {
-    // 71-73 are taken by migrations in progress elsewhere; ids are tracked
-    // alone, so a reused id would be skipped silently on deploy.
+    id: 72,
+    name: "task_token_usage_indexes_v1",
+    sql: TASK_TOKEN_USAGE_INDEX_MIGRATION,
+    transactional: false,
+    onlineIndexNames: ["usage_events_tenant_task_idx", "turn_runs_tenant_task_idx"],
+    onlineSql: TASK_TOKEN_USAGE_INDEX_STATEMENTS,
+  },
+  {
+    // 73 remains reserved for work in progress; never reuse migration ids.
     id: 74,
     name: "task_creation_idempotency_v1",
     sql: TASK_CREATION_IDEMPOTENCY_MIGRATION,

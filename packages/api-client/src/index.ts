@@ -1,8 +1,10 @@
+import { ScheduledTaskSchema, ScheduledTaskRunSchema, type ScheduledTask, type ScheduledTaskCreate, type ScheduledTaskUpdate, type ScheduledTaskRun } from "@berry/shared";
 import {
   AgentStreamEventSchema,
   ApprovalRequestSchema,
   ArtifactLibraryItemSchema,
   ContextStatsSchema,
+  TaskTokenUsageSchema,
   MultipartUploadInitiateSchema,
   MultipartUploadPartUrlsSchema,
   StoredFilePageSchema,
@@ -201,6 +203,7 @@ import {
   type CloudGitState,
   type CloudPreview,
   type ContextStats,
+  type TaskTokenUsage,
   type PersonalSkill,
   type PersonalSkillReview,
   type PersonalSkillPackage,
@@ -327,6 +330,7 @@ export interface UpdateTaskRequest {
 }
 
 interface StartTurnRequestBase {
+  timezone?: string | undefined;
   /** Stable key for retrying this exact turn admission without duplicating work or spend. */
   operationId?: string | undefined;
   workspacePath: string;
@@ -1221,6 +1225,10 @@ export class BerryApiClient {
     });
   }
 
+  async taskTokenUsage(sessionId: string, options: { signal?: AbortSignal } = {}): Promise<TaskTokenUsage> {
+    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/task-token-usage`, TaskTokenUsageSchema, options);
+  }
+
   async appendMessage(sessionId: string, input: { messageId?: string | undefined; role?: "system" | "user" | "assistant" | "tool" | undefined; parts: Array<{ kind: string; content: unknown }> }): Promise<Message> {
     return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/messages`, MessageSchema, {
       method: "POST",
@@ -1233,11 +1241,31 @@ export class BerryApiClient {
     input: StartTurnRequest,
     options: { signal?: AbortSignal } = {},
   ): Promise<StartTurnResponse> {
+    const timezone = input.timezone ?? (typeof window !== "undefined" ? Intl.DateTimeFormat().resolvedOptions().timeZone : undefined);
     return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/turns`, StartTurnResponseSchema, {
       method: "POST",
-      body: input,
+      body: { ...input, ...(timezone ? { timezone } : {}) },
       ...options,
     });
+  }
+
+  async listScheduledTasks(options: { signal?: AbortSignal } = {}): Promise<ScheduledTask[]> {
+    return this.#request("/v1/scheduled-tasks", z.array(ScheduledTaskSchema), options);
+  }
+  async createScheduledTask(input: ScheduledTaskCreate): Promise<ScheduledTask> {
+    return this.#request("/v1/scheduled-tasks", ScheduledTaskSchema, { method: "POST", body: input });
+  }
+  async updateScheduledTask(id: string, changes: ScheduledTaskUpdate, operationId?: string): Promise<ScheduledTask> {
+    return this.#request(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, ScheduledTaskSchema, { method: "PATCH", body: { changes, ...(operationId ? { operationId } : {}) } });
+  }
+  async deleteScheduledTask(id: string): Promise<{ removed: boolean }> {
+    return this.#request(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, z.object({ removed: z.boolean() }), { method: "DELETE" });
+  }
+  async runScheduledTask(id: string, operationId: string): Promise<ScheduledTaskRun> {
+    return this.#request(`/v1/scheduled-tasks/${encodeURIComponent(id)}/run`, ScheduledTaskRunSchema, { method: "POST", body: { operationId } });
+  }
+  async listScheduledTaskRuns(id: string, limit = 30, options: { signal?: AbortSignal } = {}): Promise<ScheduledTaskRun[]> {
+    return this.#request(`/v1/scheduled-tasks/${encodeURIComponent(id)}/runs?limit=${encodeURIComponent(limit)}`, z.array(ScheduledTaskRunSchema), options);
   }
 
   async listQueuedFollowUps(sessionId: string, input: { cursor?: string; limit?: number } = {}): Promise<QueuedFollowUpPage> {
@@ -1987,7 +2015,7 @@ function isSupportPath(pathname: string): boolean {
   if (/^\/v1\/workspaces\/[^/]+$/.test(pathname)) return true;
   if (pathname === "/v1/tasks" || pathname === "/v1/tasks/page" || pathname === "/v1/tasks/summary") return true;
   if (/^\/v1\/tasks\/[^/]+(?:\/restore|\/sessions|\/events)?$/.test(pathname)) return true;
-  if (/^\/v1\/sessions\/[^/]+(?:\/messages(?:\/[^/]+)?|\/context-stats|\/turns|\/turn-state|\/cancel|\/steer|\/events|\/follow-ups)?$/.test(pathname)) return true;
+  if (/^\/v1\/sessions\/[^/]+(?:\/messages(?:\/[^/]+)?|\/context-stats|\/task-token-usage|\/turns|\/turn-state|\/cancel|\/steer|\/events|\/follow-ups)?$/.test(pathname)) return true;
   if (/^\/v1\/follow-ups\/[^/]+$/.test(pathname)) return true;
   if (/^\/v1\/(?:approvals|questions\/[^/]+\/answer|runs\/[^/]+\/recovery)$/.test(pathname)) return true;
   if (/^\/v1\/approvals\/[^/]+\/decision$/.test(pathname)) return true;

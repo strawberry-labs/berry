@@ -9,6 +9,7 @@ import {
   ApprovalDecisionSchema,
   AttachmentInputSchema,
   ContextStatsSchema,
+  TaskTokenUsageSchema,
   ConversationKindSchema,
   classifyWorkflowCategory,
   DURABLE_BASE_BUILT_IN_TOOLS,
@@ -23,6 +24,7 @@ import {
   PermissionModeSchema,
   PromptImprovementRequestSchema,
   ReasoningLevelSchema,
+  ScheduleTimezoneSchema,
   resolveModelCapabilities,
   safeOperationalLog,
   sealDurableSecret,
@@ -250,6 +252,7 @@ async function retryInlineFinalization(write: () => Promise<void>): Promise<void
 }
 
 const StartTurnRequestSchema = z.object({
+  timezone: ScheduleTimezoneSchema.optional(),
   operationId: z.string().uuid().optional(),
   input: z.string().min(1).optional(),
   messageInput: z.string().min(1).optional(),
@@ -1487,6 +1490,12 @@ export class AgentApiController {
     });
   }
 
+  @Get("/sessions/:sessionId/task-token-usage")
+  async taskTokenUsage(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string) {
+    const { task } = await this.ownedSession(httpRequest, sessionId);
+    return TaskTokenUsageSchema.parse(await this.usageRepository.taskTokenUsage(tenantIdFromRequest(httpRequest), task.id));
+  }
+
   @Post("/sessions/:sessionId/messages")
   async appendMessage(@Req() request: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Body() body: unknown) {
     await this.ownedSession(request, sessionId);
@@ -1989,6 +1998,7 @@ export class AgentApiController {
         });
         const runtimeRequest = DurableTurnRuntimeRequestSchema.parse({
           capabilityVersion: 1,
+          ...(request.timezone ? { timezone: request.timezone } : {}),
           admissionFingerprint: operationFingerprint,
           ...(request.intent ? { intent: request.intent } : {}),
           providerId,

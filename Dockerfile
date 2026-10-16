@@ -65,6 +65,7 @@ RUN --mount=type=cache,id=berry-turbo,target=/app/.turbo \
 
 FROM workspace AS build-worker
 COPY apps/worker ./apps/worker
+COPY packages/db ./packages/db
 COPY packages/desktop-db ./packages/desktop-db
 COPY packages/execpolicy ./packages/execpolicy
 COPY packages/harness ./packages/harness

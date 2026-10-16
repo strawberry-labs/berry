@@ -1,3 +1,6 @@
+import { ScheduledTasksController } from "../schedules/scheduled-tasks.controller.ts";
+import { ScheduledTasksService } from "../schedules/scheduled-tasks.service.ts";
+import { ScheduledTaskDispatcher } from "../schedules/scheduled-task-dispatcher.ts";
 import { MemberSkillsController } from "./member-skills.controller.ts";
 import { Module, type DynamicModule, type FactoryProvider, type Provider } from "@nestjs/common";
 import type { SessionHost } from "@berry/local-agent";
@@ -97,7 +100,7 @@ export class AgentApiModule {
         ...(durableContextEnabled ? [MemoryModule] : []),
         SessionHostModule.register(options.sessionHost),
       ],
-      controllers: [MemberSkillsController, AgentApiController, SupportViewController, PersonalCapabilitiesController, OrganizationCapabilitiesController, ConnectorsController, OrganizationConnectorsController],
+      controllers: [ScheduledTasksController, MemberSkillsController, AgentApiController, SupportViewController, PersonalCapabilitiesController, OrganizationCapabilitiesController, ConnectorsController, OrganizationConnectorsController],
       providers: [
         // SupportViewController delegates member-scoped operations through the
         // existing API surface. Register the controller as a provider as well
@@ -118,6 +121,8 @@ export class AgentApiModule {
         { provide: DURABLE_TURN_RUNNER_ENABLED, useValue: options.durableRunnerEnabled ?? false },
         TurnCancellationPublisher,
         QueuedFollowUpService,
+        ScheduledTasksService,
+        ...(options.durableRunnerEnabled ? [ScheduledTaskDispatcher] : []),
         ...(durableContextEnabled
           ? [DurableTurnService]
           : [

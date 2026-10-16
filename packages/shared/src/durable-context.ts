@@ -1,3 +1,4 @@
+import { ScheduleTimezoneSchema } from "./scheduled-tasks.ts";
 import { z } from "zod";
 import { WorkflowCategorySchema, WORKFLOW_CATEGORY_VERSION } from "./workflow-routing.ts";
 
@@ -649,8 +650,8 @@ export const DurableTurnRuntimeRequestSchema = z.object({
   provider: DurableProviderTransportSchema,
   model: z.string().min(1).nullable(),
   conversationKind: z.enum(["chat", "code"]).default("chat"),
-  /** IANA zone for the turn's date context; the worker falls back to UTC when invalid (H-023). */
-  timezone: z.string().min(1).max(100).optional(),
+  /** IANA timezone shared by normal and scheduled turns. */
+  timezone: ScheduleTimezoneSchema.optional(),
   workspacePath: z.string().min(1),
   workspaceId: z.string().min(1),
   permissionMode: z.string().min(1),
