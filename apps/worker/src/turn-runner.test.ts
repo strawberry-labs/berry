@@ -800,7 +800,7 @@ describe("durable turn runner", () => {
     const names = durableBuiltInToolDefinitions(current).map((tool) => tool.function.name);
     expect(names).toEqual([
       "read", "bash", "edit", "write", "grep", "find", "ls",
-      "ask_user_question", "compose_message", "persist_artifact", "save_personal_skill",
+      "ask_user_question", "compose_message", "persist_artifact", "save_personal_skill", "check_environment",
     ]);
   });
 
@@ -849,6 +849,22 @@ describe("durable turn runner", () => {
       },
     });
     expect(DURABLE_BASE_BUILT_IN_TOOLS.slice(0, 7)).toEqual(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+  });
+
+  it("derives the environment checker only from admitted bash, with a stable definition", () => {
+    const current = providerSnapshot("openai-responses");
+    current.runtimeRequest = { ...current.runtimeRequest, builtInTools: ["read"] };
+    expect(durableBuiltInToolDefinitions(current).map((tool) => tool.function.name)).not.toContain("check_environment");
+    expect(JSON.stringify(modelMessages(current).messages)).not.toContain("Use check_environment");
+    current.runtimeRequest = { ...current.runtimeRequest, builtInTools: ["read", "bash"] };
+    const first = durableBuiltInToolDefinitions(current);
+    expect(first.map((tool) => tool.function.name)).toContain("check_environment");
+    expect(JSON.stringify(modelMessages(current).messages)).toContain("Use check_environment");
+    current.steps.push({
+      ...toolStep("completed", "read_only", false), type: "tool.check_environment",
+      output: { executables: [{ name: "typst", available: false }] },
+    });
+    expect(durableBuiltInToolDefinitions(current)).toEqual(first);
   });
 
   it("advertises document and ZIP routing on the read tool", () => {
@@ -3480,6 +3496,85 @@ describe("durable turn runner", () => {
       return { state, executed, toolSteps, failure, modelText, repository };
     }
     const countOf = (executed: Array<{ name: string }>, name: string) => executed.filter((call) => call.name === name).length;
+    it("continues from the production environment probe to PDF generation without a recovery hold", async () => {
+      const command = [
+        'python3 -c "import reportlab; print(\'reportlab installed\')" 2>/dev/null || echo "no reportlab"',
+        'python3 -c "import fpdf; print(\'fpdf installed\')" 2>/dev/null || echo "no fpdf"',
+        'python3 -c "import weasyprint; print(\'weasyprint installed\')" 2>/dev/null || echo "no weasyprint"',
+        "which typst pandoc libreoffice soffice pdftoppm pdfinfo qpdf 2>&1",
+      ].join("\n");
+      const result = await driveCalls([
+        [{ name: "bash", args: { command }, retryClass: "non_idempotent_manual" }],
+        [{ name: "bash", args: { command: "python3 /workspace/tmp/generate_pdf.py" }, retryClass: "non_idempotent_manual" }],
+      ], ({ name, args }) => {
+        if (name === "bash" && args.command === command) {
+          throw new Error("reportlab installed\nno fpdf\nweasyprint installed\n/usr/bin/pandoc\n\nCommand exited with code 1");
+        }
+        return name === "check_environment"
+          ? { executables: [{ name: "typst", available: false }], python_modules: [{ name: "reportlab", available: true }] }
+          : { exitCode: 0, output: "Created briefing.pdf" };
+      });
+      expect(result.state).toBe("finalizing");
+      expect(result.toolSteps[0]).toMatchObject({
+        type: "tool.check_environment", retryClass: "read_only", state: "completed",
+        input: { invokedAs: "bash" },
+      });
+      expect(result.executed.at(-1)?.args.command).toBe("python3 /workspace/tmp/generate_pdf.py");
+      const replay = modelMessages(result.repository.current).messages;
+      const original = replay.find((message) => message.role === "assistant" && message.toolCalls?.some((call) => call.function.name === "bash"));
+      expect(original?.role === "assistant" && JSON.parse(original.toolCalls![0]!.function.arguments)).toEqual({ command });
+      expect(replay.some((message) => message.role === "tool" && message.name === "bash")).toBe(true);
+    });
+
+
+    it("does not let an intervening environment check release an uncertain shell write", async () => {
+      const create = "curl -X POST https://records.example.test/create -d title=TenderA";
+      let writes = 0;
+      const result = await driveCalls([
+        [{ name: "bash", args: { command: create + " && false" }, retryClass: "non_idempotent_manual" }],
+        [{ name: "bash", args: { command: "which pandoc typst" }, retryClass: "non_idempotent_manual" }],
+        [{ name: "bash", args: { command: create }, retryClass: "non_idempotent_manual" }],
+      ], ({ name }) => {
+        if (name === "bash") {
+          writes += 1;
+          throw new Error("invalid schema after the POST was accepted\n\nCommand exited with code 1");
+        }
+        return { executables: [{ name: "pandoc", available: true }, { name: "typst", available: false }] };
+      });
+      expect(writes).toBe(1);
+      expect(result.state).toBe("recovery_required");
+      expect(result.toolSteps[1]).toMatchObject({ type: "tool.check_environment", state: "completed" });
+      expect(result.toolSteps[2]).toMatchObject({ type: "tool.bash", state: "recovery_required" });
+      expect(result.toolSteps[2]?.input.heldBy).toEqual([result.toolSteps[0]?.id]);
+    });
+
+    it("does not classify a probe mixed with a POST as read-only", async () => {
+      let writes = 0;
+      const mixed = "which pandoc\ncurl -X POST https://records.example.test/create && false";
+      const result = await driveCalls([
+        [{ name: "bash", args: { command: mixed }, retryClass: "non_idempotent_manual" }],
+        [{ name: "bash", args: { command: mixed }, retryClass: "non_idempotent_manual" }],
+      ], () => {
+        writes += 1;
+        throw new Error("created\n\nCommand exited with code 1");
+      });
+      expect(writes).toBe(1);
+      expect(result.state).toBe("recovery_required");
+      expect(result.toolSteps[0]).toMatchObject({ type: "tool.bash", retryClass: "non_idempotent_manual" });
+    });
+
+    it("a failed read-only environment check cannot hold a later ordinary shell command", async () => {
+      const result = await driveCalls([
+        [{ name: "bash", args: { command: "which pandoc" }, retryClass: "non_idempotent_manual" }],
+        [{ name: "bash", args: { command: "python3 generate_pdf.py" }, retryClass: "non_idempotent_manual" }],
+      ], ({ name }) => {
+        if (name === "check_environment") throw new Error("socket hang up");
+        return { exitCode: 0, output: "Created briefing.pdf" };
+      });
+      expect(result.state).toBe("finalizing");
+      expect(result.failure(0)).toMatchObject({ outcome: "not_applied", category: "transient" });
+      expect(result.toolSteps[1]).toMatchObject({ state: "completed", type: "tool.bash" });
+    });
 
     it("refuses an unchanged repeat of an invalid-input failure and runs the corrected call", async () => {
       const bad = { name: "read", args: { path: "notes.md", offset: -1 } };
@@ -5078,7 +5173,7 @@ describe("durable turn runner", () => {
 
     await runner.execute({ tenantId, runId, reason: "continue" });
 
-    expect(toolNames).toEqual(DURABLE_BASE_BUILT_IN_TOOLS);
+    expect(toolNames).toEqual([...DURABLE_BASE_BUILT_IN_TOOLS, "check_environment"]);
     expect(composePolicy).toEqual({
       retryClass: "read_only",
       repeatPolicy: "block_after_success",

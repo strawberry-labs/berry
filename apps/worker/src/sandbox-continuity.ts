@@ -1,3 +1,4 @@
+import { ENVIRONMENT_CHECK_SCRIPT, environmentCheckInput, environmentCheckResult } from "./environment-check.js";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { Buffer } from "node:buffer";
@@ -1422,6 +1423,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       if (!CORE_TOOL_NAMES.has(toolName)) throw error;
       throw new ToolArgumentError(notRunMessage(toolName, (error as Error).message));
     }
+    // Strictly validate names before workspace preparation or any provider I/O.
+    const environmentInput = toolName === "check_environment" ? environmentCheckInput(step.input.arguments) : null;
     const inputRepairDetails = prepared.repairs.length > 0
       ? { inputRepairs: prepared.repairs }
       : {};
@@ -1430,6 +1433,32 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const referencedInputIds = referencedInputFileIds(args, workspaceRoot);
     if (referencedInputIds.size > 0) {
       await this.stageInputFiles(snapshot, sandbox.id, this.repository, referencedInputIds, signal, reportProgress, undefined, true);
+    }
+    if (environmentInput) {
+      const output = new PiTailCollector();
+      let exitCode: number | null = null;
+      // Only Berry's fixed script runs; input is JSON argv, never source code.
+      for await (const event of this.provider.exec({
+        sandbox_id: sandbox.id,
+        request_id: step.idempotencyKey ?? step.id,
+        command: ["python3", "-I", "-S", "-c", ENVIRONMENT_CHECK_SCRIPT, JSON.stringify(environmentInput)],
+        cwd: workspaceRoot,
+        timeout_ms: 15_000,
+      }, { signal })) {
+        reportProgress?.();
+        if (event.kind === "stdout") output.append(event.data);
+        else if (event.kind === "exit") exitCode = event.exit_code;
+        else if (event.kind === "error") throw new Error(event.message);
+      }
+      signal?.throwIfAborted();
+      if (exitCode !== 0) throw new Error("The environment check did not finish; installed dependencies have not been verified.");
+      const text = output.result();
+      if (text.truncated) throw new Error("The environment check returned incomplete results.");
+      return {
+        output: environmentCheckResult(environmentInput, text.content),
+        summary: "Checked environment availability without executing requested programs or importing requested modules",
+        sandbox,
+      };
     }
     if (toolName === "read") {
       const path = safeReadablePath(requiredToolPath(args, toolName), workspaceRoot);

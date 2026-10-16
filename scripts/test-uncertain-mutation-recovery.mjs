@@ -589,6 +589,90 @@ try {
     }
   }
 
+
+  await test("the production-style environment probe reports missing dependencies and the next command runs once", async () => {
+    const root = mkdtempSync(join(tmpdir(), "berry-environment-pg-"));
+    const shellInputs = [];
+    const provider = {
+      kind: "e2b", supportsResume: false,
+      create: async () => ({ sandbox_id: "environment-local", provider: "e2b", status: "running" }),
+      files: { list: async input => ({ path: input.path, entries: [] }) },
+      exec: async function* (input) {
+        shellInputs.push(input.command);
+        try {
+          const result = await exec(input.command[0], input.command.slice(1), { cwd: root });
+          if (result.stdout) yield { kind: "stdout", data: result.stdout };
+          if (result.stderr) yield { kind: "stderr", data: result.stderr };
+          yield { kind: "exit", exit_code: 0, signal: null };
+        } catch (error) {
+          if (error.stdout) yield { kind: "stdout", data: error.stdout };
+          if (error.stderr) yield { kind: "stderr", data: error.stderr };
+          yield { kind: "exit", exit_code: Number(error.code) || 1, signal: null };
+        }
+      },
+    };
+    const manager = new SandboxContinuityManager(provider, {
+      recordSandbox: async () => {}, recordTiming: async () => {},
+      latest: async () => null, continuity: async () => null, inputFiles: async () => [],
+    }, null, { image: "local-environment-test", cwd: root });
+    try {
+      const f = await fixture(), { runId } = await admit(f);
+      const probe = [
+        'python3 -c "import json; print(\'json installed\')" 2>/dev/null || echo "no json"',
+        'python3 -c "import berry_missing_module; print(\'berry_missing_module installed\')" 2>/dev/null || echo "no berry_missing_module"',
+        "which bash berry_missing_program 2>&1",
+      ].join("\n");
+      const renderer = "printf 'generated once\\n' >> generated.txt";
+      const state = await drive(new DurableTurnRunner(repository, model([
+        ["bash", { command: probe }, "non_idempotent_manual"],
+        ["bash", { command: renderer }, "non_idempotent_manual"],
+      ]), manager, { owner: "environment-pg" }), runId);
+      assert.equal(state, "completed");
+      const steps = await toolSteps(runId);
+      assert.deepEqual(steps.map(step => [step.step_type, step.state]), [
+        ["tool.check_environment", "completed"], ["tool.bash", "completed"],
+      ]);
+      assert.equal(steps[0].output.executables.find(item => item.name === "berry_missing_program").available, false);
+      assert.equal(steps[0].output.python_modules.find(item => item.name === "berry_missing_module").available, false);
+      assert.equal(steps[0].output.python_modules.find(item => item.name === "json").available, true);
+      assert.deepEqual(shellInputs[0].slice(0, 4), ["python3", "-I", "-S", "-c"]);
+      assert.equal(shellInputs.some(command => command.includes(probe)), false, "The original Python imports must never execute");
+      assert.equal(readFileSync(join(root, "generated.txt"), "utf8"), "generated once\n");
+      await drive(new DurableTurnRunner(repository, model([]), manager, { owner: "environment-restart" }), runId);
+      assert.equal(readFileSync(join(root, "generated.txt"), "utf8"), "generated once\n");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test("an environment probe between an accepted POST failure and a retry never releases the second POST", async () => {
+    const server = await endpoint(() => 0);
+    let checks = 0;
+    try {
+      const create = "curl --silent -X POST " + server.base + "/create";
+      const f = await fixture(), { runId } = await admit(f);
+      const target = { execute: async (snapshot, step) => {
+        if (step.input.toolName === "check_environment") {
+          checks += 1;
+          return { output: { executables: [{ name: "pandoc", available: false }] }, summary: "Not installed" };
+        }
+        return shell.execute(snapshot, step);
+      } };
+      const runner = new DurableTurnRunner(repository, model([
+        ["bash", { command: create + " && false" }, "non_idempotent_manual"],
+        ["bash", { command: "which pandoc" }, "non_idempotent_manual"],
+        ["bash", { command: create }, "non_idempotent_manual"],
+      ]), target, { owner: "environment-cannot-release-write" });
+      assert.equal(await drive(runner, runId), "recovery_required");
+      assert.equal(server.accepted.create, 1);
+      assert.equal(checks, 1);
+      await drive(new DurableTurnRunner(repository, model([]), target, { owner: "environment-cannot-release-write-restart" }), runId);
+      assert.equal(server.accepted.create, 1);
+    } finally {
+      await server.close();
+    }
+  });
+
   console.log(`${passed} PostgreSQL uncertain-mutation scenarios passed${failed ? `, ${failed} failed` : ""}`);
 } finally {
   console.log(`Fixture tenant: ${tenantId}`);
