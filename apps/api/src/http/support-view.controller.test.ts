@@ -75,6 +75,7 @@ async function controllerFor(role: "owner" | "admin" | "member", agentApi?: unkn
   };
   const files = {
     describe: vi.fn(async () => ({ id: fileId })),
+    downloadUrl: vi.fn(async () => ({ url: "https://storage.test/signed", expiresIn: 60 })),
     streamContent: vi.fn(async () => undefined),
   };
   const audit = { append: vi.fn(async () => ({ id: "audit_1" })) };
@@ -212,6 +213,22 @@ describe("SupportViewController", () => {
     )).rejects.toBeInstanceOf(BadRequestException);
 
     expect(store.listMessagePage).not.toHaveBeenCalled();
+  });
+
+  it("authorizes and audits direct download grants without claiming completed delivery", async () => {
+    const { audit, controller, files } = await controllerFor("admin");
+    const response = { setHeader: vi.fn() };
+    await expect(controller.fileDownloadUrl(requestFor(actorId), SELF_HOST_TENANT_ID, subjectId, fileId, response as any)).resolves.toMatchObject({ expiresIn: 60 });
+    expect(files.downloadUrl).toHaveBeenCalledWith(SELF_HOST_TENANT_ID, subjectId, fileId);
+    expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", "private, no-store");
+    expect(audit.append).toHaveBeenCalledOnce();
+    expect(audit.append).toHaveBeenCalledWith(expect.objectContaining({ action: "support-view-file-download-requested", metadata: { subjectUserId: subjectId, delivery: "signed-url" } }));
+  });
+
+  it("rejects support download grants for a non-admin before signing", async () => {
+    const { controller, files } = await controllerFor("member");
+    await expect(controller.fileDownloadUrl(requestFor(actorId), SELF_HOST_TENANT_ID, subjectId, fileId, { setHeader: vi.fn() } as any)).rejects.toThrow();
+    expect(files.downloadUrl).not.toHaveBeenCalled();
   });
 
   it("audits file download attempts and successful delivery separately", async () => {

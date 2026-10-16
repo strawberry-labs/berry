@@ -53,6 +53,7 @@ import {
   PROTECTED_FILE_CACHE_CONTROL,
   setUntrustedFileResponseHeaders,
 } from "./files/file-response-security.ts";
+import { FileResponseTransfer } from "./files/file-response-transfer.ts";
 import { FilePlatformService } from "./files/file-platform.service.ts";
 import { CloudDatabaseModule } from "./db/cloud-database.module.ts";
 import { CloudDatabaseService } from "./db/cloud-database.service.ts";
@@ -181,8 +182,10 @@ export class ArtifactController {
       throw new NotFoundException("Artifact not found");
     }
     await authorizeArtifactKey(this.database, this.files, this.config, authenticatedUserId(request), key);
+    const transfer = new FileResponseTransfer(response);
     try {
-      const object = await this.config.client.send(new GetObjectCommand({ Bucket: this.config.bucket, Key: key }));
+      const object = await this.config.client.send(new GetObjectCommand({ Bucket: this.config.bucket, Key: key }), { abortSignal: transfer.signal });
+      transfer.track(object.Body);
       if (!object.Body) throw new NotFoundException("Artifact not found");
       const inspected = await bufferBodyPrefix(object.Body as AsyncIterable<Uint8Array>);
       const policy = fileResponsePolicy({
@@ -198,18 +201,18 @@ export class ArtifactController {
         fileName: artifactLibraryItem(key, object.ContentLength ?? 0).name,
         policy,
       });
-      for await (const chunk of inspected.body) {
-        if (!response.write(chunk)) await once(response, "drain");
-      }
-      response.end();
+      await transfer.stream(inspected.body);
     } catch (error) {
+      if (response.destroyed) return;
+      if (response.headersSent) { response.destroy(error instanceof Error ? error : new Error("File transfer failed")); return; }
+      if (transfer.signal.aborted) throw transfer.signal.reason;
       if (error instanceof NotFoundException) throw error;
       const status = typeof error === "object" && error !== null && "$metadata" in error
         ? (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode
         : undefined;
       if (status === 404) throw new NotFoundException("Artifact not found");
       throw error;
-    }
+    } finally { transfer.dispose(); }
   }
 }
 

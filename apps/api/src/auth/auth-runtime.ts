@@ -204,7 +204,7 @@ export function createBetterAuthOptions(options: CreateBerryAuthOptions = {}): {
                        updated_at = now()`,
                     [tenantId, user.id, "member", membershipSource],
                   );
-                  await upsertInitialBudgets(client, tenantId, user.id, defaultOrgBudgetMicros, defaultUserBudgetMicros);
+                  await ensureInitialBudgets(client, tenantId, user.id, defaultOrgBudgetMicros, defaultUserBudgetMicros);
                 }
                 await client.query("COMMIT");
               } catch (error) {
@@ -489,12 +489,13 @@ export class RealBetterAuthRuntime implements BerryAuthRuntime {
       if (workspace.rowCount !== 1) {
         throw new ServiceUnavailableException("The default Berry workspace has not been seeded or already has an owner.");
       }
-      await upsertInitialBudgets(
+      await ensureInitialBudgets(
         client,
         this.tenantId,
         userId,
         positiveInteger(this.env.BERRY_DEFAULT_ORG_MONTHLY_BUDGET_MICROS, 100_000_000),
         positiveInteger(this.env.BERRY_DEFAULT_USER_MONTHLY_BUDGET_MICROS, 15_000_000),
+        true,
       );
       await client.query("COMMIT");
       return {
@@ -930,7 +931,7 @@ async function recoverGoogleMembership(
     );
     const status = membership.rows[0]?.status;
     if (status === "active") {
-      await upsertInitialBudgets(client, tenantId, userId, defaultOrgBudgetMicros, defaultUserBudgetMicros);
+      await ensureInitialBudgets(client, tenantId, userId, defaultOrgBudgetMicros, defaultUserBudgetMicros);
     }
     await client.query("COMMIT");
     return status === "active" || (typeof status === "string" && status !== "pending");
@@ -1047,7 +1048,7 @@ async function completeInitialGoogleOwnerClaim(
     [tenantId, userId, SELF_HOST_WORKSPACE_ID],
   );
   if (workspace.rowCount !== 1) throw new Error("The default Berry workspace could not be claimed.");
-  await upsertInitialBudgets(client, tenantId, userId, defaultOrgBudgetMicros, defaultUserBudgetMicros);
+  await ensureInitialBudgets(client, tenantId, userId, defaultOrgBudgetMicros, defaultUserBudgetMicros, true);
 }
 
 async function clientHasOwner(client: PoolClient, tenantId: string): Promise<boolean> {
@@ -1062,31 +1063,33 @@ async function clientHasOwner(client: PoolClient, tenantId: string): Promise<boo
   return result.rows[0]?.exists === true;
 }
 
-async function upsertInitialBudgets(
+async function ensureInitialBudgets(
   client: PoolClient,
   tenantId: string,
   userId: string,
   orgBudgetMicros: number,
   userBudgetMicros: number,
+  initializeOrganization = false,
 ): Promise<void> {
+  // Defaults fill missing limits. Only initial owner setup may activate the
+  // disabled zero-value organization row seeded by the database migration.
   await client.query(
     `INSERT INTO budget_limits (tenant_id, scope_type, scope_id, period, soft_limit_micros, hard_limit_micros, status)
      VALUES ($1::uuid, 'org', $1::text, 'month', $2, $3, 'active')
-     ON CONFLICT (tenant_id, scope_type, scope_id, period) DO UPDATE SET
+     ON CONFLICT (tenant_id, scope_type, scope_id, period) ${initializeOrganization ? `DO UPDATE SET
        soft_limit_micros = EXCLUDED.soft_limit_micros,
        hard_limit_micros = EXCLUDED.hard_limit_micros,
        status = 'active',
-       updated_at = now()`,
+       updated_at = now()
+     WHERE budget_limits.status = 'disabled'
+       AND budget_limits.soft_limit_micros = 0
+       AND budget_limits.hard_limit_micros = 0` : 'DO NOTHING'}`,
     [tenantId, Math.floor(orgBudgetMicros * 0.8), orgBudgetMicros],
   );
   await client.query(
     `INSERT INTO budget_limits (tenant_id, scope_type, scope_id, period, soft_limit_micros, hard_limit_micros, status)
      VALUES ($1::uuid, 'user', $2::text, 'month', $3, $4, 'active')
-     ON CONFLICT (tenant_id, scope_type, scope_id, period) DO UPDATE SET
-       soft_limit_micros = EXCLUDED.soft_limit_micros,
-       hard_limit_micros = EXCLUDED.hard_limit_micros,
-       status = 'active',
-       updated_at = now()`,
+     ON CONFLICT (tenant_id, scope_type, scope_id, period) DO NOTHING`,
     [tenantId, userId, Math.floor(userBudgetMicros * 0.8), userBudgetMicros],
   );
 }

@@ -1069,6 +1069,7 @@ describe("BerryApiClient", () => {
     const fileId = "00000000-0000-7000-8000-000000000101";
     const uploadId = "00000000-0000-7000-8000-000000000102";
     const taskId = "00000000-0000-7000-8000-000000000103";
+    let firstPartAttempts = 0;
     const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/v1/files/uploads")) return json({ fileId, uploadId, partSize: 3, partCount: 2, expiresAt: "2026-07-22T10:00:00.000Z" });
@@ -1076,6 +1077,7 @@ describe("BerryApiClient", () => {
         return json({ parts: [{ partNumber: 1, url: "https://files.berry.test/part-1" }, { partNumber: 2, url: "https://files.berry.test/part-2" }] });
       }
       if (url.startsWith("https://files.berry.test/part-")) {
+        if (url.endsWith("1") && firstPartAttempts++ === 0) return new Response(null, { status: 503 });
         const part = url.endsWith("1") ? "1" : "2";
         return new Response(null, { status: 200, headers: { etag: `\"etag-${part}\"` } });
       }
@@ -1099,7 +1101,8 @@ describe("BerryApiClient", () => {
     const initiate = fetchImpl.mock.calls.find(([url]) => String(url).endsWith("/v1/files/uploads"));
     expect(initiate?.[1]).toMatchObject({ method: "POST", body: JSON.stringify({ name: "report.pdf", mediaType: "application/pdf", size: 6, taskId }) });
     const partPuts = fetchImpl.mock.calls.filter(([url]) => String(url).startsWith("https://files.berry.test/part-"));
-    expect(partPuts).toHaveLength(2);
+    expect(partPuts).toHaveLength(3);
+    expect(partPuts.filter(([url]) => String(url).endsWith("part-2"))).toHaveLength(1);
     expect(partPuts.every(([, init]) => init?.body instanceof Blob)).toBe(true);
     expect(Math.max(...progress)).toBe(6);
     expect(JSON.stringify(fetchImpl.mock.calls.filter(([url]) => String(url).startsWith("https://api.berry.test")))).not.toContain("data:");
@@ -1187,6 +1190,24 @@ describe("BerryApiClient", () => {
       expect.objectContaining({ method: "DELETE" }),
     );
   });
+});
+
+it("does not initiate an already cancelled upload", async () => {
+  const fetchImpl = vi.fn(); const controller = new AbortController(); controller.abort();
+  const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl });
+  await expect(client.uploadFile(new File(["abc"], "file.txt"), { signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
+  expect(fetchImpl).not.toHaveBeenCalled();
+});
+it("cleans up when signing fails before any parts are sent", async () => {
+  const fileId = "00000000-0000-7000-8000-000000000101", uploadId = "00000000-0000-7000-8000-000000000102";
+  const fetchImpl = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+    if (String(url).endsWith("/uploads")) return json({ fileId, uploadId, partSize: 3, partCount: 1, expiresAt: "2026-07-22T10:00:00.000Z" });
+    if (init?.method === "DELETE") return json({ ok: true });
+    return new Response(null, { status: 503 });
+  });
+  const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl });
+  await expect(client.uploadFile(new File(["abc"], "file.txt"))).rejects.toMatchObject({ status: 503 });
+  expect(fetchImpl).toHaveBeenLastCalledWith(expect.stringContaining(uploadId), expect.objectContaining({ method: "DELETE" }));
 });
 
 function json(body: unknown, headers: Record<string, string> = {}): Response {

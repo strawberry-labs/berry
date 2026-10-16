@@ -1112,24 +1112,14 @@ export class AgentApiController {
     });
     await this.modelGovernance.synchronizeRuntimeCatalog(tenantId, runtime.provider);
     const departmentId = await this.#primaryDepartmentId(tenantId, userId);
-    let modelDecision = await this.modelGovernance.resolve({
+    const modelDecision = await this.modelGovernance.resolveTaskModel({
       tenantId,
       mode,
       providerId: explicitModel ? requestedProviderId ?? runtime.provider.id : null,
       model: explicitModel,
       userId,
       departmentId,
-    });
-    if (!explicitModel && modelDecision.reason === "no_model_selected") {
-      modelDecision = await this.modelGovernance.resolve({
-        tenantId,
-        mode,
-        providerId: runtime.provider.id,
-        model: runtime.provider.defaultModel,
-        userId,
-        departmentId,
-      });
-    }
+    }, runtime.provider);
     if (!modelDecision.allowed) {
       throw new ForbiddenException({
         code: "model_governance_blocked",
@@ -1687,14 +1677,14 @@ export class AgentApiController {
     ]);
     await this.modelGovernance.synchronizeRuntimeCatalog(tenantId, baseRuntime.provider);
     const mode = "chat" as const;
-    const modelDecision = await this.modelGovernance.resolve({
+    const modelDecision = await this.modelGovernance.resolveTaskModel({
       tenantId,
       mode,
       providerId: selectedProviderId ?? null,
       model: selectedModel ?? null,
       userId,
       departmentId,
-    });
+    }, baseRuntime.provider);
     if (!modelDecision.allowed) {
       throw new ForbiddenException({
         code: "model_governance_blocked",

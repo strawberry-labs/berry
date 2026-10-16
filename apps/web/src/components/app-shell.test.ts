@@ -380,7 +380,7 @@ describe("cloud shell bootstrap", () => {
       label: group.label,
       items: group.items.map((item) => [item.id, item.label]),
     }))).toEqual([
-      { label: "", items: [["general", "General"], ["account", "Account"], ["personalization", "Personalization"], ["connectors", "Connectors"], ["skills", "Skills"], ["mcp", "MCP servers"], ["usage", "Usage"], ["archived", "Archived tasks"]] },
+      { label: "", items: [["general", "General"], ["account", "Account"], ["personalization", "Personalization"], ["connectors", "Connectors"], ["skills", "Skills"], ["mcp", "MCP servers"], ["schedules", "Scheduled tasks"], ["usage", "Usage"], ["archived", "Archived tasks"]] },
     ]);
   });
 

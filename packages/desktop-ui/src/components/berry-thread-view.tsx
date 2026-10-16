@@ -222,7 +222,9 @@ function useVariableHeightWindow(keys: readonly string[], containerRef: React.Re
     let frame = 0;
     const updateViewport = () => {
       cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(() => setViewport({ scrollTop: root.scrollTop, height: root.clientHeight || 720 }));
+      frame = requestAnimationFrame(() => {
+        if (root.clientHeight > 0) setViewport({ scrollTop: root.scrollTop, height: root.clientHeight });
+      });
     };
     updateViewport();
     root.addEventListener("scroll", updateViewport, { passive: true });
@@ -272,9 +274,13 @@ function useVariableHeightWindow(keys: readonly string[], containerRef: React.Re
     const observer = new ResizeObserver((entries) => {
       let changed = false;
       for (const entry of entries) {
-        const key = (entry.target as HTMLElement).dataset.historyKey;
-        if (!key) continue;
-        const next = Math.max(48, Math.round(entry.contentRect.height) + HISTORY_ROW_GAP);
+        const element = entry.target as HTMLElement;
+        const key = element.dataset.historyKey;
+        if (!key || elementsRef.current.get(key) !== element || !element.isConnected) continue;
+        const height = entry.borderBoxSize?.[0]?.blockSize ?? element.getBoundingClientRect().height;
+        // A hidden task surface has no layout; keep its last real measurement.
+        if (entry.contentRect.width <= 0 || height <= 0) continue;
+        const next = Math.max(48, height);
         const previous = measuredHeightsRef.current.get(key);
         if (previous !== next) {
           measuredHeightsRef.current.delete(key);
@@ -370,7 +376,9 @@ function useVariableHeightWindow(keys: readonly string[], containerRef: React.Re
       element.dataset.historyKey = key;
       elementsRef.current.set(key, element);
       observerRef.current?.observe(element);
-      const height = Math.max(48, Math.round(element.getBoundingClientRect().height));
+      const rect = element.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+      const height = Math.max(48, rect.height);
       if (measuredHeightsRef.current.get(key) !== height) {
         measuredHeightsRef.current.delete(key);
         measuredHeightsRef.current.set(key, height);
@@ -666,6 +674,8 @@ export function BerryThreadView({
   ]), [replaceLatestSettledAssistant, turnGroups]);
   const historyKeys = React.useMemo(() => historyRows.map((row) => row.key), [historyRows]);
   const { range: historyRange, virtualItems: virtualHistoryItems, getItemRef: getHistoryItemRef, scrollToKey } = useVariableHeightWindow(historyKeys, navContainerRef);
+  const lastHistoryItem = virtualHistoryItems.at(-1);
+  const historyTailHeight = Math.max(0, historyRange.totalHeight - (lastHistoryItem ? lastHistoryItem.start + lastHistoryItem.size : 0));
   const olderLoadInFlightRef = React.useRef(false);
   const sessionIdRef = React.useRef(sessionId);
   sessionIdRef.current = sessionId;
@@ -845,43 +855,50 @@ export function BerryThreadView({
               </div>
             ) : null}
             {historyLoadError ? <div role="alert" className="px-1 text-center text-[11px] text-destructive">{historyLoadError}</div> : null}
-            <div data-history-window="true" data-history-mounted={virtualHistoryItems.length} className="relative w-full" style={{ height: historyRange.totalHeight }}>
-              {virtualHistoryItems.map((item) => {
+            {/* Keep mounted rows in normal flow. Cached offsets only size the
+                unmounted gaps, so delayed measurements cannot overlap messages. */}
+            <div data-history-window="true" data-history-mounted={virtualHistoryItems.length} className="relative w-full shrink-0">
+              {virtualHistoryItems.map((item, index) => {
                 const row = historyRows[item.index];
                 if (!row) return null;
+                const previous = virtualHistoryItems[index - 1];
+                const gapBefore = Math.max(0, item.start - (previous ? previous.start + previous.size : 0));
                 return (
-                  <div
-                    key={row.key}
-                    role="article"
-                    {...(hasOlderMessages ? { "aria-setsize": -1 } : { "aria-setsize": historyRows.length, "aria-posinset": item.index + 1 })}
-                    ref={getHistoryItemRef(row.key)}
-                    className="absolute inset-x-0 top-0"
-                    style={{ transform: `translateY(${item.start}px)`, paddingBottom: `${HISTORY_ROW_GAP}px` }}
-                  >
-                    <MessageScrollerItem>
-                      {row.kind === "user" && row.group.user ? (
-                        <div data-user-anchor={row.group.user.id}>
-                          <BerryHistoricalUserMessage message={row.group.user} adapter={adapter} />
-                        </div>
-                      ) : row.kind === "assistant" ? (
-                        <BerryAssistantTurnGroup
-                          messages={row.group.assistants}
-                          turnKey={settledTurnKey(sessionId, stableTurnGroupKey(row.group))}
-                          showReasoning={showReasoning}
-                          showTodos={showTodos}
-                          density={density}
-                          adapter={adapter}
-                          writingBlockParts={writingBlockParts}
-                          conversationImageParts={conversationImageParts}
-                          {...(row.groupIndex === turnGroups.length - 1 && latestTurnError
-                            ? { inlineError: latestTurnError }
-                            : {})}
-                        />
-                      ) : null}
-                    </MessageScrollerItem>
-                  </div>
+                  <React.Fragment key={row.key}>
+                    {gapBefore > 0 ? <div aria-hidden="true" style={{ height: gapBefore }} /> : null}
+                    <div
+                      role="article"
+                      {...(hasOlderMessages ? { "aria-setsize": -1 } : { "aria-setsize": historyRows.length, "aria-posinset": item.index + 1 })}
+                      ref={getHistoryItemRef(row.key)}
+                      className="relative min-h-12 w-full"
+                      style={{ paddingBottom: `${HISTORY_ROW_GAP}px` }}
+                    >
+                      <MessageScrollerItem>
+                        {row.kind === "user" && row.group.user ? (
+                          <div data-user-anchor={row.group.user.id}>
+                            <BerryHistoricalUserMessage message={row.group.user} adapter={adapter} />
+                          </div>
+                        ) : row.kind === "assistant" ? (
+                          <BerryAssistantTurnGroup
+                            messages={row.group.assistants}
+                            turnKey={settledTurnKey(sessionId, stableTurnGroupKey(row.group))}
+                            showReasoning={showReasoning}
+                            showTodos={showTodos}
+                            density={density}
+                            adapter={adapter}
+                            writingBlockParts={writingBlockParts}
+                            conversationImageParts={conversationImageParts}
+                            {...(row.groupIndex === turnGroups.length - 1 && latestTurnError
+                              ? { inlineError: latestTurnError }
+                              : {})}
+                          />
+                        ) : null}
+                      </MessageScrollerItem>
+                    </div>
+                  </React.Fragment>
                 );
               })}
+              {historyTailHeight > 0 ? <div aria-hidden="true" style={{ height: historyTailHeight }} /> : null}
             </div>
 
             {liveVisible ? (

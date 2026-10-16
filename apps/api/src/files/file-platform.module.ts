@@ -19,7 +19,7 @@ import { s3ClientOptions, s3PresignClientOptions } from "../storage/s3-client-op
         const clientOptions = s3ClientOptions({ endpoint, region: process.env.BERRY_ARTIFACT_S3_REGION, accessKeyId, secretAccessKey });
         return {
           client: new S3Client(clientOptions),
-          presignClient: new S3Client(s3PresignClientOptions({ endpoint: process.env.BERRY_ARTIFACT_S3_PUBLIC_ENDPOINT ?? endpoint, region: process.env.BERRY_ARTIFACT_S3_REGION, accessKeyId, secretAccessKey })),
+          presignClient: new S3Client(s3PresignClientOptions({ endpoint: process.env.BERRY_ARTIFACT_S3_PUBLIC_ENDPOINT || endpoint, region: process.env.BERRY_ARTIFACT_S3_REGION, accessKeyId, secretAccessKey, accelerate: process.env.BERRY_ARTIFACT_S3_ACCELERATE === "true" })),
           bucket,
           prefix: (process.env.BERRY_ARTIFACT_S3_PREFIX ?? "artifacts").replace(/^\/+|\/+$/g, ""),
           maxUploadBytes: positiveInteger(process.env.BERRY_FILE_MAX_UPLOAD_BYTES, 1024 * 1024 * 1024),

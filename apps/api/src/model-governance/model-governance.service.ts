@@ -319,6 +319,52 @@ export class ModelGovernanceService {
     return this.#resolveAccess(input, providerId, model, policy, modeDefault);
   }
 
+  /**
+   * Saved task and browser selections can outlive an enabled model. Resolve
+   * their replacement against the current runtime catalog and the same access
+   * rules as an explicit selection; never re-enable the retired model.
+   */
+  async resolveTaskModel(
+    input: Parameters<ModelGovernanceService["resolve"]>[0],
+    provider: BerryModelProviderInfo,
+  ): Promise<ModelGovernanceDecision> {
+    const selected = await this.resolve(input);
+    const available = provider.models
+      ? new Set(provider.models.map((model) => model.id))
+      : null;
+    const isAvailable = (model: string): boolean => available === null || available.has(model);
+    if (selected.allowed && (selected.providerId !== provider.id || isAvailable(selected.model))) {
+      return selected;
+    }
+    // Legacy non-chat callers still have to honor an enforced mode default.
+    if (selected.reason === "mode_default_enforced") return selected;
+
+    const unavailable = selected.allowed
+      ? { ...selected, allowed: false, reason: "model_unavailable" }
+      : selected;
+    const candidates = new Set([
+      ...(selected.default?.providerId === provider.id ? [selected.default.model] : []),
+      provider.defaultModel,
+      ...(provider.models?.map((model) => model.id)
+        ?? (await this.repository.listPolicies(input.tenantId))
+          .filter((policy) => policy.providerId === provider.id && policy.status === "allowed")
+          .sort(comparePolicy)
+          .map((policy) => policy.model)),
+    ]);
+    for (const model of candidates) {
+      if (!model || !isAvailable(model)) continue;
+      if (selected.providerId === provider.id && selected.model === model) continue;
+      const replacement = await this.resolve({ ...input, providerId: provider.id, model });
+      if (!replacement.allowed) continue;
+      return {
+        ...replacement,
+        requestedProviderId: input.providerId ?? null,
+        requestedModel: input.model ?? null,
+      };
+    }
+    return unavailable;
+  }
+
   async #resolveAccess(
     input: {
       tenantId: string;

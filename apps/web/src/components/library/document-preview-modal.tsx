@@ -3,7 +3,7 @@ import type { StoredFile } from "@berry/shared";
 import { Button } from "@berry/desktop-ui/components/ui/button";
 import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@berry/desktop-ui/components/ui/dialog";
-import { FileDown, X } from "@berry/desktop-ui/lib/icons";
+import { X } from "@berry/desktop-ui/lib/icons";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
 import { PhotoProvider, PhotoView } from "react-photo-view";
 import "react-photo-view/dist/react-photo-view.css";
@@ -12,6 +12,8 @@ import { filePreviewDecision } from "./file-preview-policy";
 import { DownloadOnlyPreview, OfficePreviewGate } from "./office-preview-gate";
 import { readResponseBytes } from "./preview-stream";
 import { assertImagePreviewBounds } from "./image-preview-bounds";
+
+import { FileDownloadProvider, FileDownloadButton, FileDownloadStatus } from "./file-download-controls";
 
 const DocxDocumentViewer = React.lazy(() => import("./docx-document-viewer"));
 const PdfDocumentViewer = React.lazy(() => import("./pdf-document-viewer"));
@@ -26,20 +28,19 @@ export function DocumentPreviewModal({ file, onOpenChange }: { file: StoredFile 
     <Dialog open={Boolean(file)} onOpenChange={onOpenChange}>
       <DialogContent className="berry-document-preview-dialog !z-[60] !h-[85vh] !w-[80vw] !max-w-[80vw] gap-0 overflow-hidden rounded-[18px] border-0 bg-[var(--berry-main-bg)] p-0" showCloseButton={false}>
         {file ? (
-          <>
+          <FileDownloadProvider key={file.id} file={file}>
             <DialogHeader className="berry-document-preview-header flex h-16 shrink-0 flex-row items-center gap-3 px-4 text-left">
               <span className="berry-document-preview-icon"><FileTypeIcon path={file.name} className="size-10" /></span>
               <span className="min-w-0 flex-1">
                 <DialogTitle className="truncate text-sm font-medium" title={file.name}>{file.name}</DialogTitle>
                 <DialogDescription className="truncate text-xs">{fileTypeLabel(file)} · {formatBytes(file.size)}</DialogDescription>
               </span>
-              <Button asChild variant="ghost" size="icon" className="berry-document-preview-action" aria-label={`Download ${file.name}`}>
-                <a href={file.downloadUrl} download={file.name}><FileDown /></a>
-              </Button>
+              <FileDownloadButton file={file} compact />
               <DialogClose asChild>
                 <Button variant="ghost" size="icon" className="berry-document-preview-action" aria-label="Close preview"><X /></Button>
               </DialogClose>
             </DialogHeader>
+            <FileDownloadStatus file={file} />
             <div className="berry-document-preview-stage min-h-0 flex-1">
               {!previewDecision.allowed ? (
                 <DownloadOnlyPreview file={file} reason={previewDecision.reason ?? "This file cannot be previewed safely in the browser."} />
@@ -79,7 +80,7 @@ export function DocumentPreviewModal({ file, onOpenChange }: { file: StoredFile 
                 <DownloadOnlyPreview file={file} reason="This file type is not safe to preview in the browser." />
               )}
             </div>
-          </>
+          </FileDownloadProvider>
         ) : null}
       </DialogContent>
     </Dialog>
