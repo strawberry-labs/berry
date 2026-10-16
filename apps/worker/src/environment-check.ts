@@ -85,11 +85,38 @@ import sys
 import sysconfig
 
 request = json.loads(sys.argv[1])
-paths = list(dict.fromkeys([
-    os.getcwd(), *sys.path,
-    *[p for k, p in sysconfig.get_paths().items() if k in ("purelib", "platlib")],
-    site.getusersitepackages(),
-]))
+# On Python <= 3.13, -S also suppresses virtualenv prefix initialization.
+# Read its data-only config rather than enabling site/.pth/startup execution.
+executable_dir = os.path.dirname(os.path.abspath(sys.executable))
+venv = None
+include_system = True
+for candidate in (executable_dir, os.path.dirname(executable_dir)):
+    try:
+        with open(os.path.join(candidate, "pyvenv.cfg"), encoding="utf-8") as config:
+            settings = config.read(65536)
+    except FileNotFoundError:
+        continue
+    venv = candidate
+    include_system = any(
+        key.strip().lower() == "include-system-site-packages" and value.strip().lower() == "true"
+        for line in settings.splitlines()
+        for key, separator, value in [line.partition("=")]
+        if separator
+    )
+    break
+prefixes = [venv] if venv else [sys.prefix, sys.exec_prefix]
+if venv and include_system:
+    prefixes.extend([sys.base_prefix, sys.base_exec_prefix])
+package_paths = site.getsitepackages(list(dict.fromkeys(prefixes)))
+if venv:
+    # Debian's site helper omits virtualenv site-packages when -S left the
+    # interpreter's prefixes at their base values. Include the PEP 405 layout.
+    version = "python%d.%d%s" % (sys.version_info.major, sys.version_info.minor, "t" if "t" in sys.abiflags else "")
+    package_paths[:0] = [os.path.join(venv, lib, version, "site-packages") for lib in dict.fromkeys(["lib", sys.platlibdir])]
+if not venv or include_system:
+    package_paths.extend(p for k, p in sysconfig.get_paths().items() if k in ("purelib", "platlib"))
+    package_paths.append(site.getusersitepackages())
+paths = list(dict.fromkeys([os.getcwd(), *sys.path, *package_paths]))
 def discover(name):
     search = paths
     spec = None

@@ -90,6 +90,37 @@ describe("trusted environment checks", () => {
     }
   });
 
+
+  it.each(["native", "Debian"])("finds %s virtualenv packages with -S without executing startup hooks", (layout) => {
+    const root = mkdtempSync(join(tmpdir(), "berry-environment-venv-"));
+    try {
+      const venv = join(root, "venv");
+      const created = spawnSync("python3", ["-m", "venv", "--without-pip", venv], { encoding: "utf8" });
+      expect(created.status, created.stderr).toBe(0);
+      const python = join(venv, "bin", "python");
+      const location = spawnSync(python, ["-c", "import sysconfig; print(sysconfig.get_path('purelib'))"], { encoding: "utf8" });
+      expect(location.status, location.stderr).toBe(0);
+      const packages = location.stdout.trim();
+      const marker = join(root, "executed");
+      mkdirSync(join(packages, "venv_only_probe"));
+      writeFileSync(join(packages, "venv_only_probe", "__init__.py"), "open(" + JSON.stringify(marker) + ", 'w').write('imported')\n");
+      writeFileSync(join(packages, "sitecustomize.py"), "open(" + JSON.stringify(marker) + ", 'w').write('startup')\n");
+      writeFileSync(join(packages, "probe.pth"), "import builtins; builtins.open(" + JSON.stringify(marker) + ", 'w').write('pth')\n");
+      const input = environmentCheckInput({ python_modules: ["venv_only_probe", "berry_missing_module"] });
+      const script = layout === "Debian" ? "import site\nsite.getsitepackages = lambda prefixes=None: [p + '/lib/python3/dist-packages' for p in (prefixes or site.PREFIXES)]\n" + ENVIRONMENT_CHECK_SCRIPT : ENVIRONMENT_CHECK_SCRIPT;
+      const child = spawnSync(python, ["-I", "-S", "-c", script, JSON.stringify(input)], {
+        cwd: root, encoding: "utf8",
+      });
+      expect(child.status, child.stderr).toBe(0);
+      expect(environmentCheckResult(input, child.stdout).python_modules).toEqual([
+        { name: "venv_only_probe", available: true }, { name: "berry_missing_module", available: false },
+      ]);
+      expect(existsSync(marker)).toBe(false);
+      expect(existsSync(join(packages, "venv_only_probe", "__pycache__"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   it("refuses incomplete result sets instead of claiming dependencies were checked", () => {
     expect(() => environmentCheckResult(environmentCheckInput({ executables: ["pandoc"] }),
       JSON.stringify({ executables: [], python_modules: [], note: "not complete" }))).toThrow("incomplete or mismatched");
