@@ -15,13 +15,11 @@ const scheduleProperties = {
   runAt: { type: "string", description: "Future ISO timestamp with an explicit UTC offset for kind=once." },
   minutes: { type: "integer", minimum: 1, maximum: 525600, description: "Delay from the real server clock for kind=delay. For 'in 20 minutes' use 20; never calculate a clock time yourself." },
 };
+// Advertise a schema supported by Gemini and OpenAI-compatible providers.
+// CreateInput and UpdateInput still enforce the strict schedule variants.
 const scheduleParameter = {
   type: "object", additionalProperties: false, required: ["kind", "timezone"], properties: scheduleProperties,
-  oneOf: [
-    { properties: { kind: { const: "cron" } }, required: ["expression"], not: { anyOf: [{ required: ["runAt"] }, { required: ["minutes"] }] } },
-    { properties: { kind: { const: "once" } }, required: ["runAt"], not: { anyOf: [{ required: ["expression"] }, { required: ["minutes"] }] } },
-    { properties: { kind: { const: "delay" } }, required: ["minutes"], not: { anyOf: [{ required: ["expression"] }, { required: ["runAt"] }] } },
-  ],
+  description: "Use exactly the fields for the selected kind: cron requires expression, once requires runAt, and delay requires minutes. Always include timezone. Do not combine expression, runAt, and minutes.",
 };
 const taskProperties = {
   name: { type: "string", maxLength: 120, description: "Concise name describing the recurring work." },

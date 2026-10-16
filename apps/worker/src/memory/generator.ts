@@ -17,6 +17,8 @@ import { workerRuntimeMetrics, type WorkerRuntimeMetrics } from "../runtime-metr
 
 export const ExtractedMemoryOperationSchema = MemoryOperationSchema.extend({
   scope: z.enum(["personal", "project"]),
+  // Inferred candidates must never acquire the user-confirmed memory flag.
+  explicit: z.literal(false).default(false),
 });
 export type ExtractedMemoryOperation = MemoryOperation & { scope: MemoryScope };
 const EnvelopeSchema = z.object({
@@ -198,7 +200,7 @@ const MEMORY_OPERATIONS_JSON_SCHEMA: JsonValue = {
           value: { type: "object", additionalProperties: true },
           confidence: { type: "number", minimum: 0, maximum: 1 },
           salience: { type: "number", minimum: 0, maximum: 1 },
-          explicit: { type: "boolean", const: false },
+          explicit: { type: "boolean", description: "Always false for inferred memory candidates." },
           targetItemId: { type: ["string", "null"] },
           expiresAt: { type: ["string", "null"] },
           reason: { type: "string", maxLength: 2_000 },
