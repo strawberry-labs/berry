@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -228,32 +228,62 @@ try {
     assert.equal(steps[0].output?.failure?.category, "invalid_input");
   });
 
-  await test("a finished curl that gave up waiting for an accepted POST stops for recovery", async () => {
+  // Task dbefeb0f: a script reading a workspace PDF failed with KeyError: 'text'
+  // (PyMuPDF's 'rawdict' spans carry 'chars', not 'text'), and Berry held the
+  // corrected script for operator review. A synthetic PDF and a stand-in for
+  // that lookup reproduce it in a real shell; shell commands are never held.
+  await test("a PDF script that fails is corrected and the task finishes", async () => {
+    const workspace = mkdtempSync(join(tmpdir(), "berry-pdf-"));
+    try {
+      const pdf = join(workspace, "drawing.pdf");
+      writeFileSync(pdf, "%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\nBT /F1 12 Tf 36 760 Td (GENERAL NOTES) Tj ET\n%%EOF\n");
+      const extraction = (mode) => [
+        "python3 -I -c \"",
+        "import re, sys",
+        "text = re.findall(rb'\\((.*?)\\) Tj', open(sys.argv[1], 'rb').read())",
+        `spans = [{'bbox': (36, 760), ${mode === "rawdict" ? "'chars': [{'c': chr(c)} for c in t]" : "'text': t.decode()"}} for t in text]`,
+        "for span in spans: print(span['bbox'], repr(span['text']))",
+        `" ${pdf}`,
+      ].join("\n");
+      const f = await fixture();
+      const { runId } = await admit(f);
+      const ran = [];
+      const recording = { execute: async (snapshot, step) => { ran.push(step.input.arguments.command); return shell.execute(snapshot, step); } };
+      const state = await drive(new DurableTurnRunner(repository, model([
+        ["bash", { command: extraction("rawdict") }, "non_idempotent_manual"],
+        ["bash", { command: extraction("dict") }, "non_idempotent_manual"],
+      ]), recording, { owner: "pdf-extraction" }), runId);
+      assert.deepEqual(ran, [extraction("rawdict"), extraction("dict")], "The corrected script runs once, after the faulty one");
+      assert.equal(state, "completed");
+      const steps = await toolSteps(runId);
+      assert.deepEqual(steps.map((step) => [step.step_type, step.state]), [["tool.bash", "failed"], ["tool.bash", "completed"]]);
+      assert.match(steps[0].error, /KeyError: 'text'[\s\S]*Command exited with code 1$/);
+      assert.equal(steps[0].output?.failure?.outcome, "unknown");
+      assert.match(steps[1].output?.output ?? "", /GENERAL NOTES/);
+      const current = await run(runId);
+      assert.equal(current.error, null);
+      assert.equal(current.recovery_step_id, null);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  await test("a curl that gave up waiting for an accepted POST is reported to the model, and Berry does not send it again", async () => {
     const server = await endpoint((_path, n) => n === 1 ? 400 : 0);
     try {
       const f = await fixture();
       const { runId } = await admit(f);
       const command = `curl --silent --show-error --max-time 0.1 -X POST ${server.base}/create -d title=TenderA`;
-      const bash = ["bash", { command }, "non_idempotent_manual"];
-      const state = await drive(new DurableTurnRunner(repository, model([bash, bash]), shell, { owner: "curl-lost-response" }), runId);
-      assert.equal(server.accepted.create, 1, "The server accepted the POST that curl stopped waiting for");
-      assert.equal(state, "recovery_required");
-      assert.equal((await toolSteps(runId))[0].outcome_certainty, "unknown");
-    } finally {
-      await server.close();
-    }
-  });
-
-  await test("a compound command whose later request loses its response is not run again", async () => {
-    const server = await endpoint((path) => path === "notify" ? 400 : 0);
-    try {
-      const f = await fixture();
-      const { runId } = await admit(f);
-      const command = `curl --silent --show-error -X POST ${server.base}/create -d title=TenderA && curl --silent --show-error --max-time 0.1 -X POST ${server.base}/notify`;
-      const bash = ["bash", { command }, "non_idempotent_manual"];
-      const state = await drive(new DurableTurnRunner(repository, model([bash, bash]), shell, { owner: "compound-lost-response" }), runId);
-      assert.equal(server.accepted.create, 1, "The first request of the command was accepted before the later one failed");
-      assert.equal(state, "recovery_required");
+      const state = await drive(new DurableTurnRunner(repository, model([
+        ["bash", { command }, "non_idempotent_manual"],
+        ["bash", { command: "echo checked" }, "non_idempotent_manual"],
+      ]), shell, { owner: "curl-lost-response" }), runId);
+      assert.equal(server.accepted.create, 1, "Berry ran the POST once and did not repeat it");
+      assert.equal(state, "completed");
+      const steps = await toolSteps(runId);
+      assert.equal(steps[0].outcome_certainty, "unknown");
+      assert.equal(steps[0].output?.failure?.category, "unknown_outcome");
+      assert.equal(steps[1].state, "completed");
     } finally {
       await server.close();
     }
@@ -284,18 +314,18 @@ try {
     assert.equal(affected.target.writes.length, 2);
   });
 
-  await test("a command that failed after its POST was accepted holds the next shell call", async () => {
+  await test("a command that failed after its POST was accepted does not hold the next shell call", async () => {
     const server = await endpoint(() => 0);
     try {
       const f = await fixture();
       const { runId } = await admit(f);
       const post = `curl --silent --show-error -X POST ${server.base}/create -d title=TenderA`;
-      const script = [["bash", { command: `${post} && false` }, "non_idempotent_manual"], ["bash", { command: post }, "non_idempotent_manual"]];
+      const script = [["bash", { command: `${post} && false` }, "non_idempotent_manual"], ["bash", { command: "echo summarised" }, "non_idempotent_manual"]];
       const state = await drive(new DurableTurnRunner(repository, model(script), shell, { owner: "partial-command" }), runId);
-      assert.equal(server.accepted.create, 1, "A failure after the accepted POST does not show that the POST was rejected");
-      assert.equal(state, "recovery_required");
+      assert.equal(server.accepted.create, 1, "Berry ran the POST once and did not repeat it");
+      assert.equal(state, "completed");
       const steps = await toolSteps(runId);
-      assert.deepEqual(steps.map((step) => step.state), ["failed", "recovery_required"]);
+      assert.deepEqual(steps.map((step) => step.state), ["failed", "completed"]);
       assert.equal(steps[0].output?.failure?.outcome, "unknown");
     } finally {
       await server.close();
@@ -363,28 +393,42 @@ try {
     }
   });
 
-  await test("a command failure an older classifier stored as not applied is not proof the POST failed", async () => {
-    const server = await endpoint(() => 0);
-    try {
-      const f = await fixture();
-      const { runId } = await admit(f);
-      const post = `curl --silent --show-error -X POST ${server.base}/create -d title=TenderA`;
-      const runner = new DurableTurnRunner(repository, model([
-        ["bash", { command: `${post} && false` }, "non_idempotent_manual"],
-        ["bash", { command: post }, "non_idempotent_manual"],
-      ]), shell, { owner: "historical-typed" });
-      for (let i = 0; i < 8 && (await toolSteps(runId))[0]?.state !== "failed"; i += 1) {
-        await sql.runWithTenant(tenantId, () => runner.execute({ tenantId, runId, reason: "continue" }));
-      }
-      // What 9f0139f's classifier stored for this failure.
-      const [first] = await toolSteps(runId);
-      const stored = { category: "unknown", deterministic: false, outcome: "not_applied", action: "Read the error, change the approach or the arguments, and do not repeat the same call unchanged." };
-      await query("UPDATE turn_steps SET output=$2::jsonb,outcome_certainty=NULL WHERE id=$1", [first.id, JSON.stringify({ failure: stored })]);
-      assert.equal(await drive(runner, runId), "recovery_required");
-      assert.equal(server.accepted.create, 1, "A stored older classification does not show that the accepted POST failed");
-    } finally {
-      await server.close();
-    }
+  // The shape task dbefeb0f was left in by an older worker: a failed shell
+  // step, and the next shell step held with input.heldBy pointing at it.
+  // Continue (operator retry) runs the held step once and the task finishes.
+  await test("a shell call an older worker held runs once when the user presses Continue", async () => {
+    const affected = await uncertainWrite(() => new Error("socket hang up"));
+    await legacyShape(affected, "Traceback (most recent call last):\nKeyError: 'text'\n\nCommand exited with code 1");
+    const held = new DurableTurnRunner(repository, model([[CREATE, { title: "Tender A", note: "again" }, "non_idempotent_manual"]]), affected.target, { owner: "older-worker-hold" });
+    assert.equal(await drive(held, affected.runId), "recovery_required");
+    // Recast both calls as the incident's shell commands, as an older worker stored them.
+    const [failedStep, heldStep] = await toolSteps(affected.runId);
+    assert.equal(heldStep.state, "recovery_required");
+    const corrected = "printf 'GENERAL NOTES\\n'";
+    await query(
+      `UPDATE turn_steps SET step_type='tool.bash',
+         input=jsonb_set(jsonb_set(input,'{toolName}','"bash"'),'{arguments}',jsonb_build_object('command',$2::text))
+       WHERE id=$1`,
+      [failedStep.id, "python3 -c \"raise KeyError('text')\""],
+    );
+    await query(
+      `UPDATE turn_steps SET step_type='tool.bash',
+         input=jsonb_set(jsonb_set(input,'{toolName}','"bash"'),'{arguments}',jsonb_build_object('command',$2::text))
+       WHERE id=$1`,
+      [heldStep.id, corrected],
+    );
+    await query("UPDATE tool_calls SET tool_name='bash',input=jsonb_build_object('command',$2::text) WHERE step_id=$1", [heldStep.id, corrected]);
+    assert.deepEqual((await query("SELECT input->'heldBy' AS held FROM turn_steps WHERE id=$1", [heldStep.id]))[0].held, [failedStep.id]);
+    const ran = [];
+    const recording = { execute: async (snapshot, step) => { ran.push(step.input.arguments.command); return shell.execute(snapshot, step); } };
+    // Two concurrent Continue presses: only one is accepted.
+    const decisions = await Promise.all([1, 2].map(() => turns.recover(tenantId, userId, affected.runId, "retry", reserveNothing)));
+    assert.deepEqual(decisions.sort(), [false, true]);
+    assert.equal(await drive(new DurableTurnRunner(repository, model([]), recording, { owner: "continue-held-shell" }), affected.runId), "completed");
+    assert.deepEqual(ran, [corrected], "The held command ran exactly once");
+    assert.equal((await toolSteps(affected.runId)).find((step) => step.id === heldStep.id)?.state, "completed");
+    await drive(new DurableTurnRunner(repository, model([]), recording, { owner: "continue-held-shell-again" }), affected.runId);
+    assert.deepEqual(ran, [corrected], "A later wake-up does not run it again");
   });
 
   for (const [code, status, rpcCode] of [["RATE_LIMIT", "", ""], ["ECONNREFUSED", "", ""], ["RATE_LIMIT", "429", ""], ["CONFLICT", "409", ""], ["CONFLICT", "", "409"]]) {
@@ -425,7 +469,7 @@ try {
     });
   }
 
-  await test("a network hint after an accepted POST holds the next command, and an explicit retry runs it once", async () => {
+  await test("a network hint after an accepted POST keeps its exit status, and the next command runs", async () => {
     const server = await endpoint(() => 0);
     const workspace = mkdtempSync(join(tmpdir(), "berry-shell-"));
     try {
@@ -459,50 +503,40 @@ try {
       const blocked = `${server.base.replace("http://127.0.0.1", "https://localhost")}/notify`;
       const state = await drive(new DurableTurnRunner(repository, model([
         ["bash", { command: `${post} && curl --silent --show-error --max-time 2 ${blocked}` }, "non_idempotent_manual"],
-        ["bash", { command: post }, "non_idempotent_manual"],
+        ["bash", { command: "echo next" }, "non_idempotent_manual"],
       ]), target, { owner: "network-hint" }), runId);
-      assert.equal(server.accepted.create, 1, "A blocked second URL does not undo the first POST");
-      assert.equal(state, "recovery_required");
-      const [first] = await toolSteps(runId);
+      assert.equal(server.accepted.create, 1, "Berry ran the POST once");
+      assert.equal(state, "completed");
+      const [first, second] = await toolSteps(runId);
       assert.match(first.error, /Network access to localhost is blocked[\s\S]*Command exited with code 35$/);
-      // Continue sends the explicit retry: the held command runs once.
-      assert.equal(await turns.recover(tenantId, userId, runId, "retry", reserveNothing), true);
-      assert.equal(await drive(new DurableTurnRunner(repository, model([]), target, { owner: "network-hint-retried" }), runId), "completed");
-      assert.equal(server.accepted.create, 2);
+      assert.equal(second.state, "completed");
     } finally {
       await server.close();
       rmSync(workspace, { recursive: true, force: true });
     }
   });
 
-  for (const typed of [true, false]) {
-    await test(`a command failure an older worker stored cut at 4,000 characters ${typed ? "with" : "without"} a class is not proof the POST failed`, async () => {
-      const server = await endpoint(() => 0);
-      try {
-        const f = await fixture();
-        const { runId } = await admit(f);
-        const post = `curl --silent --show-error -X POST ${server.base}/create -d title=TenderA`;
-        const runner = new DurableTurnRunner(repository, model([
-          ["bash", { command: `${post} && printf '\\ninvalid schema in post-processing: ' && printf '%05000d' 0 && false` }, "non_idempotent_manual"],
-          ["bash", { command: post }, "non_idempotent_manual"],
-        ]), shell, { owner: `historical-cut-${typed}` });
-        for (let i = 0; i < 8 && (await toolSteps(runId))[0]?.state !== "failed"; i += 1) {
-          await sql.runWithTenant(tenantId, () => runner.execute({ tenantId, runId, reason: "continue" }));
-        }
-        const [first] = await toolSteps(runId);
-        assert.ok(!first.error.includes("Command exited with code"), "The runner stores the error cut before its exit status");
-        // What 9f0139f's classifier stored for the cut error, or no class at all.
-        const stored = { category: "invalid_input", deterministic: true, outcome: "not_applied", action: "The arguments are not valid for this tool. Correct them before calling again; the same call fails the same way." };
-        await query("UPDATE turn_steps SET output=$2::jsonb,outcome_certainty=NULL WHERE id=$1", [first.id, typed ? JSON.stringify({ failure: stored }) : null]);
-        const state = await drive(runner, runId);
-        assert.equal(server.accepted.create, 1, "A cut stored error does not show that the accepted POST failed");
-        assert.equal(state, "recovery_required");
-        await drive(new DurableTurnRunner(repository, model([]), shell, { owner: `historical-cut-${typed}-restarted` }), runId);
-        assert.equal((await run(runId)).state, "recovery_required");
-        assert.equal(server.accepted.create, 1);
-      } finally {
-        await server.close();
-      }
+  // Stopping a task mid-command cancels it; only a connector change in flight waits for review.
+  for (const [label, call, expected] of [
+    ["a shell command", ["bash", { command: "sleep 5" }, "non_idempotent_manual"], "cancelled"],
+    ["a connector change", [CREATE, { title: "Tender A" }, "non_idempotent_manual"], "recovery_required"],
+  ]) {
+    await test(`stopping a task during ${label} leaves it ${expected}`, async () => {
+      const f = await fixture();
+      const { runId } = await admit(f);
+      let started;
+      const running = new Promise((resolve) => { started = resolve; });
+      let finish;
+      const blocked = { execute: async () => { started(); await new Promise((resolve) => { finish = resolve; }); return { output: { ok: true }, summary: "Finished after stop" }; } };
+      const runner = new DurableTurnRunner(repository, model([call]), blocked, { owner: `stop-${call[0]}`, heartbeatMs: 20 });
+      const execution = drive(runner, runId).catch((error) => error);
+      await running;
+      assert.equal(await turns.cancel(tenantId, f.sessionId), true);
+      finish();
+      await execution;
+      const current = await run(runId);
+      assert.equal(current.state, expected);
+      if (expected === "cancelled") assert.equal(current.recovery_step_id, null);
     });
   }
 
@@ -645,7 +679,7 @@ try {
     }
   });
 
-  await test("an environment probe between an accepted POST failure and a retry never releases the second POST", async () => {
+  await test("an environment probe after a failed POST command runs, and Berry never repeats the POST on its own", async () => {
     const server = await endpoint(() => 0);
     let checks = 0;
     try {
@@ -661,12 +695,11 @@ try {
       const runner = new DurableTurnRunner(repository, model([
         ["bash", { command: create + " && false" }, "non_idempotent_manual"],
         ["bash", { command: "which pandoc" }, "non_idempotent_manual"],
-        ["bash", { command: create }, "non_idempotent_manual"],
-      ]), target, { owner: "environment-cannot-release-write" });
-      assert.equal(await drive(runner, runId), "recovery_required");
+      ]), target, { owner: "environment-after-failed-write" });
+      assert.equal(await drive(runner, runId), "completed");
       assert.equal(server.accepted.create, 1);
       assert.equal(checks, 1);
-      await drive(new DurableTurnRunner(repository, model([]), target, { owner: "environment-cannot-release-write-restart" }), runId);
+      await drive(new DurableTurnRunner(repository, model([]), target, { owner: "environment-after-failed-write-restart" }), runId);
       assert.equal(server.accepted.create, 1);
     } finally {
       await server.close();

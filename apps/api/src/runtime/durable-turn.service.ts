@@ -2143,6 +2143,11 @@ function validateAdmissionReplay(
   return { runId: replayed.id, sessionId: input.sessionId };
 }
 
+// Shell commands and edits act inside the task's sandbox; the worker returns
+// their interruptions to the model (turn-runner holdsForReview), so they
+// never make a run wait for review.
+const HELD_TOOL_STEP_SQL = "COALESCE(NULLIF(btrim(s.input->>'toolName'),''),substr(s.step_type,6)) NOT IN ('bash','edit')";
+
 async function cancelActiveDurableRun(
   transaction: SqlExecutor,
   tenantId: string,
@@ -2155,6 +2160,8 @@ async function cancelActiveDurableRun(
        AND status IN ('queued','delivering') AND expires_at>now()`,
     [tenantId, active.session_id],
   );
+  // Stopping a task during a shell command or edit just cancels it: those act
+  // inside the sandbox. A change outside it whose reply never came waits for review.
   const ambiguousRows = await transaction.query<{ step_id: string; tool_call_id: string }>(
     `
 SELECT s.id AS step_id,tc.id AS tool_call_id
@@ -2162,6 +2169,7 @@ FROM turn_steps s
 LEFT JOIN tool_calls tc ON tc.tenant_id=s.tenant_id AND tc.step_id=s.id
 WHERE s.tenant_id=$1::uuid AND s.run_id=$2::uuid
   AND s.state='running' AND s.retry_class='non_idempotent_manual'
+  AND ${HELD_TOOL_STEP_SQL}
 ORDER BY s.sequence DESC
 LIMIT 1
 FOR UPDATE OF s
@@ -2179,7 +2187,7 @@ FOR UPDATE OF s
     active.task_id,
     active.id,
     ambiguous ? "failed" : "cancelled",
-    ambiguous ? "The external mutation outcome is uncertain. Operator review is required before retry." : undefined,
+    ambiguous ? "Berry didn't get a reply from the last action, so it can't tell whether it went through. Check it, then press Continue to run it again." : undefined,
   );
   await transaction.execute(
     `
@@ -2360,6 +2368,7 @@ JOIN tool_calls tc ON tc.tenant_id=s.tenant_id AND tc.run_id=s.run_id AND tc.ste
 WHERE s.tenant_id=$1::uuid AND s.run_id=$2::uuid
   AND ($3::uuid IS NULL OR s.id<>$3::uuid)
   AND s.state='running' AND s.retry_class='non_idempotent_manual'
+  AND ${HELD_TOOL_STEP_SQL}
   AND tc.status='running'
 ORDER BY s.sequence DESC,s.id DESC
 LIMIT 1

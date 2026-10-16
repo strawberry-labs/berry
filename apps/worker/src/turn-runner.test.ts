@@ -1868,6 +1868,117 @@ describe("durable turn runner", () => {
     expect(repository.mutations.some((mutation) => mutation.steps?.some((step) => step.id === tool.id && step.state === "failed"))).toBe(false);
   });
 
+  // Shell commands and edits run in the sandbox: whatever cuts one off, the
+  // model is told and the task continues; Berry never runs it again by itself.
+  describe("a sandbox command that is cut off", () => {
+    const shellStep = (state: DurableTurnStep["state"]) => ({
+      ...toolStep(state, "non_idempotent_manual", false),
+      type: "tool.bash",
+      input: { toolCallId: randomUUID(), toolName: "bash", arguments: { command: "python3 build_report.py" } },
+      ...(state === "running" ? { attempt: 1, startedAt: new Date(Date.now() - 5_000).toISOString() } : {}),
+    } as DurableTurnStep);
+    const modelReads = (repository: FakeTurnRepository, stepId: string) => JSON.stringify(
+      repository.mutations.flatMap((mutation) => mutation.entries ?? []).find((entry) => (entry as { stepId?: string }).stepId === stepId)?.payload ?? null,
+    );
+
+    it("tells the model when its worker stopped mid-command, and does not run it again", async () => {
+      const tool = shellStep("running");
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+      const execute = vi.fn(async () => ({ output: {}, summary: "ran again" }));
+      const result = await new DurableTurnRunner(repository, unusedModel(), { execute }).execute({ tenantId, runId, reason: "lease-recovery" });
+
+      expect(execute).not.toHaveBeenCalled();
+      expect(result.state).toBe("calling_model");
+      expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({ state: "failed", outcomeCertainty: "unknown" });
+      expect(modelReads(repository, tool.id)).toContain("bash was interrupted");
+      expect(modelReads(repository, tool.id)).toContain("Check the workspace and continue");
+      expect(repository.current.error).toBeNull();
+      expect(repository.events.some((event) => event.kind === "turn.end")).toBe(false);
+    });
+
+    it("tells the model when a command passes its deadline without a result", async () => {
+      const tool = shellStep("pending");
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+      const execute = vi.fn(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        throw new Error("Connection lost before receiving the command result");
+      });
+      const runner = new DurableTurnRunner(repository, unusedModel(), { execute }, { toolIdleTimeoutMs: 5, toolMaxDurationMs: 1_000 });
+
+      await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ state: "calling_model" });
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({ state: "failed", timedOut: true, outcomeCertainty: "unknown" });
+      expect(repository.current.error).toBeNull();
+    });
+
+    it("tells the model when the sandbox connection breaks mid-command", async () => {
+      const tool = shellStep("pending");
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+      const execute = vi.fn(async () => { throw Object.assign(new Error("socket hang up"), { toolCallPhase: "dispatched" }); });
+
+      await expect(new DurableTurnRunner(repository, unusedModel(), { execute }).execute({ tenantId, runId, reason: "continue" }))
+        .resolves.toMatchObject({ state: "calling_model" });
+      expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({ state: "failed", outcomeCertainty: "unknown" });
+      expect((repository.current.steps.find((step) => step.id === tool.id)?.output as { failure?: unknown })?.failure).toMatchObject({ category: "unknown_outcome", outcome: "unknown" });
+      expect(repository.current.error).toBeNull();
+    });
+
+    it("is cancelled, not held for review, when the user stops the task mid-command", async () => {
+      const tool = shellStep("pending");
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+      const cancellations = new ActiveTurnCancellationRegistry();
+      let started!: () => void;
+      let finish!: (result: TurnToolResult) => void;
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        execute: async () => {
+          started();
+          return new Promise<TurnToolResult>((resolve) => { finish = resolve; });
+        },
+      }, { owner: "worker-shell-cancel", cancellations });
+      const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+
+      const execution = runner.execute({ tenantId, runId, reason: "continue" });
+      await startedPromise;
+      expect(cancellations.cancel(runId)).toBe(1);
+      finish({ output: { exitCode: 0 }, summary: "Finished after cancellation" });
+
+      await expect(execution).resolves.toMatchObject({ state: "cancelled" });
+      expect(repository.current.state).not.toBe("recovery_required");
+      expect(repository.current.error).not.toBe("ambiguous_external_operation");
+    });
+
+    it("leaves a command cut off by a lost lease to the next worker, which tells the model", async () => {
+      const tool = shellStep("pending");
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+      const heartbeat = vi.spyOn(repository, "heartbeat").mockResolvedValue(false);
+      let calls = 0;
+      let started!: () => void;
+      let lose!: () => void;
+      const first = new DurableTurnRunner(repository, unusedModel(), {
+        execute: async () => {
+          calls += 1;
+          started();
+          return new Promise<TurnToolResult>((_resolve, reject) => { lose = () => reject(new Error("socket hang up")); });
+        },
+      }, { owner: "worker-shell-lease", heartbeatMs: 5 });
+      const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+      const execution = first.execute({ tenantId, runId, reason: "continue" });
+      await startedPromise;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      lose();
+      await execution.catch(() => undefined);
+      expect(repository.current.state).not.toBe("recovery_required");
+
+      heartbeat.mockResolvedValue(true);
+      const next = vi.fn(async () => ({ output: {}, summary: "ran again" }));
+      await expect(new DurableTurnRunner(repository, unusedModel(), { execute: next }).execute({ tenantId, runId, reason: "lease-recovery" }))
+        .resolves.toMatchObject({ state: "calling_model" });
+      expect(calls).toBe(1);
+      expect(next).not.toHaveBeenCalled();
+      expect(repository.current.steps.find((step) => step.id === tool.id)?.state).toBe("failed");
+    });
+  });
+
   it("caps the model output allowance to the remaining context capacity", async () => {
     const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
     current.runtimeRequest = {
@@ -3527,40 +3638,77 @@ describe("durable turn runner", () => {
     });
 
 
-    it("does not let an intervening environment check release an uncertain shell write", async () => {
+    // Task dbefeb0f: a PDF script failed with KeyError: 'text' and Berry held
+    // the corrected script for operator review (ambiguous_external_operation).
+    it("runs the corrected script after a PDF extraction script fails, and finishes the task", async () => {
+      const pdf = "/home/user/workspace/inputs/sample/drawing.pdf";
+      const extraction = (mode: "rawdict" | "dict") => [
+        'python3 -c "',
+        "import fitz",
+        `doc = fitz.open('${pdf}')`,
+        "page = doc[0]",
+        `for block in page.get_text('${mode}')['blocks']:`,
+        "    if 'lines' in block:",
+        "        for line in block['lines']:",
+        "            for span in line['spans']:",
+        "                print(span['bbox'], repr(span['text']))",
+        '"',
+      ].join("\n");
+      const result = await driveCalls([
+        [{ name: "bash", args: { command: extraction("rawdict") }, retryClass: "non_idempotent_manual" }],
+        [{ name: "bash", args: { command: extraction("dict") }, retryClass: "non_idempotent_manual" }],
+      ], ({ args }) => {
+        if (args.command === extraction("rawdict")) {
+          throw new Error("Traceback (most recent call last):\n  File \"<string>\", line 9, in <module>\nKeyError: 'text'\n\nCommand exited with code 1");
+        }
+        return { exitCode: 0, output: "(36.0, 40.2, 120.5, 52.1) 'GENERAL NOTES'" };
+      });
+
+      expect(result.executed.map((call) => call.args.command)).toEqual([extraction("rawdict"), extraction("dict")]);
+      expect(result.toolSteps[0]).toMatchObject({ type: "tool.bash", state: "failed" });
+      expect(result.failure(0)).toMatchObject({ outcome: "unknown" });
+      expect(result.modelText(0)).toContain("Fix the problem and continue");
+      expect(result.modelText(0)).not.toContain("review");
+      expect(result.toolSteps[1]).toMatchObject({ type: "tool.bash", state: "completed" });
+      expect(result.toolSteps[1]?.input.heldBy).toBeUndefined();
+      expect(result.state).toBe("finalizing");
+      expect(result.repository.current.error).toBeNull();
+    });
+
+    // Berry runs each shell call the model makes exactly once and never repeats
+    // one on its own; the model is told what an earlier failed call may have done.
+    it("does not hold a shell call after an earlier one posted and then failed", async () => {
       const create = "curl -X POST https://records.example.test/create -d title=TenderA";
       let writes = 0;
       const result = await driveCalls([
         [{ name: "bash", args: { command: create + " && false" }, retryClass: "non_idempotent_manual" }],
         [{ name: "bash", args: { command: "which pandoc typst" }, retryClass: "non_idempotent_manual" }],
-        [{ name: "bash", args: { command: create }, retryClass: "non_idempotent_manual" }],
+        [{ name: "bash", args: { command: "python3 summarise.py" }, retryClass: "non_idempotent_manual" }],
       ], ({ name }) => {
         if (name === "bash") {
           writes += 1;
-          throw new Error("invalid schema after the POST was accepted\n\nCommand exited with code 1");
+          if (writes === 1) throw new Error("invalid schema after the POST was accepted\n\nCommand exited with code 1");
+          return { exitCode: 0, output: "Summary written" };
         }
         return { executables: [{ name: "pandoc", available: true }, { name: "typst", available: false }] };
       });
-      expect(writes).toBe(1);
-      expect(result.state).toBe("recovery_required");
+      expect(writes).toBe(2);
+      expect(result.state).toBe("finalizing");
+      expect(result.modelText(0)).toContain("do not repeat a step that sent or changed something outside the sandbox");
       expect(result.toolSteps[1]).toMatchObject({ type: "tool.check_environment", state: "completed" });
-      expect(result.toolSteps[2]).toMatchObject({ type: "tool.bash", state: "recovery_required" });
-      expect(result.toolSteps[2]?.input.heldBy).toEqual([result.toolSteps[0]?.id]);
+      expect(result.toolSteps[2]).toMatchObject({ type: "tool.bash", state: "completed" });
+      expect(result.repository.current.error).toBeNull();
     });
 
     it("does not classify a probe mixed with a POST as read-only", async () => {
-      let writes = 0;
       const mixed = "which pandoc\ncurl -X POST https://records.example.test/create && false";
       const result = await driveCalls([
         [{ name: "bash", args: { command: mixed }, retryClass: "non_idempotent_manual" }],
-        [{ name: "bash", args: { command: mixed }, retryClass: "non_idempotent_manual" }],
       ], () => {
-        writes += 1;
         throw new Error("created\n\nCommand exited with code 1");
       });
-      expect(writes).toBe(1);
-      expect(result.state).toBe("recovery_required");
-      expect(result.toolSteps[0]).toMatchObject({ type: "tool.bash", retryClass: "non_idempotent_manual" });
+      expect(result.toolSteps[0]).toMatchObject({ type: "tool.bash", retryClass: "non_idempotent_manual", state: "failed" });
+      expect(result.repository.current.error).toBeNull();
     });
 
     it("a failed read-only environment check cannot hold a later ordinary shell command", async () => {
@@ -3724,25 +3872,29 @@ describe("durable turn runner", () => {
         expect(result.repository.events).toContainEqual(expect.objectContaining({ kind: "usage", costRawMicros: "900" }));
       });
 
-      // A command that finished does not show that its change was not made (H-003).
+      // A command that finished does not show that its change was not made
+      // (H-003), but it ran in the sandbox: the model is told, and the task
+      // continues. Berry runs each call the model makes once.
       describe("a shell command whose request may have been applied", () => {
         const post = (command: string) => ({ name: "bash", args: { command }, retryClass: "non_idempotent_manual" as const });
 
-        it("stops for recovery when curl gave up waiting for a POST the server accepted", async () => {
+        it("tells the model that a POST curl gave up waiting for may have gone through, and continues", async () => {
           const call = post("curl --max-time 0.1 -X POST https://records.example.test/create -d title=TenderA");
           let accepted = 0;
-          const result = await driveCalls([[call], [call]], () => {
+          const result = await driveCalls([[call], [post("cat receipt.json")]], () => {
             accepted += 1;
             if (accepted === 1) throw new Error("curl: (28) Operation timed out after 100 milliseconds with 0 bytes received\n\nCommand exited with code 28");
-            return { exitCode: 0, output: "created" };
+            return { exitCode: 0, output: "{}" };
           });
 
-          expect(accepted).toBe(1);
-          expect(result.state).toBe("recovery_required");
+          expect(accepted).toBe(2);
+          expect(result.state).toBe("finalizing");
           expect(result.failure(0)).toMatchObject({ category: "unknown_outcome", outcome: "unknown" });
+          expect(result.modelText(0)).toContain("may have done some, all or none of its work");
+          expect(result.repository.current.error).toBeNull();
         });
 
-        it("holds the next shell call after a network hint replaced the output of a command that posted", async () => {
+        it("keeps a network hint's exit status and does not hold the next shell call", async () => {
           const create = "curl -X POST https://records.example.test/create -d title=TenderA";
           let accepted = 0;
           const manager = new SandboxContinuityManager({
@@ -3774,47 +3926,37 @@ describe("durable turn runner", () => {
             input: { toolCallId: randomUUID(), toolName: "bash", arguments: args },
           })).output;
 
-          const result = await driveCalls([[post(`${create} && curl https://blocked.example.test/notify`)], [post(create)]], shell);
+          const result = await driveCalls([[post(`${create} && curl https://blocked.example.test/notify`)], [post("ls outputs")]], shell);
 
           expect(accepted).toBe(1);
-          expect(result.state).toBe("recovery_required");
+          expect(result.state).toBe("finalizing");
           expect(result.failure(0)).toMatchObject({ outcome: "unknown" });
           expect(result.toolSteps[0]?.error).toMatch(/Network access to blocked\.example\.test is blocked[\s\S]*Command exited with code 35$/);
-        });
-
-        it("stops for recovery when a later part of a compound command loses its response after an earlier write", async () => {
-          const call = post("curl -X POST https://records.example.test/create -d title=TenderA && curl --max-time 0.1 -X POST https://records.example.test/notify");
-          let created = 0;
-          const result = await driveCalls([[call], [call]], () => {
-            created += 1;
-            if (created === 1) throw new Error("created\ncurl: (28) Operation timed out after 100 milliseconds with 0 bytes received\n\nCommand exited with code 28");
-            return { exitCode: 0, output: "created\nnotified" };
-          });
-
-          expect(created).toBe(1);
-          expect(result.state).toBe("recovery_required");
+          expect(result.toolSteps[1]?.state).toBe("completed");
         });
 
         // The command ran: its exit status and output say nothing about whether
-        // the POST before the failing part took effect.
+        // the POST before the failing part took effect, so the model is told.
         it.each([
           ["false", "created"],
           ["a local exception", "created\nTraceback (most recent call last):\n  File \"/workspace/import.py\", line 4, in <module>\nValueError: bad row"],
           ["a missing file", "created\ncat: /workspace/receipt.json: No such file or directory"],
-        ])("holds the next shell call after an accepted POST followed by %s", async (_label, output) => {
+          ["a later request that timed out", "created\ncurl: (28) Operation timed out after 100 milliseconds with 0 bytes received"],
+        ])("tells the model an accepted POST followed by %s may have gone through, and runs the next call", async (_label, output) => {
           const first = post("curl -X POST https://records.example.test/create -d title=TenderA && ./after-create.sh");
-          let accepted = 0;
-          const result = await driveCalls([[first], [post("curl -X POST https://records.example.test/create -d title=TenderA")]], () => {
-            accepted += 1;
-            if (accepted === 1) throw new Error(`${output}\n\nCommand exited with code 1`);
-            return { exitCode: 0, output: "created" };
+          let runs = 0;
+          const result = await driveCalls([[first], [post("cat /workspace/receipt.json")]], () => {
+            runs += 1;
+            if (runs === 1) throw new Error(`${output}\n\nCommand exited with code 1`);
+            return { exitCode: 0, output: "{\"id\":\"record-1\"}" };
           });
 
-          expect(accepted).toBe(1);
-          expect(result.state).toBe("recovery_required");
+          expect(runs).toBe(2);
           expect(result.failure(0)).toMatchObject({ outcome: "unknown" });
-          expect(result.modelText(0)).toContain("waits for the user to review it");
-          expect(result.toolSteps[1]?.state).toBe("recovery_required");
+          expect(result.modelText(0)).toContain("unless you know it did not happen");
+          expect(result.modelText(0)).not.toContain("review");
+          expect(result.toolSteps[1]?.state).toBe("completed");
+          expect(result.state).toBe("finalizing");
         });
 
         it.each([
@@ -4049,34 +4191,45 @@ describe("durable turn runner", () => {
         } as DurableTurnStep);
         const old = (category: string, deterministic: boolean) => ({ category, deterministic, outcome: "not_applied", action: "Read the error, change the approach or the arguments, and do not repeat the same call unchanged." });
 
-        it.each([
-          ["a command whose later part failed", "tool.bash", "created\n\nCommand exited with code 1", old("unknown", false)],
-          ["a command that mentions a missing file", "tool.bash", "created\ncat: /workspace/receipt.json: No such file or directory\n\nCommand exited with code 1", old("missing_resource", true)],
-          ["a command that mentions validation", "tool.bash", "created\nValueError: title must be unique\n\nCommand exited with code 1", old("invalid_input", true)],
-          ["a connector result rejected after the tool ran", `tool.${create.name}`, "MCP error -32602: Structured content does not match the tool's output schema: data/id must be string", old("invalid_input", true)],
-        ])("holds the next call after %s that an older classifier stored as not applied", async (_label, type, error, failure) => {
-          expectHeld(await resume([historicalCall(type, error, failure), pendingCall(type, 3)]), "create-3");
+        it("holds the next call after a connector result rejected after the tool ran that an older classifier stored as not applied", async () => {
+          const type = `tool.${create.name}`;
+          const error = "MCP error -32602: Structured content does not match the tool's output schema: data/id must be string";
+          expectHeld(await resume([historicalCall(type, error, old("invalid_input", true)), pendingCall(type, 3)]), "create-3");
         });
 
+        // Shell commands run in the sandbox: whatever an older worker stored
+        // about an earlier one, the next shell call runs.
+        const expectRuns = (outcome: Awaited<ReturnType<typeof resume>>, id: string) => {
+          expect(outcome.execute).toHaveBeenCalledTimes(1);
+          expect(outcome.repository.current.steps.find((step) => step.id === id)?.state).toBe("completed");
+          expect(outcome.repository.current.error).toBeNull();
+        };
         // Workers keep at most 4,000 characters of an error; a long command
         // output loses the "Command exited with code 1" that showed it ran.
         const cut = `create\ninvalid schema in post-processing: ${"0".repeat(5_000)}\n\nCommand exited with code 1`.slice(0, 4_000);
         it.each([
-          ["a class an older classifier stored", `Tool failed (repair attempt 1/5). ${cut}`, { output: { failure: old("invalid_input", true) } as JsonValue }],
-          ["no class", `Tool failed (repair attempt 1/5). ${cut}`, { output: null }],
-          ["no class, before the repair prefix", cut, { output: null }],
-        ])("holds the next shell call after a cut command error stored with %s", async (_label, error, overrides) => {
-          const stored = { ...historicalCall("tool.bash", "", old("invalid_input", true)), error, ...overrides } as DurableTurnStep;
-          expectHeld(await resume([stored, pendingCall("tool.bash", 3)]), "create-3");
+          ["a command whose later part failed", "created\n\nCommand exited with code 1", old("unknown", false)],
+          ["a command that mentions a missing file", "created\ncat: /workspace/receipt.json: No such file or directory\n\nCommand exited with code 1", old("missing_resource", true)],
+          ["a command that mentions validation", "created\nValueError: title must be unique\n\nCommand exited with code 1", old("invalid_input", true)],
+          ["a network hint", "Network access to blocked.example.test is blocked by this task's sandbox policy. An organization admin must allow the hostname in Execution & network, then retry in a new turn.", { ...old("invalid_input", false), outcomeVersion: 2 }],
+          ["an unknown outcome", "created\n\nCommand exited with code 1", { ...old("unknown", false), outcome: "unknown", outcomeVersion: TOOL_FAILURE_OUTCOME_VERSION }],
+          ["a cut error with an older class", `Tool failed (repair attempt 1/5). ${cut}`, old("invalid_input", true)],
+        ])("runs the next shell call after %s", async (_label, error, failure) => {
+          expectRuns(await resume([historicalCall("tool.bash", error, failure), pendingCall("tool.bash", 3)]), "create-3");
+        });
+
+        it("runs a shell call an older worker held, once the user presses Continue", async () => {
+          // Task dbefeb0f: sequence 45 waited for sequence 43, a script that failed with KeyError: 'text'.
+          const failed = historicalCall("tool.bash", "Traceback (most recent call last):\nKeyError: 'text'\n\nCommand exited with code 1", { category: "unknown", deterministic: false, outcome: "unknown", outcomeVersion: TOOL_FAILURE_OUTCOME_VERSION, action: "Read the error." }, { id: "seq-43", outcomeCertainty: "unknown" });
+          const released = { ...pendingCall("tool.bash", 3), id: "seq-45", input: { ...pendingCall("tool.bash", 3).input, heldBy: ["seq-43"] } } as DurableTurnStep;
+          expectRuns(await resume([failed, released]), "seq-45");
         });
 
         // The previous version of this classifier read codes a target returned
-        // after dispatch, and a network hint without its exit status, as not applied.
-        it.each([
-          ["a connector error result with a code", `tool.${create.name}`, "The record was saved, but updating its search index failed", { category: "transient", code: "RATE_LIMIT" }],
-          ["a network hint", "tool.bash", "Network access to blocked.example.test is blocked by this task's sandbox policy. An organization admin must allow the hostname in Execution & network, then retry in a new turn.", { category: "invalid_input" }],
-        ])("holds the next call after %s that the previous classifier stored as not applied", async (_label, type, error, failure) => {
-          const stored = historicalCall(type, error, { ...old(failure.category, false), ...failure, outcomeVersion: 2 });
+        // after dispatch as not applied.
+        it("holds the next call after a connector error result with a code that the previous classifier stored as not applied", async () => {
+          const type = `tool.${create.name}`;
+          const stored = historicalCall(type, "The record was saved, but updating its search index failed", { ...old("transient", false), code: "RATE_LIMIT", outcomeVersion: 2 });
           expectHeld(await resume([stored, pendingCall(type, 3)]), "create-3");
         });
 
@@ -4121,18 +4274,17 @@ describe("durable turn runner", () => {
           expectHeld(held, "create-4");
         });
 
-        it("is not cleared by an unrelated successful shell command", async () => {
+        it("never holds a shell command because of an earlier failed one", async () => {
           const command = (id: string, sequence: number, state: "failed" | "completed" | "pending", command: string) => ({
             ...toolStep(state, "non_idempotent_manual", false), id, sequence, type: "tool.bash", attempt: state === "pending" ? 0 : 1,
             input: { toolCallId: `call-${id}`, toolName: "bash", arguments: { command } },
             ...(state === "failed" ? { error: "Tool failed (repair attempt 1/5). created\n\nCommand exited with code 1", output: null } : {}),
           } as DurableTurnStep);
-          const held = await resume([
+          expectRuns(await resume([
             command("post", 2, "failed", "curl -X POST https://records.example.test/create && false"),
             command("listing", 3, "completed", "ls -la"),
-            command("again", 4, "pending", "curl -X POST https://records.example.test/create"),
-          ]);
-          expectHeld(held, "again");
+            command("again", 4, "pending", "python3 summarise.py"),
+          ]), "again");
         });
 
         it("holds for every unresolved call at once, and one explicit decision resolves them all", async () => {
