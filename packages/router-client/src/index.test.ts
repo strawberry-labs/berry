@@ -47,6 +47,48 @@ async function withServer(handler: (request: IncomingMessage, response: ServerRe
 }
 
 describe("router client", () => {
+
+  it.each([
+    ["production", "x-berryrouter-provider", "x-berryrouter-model"],
+    ["legacy Berry", "x-berry-served-provider", "x-berry-served-model"],
+    ["legacy router served", "x-router-served-provider", "x-router-served-model"],
+    ["legacy router", "x-router-provider", "x-router-model"],
+  ])("reads %s attribution headers for complete and streaming chat requests", async (_label, providerHeader, modelHeader) => {
+    const requestedModel = "canopywave/qwen/qwen3.8-flash-next";
+    const attribution = { requestedModel, servedProvider: "canopywave", servedModel: "qwen/qwen3.8-flash-next" };
+    const client = new OpenAIChatCompletionsClient({
+      provider: { baseUrl: "https://router.example/v1", defaultModel: requestedModel, kind: "berry-router", name: "Berry Router" },
+      apiKey: "test-key",
+      fetchImpl: async (_url, init) => {
+        const stream = (JSON.parse(String(init?.body)) as { stream: boolean }).stream;
+        const payload = {
+          id: "completion-cache-trace",
+          // BerryRouter rewrites the response model to the requested route.
+          model: requestedModel,
+          choices: [stream
+            ? { delta: { content: "ok" }, finish_reason: "stop" }
+            : { message: { content: "ok" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 20, completion_tokens: 2, total_tokens: 22, prompt_tokens_details: { cached_tokens: 16 } },
+        };
+        return new Response(stream ? `data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n` : JSON.stringify(payload), {
+          headers: {
+            "Content-Type": stream ? "text/event-stream" : "application/json",
+            "x-request-id": "brq_cache_trace",
+            [providerHeader!]: "canopywave",
+            [modelHeader!]: "qwen/qwen3.8-flash-next",
+          },
+        });
+      },
+    });
+    const options = { messages: [{ role: "user" as const, content: "hello" }] };
+    const expected = { requestId: "brq_cache_trace", attribution, usage: { cacheReadTokens: 16, cacheReadReported: true } };
+
+    expect(await client.complete(options)).toMatchObject(expected);
+    const chunks: ChatCompletionChunk[] = [];
+    for await (const chunk of client.stream(options)) chunks.push(chunk);
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]).toMatchObject(expected);
+  });
   it("reports a bounded success attempt with normalized usage", async () => {
     const baseUrl = await withServer((_request, response) => {
       response.writeHead(200, { "Content-Type": "application/json" });

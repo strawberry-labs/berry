@@ -7498,10 +7498,9 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
           content: { type: "string", minLength: 1, maxLength: 262_144 },
           path: { type: "string", description: "Workspace path to the completed skill package directory (or a legacy SKILL.md path)." },
         },
-        oneOf: [
-          { required: ["content"] },
-          { required: ["path"] },
-        ],
+        // Keep the advertised schema within Google's supported Schema fields.
+        // SavePersonalSkillInputSchema enforces this exclusive choice before I/O.
+        description: "Provide exactly one of content or path. Never provide both.",
       },
     },
   },

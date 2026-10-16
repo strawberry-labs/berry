@@ -42,6 +42,69 @@ describe("memory operation generator model selection", () => {
     expect(requests[0]?.model).toBe("verified/tool-model");
   });
 
+  it("sends a Google-compatible explicit-memory field when Gemini is selected", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", completionFetch(requests));
+    const generator = createMemoryOperationGenerator({
+      BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example/v1",
+      BERRY_ROUTER_API_KEY: "router-key",
+      BERRY_MEMORY_MODEL: "google/gemini-3.7-flash",
+    });
+
+    await expect(generator?.generate(payload())).resolves.toEqual([]);
+    expect(requests[0]?.model).toBe("google/gemini-3.7-flash");
+    const tools = requests[0]?.tools as Array<{ function: { parameters: {
+      properties: { operations: { items: { properties: { explicit: Record<string, unknown> } } } }
+    } } }>;
+    expect(tools[0]?.function.parameters.properties.operations.items.properties.explicit)
+      .toEqual({ type: "boolean", description: expect.stringContaining("false") });
+  });
+
+  it("rejects inferred memories marked explicit even after output repair", async () => {
+    const operation = {
+      scope: "personal", operation: "ADD", stableKey: "profile:writing-style",
+      kind: "preference", content: "Prefers short answers", value: {},
+      confidence: 0.9, salience: 0.5, explicit: true,
+      targetItemId: null, expiresAt: null, reason: "User preference",
+    };
+    const complete = vi.fn(async () => ({
+      id: "memory-invalid-explicit", model: "google/gemini-3.7-flash",
+      content: "", finishReason: "tool_calls",
+      toolCalls: [{
+        id: "memory-operations", type: "function" as const,
+        function: { name: "memory_operations", arguments: JSON.stringify({ operations: [operation] }) },
+      }],
+      raw: {},
+    }));
+    const client = { complete } as unknown as OpenAIChatCompletionsClient;
+    const generator = new RouterMemoryOperationGenerator(client, "google/gemini-3.7-flash");
+    await expect(generator.generate(payload())).resolves.toEqual([]);
+    expect(complete).toHaveBeenCalledTimes(2);
+  });
+
+  it("accepts an inferred memory with explicit false without repair", async () => {
+    const operation = {
+      scope: "personal", operation: "ADD", stableKey: "profile:writing-style",
+      kind: "preference", content: "Prefers short answers", value: {},
+      confidence: 0.9, salience: 0.5, explicit: false,
+      targetItemId: null, expiresAt: null, reason: "User preference",
+    };
+    const complete = vi.fn(async () => ({
+      id: "memory-valid-explicit", model: "google/gemini-3.7-flash",
+      content: "", finishReason: "tool_calls",
+      toolCalls: [{
+        id: "memory-operations", type: "function" as const,
+        function: { name: "memory_operations", arguments: JSON.stringify({ operations: [operation] }) },
+      }],
+      raw: {},
+    }));
+    const generator = new RouterMemoryOperationGenerator(
+      { complete } as unknown as OpenAIChatCompletionsClient, "google/gemini-3.7-flash",
+    );
+    await expect(generator.generate(payload())).resolves.toEqual([operation]);
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
   it("stays disabled when router connectivity is not configured", () => {
     expect(createMemoryOperationGenerator({ BERRY_ROUTER_API_KEY: "router-key" })).toBeNull();
     expect(createMemoryOperationGenerator({ BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example/v1" })).toBeNull();

@@ -1427,7 +1427,7 @@ function routerAttribution(
   const metadata = isRecord(payload?.metadata) ? payload.metadata : undefined;
   const routing = isRecord(payload?.routing) ? payload.routing : undefined;
   const servedProvider = firstString([
-    headerValue(headers, ["x-berry-served-provider", "x-router-served-provider", "x-router-provider"]),
+    headerValue(headers, ["x-berryrouter-provider", "x-berry-served-provider", "x-router-served-provider", "x-router-provider"]),
     stringField(payload, "served_provider"),
     stringField(metadata, "served_provider"),
     stringField(metadata, "provider"),
@@ -1435,7 +1435,7 @@ function routerAttribution(
   ]);
   const responseModel = stringField(payload, "model");
   const servedModel = firstString([
-    headerValue(headers, ["x-berry-served-model", "x-router-served-model", "x-router-model"]),
+    headerValue(headers, ["x-berryrouter-model", "x-berry-served-model", "x-router-served-model", "x-router-model"]),
     stringField(payload, "served_model"),
     stringField(metadata, "served_model"),
     stringField(routing, "model"),

@@ -139,6 +139,31 @@ describe("DurablePersonalSkillToolExecutor", () => {
     });
   });
 
+  it.each([
+    {},
+    { content: "instructions", path: "/workspace/skill" },
+    { path: "" },
+    { content: "" },
+    { content: "instructions", raw: true },
+  ])("rejects ambiguous or invalid save arguments before any external action: %j", async (args) => {
+    const execute = vi.fn(async () => undefined);
+    const query = vi.fn(async () => []);
+    const baseExecute = vi.fn(async () => ({ output: {}, summary: "base" }));
+    const readSkillPackage = vi.fn(async () => []);
+    const tools = new DurablePersonalSkillToolExecutor(
+      { execute: baseExecute, readSkillPackage }, { execute, query },
+    );
+
+    await expect(tools.execute({ tenantId: "tenant", userId: "user" } as never, {
+      id: "step-invalid-skill", type: "tool.save_personal_skill",
+      input: { toolName: "save_personal_skill", arguments: args },
+    } as never)).rejects.toThrow("requires exactly one field");
+    expect(execute).not.toHaveBeenCalled();
+    expect(query).not.toHaveBeenCalled();
+    expect(baseExecute).not.toHaveBeenCalled();
+    expect(readSkillPackage).not.toHaveBeenCalled();
+  });
+
   it("rejects invalid SKILL.md before writing", async () => {
     const execute = vi.fn(async () => undefined);
     const tools = new DurablePersonalSkillToolExecutor({
