@@ -800,7 +800,7 @@ describe("durable turn runner", () => {
     const names = durableBuiltInToolDefinitions(current).map((tool) => tool.function.name);
     expect(names).toEqual([
       "read", "bash", "edit", "write", "grep", "find", "ls",
-      "ask_user_question", "compose_message", "persist_artifact", "save_personal_skill", "check_environment",
+      "ask_user_question", "compose_message", "persist_artifact", "save_personal_skill", "check_environment", "upload_file",
     ]);
   });
 
@@ -865,6 +865,16 @@ describe("durable turn runner", () => {
       output: { executables: [{ name: "typst", available: false }] },
     });
     expect(durableBuiltInToolDefinitions(current)).toEqual(first);
+  });
+
+  it("offers upload_file wherever bash is admitted", () => {
+    const current = providerSnapshot("openai-responses");
+    current.runtimeRequest = { ...current.runtimeRequest, builtInTools: ["read"] };
+    expect(durableBuiltInToolDefinitions(current).map((tool) => tool.function.name)).not.toContain("upload_file");
+    expect(JSON.stringify(modelMessages(current).messages)).not.toContain("use upload_file");
+    current.runtimeRequest = { ...current.runtimeRequest, builtInTools: ["read", "bash"] };
+    expect(durableBuiltInToolDefinitions(current).map((tool) => tool.function.name)).toContain("upload_file");
+    expect(JSON.stringify(modelMessages(current).messages)).toContain("use upload_file with the URL and headers exactly as returned");
   });
 
   it("advertises document and ZIP routing on the read tool", () => {
@@ -5310,6 +5320,7 @@ describe("durable turn runner", () => {
     let writePolicy: unknown;
     let editPolicy: unknown;
     let bashPolicy: unknown;
+    let uploadPolicy: unknown;
     let toolNames: string[] = [];
     const runner = new DurableTurnRunner(repository, {
       call: async (_snapshot, _step, context) => {
@@ -5319,13 +5330,21 @@ describe("durable turn runner", () => {
         writePolicy = context.policyForTool("write");
         editPolicy = context.policyForTool("edit");
         bashPolicy = context.policyForTool("bash");
+        uploadPolicy = context.policyForTool("upload_file");
         return { text: "Done.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
       },
     }, noTools(), { owner: "worker-compose-definition" });
 
     await runner.execute({ tenantId, runId, reason: "continue" });
 
-    expect(toolNames).toEqual([...DURABLE_BASE_BUILT_IN_TOOLS, "check_environment"]);
+    expect(toolNames).toEqual([...DURABLE_BASE_BUILT_IN_TOOLS, "check_environment", "upload_file"]);
+    // A PUT of the same bytes is safe to repeat; it asks first, like bash, outside full access.
+    expect(uploadPolicy).toEqual({
+      retryClass: "idempotent",
+      repeatPolicy: "block_after_success",
+      requiresApproval: true,
+      approvalKind: "shell",
+    });
     expect(composePolicy).toEqual({
       retryClass: "read_only",
       repeatPolicy: "block_after_success",

@@ -1,4 +1,5 @@
 import { ENVIRONMENT_CHECK_SCRIPT, environmentCheckInput, environmentCheckResult } from "./environment-check.js";
+import { FILE_UPLOAD_MAX_BYTES, fileUploadInput, uploadFileBytes, uploadNetworkProblem } from "./file-upload.js";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { Buffer } from "node:buffer";
@@ -873,6 +874,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       };
       /** Emails administrators when the image provider is out of credit (H-005). */
       providerCreditAlerts?: ProviderCreditAlertSink;
+      /** Sends upload_file requests; defaults to the public-network-only client. */
+      uploadFetch?: typeof fetch;
     },
   ) {}
 
@@ -1425,6 +1428,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     }
     // Strictly validate names before workspace preparation or any provider I/O.
     const environmentInput = toolName === "check_environment" ? environmentCheckInput(step.input.arguments) : null;
+    const uploadInput = toolName === "upload_file" ? fileUploadInput(step.input.arguments) : null;
     const inputRepairDetails = prepared.repairs.length > 0
       ? { inputRepairs: prepared.repairs }
       : {};
@@ -1459,6 +1463,29 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         summary: "Checked environment availability without executing requested programs or importing requested modules",
         sandbox,
       };
+    }
+    if (uploadInput) {
+      // The worker sends the bytes, under the same network policy as the sandbox.
+      const policy = networkPolicy(snapshot.runtimeRequest.networkPolicy);
+      const blocked = uploadNetworkProblem(uploadInput.url, policy);
+      if (blocked) throw new Error(blocked);
+      const path = safeReadablePath(uploadInput.path, workspaceRoot);
+      const entry = await sandboxFileEntry(this.provider, sandbox.id, path, signal);
+      if (!entry || entry.type !== "file") throw new Error(`${path} does not exist in the workspace. Nothing was sent.`);
+      const maxBytes = Math.min(FILE_UPLOAD_MAX_BYTES, this.options.maxInputBytes ?? DEFAULT_SANDBOX_INPUT_MAX_BYTES);
+      if (entry.size_bytes > maxBytes) throw new Error(`${path} has ${entry.size_bytes} bytes, which exceeds the ${maxBytes}-byte upload limit. Nothing was sent.`);
+      const source = await this.provider.files.read({ sandbox_id: sandbox.id, path, encoding: "base64" }, signal ? { signal } : undefined);
+      const bytes = Buffer.from(source.content, "base64");
+      if (bytes.byteLength > maxBytes) throw new Error(`${path} exceeds the ${maxBytes}-byte upload limit. Nothing was sent.`);
+      reportProgress?.();
+      const uploaded = await uploadFileBytes({
+        upload: { ...uploadInput, path },
+        bytes,
+        policy,
+        ...(signal ? { signal } : {}),
+        ...(this.options.uploadFetch ? { fetch: this.options.uploadFetch } : {}),
+      });
+      return { ...uploaded, sandbox };
     }
     if (toolName === "read") {
       const path = safeReadablePath(requiredToolPath(args, toolName), workspaceRoot);
@@ -3044,7 +3071,7 @@ function requestedInspectionImagePaths(snapshot: DurableTurnSnapshot, workspaceR
 const NON_WRITING_TOOLS = new Set([
   "read", "find", "ls", "grep", "activate_skill", "ask_user_question", "compose_message",
   "inspect_images", "persist_artifact", "create_image", "save_personal_skill",
-  "remember_memory", "forget_memory",
+  "remember_memory", "forget_memory", "upload_file",
 ]);
 
 function runMayHaveWrittenFiles(snapshot: DurableTurnSnapshot): boolean {
