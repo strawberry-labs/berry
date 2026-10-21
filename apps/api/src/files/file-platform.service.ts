@@ -802,7 +802,9 @@ export class FilePlatformService {
     return resolved;
   }
 
-  async importConnectorArtifact(tenantId: string, userId: string, input: {
+  async importConnectorArtifact(tenantId: string, userId: string, request: {
+    /** Where the bytes came from; Drive is the default for older callers. */
+    source?: ConnectorImportSource;
     connectorKey: string;
     accountEmail: string | null;
     sourceFileId: string;
@@ -818,6 +820,8 @@ export class FilePlatformService {
     taskId: string;
     sessionId: string;
   }) {
+    const source: ConnectorImportSource = request.source ?? "google-drive";
+    const input = { ...request, source };
     const config = this.requireConfig();
     const name = safeFileName(input.name);
     const identity = [
@@ -855,6 +859,7 @@ export class FilePlatformService {
         revision: input.sourceRevision,
         title: name,
         mediaType: input.contentType,
+        source: input.source,
       });
     });
     if (existing) {
@@ -871,6 +876,7 @@ export class FilePlatformService {
       maximumBytes,
       fileId,
       name,
+      source: input.source,
     });
     let registered = false;
     try {
@@ -899,6 +905,7 @@ export class FilePlatformService {
             revision: input.sourceRevision,
             title: name,
             mediaType: input.contentType,
+            source: input.source,
           });
           return { file: referenced, reused: true, library: input.saveToLibrary || raced.in_library === true };
         }
@@ -912,7 +919,7 @@ export class FilePlatformService {
             id, tenant_id, bucket, object_key, size_bytes, sha256, etag,
             object_version_id, verification_status, metadata
           ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, 'unverified', $9::jsonb)
-        `, [blobId, tenantId, config.bucket, objectKey, stored.size, stored.sha256, stored.etag, stored.versionId, JSON.stringify({ source: "google-drive", expectedSha256: stored.sha256, ...metadata })]);
+        `, [blobId, tenantId, config.bucket, objectKey, stored.size, stored.sha256, stored.etag, stored.versionId, JSON.stringify({ expectedSha256: stored.sha256, ...metadata })]);
         const [created] = await executor.query<FileRow>(`
           INSERT INTO files (
             id, tenant_id, owner_user_id, blob_id, original_name, display_name,
@@ -924,7 +931,7 @@ export class FilePlatformService {
           )
           RETURNING *
         `, [fileId, tenantId, userId, blobId, name, input.contentType || "application/octet-stream", stored.size, stored.sha256, config.bucket, objectKey, stored.etag, stored.versionId, shouldIndex ? "processing" : "available", JSON.stringify(metadata)]);
-        if (!created) throw new Error("Unable to register the Drive artifact");
+        if (!created) throw new Error(`Unable to register the ${connectorSourceLabel(input.source)} artifact`);
         if (input.saveToLibrary) await reviveLibraryEntry(executor, tenantId, userId, fileId);
         else {
           // The legacy files_library_after_insert_compat trigger adds every new
@@ -952,6 +959,7 @@ export class FilePlatformService {
             title: name,
             mediaType: input.contentType,
             objectKey,
+            source: input.source,
           });
         }
         return { file: created, reused: false, library: input.saveToLibrary };
@@ -1458,7 +1466,10 @@ export class FilePlatformService {
   }
 }
 
+type ConnectorImportSource = "google-drive" | "gmail";
+
 type ConnectorImportIdentity = {
+  source: ConnectorImportSource;
   connectorKey: string;
   accountEmail: string | null;
   sourceFileId: string;
@@ -1468,17 +1479,26 @@ type ConnectorImportIdentity = {
   sourceMetadata: Record<string, unknown>;
 };
 
+function connectorSourceLabel(source: ConnectorImportSource): string {
+  return source === "gmail" ? "Gmail" : "Drive";
+}
+
 function connectorImportMetadata(input: ConnectorImportIdentity): Record<string, unknown> {
+  const details = input.sourceMetadata;
+  const text = (value: unknown) => typeof value === "string" ? value : null;
   return {
-    source: "google-drive",
+    source: input.source,
     connectorKey: input.connectorKey,
     accountEmail: input.accountEmail,
     sourceFileId: input.sourceFileId,
     sourceRevision: input.sourceRevision,
     sourceMimeType: input.sourceMimeType,
     exportMimeType: input.exportMimeType,
-    sourceModifiedTime: typeof input.sourceMetadata.modifiedTime === "string" ? input.sourceMetadata.modifiedTime : null,
-    sourceWebViewLink: typeof input.sourceMetadata.webViewLink === "string" ? input.sourceMetadata.webViewLink : null,
+    sourceModifiedTime: text(details.modifiedTime),
+    sourceWebViewLink: text(details.webViewLink),
+    ...(input.source === "gmail"
+      ? { gmail: { messageId: text(details.messageId), threadId: text(details.threadId), partId: text(details.partId), filename: text(details.filename) } }
+      : {}),
   };
 }
 
@@ -1488,15 +1508,18 @@ function connectorArtifactDto(
   reused: boolean,
   library: boolean,
 ): Record<string, unknown> {
+  // Hex for people, standard Base64 for upload checksums such as S3's x-amz-checksum-sha256.
+  const sha256 = typeof row.sha256 === "string" && /^[0-9a-f]{64}$/i.test(row.sha256) ? row.sha256.toLowerCase() : null;
   return {
     artifact: {
       fileId: row.id,
       name: row.display_name,
       mediaType: row.detected_media_type ?? row.media_type,
       size: Number(row.size_bytes),
+      ...(sha256 ? { sha256, sha256Base64: Buffer.from(sha256, "hex").toString("base64") } : {}),
       status: row.status,
       origin: "connector_import",
-      source: "google-drive",
+      source: input.source,
       sourceFileId: input.sourceFileId,
       sourceRevision: input.sourceRevision,
       exportMimeType: input.exportMimeType,
@@ -1542,6 +1565,7 @@ async function promoteConnectorKnowledgeIfNeeded(executor: SqlExecutor, input: {
   revision: string;
   title: string;
   mediaType: string;
+  source: ConnectorImportSource;
 }): Promise<FileRow> {
   if (!input.promoted) return input.file;
   const libraryFile = { ...input.file, in_library: true };
@@ -1566,6 +1590,7 @@ async function promoteConnectorKnowledgeIfNeeded(executor: SqlExecutor, input: {
     title: input.title,
     mediaType: input.mediaType,
     objectKey: input.file.object_key,
+    source: input.source,
   });
   return { ...libraryFile, status: "processing" };
 }
@@ -1583,7 +1608,7 @@ function assertConnectorIdentity(row: FileRow, input: ConnectorImportIdentity): 
     || metadata.sourceFileId !== input.sourceFileId
     || metadata.sourceRevision !== input.sourceRevision
     || (metadata.exportMimeType ?? null) !== input.exportMimeType) {
-    throw new ConflictException("Drive artifact identity conflicts with an existing file");
+    throw new ConflictException(`${connectorSourceLabel(input.source)} artifact identity conflicts with an existing file`);
   }
 }
 
@@ -1635,6 +1660,7 @@ async function enqueueConnectorKnowledgeExtraction(executor: SqlExecutor, input:
   title: string;
   mediaType: string;
   objectKey: string;
+  source: ConnectorImportSource;
 }): Promise<void> {
   const [source] = await executor.query<{ id: string }>(`
     INSERT INTO knowledge_sources (
@@ -1644,14 +1670,14 @@ async function enqueueConnectorKnowledgeExtraction(executor: SqlExecutor, input:
     ) VALUES (
       $1::uuid, $2::uuid, $3::uuid, 'file', $4::uuid::text, $5, $6, $7,
       'task_only', 'pending', 'pending', 'tika-v1', 'recursive-v1',
-      jsonb_build_object('fileId',$4::uuid,'mediaType',$8::text,'objectKey',$9::text,'taskId',$10::uuid,'source','google-drive')
+      jsonb_build_object('fileId',$4::uuid,'mediaType',$8::text,'objectKey',$9::text,'taskId',$10::uuid,'source',$11::text)
     )
     ON CONFLICT (tenant_id, workspace_id, source_type, source_id, source_revision)
     DO UPDATE SET tombstoned_at=NULL, failure_reason=NULL, extraction_status='pending',
       index_status='pending', vector_ready=false, updated_at=now()
     RETURNING id
-  `, [input.tenantId, input.userId, input.workspaceId, input.fileId, input.revision, input.contentHash, input.title, input.mediaType, input.objectKey, input.taskId]);
-  if (!source) throw new Error("Unable to queue Drive artifact extraction");
+  `, [input.tenantId, input.userId, input.workspaceId, input.fileId, input.revision, input.contentHash, input.title, input.mediaType, input.objectKey, input.taskId, input.source]);
+  if (!source) throw new Error(`Unable to queue ${connectorSourceLabel(input.source)} artifact extraction`);
   await executor.execute(`
     INSERT INTO runtime_outbox (tenant_id, event_type, aggregate_id, dedupe_key, payload)
     VALUES ($1::uuid, 'knowledge.extract', $2, $3, $4::jsonb)
@@ -1668,16 +1694,18 @@ async function storeBoundedMultipart(config: FileStorageConfig, input: {
   maximumBytes: number;
   fileId: string;
   name: string;
+  source: ConnectorImportSource;
 }): Promise<{ size: number; sha256: string; etag: string | null; versionId: string | null }> {
+  const label = connectorSourceLabel(input.source);
   if (input.declaredSize !== null && input.declaredSize > input.maximumBytes) {
     await input.body.cancel().catch(() => undefined);
-    throw new BadRequestException("Drive files are limited to 100 MB");
+    throw new BadRequestException(`${label} files are limited to ${megabytes(input.maximumBytes)}`);
   }
   const created = await config.client.send(new CreateMultipartUploadCommand({
     Bucket: config.bucket,
     Key: input.objectKey,
     ContentType: input.contentType,
-    Metadata: { "file-id": input.fileId, "original-name": encodeURIComponent(input.name), source: "google-drive" },
+    Metadata: { "file-id": input.fileId, "original-name": encodeURIComponent(input.name), source: input.source },
   }));
   if (!created.UploadId) throw new Error("Object storage did not return a multipart upload id");
   const reader = input.body.getReader();
@@ -1698,7 +1726,7 @@ async function storeBoundedMultipart(config: FileStorageConfig, input: {
       Body: body,
       ContentLength: body.byteLength,
     }));
-    if (!uploaded.ETag) throw new Error(`Object storage did not return an ETag for Drive part ${partNumber}`);
+    if (!uploaded.ETag) throw new Error(`Object storage did not return an ETag for ${label} part ${partNumber}`);
     completedParts.push({ PartNumber: partNumber, ETag: uploaded.ETag });
     partChunks = [];
     partBytes = 0;
@@ -1711,7 +1739,7 @@ async function storeBoundedMultipart(config: FileStorageConfig, input: {
       total += value.byteLength;
       if (total > input.maximumBytes) {
         await reader.cancel().catch(() => undefined);
-        throw new BadRequestException("Drive files are limited to 100 MB");
+        throw new BadRequestException(`${label} files are limited to ${megabytes(input.maximumBytes)}`);
       }
       hash.update(value);
       while (offset < value.byteLength) {
@@ -1723,7 +1751,7 @@ async function storeBoundedMultipart(config: FileStorageConfig, input: {
       }
     }
     if (input.declaredSize !== null && total !== input.declaredSize) {
-      throw new BadRequestException("The Drive response size did not match its declared size");
+      throw new BadRequestException(`The ${label} response size did not match its declared size`);
     }
     if (total === 0) {
       await config.client.send(new AbortMultipartUploadCommand({ Bucket: config.bucket, Key: input.objectKey, UploadId: created.UploadId })).catch(() => undefined);
@@ -1732,7 +1760,7 @@ async function storeBoundedMultipart(config: FileStorageConfig, input: {
         Key: input.objectKey,
         Body: new Uint8Array(),
         ContentType: input.contentType,
-        Metadata: { "file-id": input.fileId, "original-name": encodeURIComponent(input.name), source: "google-drive" },
+        Metadata: { "file-id": input.fileId, "original-name": encodeURIComponent(input.name), source: input.source },
       }));
       return { size: 0, sha256: hash.digest("hex"), etag: cleanEtag(stored.ETag), versionId: stored.VersionId ?? null };
     }
@@ -1751,6 +1779,10 @@ async function storeBoundedMultipart(config: FileStorageConfig, input: {
   } finally {
     reader.releaseLock();
   }
+}
+
+function megabytes(bytes: number): string {
+  return `${Math.floor(bytes / (1024 * 1024))} MB`;
 }
 
 function stableUuid(value: string): string {

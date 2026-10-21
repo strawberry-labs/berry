@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { McpCachedTool } from "@berry/local-agent";
 import type { ConnectorWorkspaceAccessMode } from "@berry/shared";
 
@@ -25,9 +25,16 @@ const GOOGLE_TOOL_OUTPUT_LIMIT_BYTES = 10 * 1024 * 1024;
 export const GOOGLE_DRIVE_IMPORT_LIMIT_BYTES = 100 * 1024 * 1024;
 export const GOOGLE_DRIVE_IMPORT_TIMEOUT_MS = 30 * 60 * 1000;
 const GOOGLE_ERROR_BODY_LIMIT_BYTES = 1024 * 1024;
+// Gmail accepts messages up to 50 MB, so no attachment is larger. The JSON
+// response carries it as base64url: four characters for every three bytes.
+export const GMAIL_ATTACHMENT_LIMIT_BYTES = 50 * 1024 * 1024;
+const GMAIL_ATTACHMENT_RESPONSE_LIMIT_BYTES = Math.ceil(GMAIL_ATTACHMENT_LIMIT_BYTES / 3) * 4 + 64 * 1024;
+const GMAIL_ATTACHMENT_TIMEOUT_MS = 5 * 60 * 1000;
 
 type ScopeRequirement = { all?: string[]; any?: string[] };
-export type DriveArtifactImport = {
+export type ConnectorArtifactSource = "google-drive" | "gmail";
+export type ConnectorArtifactImport = {
+  source: ConnectorArtifactSource;
   sourceFileId: string;
   sourceRevision: string;
   sourceMimeType: string;
@@ -39,8 +46,8 @@ export type DriveArtifactImport = {
   metadata: Record<string, unknown>;
   body: ReadableStream<Uint8Array>;
 };
-export type DriveArtifactImporter = (input: DriveArtifactImport) => Promise<unknown>;
-type ToolContext = { accountEmail: string | null; driveArtifactImporter?: DriveArtifactImporter };
+export type ConnectorArtifactImporter = (input: ConnectorArtifactImport) => Promise<unknown>;
+type ToolContext = { accountEmail: string | null; artifactImporter?: ConnectorArtifactImporter };
 type ToolDefinition = McpCachedTool & {
   access: GoogleAccessLevel;
   approvalRequired: boolean;
@@ -169,7 +176,12 @@ const gmailTools: ToolDefinition[] = [
   tool("gmail_search_messages", "Search individual Gmail messages using Gmail API search syntax.", gmailSearchSchema("messages"), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl("users/me/messages", gmailSearchQuery(input)))),
   tool("gmail_get_thread", "Get a Gmail thread and its messages.", gmailGetSchema("threadId"), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl(`users/me/threads/${encodeURIComponent(requiredString(input.threadId, "threadId"))}`, gmailGetQuery(input)))),
   tool("gmail_get_message", "Get one Gmail message.", gmailGetSchema("messageId", true), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl(`users/me/messages/${encodeURIComponent(requiredString(input.messageId, "messageId"))}`, gmailGetQuery(input)))),
-  tool("gmail_get_attachment", "Download one Gmail attachment as base64url data.", object({ messageId: string("Message ID."), attachmentId: string("Attachment ID.") }, ["messageId", "attachmentId"]), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl(`users/me/messages/${encodeURIComponent(requiredString(input.messageId, "messageId"))}/attachments/${encodeURIComponent(requiredString(input.attachmentId, "attachmentId"))}`))),
+  tool("gmail_get_attachment", "Download one Gmail attachment as a file for use in the current task. Berry decodes it and stages the original file in the task sandbox; the result gives its sandbox path, media type, size and SHA-256. File bytes are never placed directly in model context. Identify the attachment by messageId plus the partId shown for it by gmail_get_message (attachment IDs can change between reads), or by its attachmentId. By default the file is temporary and is not added to the Berry Library. Set saveToLibrary=true only when the user explicitly asks to keep it or clearly intends to reuse it in future tasks.", object({
+    messageId: string("Message ID."),
+    partId: string("MIME part ID of the attachment in the message payload, for example 1 or 2.1. Preferred over attachmentId."),
+    attachmentId: string("Attachment ID from the message payload. Used when partId is not supplied."),
+    saveToLibrary: boolean("Save the file to the Berry Library and queue searchable extraction. Defaults to false. Use true only for clear durable user intent, never only because the current task needs the file."),
+  }, ["messageId"]), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, getGmailAttachment),
   tool("gmail_list_labels", "List Gmail labels.", object({}), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token) => googleJson(token, gmailUrl("users/me/labels"))),
   tool("gmail_list_drafts", "List Gmail drafts.", gmailSearchSchema("drafts"), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl("users/me/drafts", gmailSearchQuery(input)))),
   tool("gmail_get_draft", "Get one Gmail draft.", object({ draftId: string("Draft ID."), format: string("Message format.", { enum: ["full", "metadata", "minimal", "raw"] }) }, ["draftId"]), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl(`users/me/drafts/${encodeURIComponent(requiredString(input.draftId, "draftId"))}`, { format: optionalString(input.format) ?? "full" }))),
@@ -226,7 +238,7 @@ export function googleToolsRequiringApproval(connector: GoogleConnectorKey, acce
     .map((item) => item.name);
 }
 
-export async function executeGoogleTool(connector: GoogleConnectorKey, access: GoogleAccessLevel, name: string, token: string, input: Record<string, unknown>, accountEmail: string | null, grantedScopes: readonly string[], context: { driveArtifactImporter?: DriveArtifactImporter } = {}): Promise<unknown> {
+export async function executeGoogleTool(connector: GoogleConnectorKey, access: GoogleAccessLevel, name: string, token: string, input: Record<string, unknown>, accountEmail: string | null, grantedScopes: readonly string[], context: { artifactImporter?: ConnectorArtifactImporter } = {}): Promise<unknown> {
   const definition = toolsByConnector[connector].find((candidate) => candidate.name === name);
   if (!definition || (access === "read" && definition.access === "full") || !scopeAllows(definition.scopes, grantedScopes)) throw new Error(`Tool ${name} is not authorized for this connection`);
   return definition.run(token, input, { accountEmail, ...context });
@@ -364,7 +376,7 @@ async function driveFilePreflight(token: string, fileId: string, operation: "rea
 async function readDriveFile(token: string, input: Record<string, unknown>, context: ToolContext): Promise<unknown> {
   const fileId = requiredString(input.fileId, "fileId"); const metadata = await driveFilePreflight(token, fileId, "download"); const mimeType = requiredString(metadata.mimeType, "mimeType");
   if (mimeType === "application/vnd.google-apps.folder") throw new Error("Drive folders cannot be downloaded");
-  if (!context.driveArtifactImporter) throw new Error("Drive artifact storage is unavailable for this task");
+  if (!context.artifactImporter) throw new Error("Drive artifact storage is unavailable for this task");
   const googleMime = mimeType.startsWith("application/vnd.google-apps."); const exportMimeType = optionalString(input.exportMimeType) ?? defaultExportMime(mimeType);
   const response = await googleFetch(
     token,
@@ -382,7 +394,8 @@ async function readDriveFile(token: string, input: Record<string, unknown>, cont
   }
   const contentType = response.headers.get("content-type")?.split(";")[0] ?? exportMimeType ?? mimeType;
   const sourceRevision = driveSourceRevision(metadata);
-  return context.driveArtifactImporter({
+  return context.artifactImporter({
+    source: "google-drive",
     sourceFileId: fileId,
     sourceRevision,
     sourceMimeType: mimeType,
@@ -476,6 +489,136 @@ function encodeMail(input: Record<string, unknown>): string { const to = require
 function gmailTargetSchema(): Record<string, unknown> { return object({ targetType: string("Message or thread.", { enum: ["message", "thread"] }), id: string("Message or thread ID.") }, ["targetType", "id"]); }
 function gmailLabelsSchema(apply: boolean): Record<string, unknown> { return object({ ...gmailTargetSchema().properties as Record<string, unknown>, labelIds: stringArray(`${apply ? "Apply" : "Remove"} these label IDs.`, 100) }, ["targetType", "id", "labelIds"]); }
 function modifyGmailLabels(token: string, input: Record<string, unknown>) { const target = requiredEnum(input.targetType, ["message", "thread"], "targetType"); const labels = requiredStringArray(input.labelIds, "labelIds").slice(0, 100); const remove = input.remove === true || input.targetAction === "remove" || false; const method = target === "message" ? "messages" : "threads"; return googleJson(token, gmailUrl(`users/me/${method}/${encodeURIComponent(requiredString(input.id, "id"))}/modify`), { method: "POST", body: jsonBody({ addLabelIds: remove ? [] : labels, removeLabelIds: remove ? labels : [] }) }); }
+
+type GmailPart = { partId: string; filename: string; mimeType: string; attachmentId: string | null; size: number | null; data: string | null };
+
+/**
+ * Imports one attachment as a Berry file: the model gets its path, size and
+ * SHA-256, never its bytes. The MIME part ID and the content hash identify
+ * it, because Gmail can issue a new attachment ID on every read, so finding
+ * the same attachment again reuses the file already stored.
+ */
+async function getGmailAttachment(token: string, input: Record<string, unknown>, context: ToolContext): Promise<unknown> {
+  const messageId = requiredString(input.messageId, "messageId");
+  const partId = optionalString(input.partId);
+  const requestedAttachmentId = optionalString(input.attachmentId);
+  if (partId === undefined && requestedAttachmentId === undefined) throw new Error("partId or attachmentId is required");
+  // Outside a task there is no file storage; keep Gmail's own response.
+  if (!context.artifactImporter && partId === undefined) return googleJson(token, gmailAttachmentUrl(messageId, requestedAttachmentId!));
+  const message = record(await googleJson(token, gmailUrl(`users/me/messages/${encodeURIComponent(messageId)}`, { format: "full", fields: "id,threadId,internalDate,payload" }))) ?? {};
+  const parts = gmailParts(record(message.payload));
+  let part = partId !== undefined ? parts.find((candidate) => candidate.partId === partId) : parts.find((candidate) => candidate.attachmentId === requestedAttachmentId);
+  if (partId !== undefined && !part) throw new Error(`Gmail message ${messageId} has no MIME part ${partId}`);
+  if (part?.mimeType.toLowerCase().startsWith("multipart/")) throw new Error(`MIME part ${part.partId} of Gmail message ${messageId} is a container, not an attachment`);
+  const attachmentId = part ? part.attachmentId : requestedAttachmentId!;
+  if (!context.artifactImporter) {
+    if (!attachmentId) throw new Error("Gmail attachment storage is unavailable outside a task");
+    return googleJson(token, gmailAttachmentUrl(messageId, attachmentId));
+  }
+  let encoded: string;
+  let declaredSize = part?.size ?? null;
+  if (attachmentId) {
+    const response = await googleFetch(token, gmailAttachmentUrl(messageId, attachmentId), { signal: AbortSignal.timeout(GMAIL_ATTACHMENT_TIMEOUT_MS) });
+    const text = await readBoundedText(
+      response,
+      response.ok ? GMAIL_ATTACHMENT_RESPONSE_LIMIT_BYTES : GOOGLE_ERROR_BODY_LIMIT_BYTES,
+      response.ok ? "Gmail attachment exceeds Berry's 50 MB limit" : "Google API error response exceeds Berry's 1 MB limit",
+    );
+    if (!response.ok) throw googleError(response.status, text);
+    let body: Record<string, unknown> | null;
+    try { body = record(JSON.parse(text)); } catch { body = null; }
+    if (typeof body?.data !== "string") throw new Error("Gmail returned no attachment data");
+    encoded = body.data;
+    const reportedSize = typeof body.size === "number" && Number.isSafeInteger(body.size) ? body.size : null;
+    if (reportedSize !== null && declaredSize !== null && reportedSize !== declaredSize) {
+      throw new Error(`Gmail reported two sizes for this attachment (${declaredSize} and ${reportedSize} bytes)`);
+    }
+    declaredSize = declaredSize ?? reportedSize;
+  } else if (part?.data !== null && part?.data !== undefined) {
+    encoded = part.data;
+  } else if (part?.size === 0) {
+    encoded = "";
+  } else {
+    throw new Error(`MIME part ${part?.partId ?? partId} of Gmail message ${messageId} is not an attachment`);
+  }
+  const bytes = decodeBase64Url(encoded);
+  if (bytes.byteLength > GMAIL_ATTACHMENT_LIMIT_BYTES) throw new Error("Gmail attachment exceeds Berry's 50 MB limit");
+  if (declaredSize !== null && bytes.byteLength !== declaredSize) {
+    throw new Error(`Gmail attachment data is incomplete: expected ${declaredSize} bytes, decoded ${bytes.byteLength}`);
+  }
+  // An attachment ID from an earlier read may no longer appear in the message;
+  // the decoded size then picks the attachment if exactly one matches.
+  if (!part) {
+    const matches = parts.filter((candidate) => (candidate.attachmentId || candidate.filename) && candidate.size === bytes.byteLength);
+    if (matches.length !== 1) throw new Error(`Could not match attachment ${requestedAttachmentId} to a part of Gmail message ${messageId}. Read the message again and pass the attachment's partId.`);
+    part = matches[0]!;
+  }
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  const mediaType = part.mimeType.split(";")[0]!.trim().toLowerCase() || "application/octet-stream";
+  const internalDate = Number(message.internalDate);
+  return context.artifactImporter({
+    source: "gmail",
+    sourceFileId: `${messageId}/${part.partId || "root"}`,
+    sourceRevision: sha256,
+    sourceMimeType: mediaType,
+    exportMimeType: null,
+    saveToLibrary: optionalBoolean(input.saveToLibrary) ?? false,
+    name: part.filename.trim() || `attachment-${part.partId || "root"}${MEDIA_TYPE_EXTENSIONS[mediaType] ?? ""}`,
+    contentType: mediaType,
+    declaredSize: bytes.byteLength,
+    metadata: compact({
+      messageId,
+      threadId: optionalString(message.threadId),
+      partId: part.partId,
+      filename: part.filename || undefined,
+      modifiedTime: Number.isFinite(internalDate) && internalDate > 0 ? new Date(internalDate).toISOString() : undefined,
+    }),
+    body: new ReadableStream<Uint8Array>({ start(controller) { if (bytes.byteLength) controller.enqueue(bytes); controller.close(); } }),
+  });
+}
+function gmailAttachmentUrl(messageId: string, attachmentId: string): string { return gmailUrl(`users/me/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(attachmentId)}`); }
+function gmailParts(payload: Record<string, unknown> | null): GmailPart[] {
+  const parts: GmailPart[] = [];
+  const visit = (part: Record<string, unknown> | null, depth: number): void => {
+    if (!part || depth > 32 || parts.length >= 1_000) return;
+    const body = record(part.body) ?? {};
+    parts.push({
+      partId: typeof part.partId === "string" ? part.partId : "",
+      filename: typeof part.filename === "string" ? part.filename : "",
+      mimeType: optionalString(part.mimeType) ?? "application/octet-stream",
+      attachmentId: optionalString(body.attachmentId) ?? null,
+      size: typeof body.size === "number" && Number.isSafeInteger(body.size) && body.size >= 0 ? body.size : null,
+      data: typeof body.data === "string" ? body.data : null,
+    });
+    if (Array.isArray(part.parts)) for (const child of part.parts) visit(record(child), depth + 1);
+  };
+  visit(payload, 0);
+  return parts;
+}
+/** Strict base64url (the standard alphabet is accepted too): no whitespace, no impossible length. */
+export function decodeBase64Url(value: string): Buffer {
+  const unpadded = value.replace(/={1,2}$/, "");
+  if (!/^[A-Za-z0-9_\-+/]*$/.test(unpadded) || unpadded.length % 4 === 1) throw new Error("Gmail returned attachment data that is not valid base64url");
+  return Buffer.from(unpadded, "base64url");
+}
+const MEDIA_TYPE_EXTENSIONS: Record<string, string> = {
+  "application/pdf": ".pdf",
+  "application/msword": ".doc",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+  "application/vnd.ms-excel": ".xls",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+  "application/vnd.ms-powerpoint": ".ppt",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+  "application/zip": ".zip",
+  "message/rfc822": ".eml",
+  "text/calendar": ".ics",
+  "text/csv": ".csv",
+  "text/html": ".html",
+  "text/plain": ".txt",
+  "image/gif": ".gif",
+  "image/jpeg": ".jpg",
+  "image/png": ".png",
+};
 
 function calendarListEventsSchema(): Record<string, unknown> { return object({ calendarId: string("Calendar ID, normally primary."), query: string("Free-text query."), timeMin: string("RFC3339 lower bound."), timeMax: string("RFC3339 upper bound."), maxResults: integer("Maximum events.", 1, 2500), pageToken: string("Continuation token."), singleEvents: boolean("Expand recurring events."), orderBy: string("Ordering.", { enum: ["startTime", "updated"] }) }); }
 function listCalendarEvents(token: string, input: Record<string, unknown>) { const singleEvents = optionalBoolean(input.singleEvents) ?? true; const orderBy = optionalString(input.orderBy) ?? (singleEvents ? "startTime" : "updated"); if (orderBy === "startTime" && !singleEvents) throw new Error("startTime ordering requires singleEvents=true"); return googleJson(token, calendarUrl(`calendars/${encodeURIComponent(optionalString(input.calendarId) ?? "primary")}/events`, { q: optionalString(input.query), timeMin: optionalString(input.timeMin), timeMax: optionalString(input.timeMax), maxResults: boundedInteger(input.maxResults, 100, 1, 2500), pageToken: optionalString(input.pageToken), singleEvents, orderBy })); }

@@ -165,10 +165,11 @@ export class ConnectorsController {
   @Post("mcp/:connectorKey")
   async googleMcp(@Headers("authorization") authorization: string | undefined, @Param("connectorKey") connectorKey: string, @Body() body: unknown, @Res() response: ServerResponse) {
     const result = await this.connectors.handleGoogleMcp(authorization, connectorKey, body, {
-      importDriveArtifact: (context, artifact) => this.files.importConnectorArtifact(
+      importArtifact: (context, artifact) => this.files.importConnectorArtifact(
         context.tenantId,
         context.userId,
         {
+          source: artifact.source,
           connectorKey: context.connectorKey,
           accountEmail: context.accountEmail,
           sourceFileId: artifact.sourceFileId,

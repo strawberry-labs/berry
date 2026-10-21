@@ -1,10 +1,13 @@
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  decodeBase64Url,
   executeGoogleTool,
   GOOGLE_DRIVE_IMPORT_TIMEOUT_MS,
   googleConnectorScopes,
   googleToolCatalog,
   googleToolsRequiringApproval,
+  type ConnectorArtifactImport,
 } from "./google-tools.ts";
 
 const GMAIL_MODIFY = "https://www.googleapis.com/auth/gmail.modify";
@@ -110,7 +113,7 @@ describe("Google connector tool policy", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     let importedBytes = 0;
-    const driveArtifactImporter = vi.fn(async (artifact: { body: ReadableStream<Uint8Array>; name: string }) => {
+    const artifactImporter = vi.fn(async (artifact: { body: ReadableStream<Uint8Array>; name: string }) => {
       const reader = artifact.body.getReader();
       while (true) {
         const { done, value } = await reader.read();
@@ -127,12 +130,12 @@ describe("Google connector tool policy", () => {
       { fileId: "file-1" },
       "person@aesg.com",
       ["https://www.googleapis.com/auth/drive.readonly"],
-      { driveArtifactImporter },
+      { artifactImporter },
     )).resolves.toEqual({ artifact: expect.objectContaining({ fileId: "berry-file-1", size: 11 * 1024 * 1024 }) });
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(emitted).toBe(11);
     expect(importedBytes).toBe(11 * 1024 * 1024);
-    expect(driveArtifactImporter).toHaveBeenCalledWith(expect.objectContaining({
+    expect(artifactImporter).toHaveBeenCalledWith(expect.objectContaining({
       sourceFileId: "file-1",
       sourceRevision: "file-1",
       saveToLibrary: false,
@@ -156,7 +159,7 @@ describe("Google connector tool policy", () => {
         headers: { "content-type": "application/pdf", "content-length": String(101 * 1024 * 1024) },
       }));
     vi.stubGlobal("fetch", fetchMock);
-    const driveArtifactImporter = vi.fn();
+    const artifactImporter = vi.fn();
     await expect(executeGoogleTool(
       "google-workspace",
       "read",
@@ -165,9 +168,9 @@ describe("Google connector tool policy", () => {
       { fileId: "file-1" },
       "person@aesg.com",
       ["https://www.googleapis.com/auth/drive.readonly"],
-      { driveArtifactImporter },
+      { artifactImporter },
     )).rejects.toThrow("100 MB import limit");
-    expect(driveArtifactImporter).not.toHaveBeenCalled();
+    expect(artifactImporter).not.toHaveBeenCalled();
   });
 
   it("uses the long streaming timeout and appends the real Google export extension", async () => {
@@ -187,7 +190,7 @@ describe("Google connector tool policy", () => {
         headers: { "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
       }));
     vi.stubGlobal("fetch", fetchMock);
-    const driveArtifactImporter = vi.fn(async (artifact: { name: string; body: ReadableStream<Uint8Array> }) => {
+    const artifactImporter = vi.fn(async (artifact: { name: string; body: ReadableStream<Uint8Array> }) => {
       await artifact.body.cancel();
       return { artifact: { fileId: "berry-sheet-1", name: artifact.name } };
     });
@@ -200,11 +203,11 @@ describe("Google connector tool policy", () => {
       { fileId: "sheet-1", saveToLibrary: true },
       "person@aesg.com",
       ["https://www.googleapis.com/auth/drive.readonly"],
-      { driveArtifactImporter },
+      { artifactImporter },
     );
 
     expect(timeout).toHaveBeenCalledWith(GOOGLE_DRIVE_IMPORT_TIMEOUT_MS);
-    expect(driveArtifactImporter).toHaveBeenCalledWith(expect.objectContaining({
+    expect(artifactImporter).toHaveBeenCalledWith(expect.objectContaining({
       name: "Forecast.v2.xlsx",
       exportMimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       saveToLibrary: true,
@@ -392,5 +395,153 @@ describe("Google Drive shared-drive scope", () => {
     await expect(run("drive_search_files", { query: "name contains 'Spec'", driveId: "0AShared" })).resolves.toMatchObject({ searchScope: "drive", files: [] });
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(requested(fetchMock)[0]!.searchParams.get("corpora")).toBe("drive");
+  });
+});
+
+describe("Gmail attachment import", () => {
+  const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+  const pdf = Buffer.from("%PDF-1.7\nÿþ binary \u0000 bytes ~?>", "latin1");
+  const sha256 = createHash("sha256").update(pdf).digest("hex");
+  const message = (attachmentId = "attachment-fresh") => ({
+    id: "message-1",
+    threadId: "thread-1",
+    internalDate: "1760000000000",
+    payload: {
+      partId: "",
+      mimeType: "multipart/mixed",
+      filename: "",
+      body: { size: 0 },
+      parts: [
+        { partId: "0", mimeType: "text/plain", filename: "", body: { size: 5, data: Buffer.from("hello").toString("base64url") } },
+        { partId: "1", mimeType: "application/pdf", filename: "RFP 2026.pdf", body: { size: pdf.byteLength, attachmentId } },
+        { partId: "2", mimeType: "image/png", filename: "logo.png", body: { size: 3, attachmentId: "logo-attachment" } },
+      ],
+    },
+  });
+  const collect = async (body: ReadableStream<Uint8Array>) => Buffer.from(await new Response(body).arrayBuffer());
+  const run = (input: Record<string, unknown>, artifactImporter?: (artifact: ConnectorArtifactImport) => Promise<unknown>) => executeGoogleTool(
+    "gmail", "read", "gmail_get_attachment", "access-token", input, "person@aesg.com", [GMAIL_READ],
+    artifactImporter ? { artifactImporter } : {},
+  );
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("imports the decoded attachment as a Gmail file and never returns its Base64", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(json(message()))
+      .mockResolvedValueOnce(json({ size: pdf.byteLength, data: pdf.toString("base64url") }));
+    vi.stubGlobal("fetch", fetchMock);
+    let imported: Buffer | null = null;
+    const artifactImporter = vi.fn(async (artifact: ConnectorArtifactImport) => {
+      imported = await collect(artifact.body);
+      return { artifact: { fileId: "berry-file-1", name: artifact.name, mediaType: artifact.contentType, size: imported.byteLength } };
+    });
+
+    const result = await run({ messageId: "message-1", partId: "1" }, artifactImporter);
+
+    expect(result).toEqual({ artifact: { fileId: "berry-file-1", name: "RFP 2026.pdf", mediaType: "application/pdf", size: pdf.byteLength } });
+    expect(JSON.stringify(result)).not.toContain(pdf.toString("base64url"));
+    expect(imported!.equals(pdf)).toBe(true);
+    expect(artifactImporter).toHaveBeenCalledWith(expect.objectContaining({
+      source: "gmail",
+      sourceFileId: "message-1/1",
+      sourceRevision: sha256,
+      sourceMimeType: "application/pdf",
+      exportMimeType: null,
+      saveToLibrary: false,
+      contentType: "application/pdf",
+      declaredSize: pdf.byteLength,
+      metadata: { messageId: "message-1", threadId: "thread-1", partId: "1", filename: "RFP 2026.pdf", modifiedTime: new Date(1760000000000).toISOString() },
+    }));
+    const urls = fetchMock.mock.calls.map(([url]) => new URL(String(url)));
+    expect(urls[0]!.pathname).toBe("/gmail/v1/users/me/messages/message-1");
+    expect(urls[0]!.searchParams.get("format")).toBe("full");
+    expect(urls[1]!.pathname).toBe("/gmail/v1/users/me/messages/message-1/attachments/attachment-fresh");
+  });
+
+  it("finds the attachment by its decoded size when Gmail has issued a new attachment ID", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(json(message("attachment-reissued")))
+      .mockResolvedValueOnce(json({ size: pdf.byteLength, data: pdf.toString("base64") }));
+    vi.stubGlobal("fetch", fetchMock);
+    const artifactImporter = vi.fn(async (artifact: ConnectorArtifactImport) => {
+      await artifact.body.cancel();
+      return { artifact: { fileId: "berry-file-1" } };
+    });
+
+    await run({ messageId: "message-1", attachmentId: "attachment-from-earlier-read" }, artifactImporter);
+
+    expect(new URL(String(fetchMock.mock.calls[1]![0])).pathname).toBe("/gmail/v1/users/me/messages/message-1/attachments/attachment-from-earlier-read");
+    expect(artifactImporter).toHaveBeenCalledWith(expect.objectContaining({ name: "RFP 2026.pdf", sourceFileId: "message-1/1", sourceRevision: sha256 }));
+  });
+
+  it("refuses data that decodes to fewer bytes than Gmail declared", async () => {
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce(json(message()))
+      .mockResolvedValueOnce(json({ size: pdf.byteLength, data: pdf.subarray(0, 12).toString("base64url") })));
+    const artifactImporter = vi.fn();
+
+    await expect(run({ messageId: "message-1", partId: "1" }, artifactImporter))
+      .rejects.toThrow(`Gmail attachment data is incomplete: expected ${pdf.byteLength} bytes, decoded 12`);
+    expect(artifactImporter).not.toHaveBeenCalled();
+  });
+
+  it("refuses attachment data that is not base64url", async () => {
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce(json(message()))
+      .mockResolvedValueOnce(json({ data: "SGVsbG8$IQ" })));
+    const artifactImporter = vi.fn();
+
+    await expect(run({ messageId: "message-1", partId: "1" }, artifactImporter)).rejects.toThrow("not valid base64url");
+    expect(artifactImporter).not.toHaveBeenCalled();
+  });
+
+  it("decodes a small part Gmail returns inline and refuses a MIME container", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(json(message()))
+      .mockResolvedValueOnce(json(message()));
+    vi.stubGlobal("fetch", fetchMock);
+    let imported: Buffer | null = null;
+    const artifactImporter = vi.fn(async (artifact: ConnectorArtifactImport) => {
+      imported = await collect(artifact.body);
+      return { artifact: { fileId: "berry-file-2" } };
+    });
+
+    await run({ messageId: "message-1", partId: "0" }, artifactImporter);
+    expect(imported!.toString()).toBe("hello");
+    expect(artifactImporter).toHaveBeenCalledWith(expect.objectContaining({ name: "attachment-0.txt", contentType: "text/plain" }));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await expect(run({ messageId: "message-1", partId: "" }, artifactImporter)).rejects.toThrow("partId or attachmentId is required");
+    fetchMock.mockReset().mockResolvedValueOnce(json({ ...message(), payload: { ...message().payload, partId: "9" } }));
+    await expect(run({ messageId: "message-1", partId: "9" }, artifactImporter)).rejects.toThrow("is a container, not an attachment");
+  });
+
+  it("keeps Gmail's own response when no task file storage is available", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(json({ size: 5, data: "aGVsbG8" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(run({ messageId: "message-1", attachmentId: "attachment-1" })).resolves.toEqual({ size: 5, data: "aGVsbG8" });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("advertises partId and saveToLibrary instead of Base64 output", () => {
+    const tool = googleToolCatalog("gmail", "read", [GMAIL_READ]).find((candidate) => candidate.name === "gmail_get_attachment");
+    expect(tool?.inputSchema.required).toEqual(["messageId"]);
+    expect(Object.keys(tool?.inputSchema.properties as Record<string, unknown>)).toEqual(["messageId", "partId", "attachmentId", "saveToLibrary"]);
+    expect(tool?.description).toContain("File bytes are never placed directly in model context");
+    expect(tool?.description).not.toContain("base64url data");
+  });
+
+  it("decodes base64url strictly", () => {
+    expect(decodeBase64Url("aGVsbG8_Pndvcmxkfg").toString()).toBe("hello?>world~");
+    expect(decodeBase64Url("aGVsbG8/Pndvcmxkfg==").toString()).toBe("hello?>world~");
+    expect(decodeBase64Url("").byteLength).toBe(0);
+    expect(() => decodeBase64Url("aGVs bG8")).toThrow("not valid base64url");
+    expect(() => decodeBase64Url("aGVsb")).toThrow("not valid base64url");
+    expect(() => decodeBase64Url("aG=Vs")).toThrow("not valid base64url");
   });
 });
