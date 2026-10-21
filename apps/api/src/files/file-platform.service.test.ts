@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { FILE_RESPONSE_SECURITY_VERSION } from "@berry/shared";
 import type { SqlExecutor } from "../db/cloud-database.service.ts";
@@ -976,6 +977,104 @@ describe("FilePlatformService.importConnectorArtifact", () => {
       .toEqual([TENANT_ID, USER_ID, expect.stringMatching(/^[0-9a-f-]{36}$/)]);
     expect(executions.some(({ sql }) => sql.includes("INSERT INTO workspace_files"))).toBe(false);
     expect(executions.some(({ sql }) => sql.includes("'knowledge.extract'"))).toBe(false);
+  });
+
+  it("labels a Gmail attachment as Gmail and returns the SHA-256 of the stored bytes", async () => {
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const createdAt = new Date();
+    const bytes = Buffer.from("%PDF-1.7 attachment bytes");
+    const digest = createHash("sha256").update(bytes).digest();
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>(sql: string, params: readonly unknown[] = []) => {
+        if (sql.includes("FROM tasks") && sql.includes("workspace_id")) return [{ id: TASK_ID, workspace_id: WORKSPACE_ID }] as T[];
+        if (sql.includes("FROM sessions s")) return [{ id: SESSION_ID }] as T[];
+        if (sql.includes("f.origin='connector_import'")) return [] as T[];
+        if (sql.includes("SELECT f.id, f.blob_id") && sql.includes("FOR UPDATE OF f")) return [{ id: params[1], blob_id: "00000000-0000-8000-8000-000000000990" }] as T[];
+        if (sql.includes("INSERT INTO files")) return [{
+          id: params[0],
+          blob_id: params[3],
+          owner_user_id: USER_ID,
+          original_name: params[4],
+          display_name: params[4],
+          media_type: params[5],
+          detected_media_type: null,
+          size_bytes: params[6],
+          sha256: params[7],
+          bucket: "berry-test",
+          object_key: params[9],
+          etag: "etag",
+          object_version_id: null,
+          origin: "connector_import",
+          status: "available",
+          metadata: JSON.parse(String(params[13])),
+          created_at: createdAt,
+          updated_at: createdAt,
+        }] as T[];
+        return [] as T[];
+      },
+    };
+    const database = { withTenant: async (_tenantId: string, callback: (tenantExecutor: SqlExecutor) => Promise<unknown>) => callback(executor) };
+    const objectMetadata: Array<Record<string, string> | undefined> = [];
+    const client = {
+      send: vi.fn(async (command: { constructor: { name: string }; input?: { Metadata?: Record<string, string> } }) => {
+        if (command.constructor.name === "CreateMultipartUploadCommand") {
+          objectMetadata.push(command.input?.Metadata);
+          return { UploadId: "gmail-upload" };
+        }
+        if (command.constructor.name === "UploadPartCommand") return { ETag: '"part-etag"' };
+        if (command.constructor.name === "CompleteMultipartUploadCommand") return { ETag: '"etag"' };
+        throw new Error(`Unexpected S3 command: ${command.constructor.name}`);
+      }),
+    };
+    const service = new FilePlatformService(database as never, {
+      client,
+      presignClient: client,
+      bucket: "berry-test",
+      prefix: "artifacts",
+      maxUploadBytes: 1024 * 1024,
+      maxIndexableBytes: 1024 * 1024,
+      partSize: 5 * 1024 * 1024,
+      presignSeconds: 900,
+    } as never);
+
+    const result = await service.importConnectorArtifact(TENANT_ID, USER_ID, {
+      source: "gmail",
+      connectorKey: "gmail",
+      accountEmail: "person@example.com",
+      sourceFileId: "message-1/1",
+      sourceRevision: digest.toString("hex"),
+      sourceMimeType: "application/pdf",
+      exportMimeType: null,
+      saveToLibrary: false,
+      name: "RFP.pdf",
+      contentType: "application/pdf",
+      declaredSize: bytes.byteLength,
+      sourceMetadata: { messageId: "message-1", threadId: "thread-1", partId: "1", filename: "RFP.pdf", modifiedTime: "2025-10-09T08:53:20.000Z" },
+      body: new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(bytes); controller.close(); } }),
+      taskId: TASK_ID,
+      sessionId: SESSION_ID,
+    });
+
+    expect(result).toEqual({ artifact: expect.objectContaining({
+      name: "RFP.pdf",
+      size: bytes.byteLength,
+      sha256: digest.toString("hex"),
+      sha256Base64: digest.toString("base64"),
+      source: "gmail",
+      sourceFileId: "message-1/1",
+      library: false,
+      reused: false,
+    }) });
+    expect(objectMetadata).toEqual([expect.objectContaining({ source: "gmail" })]);
+    const blobMetadata = JSON.parse(String(executions.find(({ sql }) => sql.includes("INSERT INTO file_blobs"))?.params[8]));
+    expect(blobMetadata).toMatchObject({
+      source: "gmail",
+      expectedSha256: digest.toString("hex"),
+      sourceModifiedTime: "2025-10-09T08:53:20.000Z",
+      gmail: { messageId: "message-1", threadId: "thread-1", partId: "1", filename: "RFP.pdf" },
+    });
+    expect(JSON.stringify(blobMetadata)).not.toContain("google-drive");
   });
 
   it("promotes a previously temporary Drive file when the model decides to keep it", async () => {

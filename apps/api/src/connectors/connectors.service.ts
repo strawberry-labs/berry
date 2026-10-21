@@ -28,7 +28,7 @@ import {
   googleConnectorScopes,
   googleToolCatalog,
   googleToolsRequiringApproval,
-  type DriveArtifactImport,
+  type ConnectorArtifactImport,
   type GoogleConnectorKey,
 } from "./google-tools.ts";
 
@@ -812,14 +812,14 @@ export class ConnectorsService {
     connectorKey: string,
     request: unknown,
     options: {
-      importDriveArtifact?: (context: {
+      importArtifact?: (context: {
         tenantId: string;
         userId: string;
         taskId: string;
         sessionId: string;
         connectorKey: GoogleConnectorKey;
         accountEmail: string | null;
-      }, input: DriveArtifactImport) => Promise<unknown>;
+      }, input: ConnectorArtifactImport) => Promise<unknown>;
     } = {},
   ): Promise<{ status: number; body?: unknown }> {
     if (!isGoogleKey(connectorKey)) return { status: 404, body: rpcError(null, -32601, "Unknown connector") };
@@ -847,8 +847,8 @@ export class ConnectorsService {
       const name = requiredTokenString(params.name, "tool name");
       const args = params.arguments && typeof params.arguments === "object" && !Array.isArray(params.arguments) ? params.arguments as Record<string, unknown> : {};
       const accessToken = await this.#googleAccessToken(session.tenantId, row, connection);
-      const driveArtifactImporter = session.taskId && session.sessionId && options.importDriveArtifact
-        ? (artifact: DriveArtifactImport) => options.importDriveArtifact!({
+      const artifactImporter = session.taskId && session.sessionId && options.importArtifact
+        ? (artifact: ConnectorArtifactImport) => options.importArtifact!({
             tenantId: session.tenantId,
             userId: session.userId,
             taskId: session.taskId!,
@@ -865,7 +865,7 @@ export class ConnectorsService {
         args,
         connection.account_email,
         grantedScopes,
-        driveArtifactImporter ? { driveArtifactImporter } : {},
+        artifactImporter ? { artifactImporter } : {},
       );
       return { status: 200, body: { jsonrpc: "2.0", id: rpc.id, result: { content: [{ type: "text", text: googleToolText(result) }], structuredContent: result, isError: false } } };
     } catch (cause) {
@@ -1231,6 +1231,9 @@ function googleToolText(result: unknown): string {
           name: item.name,
           mediaType: item.mediaType,
           size: item.size,
+          sha256: item.sha256,
+          sha256Base64: item.sha256Base64,
+          source: item.source,
           status: item.status,
           reused: item.reused,
           library: item.library === true,
