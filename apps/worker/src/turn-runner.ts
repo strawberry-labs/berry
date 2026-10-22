@@ -1,4 +1,5 @@
 import { environmentCheckDefinition, environmentCheckFromBash } from "./environment-check.js";
+import { fileUploadDefinition } from "./file-upload.js";
 import { limitModelImagePayload, modelImageLabelPath } from "./model-image.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -6380,6 +6381,16 @@ function durableToolPolicy(name: string, permissionMode: string): {
       approvalKind: "file-edit",
     };
   }
+  if (name === "upload_file") {
+    // A PUT of the same bytes to the same URL is safe to repeat, so a lost
+    // reply is retried rather than held. It sends data out like bash can.
+    return {
+      retryClass: "idempotent",
+      repeatPolicy: "block_after_success",
+      requiresApproval: permissionMode !== "full-access",
+      approvalKind: "shell",
+    };
+  }
   if (name === "inspect_images") {
     return {
       retryClass: "idempotent_with_key",
@@ -6555,6 +6566,7 @@ function durableBuiltInToolGuidance(toolNames: readonly string[]): string {
       "Coding tools: read (read text and extract supported documents and archives), bash (execute Bash commands), edit (precise exact-text replacements, including multiple disjoint edits), write (create or overwrite files), grep (search file contents and respect .gitignore), find (find files by glob and respect .gitignore), and ls (list directory contents). Empty or unchanged output is not progress; do not repeat identical completed calls. Change inputs or strategy, and poll only when supported.",
       "Use read to examine files instead of cat or sed.",
       ...(toolNames.includes("bash") ? ["Use check_environment for installed executable names and Python module availability. A missing optional dependency is a normal result: choose an available alternative. It does not execute programs or import module code, so availability alone does not verify that an import works."] : []),
+      ...(toolNames.includes("bash") ? ["To send a workspace file to an upload URL that a connector returned, use upload_file with the URL and headers exactly as returned, not curl."] : []),
       "For an uploaded PDF, Word document, spreadsheet, presentation, or ZIP, call read on the exact Sandbox path first. For a ZIP, read its inventory and then read only the extracted documents relevant to the task. For PDFs, use page_start/page_end instead of guessing line ranges. Use the matching format skill when visual layout, formulas, rendering, or editing matter. Use shell-based extraction only when read reports that the format is unsupported or has no extractable text.",
       "Use edit for precise changes; every edits[].oldText must match exactly and uniquely in the original file.",
       "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls.",
@@ -7542,8 +7554,9 @@ export function durableBuiltInToolDefinitions(snapshot: DurableTurnSnapshot): Ch
     return definition ? [definition] : [];
   });
   // Derived from admitted bash: no runtime-request schema change, and no
-  // per-call data changes the tool list.
-  if (enabled.has("bash")) definitions.push(environmentCheckDefinition);
+  // per-call data changes the tool list. upload_file reaches only what the
+  // sandbox's network policy allows.
+  if (enabled.has("bash")) definitions.push(environmentCheckDefinition, fileUploadDefinition);
   const skills = durableSkills(snapshot);
   if (enabled.has("activate_skill") && skills.length > 0) {
     definitions.push({
@@ -7575,6 +7588,7 @@ export function durableBuiltInToolDefinitions(snapshot: DurableTurnSnapshot): Ch
 
 export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
   environmentCheckDefinition,
+  fileUploadDefinition,
   {
     type: "function" as const,
     function: {

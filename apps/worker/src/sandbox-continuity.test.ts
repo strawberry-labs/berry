@@ -1557,6 +1557,75 @@ describe("SandboxContinuityManager", () => {
     });
   });
 
+  describe("upload_file", () => {
+    const url = "https://bucket.s3.eu-west-1.amazonaws.com/rfp/RFP.pdf?X-Amz-Credential=key&X-Amz-Signature=abc123";
+    const pdf = Buffer.from("%PDF-1.7 attachment \u0000ÿ bytes", "latin1");
+    const allowed = (): DurableTurnSnapshot => ({ ...snapshot(), runtimeRequest: { networkPolicy: { egress: "on", allowedDomains: ["*.amazonaws.com"] } } });
+    const sandboxFiles = (sizeBytes = pdf.byteLength) => ({
+      read: vi.fn(async () => ({ path: "/workspace/inputs/file-1/RFP.pdf", content: pdf.toString("base64"), encoding: "base64" })),
+      write: vi.fn(),
+      list: vi.fn(async () => ({ entries: [{ path: "/workspace/inputs/file-1/RFP.pdf", type: "file", size_bytes: sizeBytes }] })),
+    });
+    const upload = (args: Record<string, unknown> = {}) => toolStep("upload_file", { path: "inputs/file-1/RFP.pdf", url, headers: { "Content-Type": "application/pdf" }, ...args });
+
+    it("reads the workspace file and PUTs its exact bytes", async () => {
+      const files = sandboxFiles();
+      const uploadFetch = vi.fn<typeof fetch>(async () => new Response(null, { status: 200, headers: { etag: '"etag-1"' } }));
+      const manager = managerWithProvider(files, undefined, { uploadFetch });
+
+      const result = await manager.execute(allowed(), upload());
+
+      expect(files.read).toHaveBeenCalledWith({ sandbox_id: "sandbox-contract", path: "/workspace/inputs/file-1/RFP.pdf", encoding: "base64" }, undefined);
+      expect(uploadFetch).toHaveBeenCalledOnce();
+      const [sentTo, init] = uploadFetch.mock.calls[0]!;
+      expect(sentTo).toBe(url);
+      expect(init?.method).toBe("PUT");
+      expect(Buffer.from(init?.body as Uint8Array).equals(pdf)).toBe(true);
+      expect(result.output).toMatchObject({
+        path: "/workspace/inputs/file-1/RFP.pdf",
+        destination: "https://bucket.s3.eu-west-1.amazonaws.com/rfp/RFP.pdf",
+        status: 200,
+        sizeBytes: pdf.byteLength,
+        etag: '"etag-1"',
+      });
+      expect(JSON.stringify(result.output)).not.toContain("X-Amz-Signature");
+    });
+
+    it("applies the task's network policy before reading the file", async () => {
+      const files = sandboxFiles();
+      const uploadFetch = vi.fn<typeof fetch>();
+      const manager = managerWithProvider(files, undefined, { uploadFetch });
+
+      await expect(manager.execute(snapshot(), upload())).rejects.toThrow("blocks outbound network access");
+      await expect(manager.execute({ ...snapshot(), runtimeRequest: { networkPolicy: { egress: "on", allowedDomains: ["pypi.org"] } } } as DurableTurnSnapshot, upload()))
+        .rejects.toThrow("An organization admin must allow the hostname in Execution & network");
+      expect(files.read).not.toHaveBeenCalled();
+      expect(uploadFetch).not.toHaveBeenCalled();
+    });
+
+    it("says nothing was sent for a missing, oversized or outside file", async () => {
+      const uploadFetch = vi.fn<typeof fetch>();
+      const missing = { ...sandboxFiles(), list: vi.fn(async () => ({ entries: [] })) };
+      await expect(managerWithProvider(missing, undefined, { uploadFetch }).execute(allowed(), upload()))
+        .rejects.toThrow("/workspace/inputs/file-1/RFP.pdf does not exist in the workspace. Nothing was sent.");
+      const oversized = sandboxFiles(200 * 1024 * 1024);
+      await expect(managerWithProvider(oversized, undefined, { uploadFetch }).execute(allowed(), upload()))
+        .rejects.toThrow("exceeds the 104857600-byte upload limit. Nothing was sent.");
+      expect(oversized.read).not.toHaveBeenCalled();
+      await expect(managerWithProvider(sandboxFiles(), undefined, { uploadFetch }).execute(allowed(), upload({ path: "/etc/passwd" })))
+        .rejects.toThrow("Sandbox reads must remain under /workspace");
+      expect(uploadFetch).not.toHaveBeenCalled();
+    });
+
+    it("refuses invalid arguments before any sandbox calls", async () => {
+      const files = sandboxFiles();
+      const manager = managerWithProvider(files);
+      await expect(manager.execute(allowed(), upload({ url: "http://bucket.example.com/key" }))).rejects.toThrow("upload_file was not run");
+      expect(files.list).not.toHaveBeenCalled();
+      expect(files.read).not.toHaveBeenCalled();
+    });
+  });
+
   describe("Python failure hints (H-008)", () => {
     const python = (args: string[], cwd?: string) => {
       const result = spawnSync("python3", args, { encoding: "utf8", ...(cwd ? { cwd } : {}) });
@@ -5696,6 +5765,7 @@ function managerWithProvider(
     cwd?: string;
     documentTextExtractor?: (input: { bytes: Uint8Array; mediaType: string }) => Promise<string>;
     recordTiming?: (timing: PreparationTiming) => Promise<void>;
+    uploadFetch?: typeof fetch;
   } = {},
 ): SandboxContinuityManager {
   const { recordTiming, ...managerOptions } = options;

@@ -850,6 +850,9 @@ type ConnectorArtifact = {
   name: string;
   mediaType: string;
   library: boolean | null;
+  size?: number;
+  sha256?: string;
+  sha256Base64?: string;
 };
 
 type StagedConnectorArtifact = {
@@ -899,7 +902,19 @@ function connectorArtifact(value: unknown): ConnectorArtifact | null {
   const name = stringValue(artifact?.name);
   const mediaType = stringValue(artifact?.mediaType);
   const library = typeof artifact?.library === "boolean" ? artifact.library : null;
-  return fileId && name && mediaType ? { fileId, name, mediaType, library } : null;
+  if (!fileId || !name || !mediaType) return null;
+  const size = typeof artifact?.size === "number" && Number.isSafeInteger(artifact.size) && artifact.size >= 0 ? artifact.size : undefined;
+  const sha256 = stringValue(artifact?.sha256);
+  const sha256Base64 = stringValue(artifact?.sha256Base64);
+  return {
+    fileId,
+    name,
+    mediaType,
+    library,
+    ...(size !== undefined ? { size } : {}),
+    ...(sha256 && /^[0-9a-f]{64}$/i.test(sha256) ? { sha256 } : {}),
+    ...(sha256Base64 && /^[A-Za-z0-9+/]{43}=$/.test(sha256Base64) ? { sha256Base64 } : {}),
+  };
 }
 
 export function connectorArtifactText(
@@ -928,9 +943,17 @@ export function connectorArtifactText(
   const persistence = artifact.library === false
     ? "It was not added to the Berry Library or project knowledge."
     : "";
+  // Exact facts about the stored bytes, for checks and upload checksums.
+  const facts = [
+    `Media type: ${artifact.mediaType}`,
+    ...(artifact.size !== undefined ? [`Size: ${artifact.size} bytes`] : []),
+    ...(artifact.sha256 ? [`SHA-256 (hex): ${artifact.sha256}`] : []),
+    ...(artifact.sha256Base64 ? [`SHA-256 (base64): ${artifact.sha256Base64}`] : []),
+  ].join(". ");
   return [
     disposition,
     storage,
+    `${facts}.`,
     persistence,
     staged ? documentProcessingHint(staged.name, staged.mediaType, artifact.library !== false) : "",
   ].filter(Boolean).join("\n");

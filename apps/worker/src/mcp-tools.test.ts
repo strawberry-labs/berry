@@ -643,6 +643,18 @@ describe("connector artifact staging", () => {
     expect(text).not.toContain("still verifying");
   });
 
+  it("states the stored file's exact size and SHA-256 when the connector supplies them", () => {
+    const sha256 = "9f".repeat(32);
+    const sha256Base64 = Buffer.from(sha256, "hex").toString("base64");
+    const text = connectorArtifactText(
+      { fileId: "file-1", name: "RFP.pdf", mediaType: "application/pdf", library: false, size: 48231, sha256, sha256Base64 },
+      { name: "RFP.pdf", mediaType: "application/pdf", path: "/workspace/inputs/file-1/RFP.pdf" },
+    );
+
+    expect(text).toContain("Sandbox path: /workspace/inputs/file-1/RFP.pdf");
+    expect(text).toContain(`Media type: application/pdf. Size: 48231 bytes. SHA-256 (hex): ${sha256}. SHA-256 (base64): ${sha256Base64}.`);
+  });
+
   it("labels intentionally persisted Drive downloads as Library files", () => {
     const text = connectorArtifactText(
       { fileId: "file-1", name: "brief.pdf", mediaType: "application/pdf", library: true },
@@ -669,10 +681,10 @@ describe("connector import readiness receipts (H-068)", () => {
 
   // One Drive tool whose remote call returns a connector receipt like task
   // 2743dd77's: a Berry file id and metadata, but no sandbox path.
-  function readinessExecutor(stage: NonNullable<DurableTurnToolExecutor["stageAssociatedInputFiles"]>) {
+  function readinessExecutor(stage: NonNullable<DurableTurnToolExecutor["stageAssociatedInputFiles"]>, receipt: Record<string, unknown> = artifact) {
     const remote = vi.fn(async () => ({
-      content: [{ type: "text" as const, text: JSON.stringify({ artifact }) }],
-      details: { structuredContent: { artifact } },
+      content: [{ type: "text" as const, text: JSON.stringify({ artifact: receipt }) }],
+      details: { structuredContent: { artifact: receipt } },
     }));
     const listTools = McpToolSource.prototype.listTools;
     vi.spyOn(McpToolSource.prototype, "listTools").mockImplementation(function (this: McpToolSource) {
@@ -714,6 +726,31 @@ describe("connector import readiness receipts (H-068)", () => {
       artifacts: [{ fileId, name: "site photo.png", mediaType: "image/png", path }],
     });
     expect(String(record(result.output)?.content)).toContain(`Sandbox path: ${path}`);
+  });
+
+  it("passes the connector's size and SHA-256 to the model", async () => {
+    const sha256 = "ab".repeat(32);
+    const sha256Base64 = Buffer.from(sha256, "hex").toString("base64");
+    const { tools } = readinessExecutor(async () => [{ fileId, name: artifact.name, mediaType: artifact.mediaType, path }], { ...artifact, sha256, sha256Base64 });
+    const snapshot = driveSnapshot();
+    const step = driveStep(1);
+    snapshot.steps.push(step);
+
+    const text = String(record((await tools.execute(snapshot, step)).output)?.content);
+
+    expect(text).toContain(`Size: 425382 bytes. SHA-256 (hex): ${sha256}. SHA-256 (base64): ${sha256Base64}.`);
+  });
+
+  it("leaves out a digest that is not a SHA-256", async () => {
+    const { tools } = readinessExecutor(async () => [{ fileId, name: artifact.name, mediaType: artifact.mediaType, path }], { ...artifact, sha256: "not-a-digest", sha256Base64: "short" });
+    const snapshot = driveSnapshot();
+    const step = driveStep(1);
+    snapshot.steps.push(step);
+
+    const text = String(record((await tools.execute(snapshot, step)).output)?.content);
+
+    expect(text).toContain("Size: 425382 bytes.");
+    expect(text).not.toContain("SHA-256");
   });
 
   it("reports pending verification, then resumes staging without a second remote download", async () => {
