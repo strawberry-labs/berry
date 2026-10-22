@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM node:22-bookworm-slim AS workspace
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS workspace
 
 WORKDIR /app
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
@@ -98,7 +98,7 @@ RUN --mount=type=cache,id=berry-turbo,target=/app/.turbo \
   corepack pnpm --filter @berry/web... build \
   && corepack pnpm --filter @berry/web deploy --prod --legacy /out/apps/web
 
-FROM node:22-bookworm-slim AS runtime-base
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS runtime-base
 
 WORKDIR /app
 ARG BERRY_RDS_CA_BUNDLE_URL=https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
