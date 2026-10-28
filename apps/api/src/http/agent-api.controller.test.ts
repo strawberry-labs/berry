@@ -237,14 +237,67 @@ describe("AgentApiController", () => {
     }));
   });
 
-  it("caps optional durable admission preparation below the two-second SLA", () => {
-    expect(durableAdmissionPreparationTimeoutMs({})).toBe(1_500);
+  it("waits up to fifteen seconds per optional admission step, configurable up to thirty", () => {
+    expect(durableAdmissionPreparationTimeoutMs({})).toBe(15_000);
     expect(durableAdmissionPreparationTimeoutMs({
       BERRY_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS: "5000",
-    })).toBe(1_500);
+    })).toBe(5_000);
+    expect(durableAdmissionPreparationTimeoutMs({
+      BERRY_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS: "120000",
+    })).toBe(30_000);
     expect(durableAdmissionPreparationTimeoutMs({
       BERRY_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS: "25",
     })).toBe(25);
+  });
+
+  it("keeps connectors when an earlier preparation step uses its whole timeout", async () => {
+    vi.stubEnv("BERRY_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS", "50");
+    const never = new Promise<never>(() => undefined);
+    const contextAssembly = {
+      assemble: vi.fn(() => never),
+      portableCheckpoint: vi.fn(() => never),
+    };
+    const admit = vi.fn(async (input: DurableTurnAdmission) => ({
+      runId: "turn_connectors_kept",
+      sessionId: input.sessionId,
+    }));
+    const repository = new InMemoryModelGovernanceRepository(false);
+    await repository.upsertPolicy({
+      tenantId: SELF_HOST_TENANT_ID,
+      providerId: "router",
+      model: "chat-model",
+      status: "allowed",
+      enforce: false,
+      modeAllow: ["chat", "code"],
+    });
+    app = await createApp(fakeSessionHost(), {
+      contextAssembly,
+      modelGovernance: new ModelGovernanceService(repository),
+      runtimeConfig: chatRuntimeConfig(),
+      durableTurns: { enabled: true, replayAdmission: async () => null, admit },
+    });
+    const mcp = await request(app.getHttpServer())
+      .post("/v1/me/mcp")
+      .set(authHeader())
+      .send({ name: "Remote tools", url: "https://mcp.example.test/rpc", transport: "streamable-http", auth: "bearer", credential: "super-secret", trusted: true })
+      .expect(201);
+    const created = await request(app.getHttpServer())
+      .post("/v1/tasks")
+      .set(authHeader())
+      .send({ workspaceId: "workspace_cloud", title: "Slow grounding" })
+      .expect(201);
+
+    await request(app.getHttpServer())
+      .post(`/v1/sessions/${created.body.session.id}/turns`)
+      .set(authHeader())
+      .send({ input: "Use my connector", workspacePath: "/workspace" })
+      .expect(201);
+
+    // Grounding hangs until its own timeout. Connector setup starts after
+    // that and must still get its full time instead of an already spent one.
+    const runtimeRequest = admit.mock.calls[0]?.[0].runtimeRequest;
+    expect(runtimeRequest?.mcpServers).toEqual([expect.objectContaining({ id: mcp.body.id })]);
+    expect(runtimeRequest).not.toHaveProperty("capabilityNotices");
   });
 
   it("admits with degraded context when context and checkpoint preparation hang", async () => {
