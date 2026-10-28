@@ -4,7 +4,18 @@ import type { KnowledgeIndexTaskJobPayload, KnowledgeRevisionJobPayload } from "
 import { knowledgeDerivativeKey, SqlKnowledgeRepository } from "./repository.js";
 import { DocumentExtractor, KnowledgeChunker, type KnowledgeObjectStore } from "./services.js";
 
-const EMBEDDING_BATCH_SIZE = 32;
+// Index jobs embed a few chunks per request and take turns, so a live search
+// on the same embedding server waits behind at most one small batch.
+const EMBEDDING_BATCH_SIZE = 4;
+const DEFAULT_MAX_EMBEDDED_CHUNKS = 5_000;
+// Prose and tables with headings are well above this share of letters; mesh
+// exports, coordinate lists and binary noise sit near or below a tenth.
+const MIN_EMBEDDABLE_LETTER_SHARE = 0.15;
+// A file where fewer than half the chunks have words is data, not a document,
+// and stays keyword-only. Real documents are well above half; a mesh export
+// with load labels sits near a third (its labels and exponents count as
+// letters).
+const MIN_WORDY_CHUNK_SHARE = 0.5;
 
 export type KnowledgeJobName =
   | "knowledge.extract"
@@ -20,9 +31,12 @@ export type KnowledgeProcessorDependencies = {
   extractor: DocumentExtractor;
   chunker: KnowledgeChunker;
   embeddings: EmbeddingProvider | null;
+  maxEmbeddedChunks?: number;
 };
 
 export class KnowledgeProcessor {
+  #embeddingTurn: Promise<unknown> = Promise.resolve();
+
   constructor(private readonly dependencies: KnowledgeProcessorDependencies) {}
 
   async process(name: KnowledgeJobName, payload: KnowledgeRevisionJobPayload | KnowledgeIndexTaskJobPayload): Promise<unknown> {
@@ -132,16 +146,24 @@ export class KnowledgeProcessor {
       await this.dependencies.repository.markEmbeddingRetryable(payload.tenantId, payload.sourceId, payload.revision, "Embedding provider is unavailable; full-text search remains active");
       return { stale: false, degraded: true };
     }
+    // Every chunk stays keyword-searchable. Vectors are only worth computing
+    // for documents, for the chunks with words in them, and a file's first
+    // chunks are enough to make it findable, so one huge file cannot hold the
+    // embedding service for hours.
+    const wordy = chunks.filter((chunk) => letterShare(chunk.text) >= MIN_EMBEDDABLE_LETTER_SHARE);
+    const embeddable = wordy.length < chunks.length * MIN_WORDY_CHUNK_SHARE
+      ? []
+      : wordy.slice(0, this.dependencies.maxEmbeddedChunks ?? DEFAULT_MAX_EMBEDDED_CHUNKS);
     try {
       const vectors: number[][] = [];
-      for (let offset = 0; offset < chunks.length; offset += EMBEDDING_BATCH_SIZE) {
-        const batch = chunks.slice(offset, offset + EMBEDDING_BATCH_SIZE);
-        vectors.push(...await this.dependencies.embeddings.embed(batch.map((chunk) => chunk.text)) as number[][]);
+      for (let offset = 0; offset < embeddable.length; offset += EMBEDDING_BATCH_SIZE) {
+        const batch = embeddable.slice(offset, offset + EMBEDDING_BATCH_SIZE);
+        vectors.push(...await this.embedInTurn(this.dependencies.embeddings, batch.map((chunk) => chunk.text)));
       }
       await this.dependencies.repository.saveEmbeddings({
         tenantId: payload.tenantId,
         source,
-        chunks,
+        chunks: embeddable,
         vectors,
         profile: this.dependencies.embeddings.profile,
       });
@@ -157,6 +179,12 @@ export class KnowledgeProcessor {
     }
   }
 
+  private embedInTurn(embeddings: EmbeddingProvider, texts: readonly string[]): Promise<number[][]> {
+    const result = this.#embeddingTurn.then(() => embeddings.embed(texts) as Promise<number[][]>);
+    this.#embeddingTurn = result.catch(() => undefined);
+    return result;
+  }
+
   private async indexTask(payload: KnowledgeIndexTaskJobPayload): Promise<{ stale: boolean; chunks?: number }> {
     const result = await this.dependencies.repository.createTaskOutcomeSource(payload);
     if (!result) return { stale: true };
@@ -164,4 +192,10 @@ export class KnowledgeProcessor {
     await this.dependencies.repository.replaceChunks({ tenantId: payload.tenantId, source: result.source, chunks });
     return { stale: false, chunks: chunks.length };
   }
+}
+
+export function letterShare(text: string): number {
+  const visible = text.replace(/\s/gu, "");
+  if (!visible) return 0;
+  return (visible.match(/\p{L}/gu)?.length ?? 0) / visible.length;
 }

@@ -847,6 +847,14 @@ export const DurableContextConfigSchema = z.object({
   // because they are Berry's own output, not source material (H-040).
   retrievalMinSimilarity: z.coerce.number().min(0).max(1).default(0.15),
   retrievalTaskOutcomeMinSimilarity: z.coerce.number().min(0).max(1).default(0.45),
+  // Query embeddings and personal memory recall take tens of milliseconds on
+  // an idle embedding service. Past these limits a turn continues with keyword
+  // results and Berry's own memories instead of waiting.
+  retrievalEmbeddingTimeoutMs: EnvPositiveIntegerSchema.default(400),
+  personalMemoryRecallTimeoutMs: EnvPositiveIntegerSchema.default(800),
+  // Chunks past this count stay keyword-searchable without vectors, so one
+  // huge file cannot hold the embedding service for hours.
+  knowledgeMaxEmbeddedChunks: EnvPositiveIntegerSchema.default(5000),
   runLeaseSeconds: EnvPositiveIntegerSchema.default(90),
   sandboxSnapshotIntervalSeconds: EnvPositiveIntegerSchema.default(900),
   knowledgeMaxInputBytes: EnvPositiveIntegerSchema.default(104857600),
@@ -898,6 +906,9 @@ export function durableContextConfigFromEnv(env: Record<string, string | undefin
     retrievalTokenBudget: env.BERRY_RETRIEVAL_TOKEN_BUDGET,
     retrievalMinSimilarity: env.BERRY_RETRIEVAL_MIN_SIMILARITY,
     retrievalTaskOutcomeMinSimilarity: env.BERRY_RETRIEVAL_TASK_OUTCOME_MIN_SIMILARITY,
+    retrievalEmbeddingTimeoutMs: env.BERRY_RETRIEVAL_EMBEDDING_TIMEOUT_MS,
+    personalMemoryRecallTimeoutMs: env.BERRY_PERSONAL_MEMORY_RECALL_TIMEOUT_MS,
+    knowledgeMaxEmbeddedChunks: env.BERRY_KNOWLEDGE_MAX_EMBEDDED_CHUNKS,
     runLeaseSeconds: env.BERRY_RUN_LEASE_SECONDS,
     sandboxSnapshotIntervalSeconds: env.BERRY_SANDBOX_SNAPSHOT_INTERVAL_SECONDS,
     knowledgeMaxInputBytes: env.BERRY_KNOWLEDGE_MAX_INPUT_BYTES,
