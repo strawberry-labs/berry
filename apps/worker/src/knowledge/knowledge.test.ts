@@ -470,66 +470,65 @@ describe("knowledge ingestion and ranking", () => {
 
     await processor.process("knowledge.embed", { tenantId, sourceId, revision: "revision-1" });
 
-    expect(requestSizes).toEqual([32, 32, 1]);
+    expect(requestSizes).toEqual([...Array.from({ length: 16 }, () => 4), 1]);
     expect(savedVectorCount).toBe(65);
   });
 
   it("embeds only chunks with words in them, up to the per-file limit", async () => {
-    const source = {
-      id: sourceId,
-      tenantId,
-      workspaceId: "00000000-0000-7000-8000-000000000003",
-      userId: null,
-      sourceType: "file" as const,
-      sourceId: "00000000-0000-7000-8000-000000000004",
-      revision: "revision-1",
-      contentHash: "source-hash",
-      title: "3 - Thicker -Mesh.txt",
-      visibility: "project" as const,
-      status: "indexed",
-      mediaType: "text/plain",
-      bucket: "test",
-      objectKey: "mesh.txt",
-      derivativeObjectKey: "mesh.extract.txt",
-      inlineText: null,
-      tombstonedAt: null,
-    };
-    // Shape of the production mesh export: about a tenth of it is letters.
-    const meshLine = "Node                  1234       1     1.23456789012345E+0     -1.23456789012345E+0      1.23456789012345E+0\n";
     const chunks = [
-      ...Array.from({ length: 40 }, (_, ordinal) => ({ id: `mesh-${ordinal}`, text: meshLine.repeat(8), ordinal, tokenEstimate: 200 })),
-      ...Array.from({ length: 6 }, (_, index) => ({
-        id: `prose-${index}`,
-        text: `Section ${index}: the louvre screen hides the davit ropes on the far side.`,
-        ordinal: 40 + index,
-        tokenEstimate: 20,
-      })),
+      ...Array.from({ length: 2 }, (_, ordinal) => chunk(`mesh-${ordinal}`, MESH_NODE_LINE.repeat(8), ordinal)),
+      ...Array.from({ length: 6 }, (_, index) => chunk(`prose-${index}`, `Section ${index}: the louvre screen hides the davit ropes on the far side.`, 2 + index)),
     ];
-    let saved: readonly { id: string }[] = [];
-    const repository = {
-      loadSource: async () => source,
-      listChunks: async () => chunks,
-      saveEmbeddings: async (input: { chunks: readonly { id: string }[]; vectors: readonly number[][] }) => {
-        expect(input.vectors).toHaveLength(input.chunks.length);
-        saved = input.chunks;
-      },
-      markEmbeddingRetryable: async () => undefined,
-    } as unknown as SqlKnowledgeRepository;
-    const embed = vi.fn(async (texts: readonly string[]) => texts.map(() => [0.25, 0.75]));
-    const processor = new KnowledgeProcessor({
-      repository,
-      objects: {} as KnowledgeObjectStore,
-      extractor: new DocumentExtractor("http://tika.invalid"),
-      chunker: new KnowledgeChunker(),
-      embeddings: { profile: { id: "profile-v2", provider: "fixture", model: "fixture", dimensions: 2, version: 2 }, embed },
-      maxEmbeddedChunks: 4,
-    });
+    const { processor, embed, saved } = embeddingFixture(chunks, { maxEmbeddedChunks: 4 });
 
     await processor.process("knowledge.embed", { tenantId, sourceId, revision: "revision-1" });
 
-    expect(letterShare(meshLine)).toBeLessThan(0.15);
-    expect(saved.map((chunk) => chunk.id)).toEqual(["prose-0", "prose-1", "prose-2", "prose-3"]);
+    expect(letterShare(MESH_NODE_LINE)).toBeLessThan(0.15);
+    expect(saved.map((item) => item.id)).toEqual(["prose-0", "prose-1", "prose-2", "prose-3"]);
     expect(embed).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a mostly-numbers file keyword-only even when some of its lines have labels", async () => {
+    // Shape of the production mesh export: load lines carry a label and
+    // exponents, so they pass the per-chunk letter test, but most of the file
+    // is still numbers.
+    const chunks = [
+      ...Array.from({ length: 30 }, (_, ordinal) => chunk(`node-${ordinal}`, MESH_NODE_LINE.repeat(8), ordinal)),
+      ...Array.from({ length: 14 }, (_, ordinal) => chunk(`load-${ordinal}`, MESH_LOAD_LINE.repeat(8), 30 + ordinal)),
+      ...Array.from({ length: 6 }, (_, index) => chunk(`header-${index}`, `Model ${index}: thicker mesh for the facade bracket.`, 44 + index)),
+    ];
+    const { processor, embed, saved, finished } = embeddingFixture(chunks);
+
+    await processor.process("knowledge.embed", { tenantId, sourceId, revision: "revision-1" });
+
+    expect(letterShare(MESH_LOAD_LINE)).toBeGreaterThanOrEqual(0.15);
+    expect(embed).not.toHaveBeenCalled();
+    expect(saved).toEqual([]);
+    expect(finished()).toBe(true);
+  });
+
+  it("makes index jobs take turns on the embedding server, a few chunks at a time", async () => {
+    const chunks = Array.from({ length: 10 }, (_, index) => chunk(`prose-${index}`, `Clause ${index}: davit anchors are tested before each facade drop.`, index));
+    let inFlight = 0;
+    let mostInFlight = 0;
+    const { processor, embed } = embeddingFixture(chunks, {
+      embed: async (texts) => {
+        inFlight += 1;
+        mostInFlight = Math.max(mostInFlight, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        inFlight -= 1;
+        return texts.map(() => [0.25, 0.75]);
+      },
+    });
+
+    await Promise.all([
+      processor.process("knowledge.embed", { tenantId, sourceId, revision: "revision-1" }),
+      processor.process("knowledge.embed", { tenantId, sourceId, revision: "revision-1" }),
+    ]);
+
+    expect(mostInFlight).toBe(1);
+    expect(embed).toHaveBeenCalledTimes(6);
+    expect(Math.max(...embed.mock.calls.map(([texts]) => texts.length))).toBeLessThanOrEqual(4);
   });
 
   it("builds a bounded task outcome and removes credentials before project indexing", () => {
@@ -575,3 +574,57 @@ describe("knowledge ingestion and ranking", () => {
     expect(redacted).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz");
   });
 });
+
+const MESH_NODE_LINE = "Node                  1234       1     1.23456789012345E+0     -1.23456789012345E+0      1.23456789012345E+0\n";
+const MESH_LOAD_LINE = "BkGlobalLoad 2 18228 0 3 0.00000000000000E+0 1.10000000000000E+0 0.00000000000000E+0\n";
+
+function chunk(id: string, text: string, ordinal: number) {
+  return { id, text, ordinal, tokenEstimate: 200 };
+}
+
+function embeddingFixture(
+  chunks: readonly ReturnType<typeof chunk>[],
+  options: { maxEmbeddedChunks?: number; embed?: (texts: readonly string[]) => Promise<number[][]> } = {},
+) {
+  const source = {
+    id: sourceId,
+    tenantId,
+    workspaceId: "00000000-0000-7000-8000-000000000003",
+    userId: null,
+    sourceType: "file" as const,
+    sourceId: "00000000-0000-7000-8000-000000000004",
+    revision: "revision-1",
+    contentHash: "source-hash",
+    title: "3 - Thicker -Mesh.txt",
+    visibility: "project" as const,
+    status: "indexed",
+    mediaType: "text/plain",
+    bucket: "test",
+    objectKey: "mesh.txt",
+    derivativeObjectKey: "mesh.extract.txt",
+    inlineText: null,
+    tombstonedAt: null,
+  };
+  const saved: { id: string }[] = [];
+  let saveCalls = 0;
+  const repository = {
+    loadSource: async () => source,
+    listChunks: async () => chunks,
+    saveEmbeddings: async (input: { chunks: readonly { id: string }[]; vectors: readonly number[][] }) => {
+      expect(input.vectors).toHaveLength(input.chunks.length);
+      saveCalls += 1;
+      saved.splice(0, saved.length, ...input.chunks);
+    },
+    markEmbeddingRetryable: async () => undefined,
+  } as unknown as SqlKnowledgeRepository;
+  const embed = vi.fn(options.embed ?? (async (texts: readonly string[]) => texts.map(() => [0.25, 0.75])));
+  const processor = new KnowledgeProcessor({
+    repository,
+    objects: {} as KnowledgeObjectStore,
+    extractor: new DocumentExtractor("http://tika.invalid"),
+    chunker: new KnowledgeChunker(),
+    embeddings: { profile: { id: "profile-v2", provider: "fixture", model: "fixture", dimensions: 2, version: 2 }, embed },
+    ...(options.maxEmbeddedChunks === undefined ? {} : { maxEmbeddedChunks: options.maxEmbeddedChunks }),
+  });
+  return { processor, embed, saved, finished: () => saveCalls > 0 };
+}
