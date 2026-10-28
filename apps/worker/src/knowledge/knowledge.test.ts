@@ -489,13 +489,13 @@ describe("knowledge ingestion and ranking", () => {
   });
 
   it("keeps a mostly-numbers file keyword-only even when some of its lines have labels", async () => {
-    // Shape of the production mesh export: load lines carry a label and
+    // Shape of a finite-element mesh export: load lines carry a label and
     // exponents, so they pass the per-chunk letter test, but most of the file
     // is still numbers.
     const chunks = [
       ...Array.from({ length: 30 }, (_, ordinal) => chunk(`node-${ordinal}`, MESH_NODE_LINE.repeat(8), ordinal)),
       ...Array.from({ length: 14 }, (_, ordinal) => chunk(`load-${ordinal}`, MESH_LOAD_LINE.repeat(8), 30 + ordinal)),
-      ...Array.from({ length: 6 }, (_, index) => chunk(`header-${index}`, `Model ${index}: thicker mesh for the facade bracket.`, 44 + index)),
+      ...Array.from({ length: 6 }, (_, index) => chunk(`header-${index}`, `Model ${index}: refined mesh for the bracket study.`, 44 + index)),
     ];
     const { processor, embed, saved, finished } = embeddingFixture(chunks);
 
@@ -595,7 +595,7 @@ function embeddingFixture(
     sourceId: "00000000-0000-7000-8000-000000000004",
     revision: "revision-1",
     contentHash: "source-hash",
-    title: "3 - Thicker -Mesh.txt",
+    title: "mesh-export.txt",
     visibility: "project" as const,
     status: "indexed",
     mediaType: "text/plain",
