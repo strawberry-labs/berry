@@ -352,7 +352,36 @@ describe("MemoryService", () => {
       personal: [],
       personalDegraded: true,
     });
-    expect(observedSignal).toBe(controller.signal);
+    expect(observedSignal?.aborted).toBe(true);
+  });
+
+  it("stops waiting for a slow personal-memory search and keeps Berry's own memories", async () => {
+    const repository = new FakeMemoryRepository();
+    const personalMemory = {
+      async search(input: Parameters<PersonalMemoryProvider["search"]>[0]) {
+        return new Promise<MemoryItem[]>((_resolve, reject) => {
+          input.signal?.addEventListener("abort", () => reject(new PersonalMemoryHttpError("cancelled", null, false)), { once: true });
+        });
+      },
+    } as unknown as PersonalMemoryProvider;
+    const service = memoryService(repository, personalMemory);
+    await service.remember({
+      tenantId: tenantA,
+      userId: userA,
+      scope: "project",
+      workspaceId: workspaceA,
+      kind: "project_convention",
+      stableKey: "release-branch",
+      content: "Releases use the stable branch.",
+    });
+
+    const startedAt = Date.now();
+    const recall = await service.recall({ tenantId: tenantA, userId: userA, workspaceId: workspaceA, query: "release process" });
+
+    // Default personalMemoryRecallTimeoutMs is 800 ms.
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    expect(recall.personalDegraded).toBe(true);
+    expect(recall.project.map((item) => item.stableKey)).toEqual(["release-branch"]);
   });
 });
 

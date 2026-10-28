@@ -6,7 +6,7 @@ import {
   redactProjectKnowledgeText,
   SqlKnowledgeRepository,
 } from "./repository.js";
-import { KnowledgeProcessor } from "./processor.js";
+import { KnowledgeProcessor, letterShare } from "./processor.js";
 import { DocumentExtractor, KnowledgeChunker, type KnowledgeObjectStore } from "./services.js";
 
 const tenantId = "00000000-0000-7000-8000-000000000001";
@@ -472,6 +472,64 @@ describe("knowledge ingestion and ranking", () => {
 
     expect(requestSizes).toEqual([32, 32, 1]);
     expect(savedVectorCount).toBe(65);
+  });
+
+  it("embeds only chunks with words in them, up to the per-file limit", async () => {
+    const source = {
+      id: sourceId,
+      tenantId,
+      workspaceId: "00000000-0000-7000-8000-000000000003",
+      userId: null,
+      sourceType: "file" as const,
+      sourceId: "00000000-0000-7000-8000-000000000004",
+      revision: "revision-1",
+      contentHash: "source-hash",
+      title: "3 - Thicker -Mesh.txt",
+      visibility: "project" as const,
+      status: "indexed",
+      mediaType: "text/plain",
+      bucket: "test",
+      objectKey: "mesh.txt",
+      derivativeObjectKey: "mesh.extract.txt",
+      inlineText: null,
+      tombstonedAt: null,
+    };
+    // Shape of the production mesh export: about a tenth of it is letters.
+    const meshLine = "Node                  1234       1     1.23456789012345E+0     -1.23456789012345E+0      1.23456789012345E+0\n";
+    const chunks = [
+      ...Array.from({ length: 40 }, (_, ordinal) => ({ id: `mesh-${ordinal}`, text: meshLine.repeat(8), ordinal, tokenEstimate: 200 })),
+      ...Array.from({ length: 6 }, (_, index) => ({
+        id: `prose-${index}`,
+        text: `Section ${index}: the louvre screen hides the davit ropes on the far side.`,
+        ordinal: 40 + index,
+        tokenEstimate: 20,
+      })),
+    ];
+    let saved: readonly { id: string }[] = [];
+    const repository = {
+      loadSource: async () => source,
+      listChunks: async () => chunks,
+      saveEmbeddings: async (input: { chunks: readonly { id: string }[]; vectors: readonly number[][] }) => {
+        expect(input.vectors).toHaveLength(input.chunks.length);
+        saved = input.chunks;
+      },
+      markEmbeddingRetryable: async () => undefined,
+    } as unknown as SqlKnowledgeRepository;
+    const embed = vi.fn(async (texts: readonly string[]) => texts.map(() => [0.25, 0.75]));
+    const processor = new KnowledgeProcessor({
+      repository,
+      objects: {} as KnowledgeObjectStore,
+      extractor: new DocumentExtractor("http://tika.invalid"),
+      chunker: new KnowledgeChunker(),
+      embeddings: { profile: { id: "profile-v2", provider: "fixture", model: "fixture", dimensions: 2, version: 2 }, embed },
+      maxEmbeddedChunks: 4,
+    });
+
+    await processor.process("knowledge.embed", { tenantId, sourceId, revision: "revision-1" });
+
+    expect(letterShare(meshLine)).toBeLessThan(0.15);
+    expect(saved.map((chunk) => chunk.id)).toEqual(["prose-0", "prose-1", "prose-2", "prose-3"]);
+    expect(embed).toHaveBeenCalledTimes(1);
   });
 
   it("builds a bounded task outcome and removes credentials before project indexing", () => {

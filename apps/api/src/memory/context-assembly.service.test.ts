@@ -67,7 +67,7 @@ describe("ContextAssemblyService", () => {
     expect(knowledgeSignal).toBe(memorySignal);
   });
 
-  it("aborts hung Mem0 retrieval and fails open before two seconds", async () => {
+  it("stops waiting for hung Mem0 retrieval and keeps project knowledge", async () => {
     let mem0Aborted = false;
     const personalMemory = {
       async search(search: Parameters<PersonalMemoryProvider["search"]>[0]) {
@@ -89,18 +89,16 @@ describe("ContextAssemblyService", () => {
     const grounding = await service.assemble(input());
     const elapsedMs = performance.now() - startedAt;
 
+    // Personal recall gives up after personalMemoryRecallTimeoutMs (800 ms by
+    // default), well inside the 1.5 s assembly deadline, so the knowledge
+    // results still reach the turn.
     expect(DEFAULT_CONTEXT_ASSEMBLY_TIMEOUT_MS).toBe(1_500);
-    expect(elapsedMs).toBeLessThan(2_000);
+    expect(elapsedMs).toBeLessThan(DEFAULT_CONTEXT_ASSEMBLY_TIMEOUT_MS);
     expect(mem0Aborted).toBe(true);
     expect(grounding).toMatchObject({
       personalMemory: [],
-      projectFacts: [],
-      citations: [],
-      retrieval: {
-        tokenBudget: 0,
-        tokensSelected: 0,
-        degradedReason: "context_timeout",
-      },
+      projectFacts: [expect.objectContaining({ chunkId: "chunk-1" })],
+      retrieval: { degradedReason: "personal_memory_unavailable" },
     });
   }, 3_000);
 

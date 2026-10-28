@@ -5,6 +5,10 @@ import { knowledgeDerivativeKey, SqlKnowledgeRepository } from "./repository.js"
 import { DocumentExtractor, KnowledgeChunker, type KnowledgeObjectStore } from "./services.js";
 
 const EMBEDDING_BATCH_SIZE = 32;
+const DEFAULT_MAX_EMBEDDED_CHUNKS = 5_000;
+// Prose and tables with headings are well above this share of letters; mesh
+// exports, coordinate lists and binary noise sit near or below a tenth.
+const MIN_EMBEDDABLE_LETTER_SHARE = 0.15;
 
 export type KnowledgeJobName =
   | "knowledge.extract"
@@ -20,6 +24,7 @@ export type KnowledgeProcessorDependencies = {
   extractor: DocumentExtractor;
   chunker: KnowledgeChunker;
   embeddings: EmbeddingProvider | null;
+  maxEmbeddedChunks?: number;
 };
 
 export class KnowledgeProcessor {
@@ -132,16 +137,23 @@ export class KnowledgeProcessor {
       await this.dependencies.repository.markEmbeddingRetryable(payload.tenantId, payload.sourceId, payload.revision, "Embedding provider is unavailable; full-text search remains active");
       return { stale: false, degraded: true };
     }
+    // Every chunk stays keyword-searchable. Vectors are only worth computing
+    // for text with words in it, and a file's first chunks are enough to make
+    // it findable, so one huge file cannot hold the embedding service for
+    // hours (a 69,898-chunk mesh export did on 2026-10-28).
+    const embeddable = chunks
+      .filter((chunk) => letterShare(chunk.text) >= MIN_EMBEDDABLE_LETTER_SHARE)
+      .slice(0, this.dependencies.maxEmbeddedChunks ?? DEFAULT_MAX_EMBEDDED_CHUNKS);
     try {
       const vectors: number[][] = [];
-      for (let offset = 0; offset < chunks.length; offset += EMBEDDING_BATCH_SIZE) {
-        const batch = chunks.slice(offset, offset + EMBEDDING_BATCH_SIZE);
+      for (let offset = 0; offset < embeddable.length; offset += EMBEDDING_BATCH_SIZE) {
+        const batch = embeddable.slice(offset, offset + EMBEDDING_BATCH_SIZE);
         vectors.push(...await this.dependencies.embeddings.embed(batch.map((chunk) => chunk.text)) as number[][]);
       }
       await this.dependencies.repository.saveEmbeddings({
         tenantId: payload.tenantId,
         source,
-        chunks,
+        chunks: embeddable,
         vectors,
         profile: this.dependencies.embeddings.profile,
       });
@@ -164,4 +176,10 @@ export class KnowledgeProcessor {
     await this.dependencies.repository.replaceChunks({ tenantId: payload.tenantId, source: result.source, chunks });
     return { stale: false, chunks: chunks.length };
   }
+}
+
+export function letterShare(text: string): number {
+  const visible = text.replace(/\s/gu, "");
+  if (!visible) return 0;
+  return (visible.match(/\p{L}/gu)?.length ?? 0) / visible.length;
 }
