@@ -21,7 +21,7 @@ import { DurableTurnService, type DurableTurnAdmission, type DurableTurnAdmissio
 import { ContextAssemblyService } from "../memory/context-assembly.service.ts";
 import { InMemoryEnterpriseIdentityRepository, type EnterpriseIdentityRepository } from "../identity/identity.repository.ts";
 import { apiRuntimeMetrics } from "../runtime/runtime-metrics.ts";
-import { AgentApiController, durableAdmissionPreparationTimeoutMs, durableTaskReconciliationStatus, networkPolicyWithApprovedMcpDomains, normalizeImprovedPrompt, preservePromptSkillTokens, PROMPT_IMPROVEMENT_MODEL, promptImprovementModelInput, promptImprovementSkills, turnAdmissionFingerprint } from "./agent-api.controller.ts";
+import { AgentApiController, durableAdmissionPreparationTimeoutMs, durableCapabilityPreparationTimeoutMs, durableTaskReconciliationStatus, networkPolicyWithApprovedMcpDomains, normalizeImprovedPrompt, preservePromptSkillTokens, PROMPT_IMPROVEMENT_MODEL, promptImprovementModelInput, promptImprovementSkills, turnAdmissionFingerprint } from "./agent-api.controller.ts";
 import { SupportViewController } from "./support-view.controller.ts";
 import { MANAGEMENT_SERVICE, ManagementService } from "../management/management.service.ts";
 
@@ -237,20 +237,27 @@ describe("AgentApiController", () => {
     }));
   });
 
-  it("waits up to fifteen seconds per optional admission step, configurable up to thirty", () => {
-    expect(durableAdmissionPreparationTimeoutMs({})).toBe(15_000);
+  it("caps optional durable admission preparation below the two-second SLA", () => {
+    expect(durableAdmissionPreparationTimeoutMs({})).toBe(1_500);
     expect(durableAdmissionPreparationTimeoutMs({
       BERRY_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS: "5000",
-    })).toBe(5_000);
-    expect(durableAdmissionPreparationTimeoutMs({
-      BERRY_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS: "120000",
-    })).toBe(30_000);
+    })).toBe(1_500);
     expect(durableAdmissionPreparationTimeoutMs({
       BERRY_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS: "25",
     })).toBe(25);
   });
 
-  it("keeps connectors when an earlier preparation step uses its whole timeout", async () => {
+  it("gives connector and image-reading setup fifteen seconds, configurable up to thirty", () => {
+    expect(durableCapabilityPreparationTimeoutMs({})).toBe(15_000);
+    expect(durableCapabilityPreparationTimeoutMs({
+      BERRY_DURABLE_CAPABILITY_PREPARATION_TIMEOUT_MS: "5000",
+    })).toBe(5_000);
+    expect(durableCapabilityPreparationTimeoutMs({
+      BERRY_DURABLE_CAPABILITY_PREPARATION_TIMEOUT_MS: "120000",
+    })).toBe(30_000);
+  });
+
+  it("keeps connectors when grounding uses up the shared admission budget", async () => {
     vi.stubEnv("BERRY_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS", "50");
     const never = new Promise<never>(() => undefined);
     const contextAssembly = {
@@ -293,8 +300,8 @@ describe("AgentApiController", () => {
       .send({ input: "Use my connector", workspacePath: "/workspace" })
       .expect(201);
 
-    // Grounding hangs until its own timeout. Connector setup starts after
-    // that and must still get its full time instead of an already spent one.
+    // Grounding hangs until the shared admission budget is spent. Connector
+    // setup starts after that and must still get its own window.
     const runtimeRequest = admit.mock.calls[0]?.[0].runtimeRequest;
     expect(runtimeRequest?.mcpServers).toEqual([expect.objectContaining({ id: mcp.body.id })]);
     expect(runtimeRequest).not.toHaveProperty("capabilityNotices");

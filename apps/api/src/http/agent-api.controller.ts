@@ -112,12 +112,14 @@ const PROMPT_IMPROVEMENT_MIN_OUTPUT_TOKENS = 1_024;
 // Highest max-output limit in the current Berry catalog, verified against
 // models.dev. Explicit model metadata still takes precedence for each model.
 const DEFAULT_MODEL_MAX_OUTPUT_TOKENS = 384_000;
-// Each optional admission step waits this long for its own work, counted from
-// when that step starts. It only guards against a dependency that hangs.
-const DEFAULT_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS = 15_000;
-// Three optional steps run in sequence; at this cap they still finish well
+const DEFAULT_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS = 1_500;
+// Connector and image-reading setup wait this long for their own work, counted
+// from when each step starts. Their work takes milliseconds; the limit only
+// guards against a dependency that hangs.
+const DEFAULT_DURABLE_CAPABILITY_PREPARATION_TIMEOUT_MS = 15_000;
+// Two capability steps run in sequence; at this cap they still finish well
 // inside DURABLE_PREPARING_ADMISSION_STALE_MS.
-const MAX_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS = 30_000;
+const MAX_DURABLE_CAPABILITY_PREPARATION_TIMEOUT_MS = 30_000;
 const DURABLE_TASK_WITHOUT_ADMISSION_STALE_MS = 15_000;
 const DURABLE_PREPARING_ADMISSION_STALE_MS = 120_000;
 
@@ -428,7 +430,21 @@ export function durableAdmissionPreparationTimeoutMs(
   if (!Number.isSafeInteger(configured) || configured < 1) {
     return DEFAULT_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS;
   }
-  return Math.min(configured, MAX_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS);
+  // Admission is user-visible and cancellable. Configuration may tighten the
+  // budget for tests or an incident, but it cannot weaken the two-second SLA.
+  return Math.min(configured, DEFAULT_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS);
+}
+
+export function durableCapabilityPreparationTimeoutMs(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const raw = env.BERRY_DURABLE_CAPABILITY_PREPARATION_TIMEOUT_MS?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return DEFAULT_DURABLE_CAPABILITY_PREPARATION_TIMEOUT_MS;
+  const configured = Number(raw);
+  if (!Number.isSafeInteger(configured) || configured < 1) {
+    return DEFAULT_DURABLE_CAPABILITY_PREPARATION_TIMEOUT_MS;
+  }
+  return Math.min(configured, MAX_DURABLE_CAPABILITY_PREPARATION_TIMEOUT_MS);
 }
 
 export function durableTaskReconciliationStatus(
@@ -1599,11 +1615,12 @@ export class AgentApiController {
     body: unknown,
     admissionStartedAt: number,
   ) {
-    // Every optional step gets the full timeout from when its own work starts,
-    // so a slow earlier step cannot use up a later step's time. A shared
-    // deadline dropped connectors whenever grounding was slow.
-    const optionalPreparationTimeoutMs = durableAdmissionPreparationTimeoutMs();
-    const optionalPreparationDeadline = () => Date.now() + optionalPreparationTimeoutMs;
+    const optionalPreparationDeadlineAt = admissionStartedAt + durableAdmissionPreparationTimeoutMs();
+    // Connector and image-reading setup get their own window from when each
+    // step starts, so slow grounding cannot use up their time. The shared
+    // deadline above dropped connectors whenever grounding was slow (H-050).
+    const capabilityPreparationTimeoutMs = durableCapabilityPreparationTimeoutMs();
+    const capabilityPreparationDeadline = () => Date.now() + capabilityPreparationTimeoutMs;
     const request = parseBody(StartTurnRequestSchema, body);
     const { session, task } = await this.ownedSession(httpRequest, sessionId);
     const tenantId = tenantIdFromRequest(httpRequest);
@@ -1653,7 +1670,7 @@ export class AgentApiController {
       ...(selectedProvider ? { provider: selectedProvider } : {}),
       ...(selectedModel ? { model: selectedModel } : {}),
     });
-    const capabilityPreparationDeadlineAt = optionalPreparationDeadline();
+    const capabilityPreparationDeadlineAt = capabilityPreparationDeadline();
     const effectiveRuntimeWork = observeAdmissionPreparation(
       this.organizationCapabilities.effective(tenantId, userId),
     );
@@ -1747,10 +1764,11 @@ export class AgentApiController {
       request: request.input ?? task.title,
       taskTitle: task.title,
     };
-    const groundingPreparationDeadlineAt = optionalPreparationDeadline();
     const groundingContextWork = observeAdmissionPreparation(this.contextAssembly.assemble(
       contextInput,
-      this.durableTurns.enabled ? { timeoutMs: optionalPreparationTimeoutMs } : {},
+      this.durableTurns.enabled
+        ? { timeoutMs: Math.max(1, optionalPreparationDeadlineAt - Date.now()) }
+        : {},
     ));
     const portableCheckpointWork = observeAdmissionPreparation(
       this.contextAssembly.portableCheckpoint(tenantId, sessionId),
@@ -1760,7 +1778,7 @@ export class AgentApiController {
         ? resolveOptionalAdmissionPreparation(
             groundingContextWork,
             unavailableAdmissionGroundingContext(contextInput),
-            groundingPreparationDeadlineAt,
+            optionalPreparationDeadlineAt,
             "grounding_context",
           )
         : resolveAdmissionPreparation(groundingContextWork),
@@ -1768,7 +1786,7 @@ export class AgentApiController {
         ? resolveOptionalAdmissionPreparation(
             portableCheckpointWork,
             undefined,
-            groundingPreparationDeadlineAt,
+            optionalPreparationDeadlineAt,
             "portable_checkpoint",
           )
         : resolveAdmissionPreparation(portableCheckpointWork),
@@ -1944,7 +1962,7 @@ export class AgentApiController {
           resolvedRuntime.credentialRef,
         );
         const enabledMcpServers = governedRequest.mcpServers.filter((server) => server.enabled && server.trusted);
-        const runtimePreparationDeadlineAt = optionalPreparationDeadline();
+        const runtimePreparationDeadlineAt = capabilityPreparationDeadline();
         const mcpServersWork = observeAdmissionPreparation(Promise.all(enabledMcpServers.map((server) => durableMcpServer(server))));
         const visionWork = observeAdmissionPreparation(governedCapabilities.vision === true
           ? Promise.resolve(null)
