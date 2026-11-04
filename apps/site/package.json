@@ -1,0 +1,12 @@
+{
+  "name": "@berry/site",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "berry.me marketing, legal and support pages: static HTML and CSS.",
+  "scripts": {
+    "build": "node scripts/build-site.mjs",
+    "check": "node scripts/build-site.mjs --check",
+    "preview": "node scripts/build-site.mjs && node scripts/serve-site.mjs"
+  }
+}

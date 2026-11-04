@@ -1,0 +1,63 @@
+<section class="page-hero hero band no-rule">
+  <canvas class="hero-tiles" aria-hidden="true"></canvas>
+  <div class="frame" style="text-align: left">
+    <div class="devices">
+      <div>
+        <p class="label"><b>■</b> Berry for iPhone and Android</p>
+        <h1 class="display" style="margin: 24px 0 0" data-reveal>Follow the work<br><span class="red">from anywhere.</span></h1>
+        <p class="lead" data-reveal style="--d: 120ms; margin-inline: 0">Start a task on the train, watch the agent work, answer its questions and pick up any conversation from the web. The app connects only to your organization's own Berry.</p>
+        <div class="store-badges" data-reveal style="--d: 200ms">{{stores.links}}</div>
+        <p class="hero-note">Free. Requires an organization that runs Berry. No push notifications, no trackers.</p>
+      </div>
+      <div class="phones" data-reveal style="--d: 160ms">
+        <div class="phone"><img src="/assets/phone-sidebar.webp" alt="Projects and tasks in the Berry sidebar." width="600" height="1304"></div>
+        <div class="phone raised"><img src="/assets/phone-activity.webp" alt="Berry researching a question, with its reasoning and search steps above a streaming answer." width="600" height="1304"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="band">
+  <div class="frame">
+    <div class="cards" style="border-top: 0">
+      <article class="card" data-reveal>
+        {{px:qr}}
+        <span class="card-index">01 · SIGN IN</span>
+        <h2 class="h3">Scan, approve, done</h2>
+        <p>On the web, choose <strong>Get the mobile app</strong> and scan the code with your phone, then approve the sign-in on your computer. The code works once and expires after two minutes.</p>
+      </article>
+      <article class="card" data-reveal style="--d: 80ms">
+        {{px:lock}}
+        <span class="card-index">02 · PRIVATE</span>
+        <h2 class="h3">Talks only to your server</h2>
+        <p>Your prompts and files go to your organization's Berry server and the AI providers it uses. The app has no analytics and sends nothing to us.</p>
+      </article>
+      <article class="card" data-reveal style="--d: 160ms">
+        {{px:phone}}
+        <span class="card-index">03 · IN CONTROL</span>
+        <h2 class="h3">Revoke any phone</h2>
+        <p>See every signed-in phone under Settings, on the phone or the web, and sign one out instantly. Administrators can do the same for any member.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section class="band">
+  <div class="frame">
+    <div class="pad">
+      <div class="two-col">
+        <div>
+          <p class="label"><b>■</b> Questions</p>
+          <h2 class="h2" style="margin-top: 16px">About the <span class="red">mobile app.</span></h2>
+        </div>
+        <div>
+    <details class="faq"><summary>Do I need an account?</summary><div>You need an account on your organization's Berry. The app doesn't create accounts; your organization manages them. To try Berry for your team, <a href="mailto:{{contact.sales}}?subject=Berry%20demo">book a demo</a>.</div></details>
+    <details class="faq"><summary>Which servers does it work with?</summary><div>Any Berry server your organization runs, self-hosted or dedicated. The sign-in code tells the app which server to use.</div></details>
+    <details class="faq"><summary>What happens to my data if I sign out?</summary><div>Signing out deletes the phone's session and the data the app stored on the phone. Your tasks stay on your organization's server.</div></details>
+    <details class="faq"><summary>How do I delete my account?</summary><div>Your account belongs to your organization. Ask your Berry administrator to remove it. See the <a href="/privacy/">privacy policy</a> for details.</div></details>
+    <details class="faq"><summary>How do I report a problem with an answer?</summary><div>Tap the flag under any answer and choose a reason. The report goes to your organization's administrators.</div></details>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

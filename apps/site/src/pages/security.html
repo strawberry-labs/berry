@@ -1,0 +1,57 @@
+<section class="page-hero hero band no-rule">
+  <canvas class="hero-tiles" aria-hidden="true"></canvas>
+  <div class="frame" style="text-align: left">
+    <p class="label"><b>■</b> Security and trust</p>
+    <h1 class="display" style="margin: 24px 0 0" data-reveal>Built so your data<br><span class="red">never has to leave.</span></h1>
+    <p class="lead" data-reveal style="--d: 120ms; margin-inline: 0">Berry is designed to run inside your boundary. Here is how data moves, who can see it and what is recorded.</p>
+  </div>
+</section>
+
+<section class="band">
+  <div class="frame">
+    <div class="cards" style="border-top: 0">
+      <article class="card" data-reveal>{{px:database}}<span class="card-index">DATA</span><h2 class="h3">Stays where you run it</h2><p>Prompts, files, task history and memory are stored in your Postgres database and object storage. With a self-hosted deployment, we never receive them.</p></article>
+      <article class="card" data-reveal style="--d: 80ms">{{px:route}}<span class="card-index">MODELS</span><h2 class="h3">Only providers you approve</h2><p>Model requests go only to providers on your allow-list, under your agreements with them. Keys stay on your server as secret references. You can run open models on your own hardware.</p></article>
+      <article class="card" data-reveal style="--d: 160ms">{{px:sandbox}}<span class="card-index">EXECUTION</span><h2 class="h3">Isolated by default</h2><p>The agent runs code in a sandbox per task, separate from Berry's services, with network egress blocked, allow-listed or open by policy, and approvals for shell commands and file changes.</p></article>
+    </div>
+  </div>
+</section>
+
+<section class="band">
+  <div class="frame">
+    <div class="pad">
+      <div class="two-col">
+        <div>
+          <p class="label">[ <b>01</b> / 02 ] · Controls</p>
+          <h2 class="h2" style="margin-top: 16px">Controls in <span class="red">the product.</span></h2>
+          <div style="margin-top: 40px">{{art:globe}}</div>
+        </div>
+        <ul class="checks">
+          <li><strong>Tenant isolation.</strong> Row-level security is enabled and forced on every tenant table in Postgres, and Berry's services connect with least-privilege database roles.</li>
+          <li><strong>Identity.</strong> Google Workspace single sign-on with domain restrictions, SCIM 2.0 provisioning for users and groups, email and password with domain allow-lists, and session revocation.</li>
+          <li><strong>Access.</strong> 44 fine-grained permissions behind editable roles, departments, resource access rules, feature flags and service accounts with scoped, expiring tokens.</li>
+          <li><strong>Models.</strong> Allow and block rules per organization, department or person, with organization defaults.</li>
+          <li><strong>Spend.</strong> Daily and monthly allowances in dollars, requests, tokens and sandbox minutes, checked before each request.</li>
+          <li><strong>Audit.</strong> Sign-ins, administrative changes, approvals, phone pairings and reported responses are recorded and can be exported as JSON or CSV.</li>
+          <li><strong>Secrets.</strong> Connector tokens are encrypted with AES-GCM under a dedicated key that supports rotation. Traffic is encrypted in transit with TLS; storage encryption follows your database and storage configuration.</li>
+          <li><strong>Mobile.</strong> Phones sign in with a single-use code approved from the web. Device sessions live in the iOS Keychain or Android Keystore and can be revoked by the person or an administrator.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="band cta-band">
+  <div class="cta-grid" aria-hidden="true"></div>
+  <div class="frame">
+    <div class="pad">
+      <p class="label" style="justify-content: center">[ <b>02</b> / 02 ] · Disclosure</p>
+      <h2 class="h2 h2-cta" style="margin-top: 16px">Report a <span class="red">vulnerability.</span></h2>
+      <p class="lead">If you believe you have found a security issue in Berry, email <a href="mailto:{{contact.security}}">{{contact.security}}</a> with the steps to reproduce it. We acknowledge reports within three business days and ask for reasonable time to fix an issue before disclosure. Please don't access data that isn't yours or disrupt others' use of the service.</p>
+      <div class="hero-actions">
+        <a class="button button-primary" href="mailto:{{contact.security}}?subject=Security%20report">Email the security team <span class="arrow" aria-hidden="true">›</span></a>
+        <a class="button button-ghost" href="/privacy/">Privacy policy</a>
+      </div>
+    </div>
+  </div>
+</section>
