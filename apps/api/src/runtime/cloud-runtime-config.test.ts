@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
 import { CloudRuntimeConfigService, createCloudRuntimeConfigFromEnv } from "./cloud-runtime-config.ts";
@@ -235,6 +236,31 @@ describe("cloud runtime configuration", () => {
     expect(config.provider?.models?.[1]?.capabilities).not.toHaveProperty("promptCaching");
   });
 
+  it("loads both Inference.net Flash models and the DeepSeek 1017 default from the deployment example", async () => {
+    const example = readFileSync(new URL("../../../../deploy/.env.production.example", import.meta.url), "utf8");
+    const value = (key: string) => example.split("\n").find((line) => line.startsWith(key + "="))!.slice(key.length + 1);
+    const service = new CloudRuntimeConfigService({
+      BERRY_API_MODEL_MODE: "live",
+      BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
+      BERRY_ROUTER_DEFAULT_MODEL: value("BERRY_ROUTER_DEFAULT_MODEL"),
+      BERRY_ROUTER_MODELS_JSON: value("BERRY_ROUTER_MODELS_JSON").replace(/REPLACE_WITH_[A-Z0-9_]+/g, "1024"),
+    });
+    const catalog = await service.catalog(SELF_HOST_TENANT_ID);
+    expect(catalog?.defaultModel).toBe("inference-net/deepseek-v4.1-flash-1017");
+    expect(catalog?.models.map((model) => model.id)).not.toContain("canopywave/deepseek/deepseek-v4-flash");
+    expect(catalog?.models).toHaveLength(2);
+    for (const expected of [
+      { id: "inference-net/deepseek-v4.1-flash-1017", contextWindow: 1_040_000, maxOutputTokens: 393_216, inputModalities: ["text", "image"], cost: { input: 0.3, output: 1, cacheRead: 0.007 } },
+      { id: "inference-net/glm-5.3-flash", contextWindow: 1_048_576, maxOutputTokens: 262_144, inputModalities: ["text", "image"], cost: { input: 0.1, output: 0.45, cacheRead: 0.03 } },
+    ]) {
+      expect(catalog?.models.find((model) => model.id === expected.id)).toMatchObject({
+        id: expected.id, contextWindow: expected.contextWindow, maxOutputTokens: expected.maxOutputTokens,
+        inputModalities: expected.inputModalities, outputModalities: ["text"],
+        capabilities: { tools: true, vision: true, reasoning: true, json: true, cost: expected.cost },
+      });
+    }
+  });
+
   it("does not trust a client-supplied Worker credential reference", async () => {
     const service = new CloudRuntimeConfigService({ BERRY_API_MODEL_MODE: "fixture" });
 
@@ -356,6 +382,30 @@ describe("cloud runtime configuration", () => {
       images: [{ image_url: "data:image/png;base64,c291cmNl" }],
     });
     expect(requestBody).not.toHaveProperty("input_fidelity");
+  });
+
+  it("sends reference images through the OpenRouter unified image API", async () => {
+    const fetchMock = vi.fn(async () => Response.json({ data: [{ b64_json: "ZWRpdGVk" }] }));
+    vi.stubGlobal("fetch", fetchMock);
+    const service = new CloudRuntimeConfigService({
+      BERRY_ROUTER_INFERENCE_BASE_URL: "https://openrouter.ai/api/v1",
+      BERRY_ROUTER_DEFAULT_MODEL: "deepseek/deepseek-v4.1-flash-1017",
+      BERRY_ROUTER_IMAGE_MODEL: "openai/gpt-image-2",
+      BERRY_ROUTER_IMAGE_GENERATIONS_PATH: "/images",
+      BERRY_ROUTER_IMAGE_EDITS_PATH: "/images",
+      BERRY_ROUTER_IMAGE_COST_MICROS: "100000",
+    });
+    await expect(service.generateImage({
+      prompt: "Remove the label while preserving the product",
+      referenceImageUrls: ["data:image/png;base64,c291cmNl"],
+    })).resolves.toMatchObject({ model: "openai/gpt-image-2", data: [{ b64_json: "ZWRpdGVk" }] });
+    expect(fetchMock).toHaveBeenCalledWith("https://openrouter.ai/api/v1/images", expect.objectContaining({
+      body: expect.any(String),
+    }));
+    const body = JSON.parse(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body));
+    expect(body.input_references).toEqual([{ type: "image_url", image_url: { url: "data:image/png;base64,c291cmNl" } }]);
+    expect(body).not.toHaveProperty("images");
+    expect(body).not.toHaveProperty("input_fidelity");
   });
 
   it("surfaces the upstream image error instead of hiding it behind a generic rejection", async () => {

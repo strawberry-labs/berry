@@ -24,13 +24,29 @@ import { Button } from "@berry/desktop-ui/components/ui/button";
 import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { Archive, Check, ChevronDown, CodeXml, Ellipsis, Folder, Folder02, MenuCollapseIcon, MessageSquare, Pencil, PencilEdit02Icon, Pin, PinOff, Plus, Trash2, Users } from "@berry/desktop-ui/lib/icons";
 import { cn } from "@berry/desktop-ui/lib/utils";
+import {
+  INITIAL_CONVERSATION_SECTION_STATE,
+  PROJECT_SORT_OPTIONS,
+  allConversations,
+  conversationSectionReducer,
+  conversationsForKind,
+  sortProjects,
+  taskHasUnreadActivity,
+  taskIsInProgress,
+  visibleConversationSlice,
+  type ProjectSort,
+} from "@berry/client-core/conversations";
 
-const INITIAL_CONVERSATION_COUNT = 5;
-const PROJECT_SORT_OPTIONS = [
-  { value: "priority", label: "Priority" },
-  { value: "last-updated", label: "Last updated" },
-  { value: "manual", label: "Manual order" },
-] as const;
+export {
+  INITIAL_CONVERSATION_SECTION_STATE,
+  conversationSectionReducer,
+  conversationsForKind,
+  taskHasUnreadActivity,
+  taskIsInProgress,
+  visibleConversationSlice,
+  type ConversationSectionAction,
+  type ConversationSectionState,
+} from "@berry/client-core/conversations";
 
 export interface BerryConversationProject {
   workspace: Workspace;
@@ -69,95 +85,13 @@ export interface BerryConversationSidebarContentProps {
   onShareConversation?: (task: Task) => void | Promise<void>;
 }
 
-export interface ConversationSectionState {
-  projectsCollapsed: boolean;
-  collapsedProjects: ReadonlySet<string>;
-  expandedProjects: ReadonlySet<string>;
-  chatsCollapsed: boolean;
-  chatsExpanded: boolean;
-  allCollapsed: boolean;
-}
-
-export type ConversationSectionAction =
-  | { type: "toggle-projects" }
-  | { type: "toggle-project"; projectId: string }
-  | { type: "show-project"; projectId: string }
-  | { type: "toggle-chats" }
-  | { type: "show-chats" }
-  | { type: "toggle-all"; projectIds: string[] };
-
-export const INITIAL_CONVERSATION_SECTION_STATE: ConversationSectionState = {
-  projectsCollapsed: false,
-  collapsedProjects: new Set(),
-  expandedProjects: new Set(),
-  chatsCollapsed: false,
-  chatsExpanded: false,
-  allCollapsed: false,
-};
-
-export function conversationSectionReducer(state: ConversationSectionState, action: ConversationSectionAction): ConversationSectionState {
-  if (action.type === "toggle-projects") return { ...state, projectsCollapsed: !state.projectsCollapsed };
-  if (action.type === "toggle-project") {
-    const collapsedProjects = new Set(state.collapsedProjects);
-    const expandedProjects = new Set(state.expandedProjects);
-    if (collapsedProjects.has(action.projectId)) collapsedProjects.delete(action.projectId);
-    else {
-      collapsedProjects.add(action.projectId);
-      expandedProjects.delete(action.projectId);
-    }
-    return { ...state, projectsCollapsed: false, collapsedProjects, expandedProjects, allCollapsed: false };
-  }
-  if (action.type === "show-project") {
-    return { ...state, projectsCollapsed: false, expandedProjects: new Set([...state.expandedProjects, action.projectId]) };
-  }
-  if (action.type === "toggle-chats") {
-    return { ...state, chatsCollapsed: !state.chatsCollapsed, chatsExpanded: false, allCollapsed: false };
-  }
-  if (action.type === "show-chats") return { ...state, chatsExpanded: true };
-  const nextCollapsed = !state.allCollapsed;
-  return {
-    projectsCollapsed: false,
-    collapsedProjects: nextCollapsed ? new Set(action.projectIds) : new Set(),
-    expandedProjects: new Set(),
-    chatsCollapsed: nextCollapsed,
-    chatsExpanded: false,
-    allCollapsed: nextCollapsed,
-  };
-}
-
-export function conversationsForKind(tasks: Task[], kind: ConversationKind, excludedIds: ReadonlySet<string> = new Set()): Task[] {
-  return tasks
-    .filter((task) => task.conversationKind === kind && !excludedIds.has(task.id))
-    .sort((left, right) => Number(right.pinned) - Number(left.pinned) || right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id));
-}
-
-function allConversations(tasks: Task[], excludedIds: ReadonlySet<string> = new Set()): Task[] {
-  return tasks
-    .filter((task) => !excludedIds.has(task.id))
-    .sort((left, right) => Number(right.pinned) - Number(left.pinned) || right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id));
-}
-
-export function visibleConversationSlice(tasks: Task[], expanded: boolean): { visible: Task[]; hiddenCount: number } {
-  if (expanded || tasks.length <= INITIAL_CONVERSATION_COUNT) return { visible: tasks, hiddenCount: 0 };
-  return { visible: tasks.slice(0, INITIAL_CONVERSATION_COUNT), hiddenCount: tasks.length - INITIAL_CONVERSATION_COUNT };
-}
-
-export function taskIsInProgress(task: Pick<Task, "status">): boolean {
-  return task.status === "queued" || task.status === "running" || task.status === "waiting-for-approval";
-}
-
-export function taskHasUnreadActivity(task: Pick<Task, "unreadAt" | "lastReadAt">): boolean {
-  if (!task.unreadAt) return false;
-  return !task.lastReadAt || task.unreadAt > task.lastReadAt;
-}
-
 export function BerryConversationSidebarContent(props: BerryConversationSidebarContentProps) {
   const [sectionState, dispatch] = React.useReducer(conversationSectionReducer, INITIAL_CONVERSATION_SECTION_STATE);
   const [optimisticKind, setOptimisticKind] = React.useState<ConversationKind>(props.selectedKind ?? "chat");
   const [pendingKind, setPendingKind] = React.useState<ConversationKind | null>(null);
   const [failedKind, setFailedKind] = React.useState<ConversationKind | null>(null);
   const [kindError, setKindError] = React.useState<string | null>(null);
-  const [projectSort, setProjectSort] = React.useState<(typeof PROJECT_SORT_OPTIONS)[number]["value"]>("last-updated");
+  const [projectSort, setProjectSort] = React.useState<ProjectSort>("last-updated");
 
   React.useEffect(() => {
     if (!pendingKind) setOptimisticKind(props.selectedKind ?? "chat");
@@ -186,13 +120,7 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
   const pinned = visibleConversations(props.pinnedConversations);
   const pinnedIds = new Set(pinned.map((task) => task.id));
   const chats = visibleConversations(props.generalConversations, pinnedIds);
-  const projects = React.useMemo(() => {
-    if (projectSort === "manual") return props.projects;
-    return [...props.projects].sort((left, right) => {
-      if (projectSort === "priority" && left.workspace.pinned !== right.workspace.pinned) return Number(right.workspace.pinned) - Number(left.workspace.pinned);
-      return right.workspace.updatedAt.localeCompare(left.workspace.updatedAt) || left.workspace.name.localeCompare(right.workspace.name);
-    });
-  }, [projectSort, props.projects]);
+  const projects = React.useMemo(() => projectSort === "manual" ? props.projects : sortProjects(props.projects, projectSort), [projectSort, props.projects]);
   const projectIds = projects.map((project) => project.workspace.id);
   const openConversation = (taskId: string) => {
     props.onOpenConversation(taskId);
@@ -407,7 +335,11 @@ function ConversationRows({ tasks, emptyLabel, activeTaskId, onOpen, formatAge, 
         return (
           <SidebarMenuItem key={task.id} className="berry-sidebar-task-item group/task">
             <SidebarMenuButton type="button" isActive={task.id === activeTaskId} onClick={() => onOpen(task.id)} className={cn("berry-sidebar-task-row pr-14!", indented && "pl-8")}>
-              <span className="berry-sidebar-row-title min-w-0 flex-1" title={task.title}>{task.title}</span>
+              {/* The title's edge fade is a mask; the running shimmer is a mask
+                  too, so it lives on an inner span to keep both. */}
+              <span className="berry-sidebar-row-title min-w-0 flex-1" title={task.title}>
+                {taskIsInProgress(task) ? <span className="berry-shimmer berry-sidebar-title-shimmer">{task.title}</span> : task.title}
+              </span>
             </SidebarMenuButton>
             <ConversationActions task={task} onTogglePinned={onTogglePinned} onArchive={onArchive} onDelete={onDelete} onRename={onRename} onShare={onShare} />
             {taskIsInProgress(task) ? (

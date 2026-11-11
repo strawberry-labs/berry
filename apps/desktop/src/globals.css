@@ -666,6 +666,14 @@
     color: var(--foreground);
   }
 
+  /* Running task titles shimmer in the row's own colour, not the brighter
+     foreground the activity shimmer uses. */
+  .berry-sidebar-task-row .berry-shimmer.berry-sidebar-title-shimmer {
+    display: inline;
+    color: inherit;
+    font-size: inherit;
+  }
+
   .berry-sidebar-task-row .berry-sidebar-row-title {
     min-width: 0;
     overflow: hidden;

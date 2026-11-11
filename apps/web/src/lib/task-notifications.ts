@@ -3,6 +3,7 @@ export const SOUND_ALERTS_KEY = "berry.web.soundAlerts";
 
 const progressNotifiedAt = new Map<string, number>();
 const completionIds = new Set<string>();
+const browserHandoffIds = new Set<string>();
 const PROGRESS_THROTTLE_MS = 30_000;
 let completionAudioContext: AudioContext | null = null;
 
@@ -65,6 +66,17 @@ export function notifyBackgroundProgress(input: {
   if (now - (progressNotifiedAt.get(input.sessionId) ?? 0) < PROGRESS_THROTTLE_MS) return;
   progressNotifiedAt.set(input.sessionId, now);
   showNotification(`${input.taskTitle} is making progress`, input.detail, `berry-progress:${input.sessionId}`, input.taskId);
+}
+
+export function notifyBrowserNeedsHelp(input: {
+  handoffId: string;
+  taskId: string;
+  taskTitle: string;
+  reason: string;
+}): void {
+  if (!isAway() || !notificationsAvailable() || browserHandoffIds.has(input.handoffId)) return;
+  browserHandoffIds.add(input.handoffId);
+  showNotification("Browser needs your help", `${input.taskTitle}: ${input.reason}`, `berry-browser:${input.handoffId}`, input.taskId);
 }
 
 export function notifyTaskCompleted(input: {

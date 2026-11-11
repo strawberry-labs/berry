@@ -1,14 +1,15 @@
 # App Store Privacy Notes
 
-Nothing leaves the device except data sent to endpoints the user configures: Berry managed cloud, a self-hosted Berry API, a custom OpenAI-compatible endpoint, or an explicit localhost/RFC1918 LAN endpoint.
+Nothing leaves the device except data sent to endpoints the user configures: the self-hosted (or, later, hosted) Berry server the person paired the phone with by scanning a QR code from their signed-in web session.
 
-No data is sold, used for third-party advertising, or used for cross-app tracking.
+No data is sold, used for third-party advertising, or used for cross-app tracking. The app developer does not receive any of it.
 
-Data used for app functionality:
-- Account/session token when the user signs in to Berry managed cloud or self-hosted Berry.
-- Task titles, messages, tool rows, approvals, and approval decisions exchanged with the configured Berry API.
-- Optional push token registered with the configured Berry API for approval notifications. API responses expose only `pushTokenLast4`.
-- Direct endpoint chat prompts and responses sent only to the custom/LAN endpoint entered by the user. Direct endpoint mode does not support tools or approvals push.
+Data used for app functionality, sent only to the paired Berry server:
+- A device session token issued at pairing, stored in the Keychain (Keystore on Android) with this-device-only access.
+- The device model, platform, OS version and app version, shown to the person on the web when they approve the pairing and listed under Mobile devices.
+- Task titles, prompts, messages, attachments the person chooses (photos, camera photos, files), approvals and answers exchanged with that server.
+
+Not used in this version: push notifications, location, contacts, microphone, analytics or crash-reporting SDKs.
 
 Apple privacy manifest:
-- `apps/mobile/PrivacyInfo.xcprivacy` declares no tracking, no tracking domains, no collected data types, and no required-reason accessed APIs.
+- `apps/mobile/PrivacyInfo.xcprivacy` (mirrored in `expo.ios.privacyManifests`) declares no tracking, no tracking domains and no collected data types. Its required-reason APIs are the on-device ones React Native and Expo use: file timestamps (C617.1), the app's own UserDefaults (CA92.1) and system boot time for timers (35F9.1).

@@ -273,5 +273,223 @@ class ReportStructureTests(unittest.TestCase):
         self.assertTrue(any("flattened as body paragraphs" in error for error in errors))
 
 
+class ReportWordFunctionalityTests(unittest.TestCase):
+    """Headings, numbering, lists, and TOC must be native Word features."""
+
+    def setUp(self) -> None:
+        self.template = (
+            REPOSITORY
+            / "deploy/skills/aesg-branding/assets/templates/AESG_General_Report_Template.docx"
+        )
+
+    def build(self, sections: list[dict], **spec) -> Document:
+        document = Document(self.template)
+        docx_generator.create_report(
+            document,
+            {"title": "Word functionality test", "approvalPage": True, "sections": sections, **spec},
+        )
+        return document
+
+    @staticmethod
+    def num_id(paragraph) -> str | None:
+        node = paragraph._p.find(f"{qn('w:pPr')}/{qn('w:numPr')}/{qn('w:numId')}")
+        return node.get(qn("w:val")) if node is not None else None
+
+    @staticmethod
+    def ilvl(paragraph) -> str | None:
+        node = paragraph._p.find(f"{qn('w:pPr')}/{qn('w:numPr')}/{qn('w:ilvl')}")
+        return node.get(qn("w:val")) if node is not None else None
+
+    def test_template_heading_contract_matches_reviewer_specification(self) -> None:
+        document = Document(self.template)
+        expected = {
+            "Heading 1": (14, 14, 14),
+            "Heading 2": (12, 12, 12),
+            "Heading 3": (11, 11, 11),
+        }
+        for name, (size, before, after) in expected.items():
+            style = document.styles[name]
+            self.assertEqual(style.font.name, "Verdana")
+            self.assertEqual(style.font.size.pt, size)
+            self.assertEqual(style.paragraph_format.space_before.pt, before)
+            self.assertEqual(style.paragraph_format.space_after.pt, after)
+            indent = style.element.pPr.find(qn("w:ind"))
+            self.assertEqual(indent.get(qn("w:left")), indent.get(qn("w:hanging")))
+        numbering = document.part.numbering_part.element
+        heading_num = document.styles["Heading 1"].element.pPr.find(qn("w:numPr"))
+        num_id = heading_num.find(qn("w:numId")).get(qn("w:val"))
+        abstract_id = next(
+            num.find(qn("w:abstractNumId")).get(qn("w:val"))
+            for num in numbering.findall(qn("w:num"))
+            if num.get(qn("w:numId")) == num_id
+        )
+        abstract = next(
+            node
+            for node in numbering.findall(qn("w:abstractNum"))
+            if node.get(qn("w:abstractNumId")) == abstract_id
+        )
+        texts = [lvl.find(qn("w:lvlText")).get(qn("w:val")) for lvl in abstract.findall(qn("w:lvl"))[:3]]
+        self.assertEqual(texts, ["%1.", "%1.%2", "%1.%2.%3"])
+        hanging = {
+            lvl.find(f"{qn('w:pPr')}/{qn('w:ind')}").get(qn("w:hanging"))
+            for lvl in abstract.findall(qn("w:lvl"))[:3]
+        }
+        self.assertEqual(len(hanging), 1)
+        self.assertGreaterEqual(int(hanging.pop()), 1000)
+
+    def test_headings_use_built_in_styles_with_automatic_numbering_and_toc(self) -> None:
+        document = self.build(
+            [
+                {"heading": "Introduction", "blocks": [{"type": "paragraph", "text": "Opening."}]},
+                {"heading": "Scope", "level": 2},
+                {"heading": "Detail", "level": 3},
+                {"heading": "Findings", "divider": True},
+                {"heading": "Appendices", "headingNumbered": False},
+            ]
+        )
+        headings = {
+            paragraph.text: paragraph
+            for paragraph in document.paragraphs
+            if paragraph.style is not None and paragraph.style.name.startswith("Heading")
+        }
+        self.assertEqual(headings["Introduction"].style.name, "Heading 1")
+        self.assertEqual(headings["Scope"].style.name, "Heading 2")
+        self.assertEqual(headings["Detail"].style.name, "Heading 3")
+        # Numbers come from the style's list, never from static text.
+        self.assertIsNone(self.num_id(headings["Introduction"]))
+        self.assertEqual(self.num_id(headings["Appendices"]), "0")
+        instructions = "".join(document.element.xpath(".//w:instrText/text()"))
+        self.assertIn('TOC \\o "1-3" \\h \\z \\u', instructions)
+        self.assertEqual(instructions.count("PAGEREF _Toc"), 5)
+        toc_entries = [paragraph for paragraph in document.paragraphs if paragraph.style.name.startswith("toc ")]
+        self.assertEqual(
+            [paragraph.text.split("\t")[0] for paragraph in toc_entries[:4]],
+            ["1.", "1.1", "1.1.1", "2."],
+        )
+        divider = document.element.body.xpath('.//w:p[w:pPr/w:pStyle[@w:val="AESGDividerHeading"]]')
+        self.assertTrue(divider)
+        divider_text = "".join(divider[0].xpath(".//w:t/text()"))
+        self.assertTrue(divider_text.startswith("2. Findings"), divider_text)
+
+    def test_lists_are_restarted_multilevel_word_lists(self) -> None:
+        document = self.build(
+            [
+                {
+                    "heading": "Actions",
+                    "blocks": [
+                        {
+                            "type": "bullets",
+                            "items": [
+                                "Alpha",
+                                {"text": "Beta", "items": ["Roman", {"text": "Deeper", "items": ["Bullet"]}]},
+                            ],
+                        },
+                        {"type": "numbered", "items": ["One", "Two"]},
+                        {"type": "numbered", "items": ["Again"]},
+                    ],
+                }
+            ]
+        )
+        by_text = {paragraph.text: paragraph for paragraph in document.paragraphs}
+        self.assertEqual(
+            [self.ilvl(by_text[text]) for text in ("Alpha", "Beta", "Roman", "Deeper", "Bullet")],
+            ["0", "0", "1", "1", "2"],
+        )
+        self.assertEqual(by_text["Roman"].style.name, "AESG Bullet 2")
+        self.assertEqual(by_text["Bullet"].style.name, "AESG Bullet 3")
+        self.assertEqual(len({self.num_id(by_text[text]) for text in ("Alpha", "Roman", "Bullet")}), 1)
+        self.assertNotEqual(self.num_id(by_text["One"]), self.num_id(by_text["Again"]))
+        numbering = document.part.numbering_part.element
+        restarted = next(
+            num for num in numbering.findall(qn("w:num")) if num.get(qn("w:numId")) == self.num_id(by_text["Again"])
+        )
+        self.assertEqual(
+            restarted.find(f"{qn('w:lvlOverride')}/{qn('w:startOverride')}").get(qn("w:val")),
+            "1",
+        )
+
+    def test_generated_report_passes_word_structure_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "structure.docx"
+            spec_path = Path(directory) / "spec.json"
+            spec_path.write_text(
+                '{"kind": "report", "title": "Structure", "sections": ['
+                '{"heading": "Introduction", "bullets": ["One", {"text": "Two", "items": ["Three"]}]},'
+                '{"heading": "Scope", "level": 2}]}',
+                encoding="utf-8",
+            )
+            import subprocess
+            import sys
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(REPOSITORY / "deploy/skills/docx/scripts/create_aesg_docx.py"),
+                    "--spec",
+                    str(spec_path),
+                    "--branding-skill-dir",
+                    str(REPOSITORY / "deploy/skills/aesg-branding"),
+                    "--output",
+                    str(path),
+                    "--no-toc-pages",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            errors: list[str] = []
+            evidence: dict = {}
+            validator.validate_docx(path, errors, evidence)
+            self.assertEqual(errors, [])
+            self.assertTrue(evidence["reportWordStructure"]["tocField"])
+
+    def test_validator_rejects_static_numbered_headings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "static.docx"
+            document = self.build([{"heading": "Introduction"}, {"heading": "Scope", "level": 2}])
+            paragraph = document.add_paragraph("2. Static chapter")
+            paragraph.runs[0].bold = True
+            document.save(path)
+            errors: list[str] = []
+            validator.validate_report_structure(path, Document(path), errors, {})
+            self.assertTrue(any("static numbered text" in error for error in errors), errors)
+
+    def test_toc_page_lookup_handles_wrapped_divider_titles(self) -> None:
+        headings = [{
+            "text": "Findings and recommendations for integrated sustainability",
+            "number": "2.",
+            "bookmark": "_TocFindings",
+            "divider": True,
+        }]
+        pages = [
+            "Table of Contents\n2. Findings and recommendations ..........\n",
+            "2. Findings and\nrecommendations for integrated\nsustainability\n",
+            "2. Findings and recommendations for integrated\nsustainability\nBody text.\n",
+        ]
+        self.assertEqual(
+            docx_generator.locate_heading_pages(pages, headings, "Table of Contents"),
+            {"_TocFindings": 3},
+        )
+
+    def test_repair_adds_toc_and_fixes_legacy_divider_numbers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.docx"
+            document = self.build(
+                [{"heading": "First"}, {"heading": "Second", "divider": True}],
+                tableOfContents=False,
+            )
+            divider = document.element.body.xpath('.//w:p[w:pPr/w:pStyle[@w:val="AESGDividerHeading"]]')[0]
+            for run in divider.xpath("./w:r"):
+                if "".join(run.xpath("./w:t/text()")).strip() == "2.":
+                    divider.remove(run)
+            document.save(path)
+            docx_repair.repair_report(path)
+            self.assertTrue(docx_repair.add_missing_table_of_contents(path, paginate=False))
+            repaired = Document(path)
+            instructions = "".join(repaired.element.xpath(".//w:instrText/text()"))
+            self.assertIn("TOC \\o", instructions)
+            repaired_divider = repaired.element.body.xpath('.//w:p[w:pPr/w:pStyle[@w:val="AESGDividerHeading"]]')[0]
+            self.assertTrue("".join(repaired_divider.xpath(".//w:t/text()")).startswith("2. Second"))
+
+
 if __name__ == "__main__":
     unittest.main()

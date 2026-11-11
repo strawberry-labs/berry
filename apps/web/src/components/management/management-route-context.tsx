@@ -1,10 +1,11 @@
 import * as React from "react";
-import type { ManagementScreenProps } from "./management-context";
+import { ManagementResourceScope, type ManagementScreenProps } from "./management-context";
 
 const ManagementRouteContext = React.createContext<ManagementScreenProps | null>(null);
 
 export function ManagementRouteProvider({ value, children }: { value: ManagementScreenProps; children: React.ReactNode }) {
-  return <ManagementRouteContext.Provider value={value}>{children}</ManagementRouteContext.Provider>;
+  const scope = `${value.tenantId}:${value.userId ?? "anonymous"}:${value.supportView ? "support" : "self"}`;
+  return <ManagementResourceScope.Provider value={scope}><ManagementRouteContext.Provider value={value}>{children}</ManagementRouteContext.Provider></ManagementResourceScope.Provider>;
 }
 
 export function useManagementRouteContext() {

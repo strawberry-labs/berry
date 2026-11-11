@@ -241,7 +241,7 @@ describe("FilePlatformService.streamContent", () => {
     };
     const client = { send: vi.fn(async () => ({ Body: body, ContentType: "image/png", ContentLength: PNG_BYTES.byteLength })) };
     const response = {
-      statusCode: 0,
+      statusCode: 0, once: vi.fn(), removeListener: vi.fn(), flushHeaders: vi.fn(),
       setHeader: vi.fn(),
       write: vi.fn(() => true),
       end: vi.fn(),
@@ -260,7 +260,7 @@ describe("FilePlatformService.streamContent", () => {
 
     expect(client.send).toHaveBeenCalledWith(expect.objectContaining({
       input: expect.objectContaining({ Bucket: "berry-test", Key: "objects/history.png", VersionId: "version-7" }),
-    }));
+    }), expect.objectContaining({ abortSignal: expect.any(AbortSignal) }));
     expect(response.setHeader).toHaveBeenCalledWith("ETag", `"berry-file-response-v${FILE_RESPONSE_SECURITY_VERSION}-digest"`);
     expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", PROTECTED_FILE_CACHE_CONTROL);
     expect(response.setHeader).toHaveBeenCalledWith("Content-Type", "image/png");
@@ -306,7 +306,7 @@ describe("FilePlatformService.streamContent", () => {
     };
     const client = { send: vi.fn() };
     const response = {
-      statusCode: 0,
+      statusCode: 0, once: vi.fn(), removeListener: vi.fn(), flushHeaders: vi.fn(),
       setHeader: vi.fn(),
       write: vi.fn(() => true),
       end: vi.fn(),
@@ -380,13 +380,13 @@ describe("FilePlatformService.streamContent", () => {
       partSize: 5 * 1024 * 1024,
       presignSeconds: 900,
     } as never);
-    const grantedResponse = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(() => true), end: vi.fn() };
+    const grantedResponse = { statusCode: 0, once: vi.fn(), removeListener: vi.fn(), flushHeaders: vi.fn(), setHeader: vi.fn(), write: vi.fn(() => true), end: vi.fn() };
 
     await service.streamContent(TENANT_ID, USER_ID, fileId, undefined, grantedResponse as never);
     expect(grantedResponse.setHeader).toHaveBeenCalledWith("Cache-Control", PROTECTED_FILE_CACHE_CONTROL);
 
     accessGranted = false;
-    const revokedResponse = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(() => true), end: vi.fn() };
+    const revokedResponse = { statusCode: 0, once: vi.fn(), removeListener: vi.fn(), flushHeaders: vi.fn(), setHeader: vi.fn(), write: vi.fn(() => true), end: vi.fn() };
     await expect(service.streamContent(TENANT_ID, USER_ID, fileId, undefined, revokedResponse as never))
       .rejects.toThrow("File not found");
 
@@ -446,7 +446,7 @@ describe("FilePlatformService.streamContent", () => {
     };
     const database = { withTenant: async (_tenantId: string, callback: (value: SqlExecutor) => Promise<unknown>) => callback(executor) };
     const client = { send: vi.fn() };
-    const response = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
+    const response = { statusCode: 0, once: vi.fn(), removeListener: vi.fn(), flushHeaders: vi.fn(), setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
     const service = new FilePlatformService(database as never, {
       client, presignClient: client, bucket: "berry-test", prefix: "artifacts",
       maxUploadBytes: 1024, partSize: 5 * 1024 * 1024, presignSeconds: 900,
@@ -504,7 +504,7 @@ async function streamContentFixture(input: {
   })) };
   const writes: Buffer[] = [];
   const response = {
-    statusCode: 0,
+    statusCode: 0, once: vi.fn(), removeListener: vi.fn(), flushHeaders: vi.fn(),
     setHeader: vi.fn(),
     write: vi.fn((chunk: Uint8Array) => { writes.push(Buffer.from(chunk)); return true; }),
     end: vi.fn(),
@@ -550,7 +550,7 @@ describe("FilePlatformService.streamBrandingAsset", () => {
     const database = { withTenant: async (_tenantId: string, callback: (value: SqlExecutor) => Promise<unknown>) => callback(executor) };
     const body = { async *[Symbol.asyncIterator]() { yield PNG_BYTES; } };
     const client = { send: vi.fn(async () => ({ Body: body, ContentType: "image/svg+xml", ContentLength: PNG_BYTES.byteLength })) };
-    const response = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(() => true), end: vi.fn() };
+    const response = { statusCode: 0, once: vi.fn(), removeListener: vi.fn(), flushHeaders: vi.fn(), setHeader: vi.fn(), write: vi.fn(() => true), end: vi.fn() };
     const service = new FilePlatformService(database as never, {
       client, presignClient: client, bucket: "berry-test", prefix: "artifacts",
       maxUploadBytes: 1024, maxIndexableBytes: 1024, partSize: 5 * 1024 * 1024, presignSeconds: 900,
@@ -564,7 +564,7 @@ describe("FilePlatformService.streamBrandingAsset", () => {
     expect(response.setHeader).toHaveBeenCalledWith("Content-Security-Policy", "default-src 'none'; sandbox");
     expect(response.setHeader).toHaveBeenCalledWith("Content-Type", "image/png");
     expect(response.setHeader).toHaveBeenCalledWith("Content-Disposition", expect.stringMatching(/^inline;/));
-    expect(client.send).toHaveBeenCalledWith(expect.objectContaining({ input: expect.objectContaining({ VersionId: "version-1" }) }));
+    expect(client.send).toHaveBeenCalledWith(expect.objectContaining({ input: expect.objectContaining({ VersionId: "version-1" }) }), expect.objectContaining({ abortSignal: expect.any(AbortSignal) }));
   });
 
   it("returns a security-versioned 304 for validated content before reading S3 or updating the database", async () => {
@@ -584,7 +584,7 @@ describe("FilePlatformService.streamBrandingAsset", () => {
     };
     const database = { withTenant: async (_tenantId: string, callback: (value: SqlExecutor) => Promise<unknown>) => callback(executor) };
     const client = { send: vi.fn() };
-    const response = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
+    const response = { statusCode: 0, once: vi.fn(), removeListener: vi.fn(), flushHeaders: vi.fn(), setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
     const service = new FilePlatformService(database as never, {
       client, presignClient: client, bucket: "berry-test", prefix: "artifacts",
       maxUploadBytes: 1024, maxIndexableBytes: 1024, partSize: 5 * 1024 * 1024, presignSeconds: 900,
@@ -630,7 +630,7 @@ describe("FilePlatformService.streamBrandingAsset", () => {
       Body: { async *[Symbol.asyncIterator]() { yield content; } },
       ContentLength: content.byteLength,
     })) };
-    const response = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
+    const response = { statusCode: 0, once: vi.fn(), removeListener: vi.fn(), flushHeaders: vi.fn(), setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
     const service = new FilePlatformService(database as never, {
       client, presignClient: client, bucket: "berry-test", prefix: "artifacts",
       maxUploadBytes: 1024, maxIndexableBytes: 1024, partSize: 5 * 1024 * 1024, presignSeconds: 900,
@@ -645,7 +645,7 @@ describe("FilePlatformService.streamBrandingAsset", () => {
     expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", INVALID_FILE_CACHE_CONTROL);
 
     client.send.mockClear();
-    const repeatedResponse = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
+    const repeatedResponse = { statusCode: 0, once: vi.fn(), removeListener: vi.fn(), flushHeaders: vi.fn(), setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
     await expect(service.streamBrandingAsset(TENANT_ID, "logo", fileId, repeatedResponse as never, "*"))
       .rejects.toThrow("Branding asset not found");
     expect(client.send).not.toHaveBeenCalled();
@@ -670,7 +670,7 @@ describe("FilePlatformService.streamBrandingAsset", () => {
     const destroy = vi.fn();
     const body = { destroy, async *[Symbol.asyncIterator]() { yield PNG_BYTES; } };
     const client = { send: vi.fn(async () => ({ Body: body, ContentLength: PNG_BYTES.byteLength + 1 })) };
-    const response = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
+    const response = { statusCode: 0, once: vi.fn(), removeListener: vi.fn(), flushHeaders: vi.fn(), setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
     const service = new FilePlatformService(database as never, {
       client, presignClient: client, bucket: "berry-test", prefix: "artifacts",
       maxUploadBytes: 1024, maxIndexableBytes: 1024, partSize: 5 * 1024 * 1024, presignSeconds: 900,
@@ -698,7 +698,7 @@ describe("FilePlatformService.streamBrandingAsset", () => {
     };
     const database = { withTenant: async (_tenantId: string, callback: (value: SqlExecutor) => Promise<unknown>) => callback(executor) };
     const client = { send: vi.fn() };
-    const response = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
+    const response = { statusCode: 0, once: vi.fn(), removeListener: vi.fn(), flushHeaders: vi.fn(), setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
     const service = new FilePlatformService(database as never, {
       client, presignClient: client, bucket: "berry-test", prefix: "artifacts",
       maxUploadBytes: 1024, maxIndexableBytes: 1024, partSize: 5 * 1024 * 1024, presignSeconds: 900,
@@ -724,7 +724,7 @@ describe("FilePlatformService.streamBrandingAsset", () => {
     };
     const database = { withTenant: async (_tenantId: string, callback: (value: SqlExecutor) => Promise<unknown>) => callback(executor) };
     const client = { send: vi.fn(async () => { throw new Error("temporary S3 failure"); }) };
-    const response = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(() => true), end: vi.fn() };
+    const response = { statusCode: 0, once: vi.fn(), removeListener: vi.fn(), flushHeaders: vi.fn(), setHeader: vi.fn(), write: vi.fn(() => true), end: vi.fn() };
     const service = new FilePlatformService(database as never, {
       client, presignClient: client, bucket: "berry-test", prefix: "artifacts",
       maxUploadBytes: 1024, maxIndexableBytes: 1024, partSize: 5 * 1024 * 1024, presignSeconds: 900,
@@ -743,7 +743,7 @@ describe("FilePlatformService.streamBrandingAsset", () => {
     };
     const database = { withTenant: async (_tenantId: string, callback: (value: SqlExecutor) => Promise<unknown>) => callback(executor) };
     const client = { send: vi.fn() };
-    const response = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
+    const response = { statusCode: 0, once: vi.fn(), removeListener: vi.fn(), flushHeaders: vi.fn(), setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
     const service = new FilePlatformService(database as never, {
       client, presignClient: client, bucket: "berry-test", prefix: "artifacts",
       maxUploadBytes: 1024, maxIndexableBytes: 1024, partSize: 5 * 1024 * 1024, presignSeconds: 900,

@@ -25,6 +25,8 @@ COPY apps/worker/package.json ./apps/worker/package.json
 COPY packages/acp-adapter/package.json ./packages/acp-adapter/package.json
 COPY packages/api-client/package.json ./packages/api-client/package.json
 COPY packages/cli-npm/package.json packages/cli-npm/install.js ./packages/cli-npm/
+COPY packages/client-core/package.json ./packages/client-core/package.json
+COPY packages/design-tokens/package.json ./packages/design-tokens/package.json
 COPY packages/db/package.json ./packages/db/package.json
 COPY packages/desktop-db/package.json ./packages/desktop-db/package.json
 COPY packages/desktop-ui/package.json ./packages/desktop-ui/package.json
@@ -39,14 +41,13 @@ COPY packages/sandbox-contract/package.json ./packages/sandbox-contract/package.
 COPY packages/shared/package.json ./packages/shared/package.json
 COPY packages/thread-ui/package.json ./packages/thread-ui/package.json
 
-# Resolve dependencies from the lightweight manifest layer so ordinary source
-# changes reuse both the fetched pnpm store and the offline install.
+# Install the web platform dependency graph without desktop or mobile packages.
+# Keep patch metadata available while pnpm validates the shared lockfile.
+COPY patches ./patches
 RUN --mount=type=cache,id=berry-pnpm-store,target=/pnpm/store \
   corepack pnpm config set store-dir /pnpm/store \
-  && corepack pnpm fetch --frozen-lockfile
-
-RUN --mount=type=cache,id=berry-pnpm-store,target=/pnpm/store \
-  corepack pnpm install --offline --frozen-lockfile
+  && corepack pnpm --filter berry-chat --filter @berry/api... --filter @berry/worker... \
+    --filter @berry/mem0... --filter @berry/web... install --frozen-lockfile
 
 FROM workspace AS build-api
 COPY apps/api ./apps/api
@@ -65,6 +66,7 @@ RUN --mount=type=cache,id=berry-turbo,target=/app/.turbo \
 
 FROM workspace AS build-worker
 COPY apps/worker ./apps/worker
+COPY packages/db ./packages/db
 COPY packages/desktop-db ./packages/desktop-db
 COPY packages/execpolicy ./packages/execpolicy
 COPY packages/harness ./packages/harness
@@ -89,6 +91,7 @@ FROM workspace AS build-web
 COPY apps/desktop/src/globals.css ./apps/desktop/src/globals.css
 COPY apps/web ./apps/web
 COPY packages/api-client ./packages/api-client
+COPY packages/client-core ./packages/client-core
 COPY packages/desktop-ui ./packages/desktop-ui
 COPY packages/shared ./packages/shared
 COPY packages/thread-ui ./packages/thread-ui

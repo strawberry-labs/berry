@@ -1,73 +1,30 @@
 import * as React from "react";
-import type { Connector, GoogleConnectorConfiguration } from "@berry/shared";
-import {
-  CalendarDays,
-  Check,
-  Clock3,
-  ExternalLink,
-  FileText,
-  HardDrive,
-  KeyRound,
-  Mail,
-  Plus,
-  PlugZap,
-  RefreshCw,
-  Search,
-  ShieldCheck,
-  Trash2,
-} from "lucide-react";
+import type { Connector } from "@berry/shared";
+import { CalendarDays, ExternalLink, FileText, HardDrive, Mail, Plus, PlugZap } from "lucide-react";
 import { toast } from "sonner";
 import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@berry/desktop-ui/components/ui/alert-dialog";
-import { Badge } from "@berry/desktop-ui/components/ui/badge";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@berry/desktop-ui/components/ui/dialog";
-import { Label } from "@berry/desktop-ui/components/ui/label";
-import { cn } from "@berry/desktop-ui/lib/utils";
-import { AsyncState, Button, FormSelect, Input, ManagementPage, Section, StatusPill, Textarea } from "./management-primitives";
+  AsyncState,
+  Button,
+  CellStack,
+  DataTable,
+  DefinitionList,
+  EmptyPanel,
+  InlineNotice,
+  Input,
+  ManagementDialog,
+  ManagementPage,
+  Section,
+  SegmentedControl,
+  StatusPill,
+} from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
-
-const EMPTY_GOOGLE: GoogleConnectorConfiguration = {
-  configured: false,
-  clientId: null,
-  hostedDomain: null,
-  pickerConfigured: false,
-  pickerProjectNumber: null,
-  status: "not_configured",
-  lastTestedAt: null,
-  callbackUrl: "https://example.invalid/v1/connectors/google/callback",
-};
-
-type AdminConnectorClient = Pick<NonNullable<ManagementScreenProps["client"]>, "listOrganizationConnectors" | "googleConnectorConfiguration">;
-
-export async function loadAdminConnectorData(client: AdminConnectorClient, tenantId: string, includeGoogleConfiguration: boolean) {
-  const [connectors, google] = await Promise.all([
-    client.listOrganizationConnectors(tenantId),
-    includeGoogleConfiguration ? client.googleConnectorConfiguration(tenantId) : Promise.resolve(EMPTY_GOOGLE),
-  ]);
-  return { connectors, google };
-}
+import { PersonalConnectorsSkeleton } from "./management-screen-skeletons";
 
 export function PersonalConnectorsScreen({ client, permissions }: ManagementScreenProps) {
   const resource = useResource("connectors:me", () => client?.listConnectors() ?? Promise.resolve([]), [] as Connector[]);
   const requests = useResource("connectors:requests", () => client?.listConnectorRequests() ?? Promise.resolve([]), [] as Connector[]);
   const canApprove = permissions.includes("mcp:write");
   const requestUrlId = React.useId();
-  const [query, setQuery] = React.useState("");
   const [addOpen, setAddOpen] = React.useState(false);
   const [requestUrl, setRequestUrl] = React.useState("");
   const [requestBusy, setRequestBusy] = React.useState(false);
@@ -75,7 +32,6 @@ export function PersonalConnectorsScreen({ client, permissions }: ManagementScre
   const [access, setAccess] = React.useState<"read" | "full">("read");
   const [credential, setCredential] = React.useState("");
   const [busy, setBusy] = React.useState(false);
-  const visible = resource.data.filter((connector) => `${connector.name} ${connector.description} ${connector.services.join(" ")}`.toLowerCase().includes(query.trim().toLowerCase()));
   const hasPendingRequest = requests.data.some((connector) => connector.approvalStatus === "pending");
 
   React.useEffect(() => {
@@ -168,122 +124,157 @@ export function PersonalConnectorsScreen({ client, permissions }: ManagementScre
     } catch (cause) { toast.error(message(cause)); } finally { setBusy(false); }
   };
 
-  const unresolvedRequests = requests.data.filter((connector) => connector.approvalStatus !== "approved");
-  const approvedMcp = resource.data.filter((connector) => connector.kind === "custom_mcp");
+  // Requests that are still waiting (or were declined) are not in the catalog
+  // yet, so they join the same list instead of a separate section.
+  const rows = React.useMemo(() => {
+    const byId = new Map<string, Connector>();
+    for (const connector of requests.data) if (connector.approvalStatus !== "approved") byId.set(connector.id, connector);
+    for (const connector of resource.data) if (!byId.has(connector.id)) byId.set(connector.id, connector);
+    return [...byId.values()].sort((left, right) => connectorRank(left) - connectorRank(right) || left.name.localeCompare(right.name));
+  }, [requests.data, resource.data]);
+  const pendingCount = rows.filter((connector) => connector.approvalStatus === "pending").length;
+  const selectedApproved = selected?.approvalStatus === "approved";
+  const selectedConnected = selected?.connectionStatus === "connected";
 
-  return <ManagementPage title="Connectors" description="Connect approved apps once, then let Berry use their tools when a task needs them." actions={<Button onClick={() => setAddOpen(true)}><Plus />Add MCP server</Button>}>
-    {unresolvedRequests.length ? <Section title="MCP approval status" description="Connect becomes available after an organization administrator approves the server.">
-      <div className="grid gap-2">
-        {unresolvedRequests.map((connector) => <div key={connector.id} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-card px-3 py-2.5">
-          <span className="flex min-w-0 items-center gap-3"><ConnectorIcon connector={connector} /><span className="min-w-0"><b className="block truncate text-sm font-medium">{connector.name}</b><small className="block truncate text-xs text-muted-foreground">{connector.url}</small></span></span>
-          <div className="flex items-center gap-2"><StatusPill tone={connector.approvalStatus === "pending" ? "warning" : "neutral"}>{connector.approvalStatus === "pending" ? <><Clock3 className="size-3" />Awaiting approval</> : "Not approved"}</StatusPill><Button size="sm" disabled>{connector.approvalStatus === "pending" ? "Connect after approval" : "Connect unavailable"}</Button></div>
-        </div>)}
-      </div>
-    </Section> : null}
-    <div className="relative">
-      <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
-      <Input value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="Search connectors" aria-label="Search connectors" className="h-10 pl-9" />
-    </div>
-    <AsyncState loading={resource.loading} error={resource.error} onRetry={resource.retry} empty={!resource.loading && visible.length === 0} emptyTitle="No connectors available" emptyText="An administrator must enable connectors before they appear here.">
-      <div className="grid gap-3 md:grid-cols-2">
-        {visible.map((connector) => <ConnectorCard key={connector.id} connector={connector} onClick={() => open(connector)} />)}
-      </div>
+  return <ManagementPage title="Connectors" description="Connect your accounts in other apps so Berry can use them when a task needs to." actions={<Button disabled={!client} onClick={() => setAddOpen(true)}><Plus />Add MCP server</Button>}>
+    {pendingCount ? <InlineNotice tone="info">
+      {pendingCount === 1 ? "One server you requested is" : `${pendingCount} servers you requested are`} waiting for an organization administrator. You can connect as soon as {pendingCount === 1 ? "it is" : "they are"} approved, and this list updates on its own.
+    </InlineNotice> : null}
+    <AsyncState loading={resource.loading} error={resource.error} onRetry={resource.retry} skeleton={<PersonalConnectorsSkeleton />}>
+      {rows.length === 0 ? <EmptyPanel
+        icon={PlugZap}
+        title="No connectors available"
+        description="Your organization has not turned on any connectors yet. You can request an MCP server, or ask an administrator to enable one."
+        action={<Button variant="secondary" disabled={!client} onClick={() => setAddOpen(true)}><Plus />Add MCP server</Button>}
+      /> : <Section flush>
+        <DataTable
+          label="Connectors"
+          columns={["Connector", "Works with", "Status"]}
+          onRowSelect={(index) => { const connector = rows[index]; if (connector) open(connector); }}
+          rowLabel={(index) => `Opened ${rows[index]?.name ?? "connector"}`}
+          rows={rows.map((connector) => {
+            const status = connectorStatus(connector);
+            return [
+              <span className="flex min-w-0 max-w-[30rem] items-center gap-3">
+                <ConnectorIcon connector={connector} />
+                <CellStack primary={connector.name} secondary={connector.description || connector.url} />
+              </span>,
+              <span className="text-muted-foreground">{connector.services.length ? connector.services.join(", ") : connector.kind === "custom_mcp" ? "MCP server" : "—"}</span>,
+              <span data-sort={connectorRank(connector)}><StatusPill tone={status.tone}>{status.label}</StatusPill></span>,
+            ];
+          })}
+        />
+      </Section>}
     </AsyncState>
-    <Dialog open={addOpen} onOpenChange={setAddOpen}>
-      <DialogContent className="sm:max-w-xl">
-        <DialogHeader>
-          <DialogTitle>Add an MCP server</DialogTitle>
-          <DialogDescription>{canApprove ? "Paste a Streamable HTTP MCP URL. Administrators can approve it immediately." : "Paste a Streamable HTTP MCP URL. An administrator must approve a new server before anyone can connect."}</DialogDescription>
-        </DialogHeader>
-        {approvedMcp.length ? <div className="grid gap-2">
-          <div><b className="text-xs font-medium">Organization catalog</b><p className="mt-0.5 text-xs text-muted-foreground">Already approved and available to everyone.</p></div>
-          <div className="max-h-48 space-y-1.5 overflow-y-auto">{approvedMcp.map((connector) => <div key={connector.id} className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2"><span className="min-w-0"><b className="block truncate text-sm font-medium">{connector.name}</b><small className="block truncate text-xs text-muted-foreground">{connector.url}</small></span><Button size="sm" variant="outline" onClick={() => { setAddOpen(false); open(connector); }}>{connector.connectionStatus === "connected" ? "View" : "Connect"}</Button></div>)}</div>
-        </div> : null}
-        <form className="grid gap-3" onSubmit={(event) => void requestMcp(event)}>
-          {approvedMcp.length ? <div className="flex items-center gap-3 text-[11px] uppercase tracking-wide text-muted-foreground"><span className="h-px flex-1 bg-border" /><span>New server</span><span className="h-px flex-1 bg-border" /></div> : null}
-          <Field label="Streamable HTTP MCP URL" htmlFor={requestUrlId}><Input id={requestUrlId} type="url" required value={requestUrl} onChange={(event) => setRequestUrl(event.currentTarget.value)} placeholder="https://mcp.example.com/mcp" autoComplete="url" /></Field>
-          <div className="rounded-lg border border-border bg-muted/20 p-3 text-xs leading-5 text-muted-foreground">Berry discovers the server’s OAuth configuration when you connect. Your authorization is personal; approving the server does not share anyone’s OAuth tokens.</div>
-          <DialogFooter><Button type="button" variant="outline" onClick={() => setAddOpen(false)}>Cancel</Button><Button type="submit" disabled={requestBusy || !client || !requestUrl.trim()}>{requestBusy ? "Submitting…" : canApprove ? "Add to organization" : "Request approval"}</Button></DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
-    <Dialog open={Boolean(selected)} onOpenChange={(value) => { if (!value) setSelected(null); }}>
-      {selected ? <DialogContent className="max-h-[88vh] overflow-y-auto sm:max-w-2xl">
-        <DialogHeader className="items-center text-center sm:items-center sm:text-center">
-          <ConnectorIcon connector={selected} large />
-          <DialogTitle className="text-xl">{selected.name}</DialogTitle>
-          <DialogDescription className="max-w-lg text-sm leading-6">{selected.description}</DialogDescription>
-        </DialogHeader>
-        <div className="grid gap-5 py-2">
-          {selected.connectionStatus === "connected" ? <div className="flex items-center justify-between rounded-lg border border-border bg-muted/25 px-3 py-2.5">
-            <span className="min-w-0"><b className="block text-sm font-medium">Connected</b><small className="block truncate text-xs text-muted-foreground">{selected.accountEmail ?? (selected.authStrategy === "shared" ? "Managed by your organization" : "Credential saved")}</small></span>
-            <StatusPill tone="good"><Check className="size-3" />{selected.provider === "google" ? selected.connectedAccessLevel === "full" ? "Full access" : "Read access" : "Connected"}</StatusPill>
-          </div> : null}
-          {selected.provider === "google" && selected.authType === "oauth" && selected.connectionStatus !== "connected" ? <fieldset className="grid gap-2">
-            <legend className="text-xs font-medium text-foreground">Access to request</legend>
-            <div className="grid grid-cols-2 gap-2">
-              <AccessChoice title="Read" description="Search and review data" selected={access === "read"} onClick={() => setAccess("read")} />
-              <AccessChoice title="Full" description="Also create and change data" selected={access === "full"} disabled={selected.maxAccessLevel !== "full"} onClick={() => setAccess("full")} />
-            </div>
-            {selected.maxAccessLevel !== "full" ? <small className="text-xs text-muted-foreground">Your administrator has limited this connector to read access.</small> : null}
-          </fieldset> : null}
-          {selected.authType === "bearer" && selected.authStrategy === "personal" && selected.connectionStatus !== "connected" ? <label className="grid gap-1.5 text-xs font-medium">Access token<Input type="password" autoComplete="off" value={credential} onChange={(event) => setCredential(event.currentTarget.value)} placeholder="Paste token" /></label> : null}
-          {selected.connectionStatus !== "connected" && selected.authType !== "none" ? <div className="rounded-lg border border-border bg-muted/20 p-3 text-xs leading-5 text-muted-foreground">
-            Berry uses this connection only for tasks you request. Relevant connector data may be sent to the model provider configured by your organization. Write actions still require confirmation, and connector data is not used for generalized model training by Berry.
-          </div> : null}
-          <div>
-            <h3 className="text-xs font-medium text-foreground">Available services</h3>
-            <div className="mt-2 flex flex-wrap gap-1.5">{selected.services.map((service) => <Badge key={service} variant="secondary">{service}</Badge>)}</div>
-          </div>
-          <div>
-            <h3 className="text-xs font-medium text-foreground">What Berry can do</h3>
-            {selected.tools.length ? <div className="mt-2 grid gap-1.5 sm:grid-cols-2">{selected.tools.slice(0, 10).map((tool) => <div key={tool} className="rounded-md border border-border px-2.5 py-2 text-xs text-muted-foreground">{humanTool(tool)}</div>)}</div> : <p className="mt-2 text-xs leading-5 text-muted-foreground">Berry will discover this server’s tools after you authorize your account.</p>}
-            {selected.tools.length > 10 ? <small className="mt-2 block text-xs text-muted-foreground">Plus {selected.tools.length - 10} more approved tools</small> : null}
-          </div>
-          {selected.limitations.length ? <div className="rounded-lg border border-border bg-muted/20 p-3"><b className="text-xs font-medium">Security boundary</b>{selected.limitations.map((limitation) => <p key={limitation} className="mt-1 text-xs leading-5 text-muted-foreground">{limitation}</p>)}</div> : null}
-          {selected.websiteUrl || selected.privacyPolicyUrl ? <div><h3 className="text-xs font-medium text-foreground">More information</h3><div className="mt-2 flex flex-wrap gap-3">{selected.websiteUrl ? <a href={selected.websiteUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-xs text-foreground underline underline-offset-4">Website<ExternalLink className="size-3" /></a> : null}{selected.privacyPolicyUrl ? <a href={selected.privacyPolicyUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-xs text-foreground underline underline-offset-4">Privacy policy<ExternalLink className="size-3" /></a> : null}</div></div> : null}
+
+    <ManagementDialog
+      open={addOpen}
+      onOpenChange={setAddOpen}
+      title="Add an MCP server"
+      description={canApprove
+        ? "Add a server that signs you in with OAuth. As an administrator you approve it for the organization straight away."
+        : "Request a server that signs you in with OAuth. An administrator has to approve it before anyone can connect."}
+      footer={<>
+        <Button type="button" variant="secondary" onClick={() => setAddOpen(false)}>Cancel</Button>
+        <Button type="submit" form="request-mcp-connector-form" disabled={requestBusy || !client || !requestUrl.trim()}>{requestBusy ? "Submitting…" : canApprove ? "Add to organization" : "Request approval"}</Button>
+      </>}
+    >
+      <form id="request-mcp-connector-form" className="grid gap-4" onSubmit={(event) => void requestMcp(event)}>
+        <div className="grid gap-1.5">
+          <label htmlFor={requestUrlId} className="text-xs font-medium text-foreground">Server URL</label>
+          <Input id={requestUrlId} type="url" required value={requestUrl} onChange={(event) => setRequestUrl(event.currentTarget.value)} placeholder="https://mcp.example.com/mcp" autoComplete="url" />
+          <p className="text-xs leading-5 text-muted-foreground">The server must use the Streamable HTTP transport. Servers that are already approved are in the list on this page.</p>
         </div>
-        <DialogFooter className="sm:justify-between">
-          {selected.connectionStatus === "connected" && selected.authStrategy === "personal" ? <Button variant="outline" disabled={busy} onClick={() => void disconnect()}>Disconnect</Button> : <span />}
-          {selected.connectionStatus === "connected" && selected.key === "google-workspace" && selected.workspaceAccessMode === "selected_files" ? <Button variant="outline" disabled={busy} onClick={() => void chooseFiles()}><FileText />Choose Drive files</Button> : null}
-          {selected.connectionStatus !== "connected" && selected.authType !== "none" ? <Button disabled={busy || !client || !selected.configured} onClick={() => void connect()}>{busy ? "Connecting…" : selected.configured ? `Connect ${selected.name}` : "Admin setup required"}</Button> : null}
-        </DialogFooter>
-      </DialogContent> : null}
-    </Dialog>
+        <InlineNotice tone="info">Approval makes the server available to everyone, but each person signs in with their own account. Nobody’s sign-in is shared.</InlineNotice>
+      </form>
+    </ManagementDialog>
+
+    <ManagementDialog
+      open={Boolean(selected)}
+      onOpenChange={(value) => { if (!value) setSelected(null); }}
+      title={selected?.name ?? "Connector"}
+      description={selected?.description || "A connector approved for your organization."}
+      size="lg"
+      footer={selected ? <>
+        {selectedConnected && selected.authStrategy === "personal" ? <Button variant="secondary" disabled={busy} onClick={() => void disconnect()}>Disconnect</Button> : null}
+        {selectedConnected && selected.key === "google-workspace" && selected.workspaceAccessMode === "selected_files" ? <Button variant="secondary" disabled={busy} onClick={() => void chooseFiles()}><FileText />Choose Drive files</Button> : null}
+        {selectedApproved && !selectedConnected && selected.authType !== "none" ? <Button disabled={busy || !client || !selected.configured} onClick={() => void connect()}>{busy ? "Connecting…" : needsReconnect(selected) ? `Reconnect ${selected.name}` : `Connect ${selected.name}`}</Button> : null}
+      </> : undefined}
+    >
+      {selected ? <div className="grid gap-4">
+        {selected.approvalStatus === "pending" ? <InlineNotice tone="warning" title="Awaiting approval">An organization administrator has to approve this server before you can connect.</InlineNotice> : null}
+        {selected.approvalStatus === "rejected" ? <InlineNotice tone="danger" title="Not approved">An administrator declined this server, so it can’t be connected.</InlineNotice> : null}
+        {selectedApproved && !selectedConnected && !selected.configured && selected.authType !== "none" ? <InlineNotice tone="warning" title="Needs admin setup">An administrator has to finish setting up this connector before you can connect.</InlineNotice> : null}
+        <DefinitionList items={[
+          { term: "Status", detail: <StatusPill tone={connectorStatus(selected).tone}>{connectorStatus(selected).label}</StatusPill> },
+          ...(selectedConnected ? [{ term: "Account", detail: selected.accountEmail ?? (selected.authStrategy === "shared" ? "Managed by your organization" : "Saved access token") }] : []),
+          ...(selectedConnected && selected.provider === "google" ? [{ term: "Access", detail: selected.connectedAccessLevel === "full" ? "Read and write" : "Read only" }] : []),
+          ...(selected.services.length ? [{ term: "Works with", detail: selected.services.join(", ") }] : []),
+          ...(selected.kind === "custom_mcp" && selected.url ? [{ term: "Server", detail: <span className="break-all font-mono text-xs">{selected.url}</span> }] : []),
+        ]} />
+        {selectedApproved && selected.provider === "google" && selected.authType === "oauth" && !selectedConnected ? <div className="grid gap-1.5">
+          <span className="text-xs font-medium text-foreground">Access to request</span>
+          {selected.maxAccessLevel === "full" ? <>
+            <div><SegmentedControl label="Access to request" value={access} onChange={setAccess} options={[{ value: "read", label: "Read only" }, { value: "full", label: "Read and write" }]} /></div>
+            <p className="text-xs leading-5 text-muted-foreground">{access === "full" ? "Berry can search, read, create and change data. Changes still ask for your confirmation." : "Berry can search and read data but not change it."}</p>
+          </> : <p className="text-xs leading-5 text-muted-foreground">Read only. Your administrator has limited this connector to reading data.</p>}
+        </div> : null}
+        {selectedApproved && selected.authType === "bearer" && selected.authStrategy === "personal" && !selectedConnected ? <label className="grid gap-1.5 text-xs font-medium text-foreground">
+          Access token
+          <Input type="password" autoComplete="off" value={credential} onChange={(event) => setCredential(event.currentTarget.value)} placeholder="Paste the token from the app" />
+        </label> : null}
+        <div className="grid gap-1.5">
+          <h3 className="text-xs font-medium text-foreground">What Berry can do</h3>
+          {selected.tools.length ? <>
+            <ul className="grid gap-x-6 gap-y-1 text-md text-muted-foreground sm:grid-cols-2">{selected.tools.slice(0, 10).map((tool) => <li key={tool} className="truncate">{humanTool(tool)}</li>)}</ul>
+            {selected.tools.length > 10 ? <p className="text-xs text-muted-foreground">And {selected.tools.length - 10} more.</p> : null}
+          </> : <p className="text-xs leading-5 text-muted-foreground">Berry finds out what this server offers after you connect your account.</p>}
+        </div>
+        {selected.limitations.length ? <div className="grid gap-1.5">
+          <h3 className="text-xs font-medium text-foreground">Limits</h3>
+          <ul className="grid gap-1 text-xs leading-5 text-muted-foreground">{selected.limitations.map((limitation) => <li key={limitation}>{limitation}</li>)}</ul>
+        </div> : null}
+        {selectedApproved && !selectedConnected && selected.authType !== "none" ? <p className="text-xs leading-5 text-muted-foreground">
+          Berry uses this connection only for tasks you ask for. Data it reads may be sent to the model provider your organization has chosen, and changes always ask for your confirmation first.
+        </p> : null}
+        {selected.websiteUrl || selected.privacyPolicyUrl ? <div className="flex flex-wrap gap-4 text-xs">
+          {selected.websiteUrl ? <a href={selected.websiteUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-foreground underline underline-offset-4">Website<ExternalLink className="size-3" aria-hidden /></a> : null}
+          {selected.privacyPolicyUrl ? <a href={selected.privacyPolicyUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-foreground underline underline-offset-4">Privacy policy<ExternalLink className="size-3" aria-hidden /></a> : null}
+        </div> : null}
+      </div> : null}
+    </ManagementDialog>
   </ManagementPage>;
 }
 
-function ConnectorCard({ connector, onClick }: { connector: Connector; onClick: () => void }) {
-  const connected = connector.connectionStatus === "connected";
-  return <button type="button" onClick={onClick} className="group flex min-h-28 items-start gap-3 rounded-xl border border-border bg-card p-4 text-left transition-colors hover:border-foreground/20 hover:bg-muted/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-    <ConnectorIcon connector={connector} />
-    <span className="min-w-0 flex-1"><span className="flex items-start justify-between gap-2"><b className="text-sm font-medium text-foreground">{connector.name}</b>{connected ? <StatusPill tone="good">Connected</StatusPill> : <Plus className="size-4 text-muted-foreground transition-colors group-hover:text-foreground" />}</span><span className="mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground">{connector.description}</span><span className="mt-2 block text-[11px] text-muted-foreground">{connector.services.join(" · ")}</span></span>
-  </button>;
+/** Shared by the three capability screens' lists: what needs attention sorts first. */
+function connectorRank(connector: Connector): number {
+  if (connector.approvalStatus === "pending" || needsReconnect(connector)) return 0;
+  if (connector.connectionStatus === "connected") return 1;
+  if (connector.approvalStatus === "rejected") return 3;
+  return 2;
 }
 
-function ConnectorSummary({ label, value, detail, tone }: { label: string; value: string; detail: string; tone: "good" | "warning" | "neutral" }) {
-  return <div className="rounded-xl border border-border bg-card p-3.5"><div className="flex items-start justify-between gap-2"><span className="text-xs font-medium text-muted-foreground">{label}</span><StatusPill tone={tone}>{tone === "good" ? "Ready" : tone === "warning" ? "Setup" : "Managed"}</StatusPill></div><b className="mt-2 block text-lg font-medium tabular-nums text-foreground">{value}</b><p className="mt-0.5 text-[11px] leading-4 text-muted-foreground">{detail}</p></div>;
+function connectorStatus(connector: Connector): { label: string; tone: "good" | "warning" | "danger" | "neutral" } {
+  if (connector.approvalStatus === "pending") return { label: "Awaiting approval", tone: "warning" };
+  if (connector.approvalStatus === "rejected") return { label: "Not approved", tone: "danger" };
+  if (connector.connectionStatus === "connected") return { label: "Connected", tone: "good" };
+  if (connector.connectionStatus === "error") return { label: "Connection error", tone: "danger" };
+  if (needsReconnect(connector)) return { label: "Reconnect needed", tone: "warning" };
+  if (connector.authType === "none") return { label: "Ready", tone: "good" };
+  if (!connector.configured) return { label: "Needs admin setup", tone: "neutral" };
+  return { label: "Not connected", tone: "neutral" };
 }
 
-function ConnectorIcon({ connector, large = false }: { connector: Connector; large?: boolean }) {
+function needsReconnect(connector: Connector): boolean {
+  return connector.approvalStatus === "approved" && ["reauth_required", "revoked", "error"].includes(connector.connectionStatus);
+}
+
+function ConnectorIcon({ connector }: { connector: Connector }) {
   const Icon = connector.key === "google-workspace" ? HardDrive : connector.key === "gmail" ? Mail : connector.key === "google-calendar" ? CalendarDays : PlugZap;
-  return <span className={cn("flex shrink-0 items-center justify-center rounded-xl border border-border bg-muted/30 text-foreground", large ? "mb-1 size-16" : "size-11")}><Icon className={large ? "size-7" : "size-5"} aria-hidden /></span>;
+  return <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-[var(--berry-surface-under)] text-muted-foreground"><Icon className="size-4" aria-hidden /></span>;
 }
 
-function AccessChoice({ title, description, selected, disabled, onClick }: { title: string; description: string; selected: boolean; disabled?: boolean; onClick: () => void }) {
-  return <button type="button" disabled={disabled} onClick={onClick} className={cn("rounded-lg border px-3 py-2.5 text-left disabled:cursor-not-allowed disabled:opacity-40", selected ? "border-foreground/30 bg-muted/50" : "border-border hover:bg-muted/20")}><b className="block text-sm font-medium">{title}</b><small className="text-xs text-muted-foreground">{description}</small></button>;
-}
-
-function GooglePolicyRow({ connector, disabled, onChange }: { connector: Connector; disabled: boolean; onChange: (enabled: boolean, level: "read" | "full", mode?: "selected_files" | "search_workspace") => void }) {
-  const [mode, setMode] = React.useState(connector.workspaceAccessMode ?? "selected_files");
-  React.useEffect(() => setMode(connector.workspaceAccessMode ?? "selected_files"), [connector.workspaceAccessMode]);
-  return <div className="rounded-xl border border-border bg-card p-3.5"><div className="flex flex-wrap items-center justify-between gap-3"><span className="flex min-w-0 items-center gap-3"><ConnectorIcon connector={connector} /><span><b className="block text-sm font-medium">{connector.name}</b><small className="text-xs text-muted-foreground">{connector.services.join(" · ")}</small></span></span><div className="flex items-center rounded-lg border border-border bg-muted/20 p-0.5" role="group" aria-label={`${connector.name} access`}>
-    {(["off", "read", "full"] as const).map((level) => { const active = level === "off" ? !connector.enabled : connector.enabled && connector.maxAccessLevel === level; return <button key={level} type="button" disabled={disabled} onClick={() => onChange(level !== "off", level === "full" ? "full" : "read", mode)} className={cn("rounded-md px-3 py-1.5 text-xs font-medium capitalize text-muted-foreground transition-colors disabled:opacity-40", active && "bg-background text-foreground shadow-sm")}>{level}</button>; })}
-  </div></div>{connector.key === "google-workspace" ? <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-border pt-3"><span><b className="block text-xs font-medium">Drive access boundary</b><small className="text-xs text-muted-foreground">Selected files uses Google Picker; workspace search can search all files the user can access.</small></span><div className="w-48"><FormSelect value={mode} onChange={(value) => { const next = value as typeof mode; setMode(next); if (connector.enabled) onChange(true, connector.maxAccessLevel, next); }} options={[{ value: "selected_files", label: "Selected files only" }, { value: "search_workspace", label: "Workspace search" }]} /></div></div> : null}</div>;
-}
-
-function Field({ label, htmlFor, children }: { label: string; htmlFor?: string; children: React.ReactNode }) { return <div className="grid gap-1.5"><Label htmlFor={htmlFor} className="text-xs">{label}</Label>{children}</div>; }
-function humanTool(value: string): string { return value.replace(/^google_/, "").replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase()); }
+function humanTool(value: string): string { return value.replace(/^google_/, "").replaceAll("_", " ").replace(/^\w/, (letter) => letter.toUpperCase()); }
 function message(cause: unknown): string { return cause instanceof Error ? cause.message : "Connector request failed"; }
 
 let pickerPromise: Promise<any> | null = null;

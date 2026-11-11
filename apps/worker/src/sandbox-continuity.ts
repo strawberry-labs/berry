@@ -4177,7 +4177,10 @@ async function generateDurableImage(
 ): Promise<ImageGenerationResult> {
   const references = input.referenceImageUrls ?? [];
   const upstreamModel = input.model.split("/").at(-1) ?? input.model;
-  const response = await fetch(references.length > 0 ? config.editsEndpoint : config.endpoint, {
+  const endpoint = references.length > 0 ? config.editsEndpoint : config.endpoint;
+  const imageHost = new URL(endpoint).hostname;
+  const usesOpenRouterImageApi = imageHost === "openrouter.ai" || imageHost.endsWith(".openrouter.ai");
+  const response = await fetch(endpoint, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -4188,10 +4191,14 @@ async function generateDurableImage(
     body: JSON.stringify({
       model: input.model,
       prompt: input.prompt,
-      ...(references.length > 0 ? {
-        images: references.map((imageUrl) => ({ image_url: imageUrl })),
-        ...(!upstreamModel.startsWith("gpt-image-2") ? { input_fidelity: "high" } : {}),
-      } : {}),
+      ...(references.length > 0
+        ? usesOpenRouterImageApi
+          ? { input_references: references.map((url) => ({ type: "image_url", image_url: { url } })) }
+          : {
+              images: references.map((imageUrl) => ({ image_url: imageUrl })),
+              ...(!upstreamModel.startsWith("gpt-image-2") ? { input_fidelity: "high" } : {}),
+            }
+        : {}),
       n: 1,
       size: input.size,
       ...(!upstreamModel.startsWith("gpt-image-") ? { response_format: config.responseFormat } : {}),

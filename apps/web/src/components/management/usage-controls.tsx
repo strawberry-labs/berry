@@ -110,11 +110,11 @@ export function UsageRangeControl({
         <div className="mt-3 border-t border-border pt-3">
           <p className="mb-2 text-xs font-medium text-foreground">Custom range</p>
           <div className="grid gap-2 sm:grid-cols-2">
-            <label className="grid gap-1 text-[11px] text-muted-foreground">
+            <label className="grid gap-1 text-xs text-muted-foreground">
               From
               <Input type="date" value={custom.from} onChange={(event) => setCustom({ ...custom, from: event.currentTarget.value })} />
             </label>
-            <label className="grid gap-1 text-[11px] text-muted-foreground">
+            <label className="grid gap-1 text-xs text-muted-foreground">
               To
               <Input type="date" value={custom.to} onChange={(event) => setCustom({ ...custom, to: event.currentTarget.value })} />
             </label>

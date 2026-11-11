@@ -1,21 +1,51 @@
 import * as React from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { Copy, Download, Eye, FileUp, Plus, Save, Search, UserPlus, Users } from "lucide-react";
+import { Copy, Eye, FileUp, LineChart, Plus, Save, MonitorSmartphone, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 import {
-  AsyncState, Button, Checkbox, DataTable, FormSelect, Input, ManagementDialog,
-  ManagementPage, MetricGrid, SearchInput, Section, StatusPill, SuccessMessage,
-  Switch, Toolbar, formatDateTime, formatMoney, formatNumber,
+  AsyncState, Button, CellStack, Checkbox, DataTable, DefinitionList, DetailDrawer,
+  FormSelect, InlineNotice, Input, ManagementDialog, ManagementPage, Meter, MetricGrid,
+  Num, StatusPill, SuccessMessage, formatDate, formatMoney, formatNumber,
 } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
-import {
-  calculateCacheMetric, UsageRangeControl, usageRangeForPreset,
-  type UsageDateRange, type UsageRangePreset,
-} from "./usage-controls";
 import { parseMemberImportCsv, type MemberImportRow } from "../../lib/member-import";
 import { memberAccessStatusOptions, memberStatusUpdate } from "../../lib/member-administration";
 import { startSupportView } from "../../lib/support-view";
+import { AdminMembersSkeleton } from "./management-screen-skeletons";
 const MemberSkillsDialog = React.lazy(async () => ({ default: (await import("./member-skills-dialog")).MemberSkillsDialog }));
+const MemberDevicesDialog = React.lazy(async () => ({ default: (await import("./member-devices-dialog")).MemberDevicesDialog }));
+
+const STATUS_LABEL: Record<string, string> = {
+  active: "Active",
+  pending: "Pending sign-in",
+  disabled: "Blocked",
+  deprovisioned: "Offboarded",
+};
+const STATUS_TONE: Record<string, "good" | "warning" | "danger" | "neutral"> = {
+  active: "good",
+  pending: "warning",
+  disabled: "danger",
+  deprovisioned: "neutral",
+};
+/** Members waiting on something sort first; people who have left sort last. */
+const STATUS_ORDER: Record<string, number> = { pending: 0, disabled: 1, active: 2, deprovisioned: 3 };
+const SOURCE_LABEL: Record<string, string> = { manual: "Added by an administrator", sso: "Single sign-on", scim: "Directory sync (SCIM)" };
+const fieldLabel = "grid content-start gap-1.5 text-xs font-medium text-muted-foreground";
+const fieldHint = "text-xs font-normal leading-snug text-muted-foreground";
+
+/** A titled group inside the member drawer, separated from the one above by a hairline. */
+function DrawerSection({ title, description, children }: { title: string; description?: string; children: React.ReactNode }) {
+  return (
+    <section className="grid gap-3 border-t border-border pt-4">
+      <div className="grid gap-0.5">
+        <h3 className="text-sm font-semibold text-foreground">{title}</h3>
+        {description ? <p className="text-xs leading-snug text-muted-foreground text-pretty">{description}</p> : null}
+      </div>
+      {children}
+    </section>
+  );
+}
+
 export function AdminMembersScreen({
   client,
   config,
@@ -25,8 +55,8 @@ export function AdminMembersScreen({
 }: ManagementScreenProps) {
   const navigate = useNavigate();
   const [skillsMember, setSkillsMember] = React.useState<{ userId: string; name: string } | null>(null);
-  const [query, setQuery] = React.useState(""),
-    [addMode, setAddMode] = React.useState<"choose" | "manual" | "bulk" | null>(null),
+  const [devicesMember, setDevicesMember] = React.useState<{ userId: string; name: string } | null>(null);
+  const [addMode, setAddMode] = React.useState<"manual" | "bulk" | null>(null),
     [message, setMessage] = React.useState("");
   const [manualError, setManualError] = React.useState("");
   const [manualBusy, setManualBusy] = React.useState(false);
@@ -67,6 +97,9 @@ export function AdminMembersScreen({
   const usageFrom = new Date(
     Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1),
   ).toISOString();
+  const canReadUsage = permissions.includes("usage:read");
+  const canReadBalances = permissions.includes("budgets:read");
+  const canWrite = permissions.includes("members:write");
   const usage = useResource(
     `member-usage:${tenantId}:${usageFrom}`,
     async () =>
@@ -99,11 +132,18 @@ export function AdminMembersScreen({
   const memberBalance = new Map<string, any>(
     balances.data.map((balance: any) => [balance.userId, balance]),
   );
-  const rows = r.data.filter((m: any) =>
-    `${m.name} ${m.email} ${m.role}`
-      .toLowerCase()
-      .includes(query.toLowerCase()),
+  const rows = [...r.data].sort((left: any, right: any) =>
+    (STATUS_ORDER[left.status] ?? 2) - (STATUS_ORDER[right.status] ?? 2)
+    || String(left.name || left.email).localeCompare(String(right.name || right.email)),
   );
+  const countByStatus = (status: string) => r.data.filter((member: any) => member.status === status).length;
+  const departmentLabel = (member: any) => {
+    const ids: string[] = member.departmentIds ?? [];
+    if (ids.length === 0) return "—";
+    const primary = member.primaryDepartmentId && ids.includes(member.primaryDepartmentId) ? member.primaryDepartmentId : ids[0]!;
+    const name = departmentNames.get(primary) ?? "Unknown department";
+    return ids.length > 1 ? `${name} +${ids.length - 1}` : name;
+  };
   const submit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!client) return;
@@ -130,7 +170,9 @@ export function AdminMembersScreen({
       setManualBusy(false);
     }
   };
-  const chooseAddMode = (mode: "manual" | "bulk") => {
+  const openAdd = (mode: "manual" | "bulk") => {
+    setBulkRows([]);
+    setBulkFileName("");
     setManualError("");
     setBulkError("");
     setBulkNotice("");
@@ -265,102 +307,228 @@ export function AdminMembersScreen({
       setEditBusy(false);
     }
   };
+
+  const createdAny = bulkRows.some((row) => row.status === "created");
+  const readyCount = bulkRows.filter((row) => row.status === "ready").length;
+  const failedRows = bulkRows.filter((row) => row.status === "failed").length;
+  const canAdd = canWrite && !authConfiguration.loading && !authConfiguration.error && (!googleOnly || canAddGoogleAdministrator);
+
+  const editingIsOwner = editing?.role === "owner";
+  const roleLocked = editingIsOwner || actorRole !== "owner";
+  const statusLocked = editingIsOwner || (editing?.role === "admin" && actorRole !== "owner");
+  const editingDepartments: string[] = editing?.departmentIds ?? [];
+  const editDirty = Boolean(editing) && (
+    editRole !== editing.role
+    || editStatus !== editing.status
+    || editPrimaryDepartment !== (editing.primaryDepartmentId ?? "none")
+    || editDepartments.size !== editingDepartments.length
+    || editingDepartments.some((id) => !editDepartments.has(id))
+  );
+  const editingBalance = editing ? memberBalance.get(editing.userId) : null;
+  const editingName = editing ? editing.name || editing.email : "";
+
+  const columns = [
+    "Member", "Role", "Department", "Status",
+    ...(canReadUsage ? ["Spend this month"] : []),
+    ...(canReadBalances ? ["Allowance"] : []),
+    "Joined",
+  ];
+  const pending = countByStatus("pending");
+  const blocked = countByStatus("disabled");
+
   return (
-    <ManagementPage
+    <ManagementPage width="wide"
       title="Members"
-      description={googleOnly ? "Review Workspace users, promote trusted administrators, and manage organization access." : "Find people by name or email, review current-month spend, and administer local organization accounts."}
+      description={googleOnly ? "Everyone who can sign in to this organization, with their role, department, and access." : "Everyone with an account in this organization, with their role, department, access, and allowance."}
       eyebrow="People"
       actions={
-        permissions.includes("members:write") && !authConfiguration.loading && !authConfiguration.error && (!googleOnly || canAddGoogleAdministrator) ? (
-          <Button onClick={() => {
-            setBulkRows([]);
-            setBulkFileName("");
-            setBulkError("");
-            setBulkNotice("");
-            setManualError("");
-            setAddMode(googleOnly ? "manual" : "choose");
-          }}>
-            <Plus />
-            {googleOnly ? "Add administrator" : "Add member"}
-          </Button>
+        canAdd ? (
+          googleOnly ? (
+            <Button onClick={() => openAdd("manual")}><Plus />Add administrator</Button>
+          ) : (
+            <>
+              <Button variant="secondary" onClick={() => openAdd("bulk")}><FileUp />Import CSV</Button>
+              <Button onClick={() => openAdd("manual")}><Plus />Add member</Button>
+            </>
+          )
         ) : null
       }
     >
-      <Toolbar>
-        <SearchInput
-          label="Search members"
-          value={query}
-          onChange={setQuery}
-          placeholder="Search name, email, or role"
-        />
-      </Toolbar>
       {authConfiguration.error ? <AsyncState loading={false} error={authConfiguration.error} onRetry={authConfiguration.retry}>{null}</AsyncState> : null}
       {message ? <SuccessMessage>{message}</SuccessMessage> : null}
-      {!googleOnly ? <ManagementDialog
-        open={addMode === "choose"}
-        onOpenChange={(next) => { if (!next) setAddMode(null); }}
-        title="Add members"
-        description="Create one member manually or import a CSV with multiple names and email addresses."
-        footer={<Button type="button" variant="secondary" onClick={() => setAddMode(null)}>Cancel</Button>}
+      <AsyncState
+        loading={r.loading}
+        error={r.error}
+        onRetry={r.retry}
+        skeleton={<AdminMembersSkeleton columns={columns} />}
+        empty={r.data.length === 0}
+        emptyTitle="No members yet"
+        emptyText={googleOnly ? "People appear here after their first Google sign-in." : "Add a member or import a CSV to create accounts."}
       >
-        <div className="grid gap-3 sm:grid-cols-2">
-          <button
-            type="button"
-            className="group grid min-h-32 gap-3 rounded-xl border border-border bg-card p-4 text-left transition-colors hover:border-foreground/25 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            onClick={() => chooseAddMode("manual")}
-          >
-            <span className="flex size-9 items-center justify-center rounded-lg border border-border bg-muted/50 text-foreground"><UserPlus className="size-4" aria-hidden /></span>
-            <span><b className="block text-sm text-foreground">Add manually</b><small className="mt-1 block text-xs leading-5 text-muted-foreground">Enter account details, role, department, and a temporary password.</small></span>
-          </button>
-          <button
-            type="button"
-            className="group grid min-h-32 gap-3 rounded-xl border border-border bg-card p-4 text-left transition-colors hover:border-foreground/25 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            onClick={() => chooseAddMode("bulk")}
-          >
-            <span className="flex size-9 items-center justify-center rounded-lg border border-border bg-muted/50 text-foreground"><Users className="size-4" aria-hidden /></span>
-            <span><b className="block text-sm text-foreground">Bulk import</b><small className="mt-1 block text-xs leading-5 text-muted-foreground">Upload a CSV. New accounts use the member role and no department.</small></span>
-          </button>
-        </div>
-      </ManagementDialog> : null}
+        <MetricGrid
+          items={[
+            { label: "Active", value: formatNumber(countByStatus("active")), hint: `of ${formatNumber(r.data.length)} members` },
+            { label: "Pending sign-in", value: formatNumber(pending), hint: "Added, not yet signed in", ...(pending ? { status: "warning" as const } : {}) },
+            { label: "Blocked", value: formatNumber(blocked), hint: "Cannot sign in or run tasks" },
+            { label: "Offboarded", value: formatNumber(countByStatus("deprovisioned")), hint: "Access revoked, history kept" },
+          ]}
+        />
+        <DataTable
+          label="Members"
+          columns={columns}
+          initialPageSize={25}
+          onRowSelect={(index) => openMember(rows[index])}
+          activeRow={editing ? rows.findIndex((member: any) => member.userId === editing.userId) : null}
+          rowLabel={(index) => rows[index]?.name || rows[index]?.email || "Member"}
+          rows={rows.map((m: any) => {
+            const balance = memberBalance.get(m.userId);
+            return [
+              <CellStack primary={m.name || m.email} secondary={m.name ? m.email : undefined} />,
+              sentence(m.role),
+              departmentLabel(m),
+              <StatusPill tone={STATUS_TONE[m.status] ?? "neutral"}>{STATUS_LABEL[m.status] ?? sentence(m.status)}</StatusPill>,
+              ...(canReadUsage ? [
+                usage.loading ? "…" : memberSpend.has(m.userId)
+                  ? <Num value={memberSpend.get(m.userId)} kind="money" />
+                  : <span data-sort={0} className="text-muted-foreground" title="Not among the 100 highest spenders this month">—</span>,
+              ] : []),
+              ...(canReadBalances ? [
+                balances.loading ? "…" : <AllowanceCell balance={balance} />,
+              ] : []),
+              formatDate(m.joinedAt),
+            ];
+          })}
+        />
+      </AsyncState>
+
+      {editing ? (
+        <DetailDrawer
+          title={editingName}
+          subtitle={editing.name ? editing.email : undefined}
+          badge={<StatusPill tone={STATUS_TONE[editing.status] ?? "neutral"}>{STATUS_LABEL[editing.status] ?? sentence(editing.status)}</StatusPill>}
+          onClose={() => { if (!editBusy) setEditing(null); }}
+          footer={canWrite ? (
+            <>
+              <Button type="button" variant="secondary" onClick={() => setEditing(null)} disabled={editBusy}>Cancel</Button>
+              <Button type="button" onClick={() => void saveMember()} disabled={editingIsOwner || editBusy || !editDirty}><Save />{editBusy ? "Saving…" : "Save member"}</Button>
+            </>
+          ) : undefined}
+        >
+          <DefinitionList
+            items={[
+              { term: "Added through", detail: SOURCE_LABEL[editing.source] ?? sentence(String(editing.source ?? "manual")) },
+              { term: "Joined", detail: formatDate(editing.joinedAt) },
+              ...(canReadUsage && memberSpend.has(editing.userId) ? [{ term: "Spend this month", detail: formatMoney(memberSpend.get(editing.userId)) }] : []),
+              ...(canReadBalances && editingBalance ? [{
+                term: "Allowance",
+                detail: editingBalance.effectiveLimitMicros === null
+                  ? `${formatMoney(editingBalance.usedMicros)} used · Unlimited`
+                  : <Meter value={Number(editingBalance.usedMicros)} max={Number(editingBalance.effectiveLimitMicros)} label={`${formatMoney(editingBalance.usedMicros)} used`} detail={`of ${formatMoney(editingBalance.effectiveLimitMicros)}`} />,
+              }] : []),
+            ]}
+          />
+          <div className="flex flex-wrap gap-2">
+            {canReadUsage ? (
+              <Button variant="secondary" onClick={() => void navigate({ to: "/admin/$tab", params: { tab: "analytics" }, search: { view: "people", memberId: editing.userId } })}>
+                <LineChart />Usage
+              </Button>
+            ) : null}
+            {permissions.includes("org:admin") && permissions.includes("skills:read") ? (
+              <Button variant="secondary" onClick={() => { setSkillsMember({ userId: editing.userId, name: editingName }); setEditing(null); }}><Sparkles />Skills</Button>
+            ) : null}
+            {permissions.includes("members:read") ? (
+              <Button variant="secondary" onClick={() => { setDevicesMember({ userId: editing.userId, name: editingName }); setEditing(null); }}><MonitorSmartphone />Phones</Button>
+            ) : null}
+            {(actorRole === "owner" || actorRole === "admin") && editing.userId !== userId ? (
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  if (!userId) return;
+                  try {
+                    startSupportView({ tenantId, userId: editing.userId, name: editing.name ?? "", email: editing.email ?? "" }, userId);
+                    void navigate({ to: "/" });
+                  } catch (cause) {
+                    toast.error(cause instanceof Error ? cause.message : "Support view could not be started.");
+                  }
+                }}
+              >
+                <Eye />View as user
+              </Button>
+            ) : null}
+          </div>
+          {editingIsOwner ? (
+            <InlineNotice tone="info">The organization owner cannot be demoted, blocked, or offboarded here.</InlineNotice>
+          ) : !canWrite ? (
+            <InlineNotice tone="info">You can view members. Changing role, access, or departments needs the “Members: write” permission.</InlineNotice>
+          ) : null}
+          <DrawerSection title="Access" description="Blocked and offboarded members cannot sign in or start requests. Their audit and usage history is kept.">
+            <div className="grid items-start gap-3 sm:grid-cols-2">
+              <label className={fieldLabel}>
+                Role
+                <FormSelect ariaLabel="Role" value={editRole} onChange={setEditRole} disabled={!canWrite || roleLocked} options={editingIsOwner ? [{ value: "owner", label: "Owner" }] : [{ value: "member", label: "Member" }, { value: "admin", label: "Admin" }]} />
+                {!editingIsOwner && actorRole !== "owner" ? <small className={fieldHint}>Only the organization owner can change roles.</small> : null}
+              </label>
+              <label className={fieldLabel}>
+                Account access
+                <FormSelect ariaLabel="Account access" value={editStatus} onChange={setEditStatus} disabled={!canWrite || statusLocked} options={memberAccessStatusOptions(editing.status)} />
+                {!editingIsOwner && statusLocked ? <small className={fieldHint}>Only the owner can change an administrator’s access.</small> : null}
+              </label>
+            </div>
+          </DrawerSection>
+          <DrawerSection title="Departments" description="Model rules and allowance defaults follow the primary department.">
+            <fieldset className="m-0 min-w-0 border-0 p-0" disabled={!canWrite || editingIsOwner}>
+              <legend className="sr-only">Departments</legend>
+              {departments.data.length === 0 ? (
+                <p className="text-xs text-muted-foreground">No departments exist yet. Create one under People → Departments.</p>
+              ) : (
+                <div className="grid gap-x-4 sm:grid-cols-2">
+                  {departments.data.map((department: any) => (
+                    <label key={department.id} className="flex min-w-0 cursor-pointer items-center gap-2.5 py-1.5 text-md text-foreground">
+                      <Checkbox checked={editDepartments.has(department.id)} onCheckedChange={() => toggleDepartment(department.id)} />
+                      <span className="truncate">{department.name}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+            </fieldset>
+            <label className={fieldLabel}>
+              Primary department
+              <FormSelect ariaLabel="Primary department" value={editPrimaryDepartment} onChange={setEditPrimaryDepartment} disabled={!canWrite || editingIsOwner} options={[{ value: "none", label: "No primary department" }, ...departments.data.filter((department: any) => editDepartments.has(department.id)).map((department: any) => ({ value: department.id, label: department.name }))]} />
+            </label>
+          </DrawerSection>
+          {editError ? <InlineNotice tone="danger">{editError}</InlineNotice> : null}
+        </DetailDrawer>
+      ) : null}
+
       <ManagementDialog
         open={addMode === "manual"}
         onOpenChange={(next) => { if (!next && !manualBusy) setAddMode(null); }}
         title={googleOnly ? "Add Google administrator" : "Add member"}
-        description={googleOnly ? `Reserve the administrator role for a trusted @${authConfiguration.data.ssoProviders[0]?.domain ?? "Workspace"} account. Access activates on their first Google sign-in.` : "Create a local Berry account and apply the selected organization role. Email invitations are not sent in the current no-SSO mode."}
+        description={googleOnly ? `Reserve the administrator role for a trusted @${authConfiguration.data.ssoProviders[0]?.domain ?? "Workspace"} account. Access activates on their first Google sign-in.` : "Create a Berry account with a temporary password. No invitation email is sent, so share the password with the member yourself."}
         footer={
           <>
-            <Button
-              type="button"
-              variant="secondary"
-              onClick={() => setAddMode(googleOnly ? null : "choose")}
-              disabled={manualBusy}
-            >
-              Back
-            </Button>
+            <Button type="button" variant="secondary" onClick={() => setAddMode(null)} disabled={manualBusy}>Cancel</Button>
             <Button type="submit" form="invite-member-form" disabled={manualBusy}>
               {manualBusy ? "Saving…" : googleOnly ? "Add administrator" : "Create account"}
             </Button>
           </>
         }
       >
-        <form
-          id="invite-member-form"
-          className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground"
-          onSubmit={submit}
-        >
-          {!googleOnly ? <label>
+        <form id="invite-member-form" className="grid gap-3 sm:grid-cols-2" onSubmit={submit}>
+          {!googleOnly ? <label className={fieldLabel}>
             Name
             <Input name="name" autoFocus required />
           </label> : null}
-          <label>
+          <label className={fieldLabel}>
             Email
             <Input name="email" type="email" autoFocus={googleOnly} required />
           </label>
-          {!googleOnly ? <label>
+          {!googleOnly ? <label className={fieldLabel}>
             Temporary password
             <Input name="password" type="password" minLength={12} required />
+            <small className="text-xs font-normal leading-4">At least 12 characters.</small>
           </label> : null}
-          {!googleOnly ? <label>
+          {!googleOnly ? <label className={fieldLabel}>
             Role
             <FormSelect
               name="role"
@@ -371,7 +539,7 @@ export function AdminMembersScreen({
               ]}
             />
           </label> : null}
-          <label>
+          <label className={fieldLabel}>
             Primary department
             <FormSelect
               name="primaryDepartmentId"
@@ -380,164 +548,87 @@ export function AdminMembersScreen({
             />
           </label>
         </form>
-        {manualError ? <p className="mt-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive" role="alert">{manualError}</p> : null}
+        {manualError ? <div className="mt-3"><InlineNotice tone="danger">{manualError}</InlineNotice></div> : null}
       </ManagementDialog>
+
       {!googleOnly ? <ManagementDialog
         open={addMode === "bulk"}
         onOpenChange={(next) => { if (!next && !bulkImporting) setAddMode(null); }}
-        title="Bulk import members"
-        description="Upload a CSV with name and email columns. Passwords are generated in your browser; every account is created as a member with no department."
+        title="Import members from CSV"
+        description="Upload a CSV with name and email columns. Each account is created as a member with no department and a temporary password generated in your browser."
         size="lg"
         footer={
           <>
-            {bulkRows.some((row) => row.status === "created") ? (
+            {createdAny ? (
               <Button type="button" variant="secondary" onClick={() => void copyCreatedCredentials()}>
                 <Copy aria-hidden />
                 Copy credentials
               </Button>
             ) : null}
-            <Button type="button" variant="secondary" onClick={() => setAddMode(bulkRows.some((row) => row.status === "created") ? null : "choose")} disabled={bulkImporting}>
-              {bulkRows.some((row) => row.status === "created") ? "Done" : "Back"}
+            <Button type="button" variant="secondary" onClick={() => setAddMode(null)} disabled={bulkImporting}>
+              {createdAny ? "Done" : "Cancel"}
             </Button>
-            <Button type="button" onClick={() => void importBulkMembers()} disabled={bulkImporting || !bulkRows.some((row) => row.status === "ready")}>
+            <Button type="button" onClick={() => void importBulkMembers()} disabled={bulkImporting || readyCount === 0}>
               <FileUp aria-hidden />
-              {bulkImporting ? "Importing…" : bulkRows.some((row) => row.status === "ready") ? `Import ${bulkRows.filter((row) => row.status === "ready").length} members` : "Import members"}
+              {bulkImporting ? "Importing…" : readyCount ? `Import ${readyCount} ${readyCount === 1 ? "member" : "members"}` : "Import members"}
             </Button>
           </>
         }
       >
-        <div className="grid gap-4">
-          <label className="flex cursor-pointer items-center gap-3 rounded-xl border border-dashed border-border bg-muted/20 px-4 py-4 transition-colors hover:bg-muted/40 focus-within:ring-2 focus-within:ring-ring">
-            <span className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-border bg-card"><FileUp className="size-4" aria-hidden /></span>
-            <span className="min-w-0 flex-1"><b className="block truncate text-sm text-foreground">{bulkFileName || "Choose a CSV file"}</b><small className="mt-0.5 block text-xs text-muted-foreground">Required headers: name, email. Extra columns are ignored.</small></span>
-            <span className="rounded-md border border-border bg-card px-2.5 py-1.5 text-xs font-medium text-foreground">Browse</span>
+        <div className="grid gap-3">
+          <label className="flex cursor-pointer items-center gap-3 rounded-lg border border-dashed border-border px-4 py-3 transition-colors hover:bg-[var(--berry-hover)] focus-within:ring-2 focus-within:ring-ring">
+            <FileUp className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+            <span className="grid min-w-0 flex-1 gap-0.5">
+              <b className="truncate text-md font-medium text-foreground">{bulkFileName || "Choose a CSV file"}</b>
+              <small className="text-xs text-muted-foreground">Required headers: name, email. Extra columns are ignored.</small>
+            </span>
             <input className="sr-only" type="file" accept=".csv,text/csv" onChange={(event) => void readBulkFile(event)} disabled={bulkImporting} />
           </label>
-          {bulkError ? <p className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive" role="alert">{bulkError}</p> : null}
-          {bulkNotice ? <p className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-foreground" role="status">{bulkNotice}</p> : null}
+          {bulkError ? <InlineNotice tone="danger">{bulkError}</InlineNotice> : null}
+          {bulkNotice ? <InlineNotice tone={failedRows ? "warning" : "good"}>{bulkNotice}</InlineNotice> : null}
           {bulkRows.length ? (
-            <div className="overflow-hidden rounded-xl border border-border">
-              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-muted/20 px-3 py-2">
-                <b className="text-xs text-foreground">Import preview</b>
-                <span className="text-[11px] text-muted-foreground">{bulkRows.filter((row) => row.status === "ready").length} ready · {bulkRows.filter((row) => row.status === "failed").length} need attention</span>
-              </div>
-              <div className="max-h-72 overflow-auto">
-                <table className="w-full min-w-[620px] text-left text-xs">
-                  <thead className="sticky top-0 bg-card text-[11px] text-muted-foreground"><tr><th className="px-3 py-2 font-medium">Row</th><th className="px-3 py-2 font-medium">Member</th><th className="px-3 py-2 font-medium">Temporary password</th><th className="px-3 py-2 font-medium">Status</th></tr></thead>
-                  <tbody className="divide-y divide-border">
-                    {bulkRows.map((row) => (
-                      <tr key={row.rowNumber}>
-                        <td className="px-3 py-2 text-muted-foreground">{row.rowNumber}</td>
-                        <td className="px-3 py-2"><b className="block font-medium text-foreground">{row.name || "Missing name"}</b><span className="text-muted-foreground">{row.email || "Missing email"}</span></td>
-                        <td className="px-3 py-2 font-mono text-[11px] text-foreground">{row.password || "—"}</td>
-                        <td className="max-w-52 px-3 py-2">
-                          {row.status === "created" ? <StatusPill tone="good">Created</StatusPill> : row.status === "creating" ? <StatusPill tone="neutral">Creating</StatusPill> : row.status === "ready" ? <StatusPill tone="neutral">Ready</StatusPill> : <span className="text-[11px] leading-4 text-destructive">{row.importError || "Failed"}</span>}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
+            <>
+              <p className="text-xs text-muted-foreground">
+                <span className="tabular-nums">{readyCount}</span> ready · <span className="tabular-nums">{failedRows}</span> {failedRows === 1 ? "needs" : "need"} attention
+              </p>
+              <DataTable
+                label="Import preview"
+                searchable={false}
+                initialPageSize={25}
+                columns={["Row", "Member", "Temporary password", "Status"]}
+                rows={bulkRows.map((row) => [
+                  <span data-sort={row.rowNumber} className="tabular-nums text-muted-foreground">{row.rowNumber}</span>,
+                  <CellStack primary={row.name || "Missing name"} secondary={row.email || "Missing email"} />,
+                  <span className="font-mono text-xs">{row.password || "—"}</span>,
+                  row.status === "created" ? <StatusPill tone="good">Created</StatusPill>
+                    : row.status === "creating" ? <StatusPill tone="info">Creating</StatusPill>
+                    : row.status === "ready" ? <StatusPill tone="neutral">Ready</StatusPill>
+                    : <CellStack primary={<StatusPill tone="danger">Failed</StatusPill>} secondary={row.importError} />,
+                ])}
+              />
+            </>
           ) : null}
-          <p className="text-[11px] leading-4 text-muted-foreground">Password format: capitalized first name, @, then at least six random numbers. Generated passwords are at least 12 characters long.</p>
+          <p className="text-xs leading-4 text-muted-foreground">Passwords use the capitalized first name, @, then at least six random digits, and are at least 12 characters long.</p>
         </div>
       </ManagementDialog> : null}
-      <ManagementDialog
-        open={Boolean(editing)}
-        onOpenChange={(next) => { if (!next && !editBusy) setEditing(null); }}
-        title={editing?.name || "Manage member"}
-        description={editing ? `${editing.email} · Set role, access status, and primary department.` : ""}
-        size="lg"
-        footer={<><Button type="button" variant="secondary" onClick={() => setEditing(null)} disabled={editBusy}>Cancel</Button><Button type="button" onClick={() => void saveMember()} disabled={editing?.role === "owner" || editBusy}><Save />{editBusy ? "Saving…" : "Save member"}</Button></>}
-      >
-        {editing ? (
-          <div className="grid gap-4">
-            {editing.role === "owner" ? <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">The organization owner cannot be demoted, blocked, or offboarded from this screen.</p> : null}
-            <div className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground">
-              <label>Role<FormSelect value={editRole} onChange={setEditRole} disabled={editing.role === "owner" || actorRole !== "owner"} options={[{ value: "member", label: "Member" }, { value: "admin", label: "Admin" }]} /></label>
-              <label>Account access<FormSelect value={editStatus} onChange={setEditStatus} disabled={editing.role === "owner" || (editing.role === "admin" && actorRole !== "owner")} options={memberAccessStatusOptions(editing.status)} /></label>
-            </div>
-            <fieldset className="grid gap-2 border-0 p-0" disabled={editing.role === "owner"}>
-              <legend className="mb-1 text-xs font-semibold">Departments</legend>
-              {departments.data.map((department: any) => (
-                <label key={department.id} className="flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm">
-                  <Checkbox checked={editDepartments.has(department.id)} onCheckedChange={() => toggleDepartment(department.id)} />
-                  {department.name}
-                </label>
-              ))}
-            </fieldset>
-            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Primary department<FormSelect value={editPrimaryDepartment} onChange={setEditPrimaryDepartment} disabled={editing.role === "owner"} options={[{ value: "none", label: "No primary department" }, ...departments.data.filter((department: any) => editDepartments.has(department.id)).map((department: any) => ({ value: department.id, label: department.name }))]} /></label>
-            <p className="text-xs text-muted-foreground">Blocked and offboarded members cannot authorize new requests. Their audit and usage history remains available.</p>
-            {editError ? <p className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive" role="alert">{editError}</p> : null}
-          </div>
-        ) : null}
-      </ManagementDialog>
-      <AsyncState
-        loading={r.loading}
-        error={r.error}
-        onRetry={r.retry}
-        empty={rows.length === 0}
-      >
-        <DataTable
-          label="Members"
-          columns={["Member", "Role", "Departments", "Spend this month", "Allowance cycle", "Source", "Status", ""]}
-          rows={rows.map((m: any) => [
-            <Button
-              variant="ghost"
-              className="grid h-auto justify-start gap-0 p-0 text-left"
-              onClick={() =>
-                void navigate({
-                  to: "/admin/$tab",
-                  params: { tab: "analytics" },
-                  search: { view: "people", memberId: m.userId },
-                })
-              }
-            >
-              <b>{m.name}</b>
-              <small>{m.email}</small>
-            </Button>,
-            m.role,
-            (m.departmentIds ?? [])
-              .map((id: string) => departmentNames.get(id) ?? id.slice(0, 8))
-              .join(", ") || "—",
-            usage.loading
-              ? "Loading…"
-              : formatMoney(memberSpend.get(m.userId) ?? "0"),
-            balances.loading
-              ? "Loading…"
-              : memberBalance.get(m.userId)?.effectiveLimitMicros === null
-                ? `${formatMoney(memberBalance.get(m.userId)?.usedMicros ?? "0")} · Unlimited`
-                : `${formatMoney(memberBalance.get(m.userId)?.usedMicros ?? "0")} / ${formatMoney(memberBalance.get(m.userId)?.effectiveLimitMicros ?? "0")}`,
-            m.source,
-            <StatusPill tone={m.status === "active" ? "good" : "warning"}>
-              {m.status}
-            </StatusPill>,
-            <div className="flex items-center justify-end gap-1.5">
-              {(actorRole === "owner" || actorRole === "admin") && m.userId !== userId ? (
-                <Button
-                  variant="secondary"
-                  onClick={() => {
-                    if (!userId) return;
-                    try {
-                      startSupportView({ tenantId, userId: m.userId, name: m.name ?? "", email: m.email ?? "" }, userId);
-                      void navigate({ to: "/" });
-                    } catch (cause) {
-                      toast.error(cause instanceof Error ? cause.message : "Support view could not be started.");
-                    }
-                  }}
-                >
-                  <Eye /> View as user
-                </Button>
-              ) : null}
-              {permissions.includes("org:admin") && permissions.includes("skills:read") ? <Button variant="secondary" onClick={() => setSkillsMember({ userId: m.userId, name: m.name || m.email })}>Skills</Button> : null}
-              {permissions.includes("members:write") ? <Button variant="secondary" onClick={() => openMember(m)}>Manage</Button> : null}
-            </div>,
-          ])}
-        />
-      </AsyncState>
+
       {skillsMember ? <React.Suspense fallback={<p role="status" className="text-xs text-muted-foreground">Loading member skills…</p>}><MemberSkillsDialog client={client} tenantId={tenantId} member={skillsMember} canWrite={permissions.includes("skills:write")} onClose={() => setSkillsMember(null)} /></React.Suspense> : null}
+      {devicesMember ? <React.Suspense fallback={<p role="status" className="text-xs text-muted-foreground">Loading member phones…</p>}><MemberDevicesDialog client={client} tenantId={tenantId} member={devicesMember} canRevoke={permissions.includes("members:write")} onClose={() => setDevicesMember(null)} /></React.Suspense> : null}
     </ManagementPage>
+  );
+}
+
+function AllowanceCell({ balance }: { balance: any }) {
+  if (!balance) return <span data-sort={-2} className="text-muted-foreground">—</span>;
+  if (balance.effectiveLimitMicros === null) {
+    return <span data-sort={-1} className="tabular-nums" title={`${formatMoney(balance.usedMicros)} used`}>Unlimited</span>;
+  }
+  const used = Number(balance.usedMicros);
+  const limit = Number(balance.effectiveLimitMicros);
+  return (
+    <span data-sort={limit > 0 ? used / limit : 0} className="inline-block w-40 text-left">
+      <Meter value={used} max={limit} label={formatMoney(balance.usedMicros)} detail={`of ${formatMoney(balance.effectiveLimitMicros)}`} />
+    </span>
   );
 }
 
@@ -546,6 +637,7 @@ type BulkMemberRow = MemberImportRow & {
   importError: string | undefined;
 };
 
-function human(value: string) {
-  return value.replaceAll("_", " ").replaceAll("-", " ").replace(/\b\w/g, (c) => c.toUpperCase());
+function sentence(value: string) {
+  const text = String(value ?? "").replaceAll("_", " ").replaceAll("-", " ");
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }

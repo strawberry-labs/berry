@@ -115,7 +115,7 @@ describe("BerryApiClient", () => {
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
 
-    await expect(client.listPersonalSkills()).rejects.toMatchObject({
+    await expect(client.listOrganizations()).rejects.toMatchObject({
       status: 403,
       body: { code: "support_view_read_not_available" },
     });
@@ -139,10 +139,56 @@ describe("BerryApiClient", () => {
 
     const sessionSource = client.streamEvents("session_1", { onEvent: vi.fn() });
     const taskSource = client.streamTaskEvents("task_1", { onEvent: vi.fn() });
-    expect(sessionSource.url).toBe("https://api.berry.test/v1/orgs/org_1/support/users/user_2/sessions/session_1/events");
-    expect(taskSource.url).toBe("https://api.berry.test/v1/orgs/org_1/support/users/user_2/tasks/task_1/events");
+    expect((sessionSource as unknown as FakeEventSource).url).toBe("https://api.berry.test/v1/orgs/org_1/support/users/user_2/sessions/session_1/events");
+    expect((taskSource as unknown as FakeEventSource).url).toBe("https://api.berry.test/v1/orgs/org_1/support/users/user_2/tasks/task_1/events");
     expect((sessionSource as unknown as FakeEventSource).init).toEqual({ withCredentials: true });
     vi.unstubAllGlobals();
+  });
+
+  it("lets bearer-token clients supply their own event stream transport", () => {
+    const opened: Array<{ url: string; withCredentials: boolean; authorization: string | null }> = [];
+    const source = { onopen: null, onerror: null, onmessage: null as ((event: { data: string; lastEventId: string }) => void) | null, close: vi.fn() };
+    const client = new BerryApiClient({
+      baseUrl: "https://berry.acme.com",
+      headers: { Authorization: "Bearer mobile-token" },
+      credentials: "omit",
+      fetchImpl: vi.fn() as unknown as typeof fetch,
+      eventSource: (url, init) => {
+        opened.push({ url, withCredentials: init.withCredentials, authorization: init.headers.get("authorization") });
+        return source;
+      },
+    });
+    const onEvent = vi.fn();
+    const stream = client.streamEvents("session_1", { onEvent }, "cursor-9");
+    expect(opened).toEqual([{ url: "https://berry.acme.com/v1/sessions/session_1/events?cursor=cursor-9", withCredentials: false, authorization: "Bearer mobile-token" }]);
+    source.onmessage?.({ data: JSON.stringify({ kind: "turn.end", turnId: "turn_1", status: "completed" }), lastEventId: "cursor-10" });
+    expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: "turn.end" }), "cursor-10");
+    stream.close();
+    expect(source.close).toHaveBeenCalled();
+  });
+
+  it("drives the mobile pairing endpoints", async () => {
+    const calls: Array<{ url: string; method: string; credentials: RequestCredentials | undefined; body: unknown }> = [];
+    const responses: Record<string, unknown> = {
+      "POST /v1/mobile/pairings/claim": { pairingId: "6f1c3c1e-2b9a-4f7e-9a51-0c6c2d3e4f50", claimToken: "c".repeat(43), expiresAt: "2026-10-09T10:03:00.000Z", brand: { applicationName: "Acme", logoUrl: null, accentColor: null } },
+      "POST /v1/mobile/pairings/poll": { status: "awaiting" },
+      "DELETE /v1/mobile/session": { ok: true },
+    };
+    const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+      const path = new URL(url).pathname;
+      calls.push({ url: path, method: init.method ?? "GET", credentials: init.credentials, body: init.body ? JSON.parse(String(init.body)) : undefined });
+      return new Response(JSON.stringify(responses[`${init.method} ${path}`]), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const client = new BerryApiClient({ baseUrl: "https://berry.acme.com", credentials: "omit", fetchImpl: fetchImpl as unknown as typeof fetch });
+    const device = { model: "Pixel 8a", platform: "android" as const, osVersion: "16", appVersion: "1.0.0" };
+    const claim = await client.claimMobilePairing({ manualCode: "ABCD-EFGH", device });
+    await expect(client.pollMobilePairing({ pairingId: claim.pairingId, claimToken: claim.claimToken })).resolves.toEqual({ status: "awaiting" });
+    await client.signOutMobileSession();
+    expect(calls).toEqual([
+      { url: "/v1/mobile/pairings/claim", method: "POST", credentials: "omit", body: { manualCode: "ABCD-EFGH", device } },
+      { url: "/v1/mobile/pairings/poll", method: "POST", credentials: "omit", body: { pairingId: claim.pairingId, claimToken: claim.claimToken } },
+      { url: "/v1/mobile/session", method: "DELETE", credentials: "omit", body: undefined },
+    ]);
   });
 
   it("normalizes generated-image URLs to the scoped support endpoint", async () => {
@@ -550,6 +596,18 @@ describe("BerryApiClient", () => {
       method: "POST",
       body: JSON.stringify({ model: "berry/auto", pendingInput: "Continue the task" }),
     }));
+  });
+
+  it("reads task-wide token usage with abort support and support-view routing", async () => {
+    const totals = { taskId: "task_1", inputTokens: 8_000, cachedInputTokens: 6_000, uncachedInputTokens: 2_000, outputTokens: 250, totalTokens: 8_250, cacheHitRate: 0.75 };
+    const fetchImpl = vi.fn(async () => json(totals));
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+    const controller = new AbortController();
+    await expect(client.taskTokenUsage("session_1", { signal: controller.signal })).resolves.toEqual(totals);
+    expect(fetchImpl).toHaveBeenCalledWith("https://api.berry.test/v1/sessions/session_1/task-token-usage", expect.objectContaining({ signal: controller.signal }));
+    const support = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch, supportView: { tenantId: "tenant_1", userId: "user_1" } });
+    await expect(support.taskTokenUsage("session_1")).resolves.toEqual(totals);
+    expect(fetchImpl).toHaveBeenLastCalledWith("https://api.berry.test/v1/orgs/tenant_1/support/users/user_1/sessions/session_1/task-token-usage", expect.anything());
   });
 
   it("queues steering input for an active turn", async () => {
@@ -968,6 +1026,7 @@ describe("BerryApiClient", () => {
     const fileId = "00000000-0000-7000-8000-000000000101";
     const uploadId = "00000000-0000-7000-8000-000000000102";
     const taskId = "00000000-0000-7000-8000-000000000103";
+    let firstPartAttempts = 0;
     const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/v1/files/uploads")) return json({ fileId, uploadId, partSize: 3, partCount: 2, expiresAt: "2026-07-22T10:00:00.000Z" });
@@ -975,6 +1034,7 @@ describe("BerryApiClient", () => {
         return json({ parts: [{ partNumber: 1, url: "https://files.berry.test/part-1" }, { partNumber: 2, url: "https://files.berry.test/part-2" }] });
       }
       if (url.startsWith("https://files.berry.test/part-")) {
+        if (url.endsWith("1") && firstPartAttempts++ === 0) return new Response(null, { status: 503 });
         const part = url.endsWith("1") ? "1" : "2";
         return new Response(null, { status: 200, headers: { etag: `\"etag-${part}\"` } });
       }
@@ -998,7 +1058,8 @@ describe("BerryApiClient", () => {
     const initiate = fetchImpl.mock.calls.find(([url]) => String(url).endsWith("/v1/files/uploads"));
     expect(initiate?.[1]).toMatchObject({ method: "POST", body: JSON.stringify({ name: "report.pdf", mediaType: "application/pdf", size: 6, taskId }) });
     const partPuts = fetchImpl.mock.calls.filter(([url]) => String(url).startsWith("https://files.berry.test/part-"));
-    expect(partPuts).toHaveLength(2);
+    expect(partPuts).toHaveLength(3);
+    expect(partPuts.filter(([url]) => String(url).endsWith("part-2"))).toHaveLength(1);
     expect(partPuts.every(([, init]) => init?.body instanceof Blob)).toBe(true);
     expect(Math.max(...progress)).toBe(6);
     expect(JSON.stringify(fetchImpl.mock.calls.filter(([url]) => String(url).startsWith("https://api.berry.test")))).not.toContain("data:");
@@ -1086,6 +1147,24 @@ describe("BerryApiClient", () => {
       expect.objectContaining({ method: "DELETE" }),
     );
   });
+});
+
+it("does not initiate an already cancelled upload", async () => {
+  const fetchImpl = vi.fn(); const controller = new AbortController(); controller.abort();
+  const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl });
+  await expect(client.uploadFile(new File(["abc"], "file.txt"), { signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
+  expect(fetchImpl).not.toHaveBeenCalled();
+});
+it("cleans up when signing fails before any parts are sent", async () => {
+  const fileId = "00000000-0000-7000-8000-000000000101", uploadId = "00000000-0000-7000-8000-000000000102";
+  const fetchImpl = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+    if (String(url).endsWith("/uploads")) return json({ fileId, uploadId, partSize: 3, partCount: 1, expiresAt: "2026-07-22T10:00:00.000Z" });
+    if (init?.method === "DELETE") return json({ ok: true });
+    return new Response(null, { status: 503 });
+  });
+  const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl });
+  await expect(client.uploadFile(new File(["abc"], "file.txt"))).rejects.toMatchObject({ status: 503 });
+  expect(fetchImpl).toHaveBeenLastCalledWith(expect.stringContaining(uploadId), expect.objectContaining({ method: "DELETE" }));
 });
 
 function json(body: unknown): Response {

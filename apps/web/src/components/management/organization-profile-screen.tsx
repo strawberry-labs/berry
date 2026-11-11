@@ -11,7 +11,7 @@ import {
 import { Save } from "lucide-react";
 import { FileImage, ImagePlus, Trash2 } from "@berry/desktop-ui/lib/icons";
 import { cn } from "@berry/desktop-ui/lib/utils";
-import { AsyncState, Button, DataTable, Input, ManagementPage, Section, StatusPill, SuccessMessage } from "./management-primitives";
+import { AsyncState, Button, DataTable, DefinitionList, InlineNotice, Input, ManagementPage, Section, SettingList, SettingRow, StatusPill, SuccessMessage, formatDate, formatDateTime } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
 import { TimezoneSelect } from "./timezone-select";
 import { resolveDeploymentBrandAssetUrl } from "../shell/deployment-brand";
@@ -28,6 +28,7 @@ export function OrganizationProfileScreen({ client, config, tenantId, permission
   const [message, setMessage] = React.useState("");
   const [error, setError] = React.useState("");
   React.useEffect(() => { if (resource.data) setDraft(resource.data); }, [resource.data]);
+  const formId = React.useId();
   const writable = permissions.includes("org_settings:write");
   const branding = brandingRecord(draft?.branding);
   const applicationName = typeof branding.applicationName === "string" ? branding.applicationName : "Berry";
@@ -99,21 +100,34 @@ export function OrganizationProfileScreen({ client, config, tenantId, permission
     }
   }
 
-  return <ManagementPage title="Organization settings" description="Manage the identity, browser branding, locale, and support details first configured during onboarding." eyebrow="Organization">
-    <AsyncState loading={resource.loading} error={resource.error} onRetry={resource.retry} empty={!resource.data} emptyTitle="Profile unavailable">
-      {draft ? <>
-        <Section title="Identity and branding" description={writable ? "Logo and favicon uploads are stored in Berry S3 and applied across this deployment." : "Your role can view this managed profile but cannot change it."}>
-          <form className="grid gap-5" onSubmit={save}>
-            <div className="grid gap-3 sm:grid-cols-2">
-              <FieldLabel label="Name"><Input disabled={!writable || saving} value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.currentTarget.value })} /></FieldLabel>
-              <FieldLabel label="Application name"><Input disabled={!writable || saving} value={applicationName} onChange={(event) => updateBranding({ applicationName: event.currentTarget.value })} /></FieldLabel>
-              <FieldLabel label="Slug"><Input disabled={!writable || saving} pattern="[a-z0-9-]+" value={draft.slug} onChange={(event) => setDraft({ ...draft, slug: event.currentTarget.value })} /></FieldLabel>
-              <FieldLabel label="Accent color">
-                <span className="flex items-center gap-2"><Input className="w-14 shrink-0 p-1" disabled={!writable || saving} type="color" value={accentColor} onChange={(event) => updateBranding({ accentColor: event.currentTarget.value })} /><Input disabled={!writable || saving} pattern="#[0-9A-Fa-f]{6}" value={accentColor} onChange={(event) => updateBranding({ accentColor: event.currentTarget.value })} /></span>
-              </FieldLabel>
-            </div>
+  const dirty = Boolean(draft && resource.data && (JSON.stringify(draft) !== JSON.stringify(resource.data) || pendingAssets.logo || pendingAssets.favicon));
+  const locked = !writable || saving;
 
-            <div className="grid gap-3 border-t border-[var(--berry-border-subtle)] pt-4 lg:grid-cols-2">
+  return <ManagementPage width="narrow"
+    title="Organization settings"
+    description="The name, branding, and contact details members see across this deployment."
+    eyebrow="Organization"
+    actions={draft && writable ? (
+      <Button type="submit" form={formId} disabled={saving || !dirty}><Save />{saving ? "Saving…" : "Save settings"}</Button>
+    ) : null}
+  >
+    {draft && !writable ? <InlineNotice tone="info">You can view these settings. Changing them needs a role with the organization settings write permission.</InlineNotice> : null}
+    {error ? <InlineNotice tone="danger" title="Settings not saved">{error}</InlineNotice> : null}
+    {message ? <SuccessMessage>{message}</SuccessMessage> : null}
+    <AsyncState loading={resource.loading} error={resource.error} onRetry={resource.retry} empty={!resource.data} emptyTitle="Profile unavailable" emptyText="Connect the organization API to load and edit the organization profile.">
+      {draft ? <>
+        <form id={formId} className="grid min-w-0 gap-5" onSubmit={save}>
+          <Section title="Identity" flush>
+            <SettingList>
+              <SettingRow title="Organization name" description="Shown in the sidebar, on sign-in, and in emails.">
+                <Control><Input aria-label="Organization name" disabled={locked} required value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.currentTarget.value })} /></Control>
+              </SettingRow>
+              <SettingRow title="Application name" description="What the product is called for your members, in the browser tab and on sign-in.">
+                <Control><Input aria-label="Application name" disabled={locked} value={applicationName} onChange={(event) => updateBranding({ applicationName: event.currentTarget.value })} /></Control>
+              </SettingRow>
+              <SettingRow title="Slug" description="The short identifier used in links. Lowercase letters, numbers, and hyphens. Changing it can break saved links.">
+                <Control><Input aria-label="Slug" className="font-mono text-xs" disabled={locked} required pattern="[a-z0-9-]+" value={draft.slug} onChange={(event) => setDraft({ ...draft, slug: event.currentTarget.value })} /></Control>
+              </SettingRow>
               <BrandAssetField
                 kind="logo"
                 title="Organization logo"
@@ -121,7 +135,7 @@ export function OrganizationProfileScreen({ client, config, tenantId, permission
                 previewUrl={logoPreview}
                 pending={pendingAssets.logo}
                 progress={uploadProgress.logo}
-                disabled={!writable || saving}
+                disabled={locked}
                 onSelect={(file) => selectAsset("logo", file)}
                 onRemove={() => removeAsset("logo")}
               />
@@ -132,43 +146,83 @@ export function OrganizationProfileScreen({ client, config, tenantId, permission
                 previewUrl={faviconPreview}
                 pending={pendingAssets.favicon}
                 progress={uploadProgress.favicon}
-                disabled={!writable || saving}
+                disabled={locked}
                 onSelect={(file) => selectAsset("favicon", file)}
                 onRemove={() => removeAsset("favicon")}
               />
-            </div>
-
-            <div className="grid gap-3 border-t border-[var(--berry-border-subtle)] pt-4 sm:grid-cols-2">
-              <FieldLabel label="Timezone" hint="Choose a city. Berry stores the IANA timezone and shows its current UTC offset.">
-                <TimezoneSelect disabled={!writable || saving} value={draft.timezone} onChange={(timezone) => setDraft({ ...draft, timezone })} />
-              </FieldLabel>
-              <FieldLabel label="Language"><Input disabled={!writable || saving} value={draft.language} onChange={(event) => setDraft({ ...draft, language: event.currentTarget.value })} /></FieldLabel>
-              <FieldLabel label="Support contact"><Input disabled={!writable || saving} type="email" value={draft.supportEmail ?? ""} onChange={(event) => setDraft({ ...draft, supportEmail: event.currentTarget.value || null })} /></FieldLabel>
-              <FieldLabel label="Security contact"><Input disabled={!writable || saving} type="email" value={draft.securityEmail ?? ""} onChange={(event) => setDraft({ ...draft, securityEmail: event.currentTarget.value || null })} /></FieldLabel>
-              <FieldLabel label="Terms URL"><Input disabled={!writable || saving} type="url" value={draft.termsUrl ?? ""} onChange={(event) => setDraft({ ...draft, termsUrl: event.currentTarget.value || null })} /></FieldLabel>
-              <FieldLabel label="Privacy URL"><Input disabled={!writable || saving} type="url" value={draft.privacyUrl ?? ""} onChange={(event) => setDraft({ ...draft, privacyUrl: event.currentTarget.value || null })} /></FieldLabel>
-            </div>
-
-            {error ? <p className="text-sm text-[var(--berry-danger)]" role="alert">{error}</p> : null}
-            {message ? <SuccessMessage>{message}</SuccessMessage> : null}
-            {writable ? <div className="flex justify-end"><Button disabled={saving}><Save />{saving ? "Saving…" : "Save settings"}</Button></div> : null}
-          </form>
+              <SettingRow title="Accent color" description="Used for buttons and highlights. A six-digit hex value.">
+                <span className="flex items-center gap-2">
+                  <Input aria-label="Pick accent color" className="w-11 shrink-0 p-1" disabled={locked} type="color" value={accentColor} onChange={(event) => updateBranding({ accentColor: event.currentTarget.value })} />
+                  <Input aria-label="Accent color hex value" className="w-28 font-mono text-xs" disabled={locked} pattern="#[0-9A-Fa-f]{6}" value={accentColor} onChange={(event) => updateBranding({ accentColor: event.currentTarget.value })} />
+                </span>
+              </SettingRow>
+            </SettingList>
+          </Section>
+          <Section title="Defaults" flush>
+            <SettingList>
+              <SettingRow title="Timezone" description="The organization’s default timezone. Search by city or UTC offset.">
+                <Control><TimezoneSelect disabled={locked} value={draft.timezone} onChange={(timezone) => setDraft({ ...draft, timezone })} /></Control>
+              </SettingRow>
+              <SettingRow title="Language" description="The default language code, such as en.">
+                <Control><Input aria-label="Language" disabled={locked} value={draft.language} onChange={(event) => setDraft({ ...draft, language: event.currentTarget.value })} /></Control>
+              </SettingRow>
+            </SettingList>
+          </Section>
+          <Section title="Contacts and legal" description="Where members are sent for help and which terms they are shown." flush>
+            <SettingList>
+              <SettingRow title="Support contact" description="Members are pointed here when they need help.">
+                <Control><Input aria-label="Support contact" disabled={locked} type="email" placeholder="support@example.com" value={draft.supportEmail ?? ""} onChange={(event) => setDraft({ ...draft, supportEmail: event.currentTarget.value || null })} /></Control>
+              </SettingRow>
+              <SettingRow title="Security contact" description="Where security reports and incident notices go.">
+                <Control><Input aria-label="Security contact" disabled={locked} type="email" placeholder="security@example.com" value={draft.securityEmail ?? ""} onChange={(event) => setDraft({ ...draft, securityEmail: event.currentTarget.value || null })} /></Control>
+              </SettingRow>
+              <SettingRow title="Terms of use" description="Linked from the sign-in page.">
+                <Control><Input aria-label="Terms URL" disabled={locked} type="url" placeholder="https://" value={draft.termsUrl ?? ""} onChange={(event) => setDraft({ ...draft, termsUrl: event.currentTarget.value || null })} /></Control>
+              </SettingRow>
+              <SettingRow title="Privacy policy" description="Linked from the sign-in page.">
+                <Control><Input aria-label="Privacy URL" disabled={locked} type="url" placeholder="https://" value={draft.privacyUrl ?? ""} onChange={(event) => setDraft({ ...draft, privacyUrl: event.currentTarget.value || null })} /></Control>
+              </SettingRow>
+            </SettingList>
+          </Section>
+        </form>
+        <Section title="Domains" description="Email domains members sign in with and custom hostnames for this organization. They are managed by the deployment and read only here." flush>
+          {draft.domains.length ? (
+            <DataTable
+              label="Organization domains"
+              columns={["Domain", "Used for", "Status", "Verified"]}
+              rows={[...draft.domains]
+                .sort((left, right) => Number(left.status === "verified") - Number(right.status === "verified"))
+                .map((domain) => [
+                  <span className="font-mono text-xs text-foreground">{domain.domain}</span>,
+                  domain.customDomain ? "Custom hostname" : "Sign-in domain",
+                  <StatusPill tone={domain.status === "verified" ? "good" : domain.status === "failed" ? "danger" : "warning"}>{domain.status === "verified" ? "Verified" : domain.status === "failed" ? "Failed" : "Pending"}</StatusPill>,
+                  domain.verifiedAt ? formatDate(domain.verifiedAt) : "—",
+                ])}
+            />
+          ) : (
+            <p className="px-4 py-3 text-md text-muted-foreground">No domains are attached to this organization.</p>
+          )}
         </Section>
-        <div className="grid gap-4 xl:grid-cols-2">
-          <Section title="Domains" description="Verification state is returned by the organization domain service.">
-            <DataTable label="Organization domains" columns={["Domain", "Use", "Status"]} rows={draft.domains.map((domain) => [domain.domain, domain.customDomain ? "Custom hostname" : "Login domain", <StatusPill tone={domain.status === "verified" ? "good" : domain.status === "failed" ? "danger" : "warning"}>{domain.status}</StatusPill>])} />
-          </Section>
-          <Section title="Deployment" description="These values are platform-managed and read only.">
-            <dl className="grid divide-y divide-border [&>div]:flex [&>div]:justify-between [&>div]:gap-4 [&>div]:py-2 [&_dt]:text-xs [&_dt]:text-muted-foreground [&_dd]:text-right [&_dd]:text-sm"><div><dt>Mode</dt><dd>{draft.deploymentMode}</dd></div><div><dt>Region</dt><dd>{draft.region ?? "Deployment default"}</dd></div><div><dt>Last updated</dt><dd>{new Date(draft.updatedAt).toLocaleString()}</dd></div></dl>
-          </Section>
-        </div>
+        <Section title="Deployment" description="Set when the organization was provisioned. Only a platform operator can change these.">
+          <DefinitionList
+            items={[
+              { term: "Mode", detail: deploymentLabel(draft.deploymentMode) },
+              { term: "Region", detail: draft.region ?? "Deployment default" },
+              { term: "Last updated", detail: formatDateTime(draft.updatedAt) },
+            ]}
+          />
+        </Section>
       </> : null}
     </AsyncState>
   </ManagementPage>;
 }
 
-function FieldLabel({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
-  return <label className="grid content-start gap-1.5 text-xs font-medium text-[var(--berry-text-secondary)]"><span>{label}</span>{children}{hint ? <span className="font-normal leading-4 text-[var(--berry-text-tertiary)]">{hint}</span> : null}</label>;
+function Control({ children }: { children: React.ReactNode }) {
+  return <div className="w-full sm:w-72">{children}</div>;
+}
+
+function deploymentLabel(mode: string) {
+  return mode === "shared" ? "Shared" : mode === "dedicated" ? "Dedicated" : mode === "selfhost" ? "Self-hosted" : mode;
 }
 
 function BrandAssetField({ kind, title, description, previewUrl, pending, progress, disabled, onSelect, onRemove }: {
@@ -187,34 +241,32 @@ function BrandAssetField({ kind, title, description, previewUrl, pending, progre
   const [failedPreviewUrl, setFailedPreviewUrl] = React.useState<string | null>(null);
   React.useEffect(() => setFailedPreviewUrl(null), [previewUrl]);
   const visiblePreviewUrl = previewUrl && previewUrl !== failedPreviewUrl ? previewUrl : null;
-  return <div className="flex min-w-0 items-center gap-3 rounded-xl bg-[var(--berry-control-bg)] p-3 shadow-[var(--berry-ring-subtle)]">
-    <div className={cn("flex shrink-0 items-center justify-center overflow-hidden bg-[var(--berry-surface)] outline outline-1 -outline-offset-1 outline-[var(--berry-image-outline)]", kind === "logo" ? "h-14 w-24 rounded-lg" : "size-14 rounded-xl")}>
-      {visiblePreviewUrl ? <img src={visiblePreviewUrl} alt="" className={cn("size-full object-contain", kind === "logo" ? "p-2" : "p-1.5")} onError={() => setFailedPreviewUrl(visiblePreviewUrl)} /> : <FileImage className="size-5 text-[var(--berry-text-tertiary)]" aria-hidden />}
-    </div>
-    <div className="min-w-0 flex-1">
-      <div className="flex items-center gap-2"><strong className="truncate text-sm font-medium text-[var(--berry-text-primary)]">{title}</strong>{pending ? <span className="rounded-full bg-[var(--berry-accent-soft)] px-2 py-0.5 text-[11px] text-[var(--berry-accent)]">Ready to save</span> : null}</div>
-      <p className="mt-0.5 text-xs leading-4 text-[var(--berry-text-tertiary)]">{description}</p>
-      {progress !== null ? <p className="mt-1 text-xs tabular-nums text-[var(--berry-text-secondary)]" role="status">Uploading {Math.round(progress * 100)}%</p> : null}
-      <div className="mt-2 flex flex-wrap gap-1.5">
-        <input
-          id={inputId}
-          ref={inputRef}
-          className="sr-only"
-          type="file"
-          aria-label={`Upload ${title.toLowerCase()}`}
-          accept={kind === "logo" ? ".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" : ".png,.webp,.ico,image/png,image/webp,image/x-icon,image/vnd.microsoft.icon"}
-          disabled={disabled}
-          onChange={(event) => {
-            const file = event.currentTarget.files?.[0];
-            if (file) onSelect(file);
-            event.currentTarget.value = "";
-          }}
-        />
-        <Button type="button" variant="outline" size="sm" disabled={disabled} onClick={() => inputRef.current?.click()}><ImagePlus />{previewUrl ? "Replace" : "Upload"}</Button>
-        {previewUrl ? <Button type="button" variant="ghost" size="sm" disabled={disabled} onClick={onRemove}><Trash2 />Remove</Button> : null}
-      </div>
-    </div>
-  </div>;
+  return <SettingRow
+    title={<span className="flex flex-wrap items-center gap-2"><span>{title}</span>{pending ? <StatusPill tone="info">Ready to save</StatusPill> : null}</span>}
+    description={<>{description}{progress !== null ? <span className="block tabular-nums text-foreground" role="status">Uploading {Math.round(progress * 100)}%</span> : null}</>}
+  >
+    <span className="flex flex-wrap items-center gap-2">
+      <span className={cn("flex h-10 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-border bg-[var(--berry-surface-under)]", kind === "logo" ? "w-20" : "w-10")}>
+        {visiblePreviewUrl ? <img src={visiblePreviewUrl} alt="" className="size-full object-contain p-1.5" onError={() => setFailedPreviewUrl(visiblePreviewUrl)} /> : <FileImage className="size-4 text-muted-foreground" aria-hidden />}
+      </span>
+      <input
+        id={inputId}
+        ref={inputRef}
+        className="sr-only"
+        type="file"
+        aria-label={`Upload ${title.toLowerCase()}`}
+        accept={kind === "logo" ? ".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" : ".png,.webp,.ico,image/png,image/webp,image/x-icon,image/vnd.microsoft.icon"}
+        disabled={disabled}
+        onChange={(event) => {
+          const file = event.currentTarget.files?.[0];
+          if (file) onSelect(file);
+          event.currentTarget.value = "";
+        }}
+      />
+      <Button type="button" variant="secondary" disabled={disabled} onClick={() => inputRef.current?.click()}><ImagePlus />{previewUrl ? "Replace" : "Upload"}</Button>
+      {previewUrl ? <Button type="button" variant="ghost" disabled={disabled} onClick={onRemove}><Trash2 />Remove</Button> : null}
+    </span>
+  </SettingRow>;
 }
 
 export function normalizeBrandingAssetFile(file: File, kind: OrganizationBrandingAssetKind): File {

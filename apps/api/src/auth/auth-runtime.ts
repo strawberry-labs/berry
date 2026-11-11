@@ -3,7 +3,7 @@ import type { OnModuleDestroy } from "@nestjs/common";
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from "node:http";
 import { APIError, betterAuth, type Auth, type BetterAuthOptions } from "better-auth";
-import { hashPassword } from "better-auth/crypto";
+import { hashPassword, makeSignature } from "better-auth/crypto";
 import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
 import { Pool, type PoolClient } from "pg";
 import { SELF_HOST_TENANT_ID, SELF_HOST_WORKSPACE_ID } from "@berry/db";
@@ -17,11 +17,15 @@ import {
 
 export const BERRY_AUTH_RUNTIME = Symbol("BERRY_AUTH_RUNTIME");
 
+export type BerryAuthClientKind = "web" | "mobile";
+
 export type BerryAuthSession = {
   session: {
     id: string;
     userId: string;
     expiresAt?: Date | string;
+    /** "mobile" sessions belong to a paired companion app and arrive as bearer tokens. */
+    clientKind?: BerryAuthClientKind;
   };
   user: {
     id: string;
@@ -58,12 +62,21 @@ export type BerryOwnerSetupResult = {
   organization: { id: string; name: string };
 };
 
+export type BerryMobileSessionGrant = {
+  sessionId: string;
+  token: string;
+  expiresAt: string;
+  user: { id: string; email: string; name: string | null; image: string | null };
+};
+
 export interface BerryAuthRuntime {
   describe(): BerryAuthDescription | Promise<BerryAuthDescription>;
   setupOwner?(input: unknown): Promise<BerryOwnerSetupResult>;
   getSession(headers: IncomingHttpHeaders): Promise<BerryAuthSession | null>;
   requireSession(headers: IncomingHttpHeaders): Promise<BerryAuthSession>;
   authorizeSession?(session: BerryAuthSession): Promise<boolean>;
+  /** Mints a companion-app session for a user who approved pairing on the web. */
+  createMobileSession?(input: { userId: string; ipAddress: string | null; userAgent: string | null }): Promise<BerryMobileSessionGrant>;
   handleNodeRequest(req: IncomingMessage, res: ServerResponse): Promise<void>;
   close?(): Promise<void>;
 }
@@ -204,7 +217,7 @@ export function createBetterAuthOptions(options: CreateBerryAuthOptions = {}): {
                        updated_at = now()`,
                     [tenantId, user.id, "member", membershipSource],
                   );
-                  await upsertInitialBudgets(client, tenantId, user.id, defaultOrgBudgetMicros, defaultUserBudgetMicros);
+                  await ensureInitialBudgets(client, tenantId, user.id, defaultOrgBudgetMicros, defaultUserBudgetMicros);
                 }
                 await client.query("COMMIT");
               } catch (error) {
@@ -250,6 +263,17 @@ export function createBetterAuthOptions(options: CreateBerryAuthOptions = {}): {
         userAgent: "user_agent",
         createdAt: "created_at",
         updatedAt: "updated_at",
+      },
+      additionalFields: {
+        // Browser sign-ins are always "web"; only the pairing flow mints
+        // "mobile" sessions, and only those are accepted as bearer tokens.
+        clientKind: {
+          type: "string",
+          fieldName: "client_kind",
+          required: false,
+          defaultValue: "web",
+          input: false,
+        },
       },
     },
     account: {
@@ -378,6 +402,8 @@ export class RealBetterAuthRuntime implements BerryAuthRuntime {
   private googleHandlerCache?: { fingerprint: string; handler: ReturnType<typeof toNodeHandler> };
   private readonly completedMembershipRecoveryChecks = new Set<string>();
   private readonly completedOwnerRepairChecks = new Set<string>();
+  private mobilePolicyCache?: { allowed: boolean; expiresAt: number };
+  private readonly mobileDeviceTouches = new Map<string, number>();
 
   constructor(
     private readonly auth: Auth,
@@ -489,12 +515,13 @@ export class RealBetterAuthRuntime implements BerryAuthRuntime {
       if (workspace.rowCount !== 1) {
         throw new ServiceUnavailableException("The default Berry workspace has not been seeded or already has an owner.");
       }
-      await upsertInitialBudgets(
+      await ensureInitialBudgets(
         client,
         this.tenantId,
         userId,
         positiveInteger(this.env.BERRY_DEFAULT_ORG_MONTHLY_BUDGET_MICROS, 100_000_000),
         positiveInteger(this.env.BERRY_DEFAULT_USER_MONTHLY_BUDGET_MICROS, 15_000_000),
+        true,
       );
       await client.query("COMMIT");
       return {
@@ -517,10 +544,122 @@ export class RealBetterAuthRuntime implements BerryAuthRuntime {
   }
 
   async getSession(headers: IncomingHttpHeaders): Promise<BerryAuthSession | null> {
+    const bearer = bearerToken(headers.authorization);
+    if (bearer !== undefined) {
+      const mobile = await this.getMobileSession(bearer);
+      if (mobile) this.touchMobileDevice(mobile.session.id, headers);
+      return mobile;
+    }
     const session = await (this.auth.api.getSession as (context: { headers: Headers }) => Promise<unknown>)({
       headers: fromNodeHeaders(headers),
     });
+    // A mobile session is only valid as a bearer token, never as a cookie.
+    const normalized = rejectMobileCookieSession(normalizeSession(session));
+    return this.afterSessionResolved(normalized);
+  }
+
+  /**
+   * Resolves a companion-app bearer token through Better Auth so expiry,
+   * sliding refresh and revocation behave exactly like browser sessions. The
+   * request's own cookies are dropped; only the signed session token is sent.
+   */
+  private async getMobileSession(token: string | null): Promise<BerryAuthSession | null> {
+    if (!token || !MOBILE_BEARER_TOKEN_PATTERN.test(token)) return null;
+    const context = await this.auth.$context;
+    const signature = await makeSignature(token, context.secret);
+    const cookie = `${context.authCookies.sessionToken.name}=${encodeURIComponent(`${token}.${signature}`)}`;
+    const session = await (this.auth.api.getSession as (context: { headers: Headers }) => Promise<unknown>)({
+      headers: new Headers({ cookie }),
+    });
     const normalized = normalizeSession(session);
+    if (!normalized || normalized.session.clientKind !== "mobile") return null;
+    if (!await this.mobileAccessAllowed()) return null;
+    return this.afterSessionResolved(normalized);
+  }
+
+  /** Keeps "last active" on the devices list fresh without a write per request. */
+  private touchMobileDevice(sessionId: string, headers: IncomingHttpHeaders): void {
+    if (!this.pool) return;
+    const now = Date.now();
+    if ((this.mobileDeviceTouches.get(sessionId) ?? 0) > now - MOBILE_DEVICE_TOUCH_INTERVAL_MS) return;
+    this.mobileDeviceTouches.set(sessionId, now);
+    if (this.mobileDeviceTouches.size > 5_000) {
+      for (const [candidate, touchedAt] of this.mobileDeviceTouches) {
+        if (touchedAt <= now - MOBILE_DEVICE_TOUCH_INTERVAL_MS) this.mobileDeviceTouches.delete(candidate);
+      }
+    }
+    const ip = clientIpFromHeaders(headers, parseCsv(this.env.BERRY_AUTH_IP_ADDRESS_HEADERS ?? "x-berry-client-ip"));
+    const pool = this.pool;
+    void (async () => {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query("SELECT berry_set_tenant_id($1::uuid)", [this.tenantId]);
+        await client.query(
+          "UPDATE mobile_devices SET last_seen_at=now(), last_ip=COALESCE($3, last_ip) WHERE tenant_id=$1::uuid AND auth_session_id=$2::uuid AND status='active'",
+          [this.tenantId, sessionId, ip],
+        );
+        await client.query("COMMIT");
+      } catch {
+        await client.query("ROLLBACK").catch(() => undefined);
+      } finally {
+        client.release();
+      }
+    })().catch(() => undefined);
+  }
+
+  private async mobileAccessAllowed(): Promise<boolean> {
+    if (!this.pool) return true;
+    const now = Date.now();
+    if (this.mobilePolicyCache && this.mobilePolicyCache.expiresAt > now) return this.mobilePolicyCache.allowed;
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT berry_set_tenant_id($1::uuid)", [this.tenantId]);
+      const result = await client.query<{ enabled: string | null }>(
+        "SELECT policy->>'mobileAppEnabled' AS enabled FROM authentication_policies WHERE tenant_id=$1::uuid LIMIT 1",
+        [this.tenantId],
+      );
+      await client.query("COMMIT");
+      const allowed = result.rows[0]?.enabled !== "false";
+      this.mobilePolicyCache = { allowed, expiresAt: now + MOBILE_POLICY_CACHE_MS };
+      return allowed;
+    } catch (cause) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw cause;
+    } finally {
+      client.release();
+    }
+  }
+
+  async createMobileSession(input: { userId: string; ipAddress: string | null; userAgent: string | null }): Promise<BerryMobileSessionGrant> {
+    const context = await this.auth.$context;
+    // overrideAll: Better Auth applies additional-field defaults after the
+    // override object unless told otherwise, which would reset clientKind.
+    const session = await context.internalAdapter.createSession(input.userId, false, {
+      clientKind: "mobile",
+      ipAddress: input.ipAddress ?? "",
+      userAgent: input.userAgent ?? "",
+    }, true) as { id: string; token: string; expiresAt: Date | string; clientKind?: string } | null;
+    if (!session) throw new ServiceUnavailableException("Could not create a mobile session.");
+    if (session.clientKind !== "mobile") {
+      await context.internalAdapter.deleteSession(session.token).catch(() => undefined);
+      throw new ServiceUnavailableException("Mobile sessions are not available on this server.");
+    }
+    const user = await context.internalAdapter.findUserById(input.userId) as { id: string; email: string; name?: string | null; image?: string | null } | null;
+    if (!user) {
+      await context.internalAdapter.deleteSession(session.token).catch(() => undefined);
+      throw new UnauthorizedException("User not found");
+    }
+    return {
+      sessionId: session.id,
+      token: session.token,
+      expiresAt: new Date(session.expiresAt).toISOString(),
+      user: { id: user.id, email: user.email, name: user.name ?? null, image: user.image ?? null },
+    };
+  }
+
+  private async afterSessionResolved(normalized: BerryAuthSession | null): Promise<BerryAuthSession | null> {
     if (normalized && this.pool) {
       const setupOwnerEmail = normalizeEmail(this.env.BERRY_SETUP_OWNER_EMAIL);
       if (setupOwnerEmail
@@ -650,6 +789,13 @@ export class BerryAuthService implements BerryAuthRuntime, OnModuleDestroy {
     return this.runtime.authorizeSession?.(session) ?? Promise.resolve(true);
   }
 
+  createMobileSession(input: { userId: string; ipAddress: string | null; userAgent: string | null }): Promise<BerryMobileSessionGrant> {
+    if (!this.runtime.createMobileSession) {
+      throw new ServiceUnavailableException("Mobile sign-in is not available for this authentication runtime.");
+    }
+    return this.runtime.createMobileSession(input);
+  }
+
   handleNodeRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return this.runtime.handleNodeRequest(req, res);
   }
@@ -679,8 +825,37 @@ function normalizeSession(value: unknown): BerryAuthSession | null {
     },
   };
   if (session.expiresAt instanceof Date || typeof session.expiresAt === "string") normalized.session.expiresAt = session.expiresAt;
+  normalized.session.clientKind = session.clientKind === "mobile" ? "mobile" : "web";
   if (typeof user.emailVerified === "boolean") normalized.user.emailVerified = user.emailVerified;
   return normalized;
+}
+
+// Better Auth session tokens are 32 alphanumeric characters; allow some room
+// for future formats without accepting anything that could smuggle a cookie.
+const MOBILE_BEARER_TOKEN_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
+const MOBILE_POLICY_CACHE_MS = 15_000;
+const MOBILE_DEVICE_TOUCH_INTERVAL_MS = 5 * 60_000;
+
+function clientIpFromHeaders(headers: IncomingHttpHeaders, names: string[]): string | null {
+  for (const name of names) {
+    const value = headers[name.toLowerCase()];
+    const first = (Array.isArray(value) ? value[0] : value)?.split(",")[0]?.trim();
+    if (first) return first.slice(0, 64);
+  }
+  return null;
+}
+
+/** undefined: no Authorization header. null: a malformed or non-bearer header. */
+function bearerToken(header: string | string[] | undefined): string | null | undefined {
+  if (header === undefined) return undefined;
+  const value = Array.isArray(header) ? header[0] : header;
+  if (!value) return null;
+  const match = /^Bearer\s+(\S+)\s*$/i.exec(value);
+  return match?.[1] ?? null;
+}
+
+function rejectMobileCookieSession(session: BerryAuthSession | null): BerryAuthSession | null {
+  return session?.session.clientKind === "mobile" ? null : session;
 }
 
 function parseCsv(value: string | undefined): string[] {
@@ -930,7 +1105,7 @@ async function recoverGoogleMembership(
     );
     const status = membership.rows[0]?.status;
     if (status === "active") {
-      await upsertInitialBudgets(client, tenantId, userId, defaultOrgBudgetMicros, defaultUserBudgetMicros);
+      await ensureInitialBudgets(client, tenantId, userId, defaultOrgBudgetMicros, defaultUserBudgetMicros);
     }
     await client.query("COMMIT");
     return status === "active" || (typeof status === "string" && status !== "pending");
@@ -1047,7 +1222,7 @@ async function completeInitialGoogleOwnerClaim(
     [tenantId, userId, SELF_HOST_WORKSPACE_ID],
   );
   if (workspace.rowCount !== 1) throw new Error("The default Berry workspace could not be claimed.");
-  await upsertInitialBudgets(client, tenantId, userId, defaultOrgBudgetMicros, defaultUserBudgetMicros);
+  await ensureInitialBudgets(client, tenantId, userId, defaultOrgBudgetMicros, defaultUserBudgetMicros, true);
 }
 
 async function clientHasOwner(client: PoolClient, tenantId: string): Promise<boolean> {
@@ -1062,31 +1237,33 @@ async function clientHasOwner(client: PoolClient, tenantId: string): Promise<boo
   return result.rows[0]?.exists === true;
 }
 
-async function upsertInitialBudgets(
+async function ensureInitialBudgets(
   client: PoolClient,
   tenantId: string,
   userId: string,
   orgBudgetMicros: number,
   userBudgetMicros: number,
+  initializeOrganization = false,
 ): Promise<void> {
+  // Defaults fill missing limits. Only initial owner setup may activate the
+  // disabled zero-value organization row seeded by the database migration.
   await client.query(
     `INSERT INTO budget_limits (tenant_id, scope_type, scope_id, period, soft_limit_micros, hard_limit_micros, status)
      VALUES ($1::uuid, 'org', $1::text, 'month', $2, $3, 'active')
-     ON CONFLICT (tenant_id, scope_type, scope_id, period) DO UPDATE SET
+     ON CONFLICT (tenant_id, scope_type, scope_id, period) ${initializeOrganization ? `DO UPDATE SET
        soft_limit_micros = EXCLUDED.soft_limit_micros,
        hard_limit_micros = EXCLUDED.hard_limit_micros,
        status = 'active',
-       updated_at = now()`,
+       updated_at = now()
+     WHERE budget_limits.status = 'disabled'
+       AND budget_limits.soft_limit_micros = 0
+       AND budget_limits.hard_limit_micros = 0` : 'DO NOTHING'}`,
     [tenantId, Math.floor(orgBudgetMicros * 0.8), orgBudgetMicros],
   );
   await client.query(
     `INSERT INTO budget_limits (tenant_id, scope_type, scope_id, period, soft_limit_micros, hard_limit_micros, status)
      VALUES ($1::uuid, 'user', $2::text, 'month', $3, $4, 'active')
-     ON CONFLICT (tenant_id, scope_type, scope_id, period) DO UPDATE SET
-       soft_limit_micros = EXCLUDED.soft_limit_micros,
-       hard_limit_micros = EXCLUDED.hard_limit_micros,
-       status = 'active',
-       updated_at = now()`,
+     ON CONFLICT (tenant_id, scope_type, scope_id, period) DO NOTHING`,
     [tenantId, userId, Math.floor(userBudgetMicros * 0.8), userBudgetMicros],
   );
 }

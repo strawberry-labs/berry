@@ -5,6 +5,7 @@ import {
   providerAttemptStatusClass,
   type JsonValue,
   type ModelApiType,
+  type ReasoningLevel,
   type ProviderAttemptDecision,
   type ProviderAttemptErrorDetails,
   type ProviderAttemptReport,
@@ -181,7 +182,7 @@ export interface ChatCompletionOptions {
   messages: ChatMessage[];
   tools?: ChatToolDefinition[];
   toolChoice?: ChatToolChoice;
-  reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
+  reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   temperature?: number;
   maxTokens?: number;
   signal?: AbortSignal;
@@ -357,11 +358,11 @@ export async function listProviderModels(options: RouterClientOptions): Promise<
         model.name = typeof entry.display_name === "string" ? entry.display_name : entry.id;
       }
       if (typeof entry?.owned_by === "string") model.ownedBy = entry.owned_by;
-      const contextWindow = positiveNumber(entry?.max_input_tokens) ?? positiveNumber(entry?.context_length);
-      const maxOutputTokens = positiveNumber(entry?.max_output_tokens) ?? positiveNumber(entry?.max_tokens);
+      const contextWindow = positiveNumber(entry?.max_input_tokens) ?? positiveNumber(entry?.context_length) ?? positiveNumber(entry?.context_window);
+      const maxOutputTokens = positiveNumber(entry?.max_output_tokens) ?? positiveNumber(entry?.max_completion_tokens) ?? positiveNumber(entry?.max_tokens);
       if (contextWindow) model.contextWindow = contextWindow;
       if (maxOutputTokens) model.maxOutputTokens = maxOutputTokens;
-      const capabilities = normalizeProviderModelCapabilities(entry?.capabilities, contextWindow, maxOutputTokens);
+      const capabilities = normalizeProviderModelCapabilities(entry, contextWindow, maxOutputTokens);
       if (capabilities) model.capabilities = capabilities;
       return model;
     })
@@ -878,7 +879,13 @@ export class OpenAIChatCompletionsClient {
     if (options.reasoningEffort) {
       if (usesKimiThinking) body.thinking = { type: "enabled" };
       else if (usesOpenRouterReasoningShape(this.#provider)) body.reasoning = { effort: options.reasoningEffort };
-      else body.reasoning_effort = options.reasoningEffort;
+      else {
+        const inferenceNet = this.#provider.id === "inference-net" || /^https:\/\/api\.inference\.net(?:\/|$)/i.test(this.#provider.baseUrl);
+        body.reasoning_effort = inferenceNet && /^(?:inference-net\/)?(?:deepseek-v4\.1-flash(?:-|$)|glm-5\.3-flash$)/i.test(model)
+          ? options.reasoningEffort === "minimal" ? "low" : options.reasoningEffort === "medium" ? "high"
+            : options.reasoningEffort === "xhigh" ? "max" : options.reasoningEffort
+          : options.reasoningEffort;
+      }
     }
     if (options.promptCacheKey) body.prompt_cache_key = options.promptCacheKey;
     if (options.promptCacheRetention === "long") body.prompt_cache_retention = "24h";
@@ -1504,17 +1511,25 @@ function firstString(values: Array<string | undefined>): string | undefined {
 }
 
 function normalizeProviderModelCapabilities(
-  value: ProviderModelEntry["capabilities"],
+  entry: ProviderModelEntry,
   contextWindow: number | undefined,
   maxOutputTokens: number | undefined,
 ): RemoteModel["capabilities"] | undefined {
-  const vision = capabilitySupported(value?.image_input);
-  const reasoning = capabilitySupported(value?.thinking) ?? capabilitySupported(value?.effort);
+  const value = entry.capabilities;
+  const efforts: ReasoningLevel[] = [];
+  for (const effort of entry.reasoning_efforts ?? []) {
+    const normalized = effort === "none" ? "off" : effort === "max" ? "xhigh" : effort;
+    if ((normalized === "off" || normalized === "low" || normalized === "medium"
+      || normalized === "high" || normalized === "xhigh") && !efforts.includes(normalized)) efforts.push(normalized);
+  }
+  const vision = capabilitySupported(value?.image_input) ?? (entry.input_modalities ? entry.input_modalities.includes("image") : undefined);
+  const reasoning = capabilitySupported(value?.thinking) ?? capabilitySupported(value?.effort) ?? (efforts.length > 0 ? true : undefined);
   const json = capabilitySupported(value?.structured_outputs);
   if (vision === undefined && reasoning === undefined && json === undefined && !contextWindow && !maxOutputTokens) return undefined;
   return {
     ...(vision !== undefined ? { vision } : {}),
     ...(reasoning !== undefined ? { reasoning } : {}),
+    ...(efforts.length > 0 ? { reasoningEfforts: efforts } : {}),
     ...(json !== undefined ? { json } : {}),
     ...((contextWindow || maxOutputTokens) ? {
       context: {
@@ -1634,6 +1649,10 @@ interface ProviderModelEntry {
   owned_by?: string;
   display_name?: string;
   context_length?: number;
+  context_window?: number;
+  max_completion_tokens?: number;
+  reasoning_efforts?: string[];
+  input_modalities?: string[];
   max_input_tokens?: number;
   max_tokens?: number;
   max_output_tokens?: number;

@@ -14,6 +14,29 @@ function skill(name: string, id = name, disableModelInvocation = false): Skill {
 }
 
 describe("formatSkillsForSystemPrompt", () => {
+	it("renders identical catalogues consistently while keeping shared skills first", () => {
+		const shared = [skill("z-shared"), skill("b-shared")];
+		const personal = { ...skill("a-personal"), filePath: "/personal-skills/record-id/SKILL.md" };
+		const input = [shared[0], personal, shared[1]];
+		const before = [...input];
+		const first = formatSkillsForSystemPrompt(input);
+		expect(first).toBe(formatSkillsForSystemPrompt([...input].reverse()));
+		expect(input).toEqual(before);
+		expect(first.indexOf("<name>b-shared</name>")).toBeLessThan(first.indexOf("<name>z-shared</name>"));
+		expect(first.indexOf("<name>z-shared</name>")).toBeLessThan(first.indexOf("<name>a-personal</name>"));
+	});
+
+	it("places common AESG rules before personal catalogue differences", () => {
+		const common = ["aesg-branding", "cv-creator", "docx", "pdf", "pptx", "xlsx"].map((name) => skill(name));
+		const first = formatSkillsForSystemPrompt([...common, skill("personal-a")]);
+		const second = formatSkillsForSystemPrompt([...common, skill("personal-b")]);
+		const boundary = first.indexOf("<available_skills>");
+		expect(first.indexOf("# AESG artifact workspace")).toBeLessThan(boundary);
+		expect(first.slice(0, boundary)).toBe(second.slice(0, boundary));
+		expect(first).toContain("personal-a");
+		expect(second).toContain("personal-b");
+	});
+
 	it("adds mandatory format routing when the complete AESG artifact set is visible", () => {
 		const prompt = formatSkillsForSystemPrompt([
 			skill("AESG branding", "aesg-branding"),

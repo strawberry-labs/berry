@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { mcpServerSpecsFromJson } from "@berry/local-agent/mcp";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DURABLE_BASE_BUILT_IN_TOOLS,
+  resolveContextBudget,
   latestAssistantStreamDraft,
   type AgentStreamEvent,
   type JsonValue,
@@ -33,6 +35,7 @@ import {
   modelMessages,
   pendingContextEntries,
   stepTimingFields,
+  settleToolPool,
   usageCostMicros,
   type BudgetReservationDecision,
   type DurableTurnModel,
@@ -47,7 +50,7 @@ import {
 } from "./turn-runner.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 import { SandboxContinuityManager } from "./sandbox-continuity.js";
-import { DurableMcpToolExecutor } from "./mcp-tools.js";
+import { DurableMcpToolExecutor, durableMcpToolPolicy } from "./mcp-tools.js";
 import { DurablePersonalMemoryToolExecutor } from "./memory/tools.js";
 import { ActiveTurnCancellationRegistry } from "./turn-cancellation.js";
 import type { ProviderCreditAlert, ProviderCreditAlertSink } from "./provider-credits.js";
@@ -126,7 +129,7 @@ describe("durable turn runner", () => {
     const assistantText = history.filter((message) => message.role === "assistant").map((message) => JSON.stringify(message.content)).join("\n");
     expect(assistantText).not.toContain("HTTP 400");
     expect(assistantText).toContain("Partial draft: the fee is AED 450");
-    expect(JSON.stringify(history.at(-1)?.content)).toContain("Rewrite this error for my team");
+    expect(history.some((message) => message.role === "user" && String(message.content).includes("Rewrite this error for my team"))).toBe(true);
     expect(history.filter((message) => message.role === "assistant")).toHaveLength(1);
   });
 
@@ -171,6 +174,58 @@ describe("durable turn runner", () => {
         payload: { type: "message", id, message },
       });
     };
+
+    it("appends changed and retired skill catalogues without rewriting the system or earlier history", async () => {
+      const current = turn({}, ["read", "activate_skill"], firstTurn);
+      const skill = { name: "pdf", description: "Read PDFs", content: "Exact rules", filePath: "/skills/pdf/SKILL.md", resources: [], disableModelInvocation: false };
+      current.runtimeRequest.extraSkills = [skill];
+      journal(current, await pendingContextEntries(current));
+      const before = modelMessages(current).messages;
+      expect(String(before[0]!.content)).not.toContain("Read PDFs");
+      current.runtimeRequest.extraSkills = [{ ...skill, description: "Updated PDF description " + "x".repeat(2_000) }];
+      journal(current, await pendingContextEntries(current));
+      const after = modelMessages(current).messages;
+      expect(after.slice(0, before.length)).toEqual(before);
+      expect(String(after.at(-1)?.content)).toContain("Updated PDF description");
+      expect(String(after.at(-1)?.content)).not.toContain("x".repeat(501));
+      expect(await pendingContextEntries(current)).toEqual([]);
+      current.runtimeRequest.extraSkills = [];
+      journal(current, await pendingContextEntries(current));
+      expect(modelMessages(current).messages.slice(0, after.length)).toEqual(after);
+      expect(String(modelMessages(current).messages.at(-1)?.content)).toContain("No installed skills are available");
+    });
+
+    it("restores exact activated skill instructions and staged paths after compaction only once", async () => {
+      const current = turn({}, ["read", "activate_skill"], firstTurn);
+      current.runtimeRequest.extraSkills = [{ name: "pdf", description: "PDFs", content: "Current catalogue version", filePath: "/skills/pdf/SKILL.md", resources: [], disableModelInvocation: false }];
+      const exact = '<skill_content name="pdf">\nValidate every page.\nSkill directory: /workspace/runtime-skills/revision-1/pdf\n</skill_content>';
+      pushMessage(current, "activated", { role: "toolResult", toolName: "activate_skill", content: exact, isError: false });
+      pushMessage(current, "covered", { role: "assistant", content: "Done the first stage." });
+      pushMessage(current, "new-request", { role: "user", content: "Continue." });
+      current.checkpointCoveredEntryId = "covered";
+      current.requestMessageId = "new-request";
+      journal(current, await pendingContextEntries(current));
+      expect(JSON.stringify(modelMessages(current).messages)).toContain("Validate every page.");
+      expect(JSON.stringify(modelMessages(current).messages)).toContain("/workspace/runtime-skills/revision-1/pdf");
+      expect(await pendingContextEntries(current)).toEqual([]);
+      expect(String(modelMessages(current).messages[0]?.content)).not.toContain("Validate every page.");
+    });
+
+    it("keeps a newer retained skill activation instead of restoring the covered version", async () => {
+      const current = turn({}, ["read", "activate_skill"], firstTurn);
+      current.runtimeRequest.extraSkills = [{ name: "pdf", description: "PDFs", content: "Current rules", filePath: "/skills/pdf/SKILL.md", resources: [], disableModelInvocation: false }];
+      pushMessage(current, "old-activation", { role: "toolResult", toolName: "activate_skill", content: '<skill_content name="pdf">Obsolete rules</skill_content>' });
+      pushMessage(current, "covered", { role: "assistant", content: "First stage done." });
+      pushMessage(current, "new-request", { role: "user", content: "Continue." });
+      pushMessage(current, "new-call", { role: "assistant", content: [{ type: "toolCall", id: "new-skill-call", name: "activate_skill", arguments: { name: "pdf" } }], stopReason: "toolUse" });
+      pushMessage(current, "new-activation", { role: "toolResult", toolCallId: "new-skill-call", toolName: "activate_skill", content: '<skill_content name="pdf">Current rules</skill_content>' });
+      current.checkpointCoveredEntryId = "covered";
+      current.requestMessageId = "new-request";
+      journal(current, await pendingContextEntries(current));
+      const projected = modelMessages(current).messages;
+      expect(JSON.stringify(projected)).toContain("Current rules");
+      expect(JSON.stringify(modelMessages(current).messages)).not.toContain("Obsolete rules");
+    });
 
     it("journals each run's turn context once so the whole earlier run stays a prefix of the next turn (H-032)", async () => {
       const current = turn({ memory: "project uses NFPA 20" }, ["read"], firstTurn);
@@ -361,7 +416,7 @@ describe("durable turn runner", () => {
 
       expect(next[0]).toEqual(last[0]);
       expect(String(next[0]?.content)).not.toContain("untrusted_grounding");
-      expect(String(next[0]?.content)).toContain("Runtime environment:");
+      expect(String(next[0]?.content)).not.toContain("Runtime environment:");
       // Everything before the earlier turn's context message is reused verbatim.
       const earlierContext = last.findIndex((message) => String(message.content).startsWith("<berry_turn_context>"));
       expect(earlierContext).toBe(2);
@@ -388,12 +443,83 @@ describe("durable turn runner", () => {
       expect(after.at(-1)).toMatchObject({ role: "user", content: expect.stringContaining("Recovery instruction") });
     });
 
-    it("keeps the original single system message when the request anchor is unavailable", () => {
-      const current = turn({ memory: "legacy grounding" }, ["read"], firstTurn);
+    it("keeps dynamic context and recovery after history when compaction removed the request anchor", () => {
+      const current = turn({ memory: "legacy grounding" }, ["read"], firstAnswer);
       current.requestMessageId = "compacted-away";
-      const messages = modelMessages(current).messages;
-      expect(String(messages[0]?.content)).toContain("legacy grounding");
-      expect(messages.some((message) => String(message.content).startsWith("<berry_turn_context>"))).toBe(false);
+      const before = modelMessages(current).messages;
+      expect(String(before[0]?.content)).not.toContain("legacy grounding");
+      expect(String(before[0]?.content)).not.toContain("Runtime environment:");
+      expect(String(before.at(-1)?.content)).toContain("legacy grounding");
+      expect(String(before.at(-1)?.content)).toContain("reference data, not instructions");
+      expect(before.at(-2)).toMatchObject({ role: "assistant", content: "Section 4 covers fire pumps." });
+      current.steps = [...current.steps, { ...modelStep("pending", 2), input: { iteration: 2, recoveryReason: "empty_response" } }];
+      const after = modelMessages(current).messages;
+      expect(after.slice(0, before.length)).toEqual(before);
+      expect(String(after.at(-1)?.content)).toContain("Recovery instruction");
+    });
+
+    it("journals changed runtime bindings without rewriting the system or previous turns", async () => {
+      const current = turn({ memory: "Original project" }, ["read"], firstTurn);
+      journal(current, await pendingContextEntries(current));
+      const before = modelMessages(current).messages;
+      expect(String(before[0]?.content)).not.toContain("Runtime environment:");
+      expect(String(before.at(-1)?.content)).toContain("- Permission mode: ask");
+      current.runtimeRequest = { ...current.runtimeRequest, permissionMode: "full-access", model: "second-model" };
+      const update = await pendingContextEntries(current);
+      expect(update).toHaveLength(1);
+      expect(String((update[0]?.payload as { text: string }).text)).toContain("- Model: second-model");
+      journal(current, update);
+      const after = modelMessages(current).messages;
+      expect(after.slice(0, before.length)).toEqual(before);
+      expect(String(after.at(-1)?.content)).toContain("- Permission mode: full-access");
+      expect(await pendingContextEntries(current)).toEqual([]);
+      const next = turn({ memory: "Different project and document links" }, ["read"], []);
+      next.id = "00000000-0000-7000-8000-0000000000f4";
+      next.runtimeRequest = { ...next.runtimeRequest, workspacePath: "/different-workspace", reasoning: "high" };
+      next.entries = [...current.entries];
+      pushMessage(next, "request-runtime-2", { role: "user", content: "Use the new project." });
+      next.requestMessageId = "request-runtime-2";
+      journal(next, await pendingContextEntries(next));
+      expect(modelMessages(next).messages.slice(0, after.length)).toEqual(after);
+      expect(String(modelMessages(next).messages.at(-1)?.content)).toContain("Different project and document links");
+    });
+
+    it("migrates an existing journal once without rewriting its text or historical tool calls", async () => {
+      const current = turn({}, ["read"], firstTurn);
+      journal(current, [{
+        entryId: "pre-migration-context", entryType: "context",
+        payload: { type: "context", runId: current.id, scope: "turn", text: "<berry_turn_context>Existing context</berry_turn_context>" },
+      }]);
+      pushMessage(current, "old-call", firstAnswer[1]!);
+      pushMessage(current, "old-result", firstAnswer[2]!);
+      const oldEntries = structuredClone(current.entries);
+      const direct = modelMessages(current).messages;
+      expect(String(direct.at(-1)?.content)).toContain("Runtime environment:");
+      const migration = await pendingContextEntries(current);
+      expect(migration).toHaveLength(1);
+      journal(current, migration);
+      expect(current.entries.slice(0, oldEntries.length)).toEqual(oldEntries);
+      expect(modelMessages(current).messages).toEqual(direct);
+      expect(await pendingContextEntries(current)).toEqual([]);
+    });
+
+    it("places reusable attachment instructions before runtime and project data", async () => {
+      const current = turn({ projectName: "Variable project", link: "https://example.test/project" }, ["read"], firstTurn);
+      current.runtimeRequest = {
+        ...current.runtimeRequest,
+        attachments: [{ fileId: "00000000-0000-7000-8000-0000000000a2", name: "report.pdf", mediaType: "application/pdf", size: 10 }],
+        extraSkills: [{ name: "pdf", description: "PDF", content: "Fixed PDF template rules.", filePath: "/managed-skills/pdf/SKILL.md", disableModelInvocation: false, resources: [] }],
+      };
+      const entries = await pendingContextEntries(current);
+      const text = String((entries[0]?.payload as { text: string }).text);
+      expect(text.indexOf("Fixed PDF template rules.")).toBeGreaterThan(0);
+      expect(text.indexOf("Fixed PDF template rules.")).toBeLessThan(text.indexOf("Current date and time"));
+      expect(text.indexOf("Fixed PDF template rules.")).toBeLessThan(text.indexOf("Variable project"));
+      journal(current, entries);
+      const before = modelMessages(current).messages;
+      current.groundingContext = { projectName: "Changed retrieval during the turn" };
+      expect(await pendingContextEntries(current)).toEqual([]);
+      expect(modelMessages(current).messages).toEqual(before);
     });
   });
 
@@ -540,7 +666,7 @@ describe("durable turn runner", () => {
     });
     const current = providerSnapshot("openai-responses");
     current.runtimeRequest = { ...current.runtimeRequest, builtInTools: [...DURABLE_BASE_BUILT_IN_TOOLS] };
-    expect(modelMessages(current).messages[0]?.content)
+    expect(JSON.stringify(modelMessages(current).messages))
       .toContain("For an uploaded PDF, Word document, spreadsheet, presentation, or ZIP, call read");
   });
 
@@ -1543,7 +1669,8 @@ describe("durable turn runner", () => {
     });
 
     const toolMessage = modelMessages(current).messages.find((message) => message.role === "tool");
-    expect(String(toolMessage?.content).length).toBeLessThanOrEqual((32_000 - 16_384 - 1_024) * 4);
+    const budget = resolveContextBudget(32_000, 0, 8_000);
+    expect(String(toolMessage?.content).length).toBeLessThanOrEqual((32_000 - budget.maxOutputTokens - budget.safetyTokens) * 4);
     expect(String(toolMessage?.content)).toContain("[durable-result:huge-tool-entry]");
     expect(String(toolMessage?.content)).toContain("[result content bounded]");
   });
@@ -1838,10 +1965,201 @@ describe("durable turn runner", () => {
       ]);
   });
 
+
+  describe("model-directed MCP failure recovery", () => {
+    const mcpCases = [
+      { name: "mcp__CustomServer__lookup", retryClass: "non_idempotent_manual", error: "403: proxy access denied" },
+      { name: "mcp__Google_Workspace__update_record", retryClass: "non_idempotent_manual", error: "socket hang up" },
+      { name: "mcp__Internal__get_report", retryClass: "read_only", error: "MCP tool returned isError: upstream unavailable" },
+      { name: "mcp__Records__upsert", retryClass: "idempotent_with_key", error: "MCP error: service unavailable" },
+    ] as const;
+
+    for (const choice of ["retry", "change arguments", "switch tools", "move on"] as const) {
+      it.each(mcpCases)(`lets the model ${choice} after $name fails`, async ({ name, retryClass, error }) => {
+        const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+        const executed: string[] = [];
+        let modelCalls = 0;
+        const runner = new DurableTurnRunner(repository, {
+          call: async (current) => {
+            modelCalls += 1;
+            if (modelCalls === 2) {
+              const failure = current.entries.find((entry) =>
+                (entry.payload as { message?: { role?: string } }).message?.role === "toolResult"
+              )?.payload as { message?: { isError?: boolean; content?: Array<{ text?: string }> } };
+              expect(failure.message?.isError).toBe(true);
+              expect(failure.message?.content?.[0]?.text).toContain(error);
+              expect(failure.message?.content?.[0]?.text).toContain("Choose whether to retry this tool, use a different tool, or continue without it.");
+            }
+            const call = modelCalls === 1 || (modelCalls === 2 && choice !== "move on");
+            return {
+              text: call ? "" : "Answered with the available information.",
+              inputTokens: 1, outputTokens: 1,
+              toolCalls: call ? [{
+                id: `mcp-${modelCalls}`,
+                name: modelCalls === 2 && choice === "switch tools" ? "mcp__AlternateServer__search" : name,
+                input: { target: modelCalls === 2 && choice === "change arguments" ? "second" : "first" },
+                retryClass, repeatPolicy: "block_after_success" as const,
+                requiresApproval: false, approvalKind: "mcp" as const, idempotencyKey: null,
+              }] : [],
+            };
+          },
+        }, {
+          execute: async (_current, step) => {
+            executed.push(String(step.input.toolName));
+            if (executed.length === 1) throw Object.assign(new Error(error), { toolCallPhase: "dispatched" });
+            return { output: { ok: true }, summary: "Succeeded" };
+          },
+        });
+        for (let i = 0; i < 12 && repository.current.state !== "completed"; i += 1) {
+          const result = await runner.execute({ tenantId, runId, reason: "continue" });
+          expect(["waiting", "recovery_required", "failed"]).not.toContain(result.state);
+        }
+        expect(repository.current.state).toBe("completed");
+        expect(executed).toHaveLength(choice === "move on" ? 1 : 2);
+        expect(repository.events.filter((event) => event.kind === "error")).toEqual([]);
+      });
+    }
+
+    it.each(["read_only", "idempotent_with_key", "non_idempotent_manual"] as const)(
+      "reports an interrupted %s MCP call to the model without replaying it",
+      async (retryClass) => {
+        const tool = toolStep("running", retryClass, false);
+        tool.type = "tool.mcp__AnyServer__operation";
+        tool.input = { ...tool.input, toolName: "mcp__AnyServer__operation", approvalKind: "mcp" };
+        // A running call must be reported even when earlier receipts would
+        // suppress a fresh duplicate. It must never be silently replayed.
+        tool.sequence = 3;
+        const history = [1, 2].map((sequence) => ({
+          ...tool, id: randomUUID(), sequence, state: "completed" as const,
+          output: { content: "Earlier result" },
+        }));
+        const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), ...history, tool]));
+        const execute = vi.fn(async () => ({ output: {}, summary: "Must not execute" }));
+        const runner = new DurableTurnRunner(repository, unusedModel(), { execute });
+        await expect(runner.execute({ tenantId, runId, reason: "lease-recovery" }))
+          .resolves.toMatchObject({ state: "calling_model" });
+        expect(execute).not.toHaveBeenCalled();
+        expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
+          state: "failed",
+          output: { failure: { outcome: retryClass === "read_only" ? "not_applied" : "unknown" } },
+          ...(retryClass !== "read_only" ? { outcomeCertainty: "unknown" } : {}),
+        });
+        const entry = repository.current.entries.at(-1)?.payload as { message?: { isError?: boolean; content?: Array<{ text?: string }> } };
+        expect(entry.message?.isError).toBe(true);
+        expect(entry.message?.content?.[0]?.text).toContain("Choose whether to retry");
+        expect(repository.events.filter((event) => event.kind === "error")).toEqual([]);
+      },
+    );
+
+    it("keeps a confirmed idempotent MCP receipt that arrives after the deadline", async () => {
+      const tool = toolStep("pending", "idempotent_with_key", false);
+      tool.type = "tool.mcp__Records__upsert";
+      tool.input = { ...tool.input, toolName: "mcp__Records__upsert", approvalKind: "mcp" };
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+      const execute = vi.fn(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        return { output: { id: "saved-record" }, summary: "Saved" };
+      });
+      const runner = new DurableTurnRunner(repository, unusedModel(), { execute }, {
+        toolIdleTimeoutMs: 5, toolMaxDurationMs: 1_000,
+      });
+      await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+        .resolves.toMatchObject({ state: "calling_model" });
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
+        state: "completed", output: { id: "saved-record" },
+      });
+    });
+
+    it.each(["read_only", "idempotent_with_key", "non_idempotent_manual"] as const)(
+      "returns a timed-out %s MCP call to the model without recovery",
+      async (retryClass) => {
+        const tool = toolStep("pending", retryClass, false);
+        tool.type = "tool.mcp__AnyServer__operation";
+        tool.input = { ...tool.input, toolName: "mcp__AnyServer__operation", approvalKind: "mcp" };
+        const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+        const execute = vi.fn(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          throw new Error("Connection lost before receiving the MCP result");
+        });
+        const runner = new DurableTurnRunner(repository, unusedModel(), { execute }, {
+          toolIdleTimeoutMs: 5, toolMaxDurationMs: 1_000,
+        });
+        await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+          .resolves.toMatchObject({ state: "calling_model" });
+        expect(execute).toHaveBeenCalledTimes(1);
+        expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
+          state: "failed", timedOut: true,
+          outcomeCertainty: retryClass === "read_only" ? "known" : "unknown",
+        });
+        expect(repository.current.error).toBeNull();
+      },
+    );
+  });
+
+  it("returns three failed billed scrapes to the model and lets it choose another URL", async () => {
+    const name = "mcp__BerryCrawl__berrycrawl_scrape_url";
+    const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+    const called: string[] = [];
+    let modelCalls = 0;
+    const policy = durableMcpToolPolicy(
+      { trustReadOnlyAnnotations: true },
+      { readOnly: true, trustedReadOnly: true, nonReplayable: true, destructive: false, idempotent: true, openWorld: true },
+      "full-access",
+    );
+    const runner = new DurableTurnRunner(repository, {
+      call: async (current) => {
+        modelCalls += 1;
+        const urls = modelCalls === 1
+          ? ["https://one.example/blocked", "https://two.example/proxy", "https://three.example/unavailable"]
+          : modelCalls === 2 ? ["https://four.example/working"] : [];
+        if (modelCalls === 2) {
+          const failures = current.entries.filter((entry) => {
+            const message = (entry.payload as { message?: { role?: string; isError?: boolean } }).message;
+            return message?.role === "toolResult" && message.isError;
+          });
+          expect(failures).toHaveLength(3);
+        }
+        return {
+          text: urls.length ? "" : "Answered using the working source.",
+          inputTokens: 10, outputTokens: 10,
+          toolCalls: urls.map((url, index) => ({
+            id: `scrape-${modelCalls}-${index}`, name, input: { url },
+            ...policy, idempotencyKey: null,
+          })),
+        };
+      },
+    }, {
+      policy: () => policy,
+      execute: async (_current, step) => {
+        const url = String((step.input.arguments as { url: string }).url);
+        called.push(url);
+        if (!url.endsWith("/working")) {
+          throw Object.assign(new Error(url.includes("blocked")
+            ? "SCRAPE_CHALLENGE_DETECTED: target returned an anti-bot challenge"
+            : "SCRAPE_PROXY_UNAVAILABLE: upstream proxy failed"), { toolCallPhase: "dispatched" });
+        }
+        return { output: { markdown: "Working source content" }, summary: "Scraped successfully" };
+      },
+    }, { owner: "worker-billed-read-failures" });
+
+    for (let i = 0; i < 12 && repository.current.state !== "completed"; i += 1) {
+      const result = await runner.execute({ tenantId, runId, reason: "continue" });
+      expect(result.state).not.toBe("recovery_required");
+      expect(result.state).not.toBe("waiting");
+    }
+    expect(repository.current.state).toBe("completed");
+    expect(called).toHaveLength(4);
+    expect(repository.current.steps.filter((step) => step.type === `tool.${name}` && step.state === "failed"))
+      .toHaveLength(3);
+    expect(repository.events.filter((event) => event.kind === "error")).toEqual([]);
+  });
+
   it("heartbeats a parallel read batch and aborts its durable wait on cancellation", async () => {
     const first = readOnlyToolStep("read", 1, "/workspace/first.txt");
     const second = readOnlyToolStep("find", 2, "/workspace");
-    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), first, second]));
+    const queued = readOnlyToolStep("read", 3, "/workspace/queued.txt");
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), first, second, queued]));
     let heartbeatCount = 0;
     repository.heartbeat = async () => {
       heartbeatCount += 1;
@@ -1856,6 +2174,7 @@ describe("durable turn runner", () => {
       },
     }, {
       owner: "worker-parallel-cancel",
+      maxParallelToolCalls: 2,
       cancellations,
       heartbeatMs: 1,
       leaseSeconds: 1,
@@ -1872,7 +2191,9 @@ describe("durable turn runner", () => {
       .toEqual([
         expect.objectContaining({ id: first.id, state: "running" }),
         expect.objectContaining({ id: second.id, state: "running" }),
+        expect.objectContaining({ id: queued.id, state: "running" }),
       ]);
+    expect(releases).toHaveLength(2);
     expect(repository.mutations.some((mutation) => mutation.toolResultMessages)).toBe(false);
   });
 
@@ -2019,11 +2340,108 @@ describe("durable turn runner", () => {
     expect(repository.outbox.some((item) => item.eventType === "turn.execute")).toBe(true);
   });
 
+
+  it("meters journaled connector context before deciding to compact", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest.contextWindowTokens = 80_000;
+    const repository = new FakeTurnRepository(current);
+    const call = vi.fn(async () => ({ text: "done", inputTokens: 1, outputTokens: 1, toolCalls: [] }));
+    const runner = new DurableTurnRunner(repository, { call }, {
+      ...noTools(),
+      turnContext: async () => "Connector catalog ".repeat(25_000),
+    }, {
+      owner: "worker-complete-request-meter",
+      compactor: { compactSession: async () => ({ sessionId: current.sessionId, summary: "compact", tokensBefore: 100_000, tokensAfter: 100 }) },
+    });
+    expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("compacting");
+    expect(call).not.toHaveBeenCalled();
+    expect(repository.current.entries.some((entry) => JSON.stringify(entry.payload).includes("Connector catalog"))).toBe(true);
+  });
+
+  it("reserves the model output budget before a million-token chat reaches its limit", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest.contextWindowTokens = 1_040_000;
+    current.runtimeRequest.maxTokens = 393_216;
+    current.entries[0]!.payload = { type: "message", message: { role: "user", content: "x".repeat(700_000 * 4) } };
+    const repository = new FakeTurnRepository(current);
+    const call = vi.fn(async () => ({ text: "done", inputTokens: 1, outputTokens: 1, toolCalls: [] }));
+    const runner = new DurableTurnRunner(repository, { call }, noTools(), {
+      owner: "worker-output-headroom",
+      compactor: { compactSession: async () => ({ sessionId: current.sessionId, summary: "compact", tokensBefore: 700_000, tokensAfter: 100 }) },
+    });
+    expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("compacting");
+    expect(call).not.toHaveBeenCalled();
+  });
+
+  it("recovers a provider context overflow once while preserving history and failed-call evidence", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest.contextWindowTokens = 1_040_000;
+    const repository = new FakeTurnRepository(current);
+    const originalEntry = structuredClone(current.entries[0]);
+    let calls = 0;
+    const compact = vi.fn(async () => {
+      repository.current.checkpointCoveredEntryId = repository.current.entries.at(-1)?.entryId ?? null;
+      return { sessionId: current.sessionId, summary: "Saved the prior work.", tokensBefore: 80_000, tokensAfter: 100 };
+    });
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        calls += 1;
+        if (calls === 1) throw new RouterClientError("provider request rejected", 400, undefined, { code: "CONTEXT_LENGTH_EXCEEDED" });
+        return { text: "Continued with the saved history.", inputTokens: 500, outputTokens: 10, toolCalls: [] };
+      },
+    }, noTools(), { owner: "worker-context-recovery", maxModelAttempts: 1, compactor: { compactSession: compact } });
+    expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("compacting");
+    expect(repository.current.steps.find((step) => step.type === "model.call")).toMatchObject({
+      state: "failed", output: { providerDiagnostics: { errorCode: "CONTEXT_LENGTH_EXCEEDED", retryDecision: "retry" } },
+    });
+    expect(repository.events.some((event) => event.kind === "error")).toBe(false);
+    expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("calling_model");
+    expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("finalizing");
+    expect(compact).toHaveBeenCalledTimes(1);
+    expect(calls).toBe(2);
+    expect(repository.current.entries[0]).toEqual(originalEntry);
+  });
+
+  it("stops repeated provider context overflows with a clear saved-history error", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest.contextWindowTokens = 1_040_000;
+    const repository = new FakeTurnRepository(current);
+    let calls = 0;
+    const compact = vi.fn(async () => {
+      repository.current.checkpointCoveredEntryId = repository.current.entries.at(-1)?.entryId ?? null;
+      return { sessionId: current.sessionId, summary: "Checkpointed.", tokensBefore: 80_000, tokensAfter: 100 };
+    });
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        calls += 1;
+        throw new RouterClientError("provider request rejected", 400, undefined, { code: "CONTEXT_LENGTH_EXCEEDED" });
+      },
+    }, noTools(), { owner: "worker-bounded-context-recovery", compactor: { compactSession: compact } });
+    expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("compacting");
+    expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("calling_model");
+    expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("failed");
+    expect(compact).toHaveBeenCalledTimes(1);
+    expect(calls).toBe(2);
+    expect(repository.current.error).toContain("model's context limit");
+    expect(repository.current.error).toContain("history and files are saved");
+    expect(repository.current.error).not.toContain("configuration");
+  });
+
+  it("reports context overflow clearly when no compactor is available", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => { throw new RouterClientError("rejected", 400, undefined, { code: "CONTEXT_LENGTH_EXCEEDED" }); },
+    }, noTools(), { owner: "worker-no-context-compactor" });
+    expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("failed");
+    expect(repository.current.error).toContain("model's context limit");
+    expect(repository.current.error).not.toContain("configuration");
+  });
+
   it("compacts an oversized in-flight journal before the next model request", async () => {
     const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
     repository.current.entries[0]!.payload = {
       type: "message",
-      message: { role: "user", content: "x".repeat(16_000) },
+      message: { role: "user", content: "x".repeat(64_000) },
     };
     let compactions = 0;
     let modelCalls = 0;
@@ -2113,7 +2531,7 @@ describe("durable turn runner", () => {
         type: "message",
         message: {
           role: "assistant",
-          content: "Retained response",
+          content: "Retained response " + "x".repeat(40_000),
           usage: { input: 18_000, output: 1_000, totalTokens: 19_000 },
         },
       },
@@ -3042,17 +3460,31 @@ describe("durable turn runner", () => {
       expect(result.toolSteps[4]?.state).toBe("completed");
     });
 
-    it("keeps refusing a credential failure for the rest of the run", async () => {
+    it("lets the model retry an MCP credential failure without a platform refusal", async () => {
       const drive = { name: "mcp__Google_Workspace__drive_read_file", args: { fileId: "drive-1" } };
       const result = await driveCalls([[drive], [{ name: "bash", args: { command: "echo hi" }, retryClass: "idempotent" }], [drive]], ({ name }) => {
         if (name === drive.name) throw new Error("Connector token is invalid or expired");
         return { ok: true };
       });
 
-      expect(countOf(result.executed, drive.name)).toBe(1);
+      expect(countOf(result.executed, drive.name)).toBe(2);
       expect(result.failure(0)).toMatchObject({ category: "credentials" });
       expect(String(result.failure(0)?.action)).toContain("Settings → Connectors");
-      expect(result.failure(2)).toMatchObject({ category: "credentials", refusedUnchangedRetry: true });
+      expect(result.failure(2)).toMatchObject({ category: "credentials" });
+      expect(result.failure(2)).not.toHaveProperty("refusedUnchangedRetry");
+    });
+
+    it("lets the model retry MCP failures beyond the per-tool failure limit", async () => {
+      const call = { name: "mcp__CustomServer__lookup", args: { id: "record-1" }, retryClass: "non_idempotent_manual" as const };
+      let attempts = 0;
+      const result = await driveCalls(Array.from({ length: 7 }, () => [call]), () => {
+        attempts += 1;
+        if (attempts <= 6) throw new Error("socket hang up");
+        return { found: true };
+      });
+      expect(countOf(result.executed, call.name)).toBe(7);
+      expect(result.toolSteps[6]?.state).toBe("completed");
+      expect(result.state).toBe("finalizing");
     });
 
     it("lets a transient read failure be retried within the existing limit", async () => {
@@ -3069,11 +3501,10 @@ describe("durable turn runner", () => {
       expect(result.toolSteps[1]?.state).toBe("completed");
     });
 
-    it("marks an interrupted change-making call as an unknown outcome and never replays it unchecked", async () => {
+    it("lets the model check an uncertain MCP write and then choose to retry it", async () => {
       const create = { name: "mcp__Connect_Aesg_MCP__create_record", args: { title: "Tender A" }, retryClass: "non_idempotent_manual" as const };
       let creates = 0;
       const result = await driveCalls([
-        [create],
         [create],
         [{ name: "mcp__Connect_Aesg_MCP__list_records", args: { title: "Tender A" } }],
         [create],
@@ -3087,9 +3518,9 @@ describe("durable turn runner", () => {
 
       expect(countOf(result.executed, create.name)).toBe(2);
       expect(result.failure(0)).toMatchObject({ category: "unknown_outcome", outcome: "unknown" });
-      expect(result.modelText(0)).toContain("may already have taken effect");
-      expect(result.failure(1)).toMatchObject({ category: "unknown_outcome", refusedUnchangedRetry: true });
-      expect(result.toolSteps[3]?.state).toBe("completed");
+      expect(result.modelText(0)).toContain("may already have changed something");
+      expect(result.modelText(0)).toContain("Check the target state");
+      expect(result.toolSteps[2]?.state).toBe("completed");
     });
 
     it("refuses an unchanged deterministic repeat inside a parallel read batch", async () => {
@@ -3583,6 +4014,59 @@ describe("durable turn runner", () => {
       expect(executions).toBe(2);
       expect(repository.current.steps.some((step) => step.error === "duplicate_tool_call_loop")).toBe(true);
       expect(repository.current.error).toBeNull();
+    });
+  });
+
+  describe("native browser repeat guard", () => {
+    const browserStep = (action: string, sequence: number, state: DurableTurnStep["state"] = "completed", session = "bses_fixture"): DurableTurnStep => ({
+      ...toolStep(state, ["snapshot", "read", "screenshot"].includes(action) ? "read_only" : "non_idempotent_manual", false),
+      sequence, type: `tool.mcp__BerryCrawl__berrycrawl_browser_${action}`,
+      input: { toolCallId: randomUUID(), toolName: `mcp__BerryCrawl__berrycrawl_browser_${action}`, arguments: { session_id: session, ...(action === "click" ? { ref: "e1" } : {}) }, requiresApproval: false, approvalKind: "mcp", repeatPolicy: ["snapshot", "read", "screenshot"].includes(action) ? "compare_result" : "block_after_success" },
+      output: { content: "Current browser page", ...(action === "screenshot" ? { hasImages: true } : {}) },
+    });
+    const browserExecutor = () => new DurableMcpToolExecutor(noTools(), mcpServerSpecsFromJson(JSON.stringify([{
+      id: "berrycrawl", name: "BerryCrawl", transport: "streamable-http", url: "https://api.berrycrawl.com/api/v1/mcp",
+    }])), undefined, 1000, {}, null);
+
+    it.each([
+      { observation: "snapshot", session: "bses_fixture", state: "completed", vision: false, runs: true },
+      { observation: "read", session: "bses_fixture", state: "completed", vision: false, runs: true },
+      { observation: "screenshot", session: "bses_fixture", state: "completed", vision: true, runs: true },
+      { observation: "screenshot", session: "bses_fixture", state: "completed", vision: false, runs: false },
+      { observation: "snapshot", session: "bses_other", state: "completed", vision: true, runs: false },
+      { observation: "snapshot", session: "bses_fixture", state: "failed", vision: true, runs: false },
+      { observation: "tabs", session: "bses_fixture", state: "completed", vision: true, runs: false },
+    ])("allows another click only after a fresh page observation: $observation / $session / $state / vision=$vision", async ({ observation, session, state, vision, runs }) => {
+      const next = browserStep("click", 3, "pending");
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), browserStep("click", 1), browserStep(observation, 2, state as DurableTurnStep["state"], session), next]));
+      repository.current.runtimeRequest.modelAcceptsImages = vision;
+      const browser = browserExecutor();
+      const execute = vi.fn(async () => ({ output: { content: "Next page" }, summary: "Clicked" }));
+      const runner = new DurableTurnRunner(repository, unusedModel(), { repeatContextSince: (current, step) => browser.repeatContextSince(current, step), execute });
+      await runner.execute({ tenantId, runId, reason: "continue" });
+      expect(execute).toHaveBeenCalledTimes(runs ? 1 : 0);
+      expect(repository.current.steps.find((step) => step.id === next.id)?.state).toBe(runs ? "completed" : "failed");
+      await browser.close();
+    });
+
+    it.each(["completed", "failed"])("allows fresh DOM reads after a %s page-changing action", async (state) => {
+      const next = browserStep("snapshot", 4, "pending");
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), browserStep("snapshot", 1), browserStep("snapshot", 2), browserStep("click", 3, state as DurableTurnStep["state"]), next]));
+      const browser = browserExecutor();
+      const execute = vi.fn(async () => ({ output: { content: "Current page after click" }, summary: "Observed" }));
+      await new DurableTurnRunner(repository, unusedModel(), { repeatContextSince: (current, step) => browser.repeatContextSince(current, step), execute }).execute({ tenantId, runId, reason: "continue" });
+      expect(execute).toHaveBeenCalledOnce();
+      await browser.close();
+    });
+
+    it("keeps browser close deduplicated after an observation", async () => {
+      const next = browserStep("close", 3, "pending");
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), browserStep("close", 1), browserStep("snapshot", 2), next]));
+      const browser = browserExecutor();
+      const execute = vi.fn();
+      await new DurableTurnRunner(repository, unusedModel(), { repeatContextSince: (current, step) => browser.repeatContextSince(current, step), execute }).execute({ tenantId, runId, reason: "continue" });
+      expect(execute).not.toHaveBeenCalled();
+      await browser.close();
     });
   });
 
@@ -4411,10 +4895,41 @@ describe("durable turn runner", () => {
       policyForTool: () => ({ retryClass: "read_only", repeatPolicy: "compare_result", requiresApproval: false, approvalKind: "file-edit" }),
     });
     expect(request!.messages.find((message) => message.role === "user")!.content).toEqual(original);
-    expect(request!.messages.at(-2)).toMatchObject({ role: "tool", toolCallId: "read-page" });
-    expect(request!.messages.at(-1)).toMatchObject({ role: "user", content: expect.arrayContaining([pixels]) });
-    expect(JSON.stringify(request!.messages.at(-1)!.content)).toContain("page-1.png");
+    const resultIndex = request!.messages.findIndex((message) => message.role === "tool" && message.toolCallId === "read-page");
+    expect(resultIndex).toBeGreaterThan(0);
+    const imageIndex = request!.messages.findIndex((message) => Array.isArray(message.content)
+      && message.content.some((part) => part.type === "image_url" && part.image_url.url === pixels.image_url.url));
+    expect(imageIndex).toBeGreaterThan(resultIndex);
+    expect(request!.messages[imageIndex]).toMatchObject({ role: "user", content: expect.arrayContaining([pixels]) });
+    expect(JSON.stringify(request!.messages[imageIndex]!.content)).toContain("page-1.png");
     expect(JSON.stringify(current.entries)).not.toContain("base64");
+  });
+
+  it("times reasoning and tool argument deltas without treating role/usage frames as output", async () => {
+    let clock = 0;
+    const timerSpy = vi.spyOn(performance, "now").mockImplementation(() => clock);
+    try {
+      const model = new RouterDurableTurnModel({
+        stream: async function* (): AsyncGenerator<ChatCompletionChunk> {
+          clock = 100;
+          yield { id: "timed", model: "test", finishReason: null, delta: "", raw: {} };
+          clock = 5_000;
+          yield { id: "timed", model: "test", finishReason: null, delta: "", reasoningDelta: "Think", raw: {} };
+          clock = 6_000;
+          yield { id: "timed", model: "test", finishReason: null, delta: "", toolCalls: [{ index: 0, id: "call_t", function: { name: "read", arguments: "{}" } }], raw: {} };
+          clock = 7_000;
+          yield { id: "timed", model: "test", finishReason: null, delta: "", usage: { inputTokens: 100, outputTokens: 200, totalTokens: 300 }, raw: {} };
+        },
+      }, "test", {
+        provider: "router", route: "/chat/completions",
+        capabilityForModel: () => ({ supported: false, cacheKey: false, cacheControl: false, retention: [], minimumTokens: 1024 }),
+      });
+      const result = await model.call(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]), modelStep("pending", 1), {
+        messageId: randomUUID(), tools: [], emitDelta: async () => {},
+        policyForTool: () => ({ retryClass: "read_only", repeatPolicy: "compare_result", requiresApproval: false, approvalKind: "file-edit" }),
+      });
+      expect(result).toMatchObject({ requestMs: 7_000, firstTokenMs: 5_000, decodeMs: 2_000, outputTokens: 200 });
+    } finally { timerSpy.mockRestore(); }
   });
 
   it("records the router-attributed serving backend on the usage event", async () => {
@@ -4675,17 +5190,18 @@ describe("durable turn runner", () => {
     );
 
     expect(request?.tools?.map((tool) => tool.function.name)).toEqual(["create_image", "mcp__BerryCrawl__search"]);
-    expect(request?.messages[0]?.content).toContain("The user explicitly selected Create image. Call create_image");
-    expect(request?.messages[0]?.content).toContain(DURABLE_IMAGE_TOOL_SELECTION_PROMPT);
+    expect(request?.messages.map((message) => typeof message.content === "string" ? message.content : "").join("\n")).toContain("The user explicitly selected Create image. Call create_image");
+    expect(request?.messages.map((message) => typeof message.content === "string" ? message.content : "").join("\n")).toContain(DURABLE_IMAGE_TOOL_SELECTION_PROMPT);
     expect(request?.messages[0]?.content).toContain(
       "call compose_message so it renders as an editable writing block",
     );
     expect(request?.messages[0]?.content).toContain(
       "call ask_user_question so the frontend renders the interactive question UI",
     );
-    expect(request?.messages[0]?.content).toContain(
+    expect(JSON.stringify(request?.messages)).toContain(
       "Path rule: use /home/user/workspace exactly",
     );
+    expect(request?.messages[0]?.content).not.toContain("Runtime environment:");
     expect(request?.messages[0]?.content).toContain(
       "Never JSON-stringify the entire argument object inside raw",
     );
@@ -5170,6 +5686,28 @@ describe("durable turn runner", () => {
       .toMatchObject({ toolCallId: providerCallId });
     expect(replayedRequest?.messages.find((message) => message.role === "system")?.content)
       .not.toContain("file-tool compatibility guard");
+
+    const earlierToolMessages = replayedRequest?.messages.filter((message) => message.role === "assistant" || message.role === "tool");
+    // A new run has none of the previous run's steps. Active history hydration
+    // carries their continuation metadata with the corresponding journal entry.
+    repository.current.entries = repository.current.entries.map((entry) => {
+      const payload = entry.payload as Record<string, unknown>;
+      const message = payload.message as { role?: string } | undefined;
+      return message?.role === "assistant"
+        ? { ...entry, payload: { ...payload, providerToolCalls: { [toolCallId]: { providerCallId, extraContent } } } }
+        : entry;
+    });
+    repository.current.id = randomUUID();
+    repository.current.steps = [admittedStep(), modelStep("pending", 1)];
+    await model.call(repository.current, modelStep("pending", 1), {
+      messageId: randomUUID(), tools: [], emitDelta: async () => undefined,
+      policyForTool: () => ({
+        retryClass: "read_only", repeatPolicy: "compare_result",
+        requiresApproval: false, approvalKind: "file-edit",
+      }),
+    });
+    expect(replayedRequest?.messages.filter((message) => message.role === "assistant" || message.role === "tool"))
+      .toEqual(earlierToolMessages);
   });
 
   it("casts persisted tool statuses to the PostgreSQL enum", async () => {
@@ -5177,7 +5715,7 @@ describe("durable turn runner", () => {
     const tool = toolStep("completed", "read_only", false);
     const executor: SqlExecutor = {
       query: async <T>(sql: string) => {
-        if (sql.includes("SELECT state,cancelled_at FROM turn_runs")) {
+        if (sql.includes("SELECT state,cancelled_at,browser_handoff FROM turn_runs")) {
           return [{ state: "executing_tool", cancelled_at: null }] as T[];
         }
         if (sql.startsWith("INSERT INTO turn_steps")) {
@@ -5293,7 +5831,7 @@ describe("durable turn runner", () => {
     const statements: Array<{ sql: string; params: readonly unknown[] }> = [];
     const executor: SqlExecutor = {
       query: async <T>(sql: string) => {
-        if (sql.includes("SELECT state,cancelled_at FROM turn_runs")) {
+        if (sql.includes("SELECT state,cancelled_at,browser_handoff FROM turn_runs")) {
           return [{ state: "calling_model", cancelled_at: null }] as T[];
         }
         if (sql.startsWith("INSERT INTO turn_steps")) return [] as T[];
@@ -5338,7 +5876,7 @@ describe("durable turn runner", () => {
     const statements: Array<{ sql: string; params: readonly unknown[] }> = [];
     const executor: SqlExecutor = {
       query: async <T>(sql: string) => {
-        if (sql.includes("SELECT state,cancelled_at FROM turn_runs")) {
+        if (sql.includes("SELECT state,cancelled_at,browser_handoff FROM turn_runs")) {
           return [{ state: "calling_model", cancelled_at: null }] as T[];
         }
         throw new Error(`Unexpected query: ${sql}`);
@@ -5375,7 +5913,7 @@ describe("durable turn runner", () => {
     const statements: Array<{ sql: string; params: readonly unknown[] }> = [];
     const executor: SqlExecutor = {
       query: async <T>(sql: string) => {
-        if (sql.includes("SELECT state,cancelled_at FROM turn_runs")) {
+        if (sql.includes("SELECT state,cancelled_at,browser_handoff FROM turn_runs")) {
           return [{ state: "calling_model", cancelled_at: null }] as T[];
         }
         if (sql.includes("SELECT COALESCE(MAX(sequence),0) AS sequence FROM turn_events")) {
@@ -5438,7 +5976,7 @@ describe("durable turn runner", () => {
     const executor: SqlExecutor = {
       query: async <T>(sql: string) => {
         queries.push(sql);
-        if (sql.includes("SELECT state,cancelled_at FROM turn_runs")) {
+        if (sql.includes("SELECT state,cancelled_at,browser_handoff FROM turn_runs")) {
           return [{ state: "executing_tool", cancelled_at: null }] as T[];
         }
         if (sql.startsWith("INSERT INTO turn_steps")) return [];
@@ -5978,3 +6516,104 @@ function unusedModel(): DurableTurnModel {
 function safeBigIntForTest(value: string): bigint {
   return BigInt(value || "0");
 }
+
+describe("bounded trusted MCP scheduling", () => {
+  it("prepares the connector catalog before dispatching three resumed Gmail reads", async () => {
+    const steps = [1, 2, 3].map((sequence) => {
+      const step = readOnlyToolStep("read", sequence, `/workspace/${sequence}`);
+      step.type = "tool.mcp__Gmail__gmail_get_message";
+      step.input = { ...step.input, toolName: "mcp__Gmail__gmail_get_message", arguments: { messageId: `message-${sequence}` } };
+      return step;
+    });
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), ...steps]));
+    let prepared = false;
+    const definitions = vi.fn(async () => { prepared = true; return []; });
+    const execute = vi.fn(async (_snapshot: DurableTurnSnapshot, step: DurableTurnStep) => {
+      expect(prepared).toBe(true);
+      return { output: { content: String((step.input.arguments as { messageId: string }).messageId) }, summary: "Read email" };
+    });
+    const result = await new DurableTurnRunner(repository, unusedModel(), {
+      definitions,
+      supportsConcurrency: () => prepared,
+      execute,
+    }).execute({ tenantId, runId, reason: "continue" });
+    expect(result.state).toBe("calling_model");
+    expect(definitions).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledTimes(3);
+    expect(repository.current.steps.filter((step) => step.type.startsWith("tool.mcp__")).every((step) => step.state === "completed")).toBe(true);
+    expect(repository.current.entries.slice(-3).map((entry) => (entry.payload as { message: { toolCallId: string } }).message.toolCallId)).toEqual(steps.map((step) => step.input.toolCallId));
+  });
+
+  it("keeps writes as barriers and records a failed MCP read alongside successful siblings", async () => {
+    const first = readOnlyToolStep("read", 1, "/workspace/one");
+    const second = readOnlyToolStep("read", 2, "/workspace/two");
+    first.type = "tool.mcp__Records__lookup";
+    first.input = { ...first.input, toolName: "mcp__Records__lookup", arguments: { id: 1 } };
+    second.type = "tool.mcp__Records__lookup";
+    second.input = { ...second.input, toolName: "mcp__Records__lookup", arguments: { id: 2 } };
+    const mutation = { ...toolStep("pending", "non_idempotent_manual", false), sequence: 3 };
+    const current = snapshot("executing_tool", [admittedStep(), first, second, mutation]);
+    const repository = new FakeTurnRepository(current);
+    const started: string[] = [];
+    const release = new Map<string, () => void>();
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      definitions: async () => [],
+      supportsConcurrency: (_snapshot, step) => step.type.startsWith("tool.mcp__"),
+      execute: async (_snapshot, step) => {
+        started.push(step.id);
+        await new Promise<void>((resolve) => release.set(step.id, resolve));
+        if (step.id === first.id) throw new Error("403 proxy restriction");
+        return { output: { content: "Evidence from the second source" }, summary: "Read source" };
+      },
+    }, { maxParallelToolCalls: 2 });
+    const pending = runner.execute({ tenantId, runId, reason: "continue" });
+    await vi.waitFor(() => expect(started).toHaveLength(2));
+    release.get(second.id)!();
+    release.get(first.id)!();
+    expect(await pending).toMatchObject({ state: "executing_tool" });
+    expect(started).not.toContain(mutation.id);
+    expect(repository.current.steps.find((step) => step.id === first.id)?.state).toBe("failed");
+    expect(repository.current.steps.find((step) => step.id === second.id)?.state).toBe("completed");
+    expect(repository.current.steps.find((step) => step.id === mutation.id)?.state).toBe("pending");
+    expect(repository.current.entries.slice(-2).map((entry) => (entry.payload as { message: { toolCallId: string } }).message.toolCallId)).toEqual([first.input.toolCallId, second.input.toolCallId]);
+  });
+
+  it("does not parallelize an MCP read without the host capability", async () => {
+    const steps = [1, 2].map((sequence) => {
+      const step = readOnlyToolStep("read", sequence, `/workspace/${sequence}`);
+      step.type = "tool.mcp__Untrusted__lookup";
+      step.input.toolName = "mcp__Untrusted__lookup";
+      return step;
+    });
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), ...steps]));
+    const execute = vi.fn(async () => ({ output: { content: "read" }, summary: "read" }));
+    await new DurableTurnRunner(repository, unusedModel(), { definitions: async () => [], execute }).execute({ tenantId, runId, reason: "continue" });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(repository.current.steps.find((step) => step.id === steps[1]!.id)?.state).toBe("pending");
+  });
+
+  it("uses a rolling pool, bounds fanout and retains result order", async () => {
+    let active = 0;
+    let peak = 0;
+    const releases: Array<() => void> = [];
+    const pending = settleToolPool([0, 1, 2, 3, 4], 2, async (index) => {
+      peak = Math.max(peak, ++active);
+      await new Promise<void>((resolve) => releases[index] = resolve);
+      active--;
+      if (index === 1) throw new Error("ordinary tool failure");
+      return index;
+    });
+    await vi.waitFor(() => expect(releases.filter(Boolean)).toHaveLength(2));
+    releases[1]!();
+    await vi.waitFor(() => expect(releases[2]).toBeDefined());
+    releases[2]!();
+    await vi.waitFor(() => expect(releases[3]).toBeDefined());
+    releases[0]!();
+    releases[3]!();
+    await vi.waitFor(() => expect(releases[4]).toBeDefined());
+    releases[4]!();
+    const settled = await pending;
+    expect(peak).toBe(2);
+    expect(settled.map((result) => result.status === "fulfilled" ? result.value : "failed")).toEqual([0, "failed", 2, 3, 4]);
+  });
+});

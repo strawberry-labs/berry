@@ -116,3 +116,71 @@ test("preserves the viewport while prepending an older variable-height page", as
   expect(Math.abs(after.top! - before.top!)).toBeLessThanOrEqual(8);
   expect(after.scrollTop).toBeGreaterThan(0);
 });
+
+test("keeps long history rows separate before resize measurements catch up", async ({ page }) => {
+  await page.goto("/?benchmark=message-history&layout=long");
+  await expect(page.getByTestId("message-history-benchmark")).toBeVisible();
+  const history = page.locator('[data-history-window="true"]');
+  await expect.poll(() => history.locator('[data-history-key]').count()).toBeGreaterThan(2);
+  // Flush layout inside the same task as a width change: ResizeObserver and
+  // React have not yet updated the cached row offsets in this frame.
+  const result = await history.evaluate((element) => {
+    const rows = Array.from(element.querySelectorAll<HTMLElement>('[data-history-key]'));
+    const before = rows.map((row) => row.getBoundingClientRect().height);
+    (element as HTMLElement).style.width = "400px";
+    const rects = rows.map((row) => row.getBoundingClientRect());
+    return {
+      grew: rects.some((rect, index) => rect.height > before[index]! + 100),
+      overlaps: rects.flatMap((rect, index) => {
+        const next = rects[index + 1];
+        return next && rect.bottom > next.top + 1
+          ? [{ row: rows[index]!.dataset.historyKey, overlap: rect.bottom - next.top }]
+          : [];
+      }),
+    };
+  });
+  expect(result.grew).toBe(true);
+  expect(result.overlaps).toEqual([]);
+});
+
+test("keeps older long turns readable when scrolling up and reopening a hidden task", async ({ page }, testInfo) => {
+  await page.goto("/?benchmark=message-history&layout=long");
+  const viewport = page.getByRole("region", { name: "Messages", exact: true });
+  await expect.poll(() => viewport.evaluate((element) => element.scrollTop)).toBeGreaterThan(1_000);
+  const result = await viewport.evaluate(async (element) => {
+    const frame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    const firstKey = element.querySelector<HTMLElement>('[data-history-key]')?.dataset.historyKey;
+    let overlap = 0;
+    let maxMounted = 0;
+    for (let step = 0; step < 20; step += 1) {
+      element.scrollTop -= element.clientHeight;
+      element.dispatchEvent(new Event("scroll", { bubbles: true }));
+      await frame();
+      await frame();
+      const rows = Array.from(element.querySelectorAll<HTMLElement>('[data-history-key]'));
+      maxMounted = Math.max(maxMounted, rows.length);
+      rows.forEach((row, index) => {
+        const next = rows[index + 1];
+        if (next) overlap = Math.max(overlap, row.getBoundingClientRect().bottom - next.getBoundingClientRect().top);
+      });
+    }
+    return { firstKey, lastKey: element.querySelector<HTMLElement>('[data-history-key]')?.dataset.historyKey, overlap, maxMounted };
+  });
+  expect(result.lastKey).not.toBe(result.firstKey);
+  expect(result.overlap).toBeLessThanOrEqual(1);
+  expect(result.maxMounted).toBeLessThanOrEqual(18);
+  const before = await viewport.evaluate((element) => {
+    const top = element.getBoundingClientRect().top;
+    const anchor = Array.from(element.querySelectorAll<HTMLElement>('[data-history-key]')).find((row) => row.getBoundingClientRect().bottom > top);
+    return { key: anchor?.dataset.historyKey, top: anchor?.getBoundingClientRect().top };
+  });
+  expect(before.key).toBeTruthy();
+  await page.getByRole("button", { name: "Toggle task visibility" }).click();
+  await expect(viewport).toBeHidden();
+  await page.getByRole("button", { name: "Toggle task visibility" }).click();
+  await expect(viewport).toBeVisible();
+  const anchor = page.locator(`[data-history-key="${before.key}"]`);
+  await expect(anchor).toBeAttached();
+  await expect.poll(() => anchor.evaluate((element) => element.getBoundingClientRect().top)).toBeCloseTo(before.top!, 0);
+  await page.screenshot({ path: testInfo.outputPath("scroll-up.png") });
+});

@@ -1360,3 +1360,29 @@ describe("router client", () => {
     expect(seen.map((body) => body.reasoning)).toEqual([{ effort: "high" }, { effort: "high" }]);
   });
 });
+
+describe("Inference.net metadata and reasoning", () => {
+  it("reads model reasoning efforts, native vision and completion limits", async () => {
+    const models = await listProviderModels({
+      provider: { id: "inference-net", kind: "openai", name: "Inference.net", baseUrl: "https://api.inference.net/v1", defaultModel: "deepseek-v4.1-flash-1017" },
+      fetchImpl: async () => Response.json({ data: [{
+        id: "deepseek-v4.1-flash-1017", context_length: 1_040_000, max_completion_tokens: 393_216,
+        reasoning_efforts: ["none", "low", "high", "max"], input_modalities: ["text", "image"],
+      }] }),
+    });
+    expect(models[0]).toMatchObject({ contextWindow: 1_040_000, maxOutputTokens: 393_216,
+      capabilities: { reasoning: true, vision: true, reasoningEfforts: ["off", "low", "high", "xhigh"] } });
+  });
+  it.each([["medium", "high"], ["xhigh", "max"], ["none", "none"]] as const)("normalizes direct effort %s to %s", async (effort, expected) => {
+    let body: Record<string, unknown> = {};
+    const client = new OpenAIChatCompletionsClient({
+      provider: { id: "inference-net", kind: "openai", name: "Inference.net", baseUrl: "https://api.inference.net/v1", defaultModel: "deepseek-v4.1-flash-1017" },
+      fetchImpl: async (_url, init) => {
+        body = JSON.parse(String(init?.body));
+        return Response.json({ id: "test", choices: [{ message: { content: "ok" }, finish_reason: "stop" }] });
+      },
+    });
+    await client.complete({ messages: [{ role: "user", content: "test" }], reasoningEffort: effort });
+    expect(body.reasoning_effort).toBe(expected);
+  });
+});

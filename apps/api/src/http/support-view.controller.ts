@@ -310,6 +310,18 @@ export class SupportViewController {
     }, (scoped) => this.requireAgentApi().contextStats(scoped, sessionId, body));
   }
 
+  @Get("/sessions/:sessionId/task-token-usage")
+  async taskTokenUsage(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("sessionId") sessionId: string,
+  ) {
+    return this.subjectRead(request, tenantId, userId, {
+      targetType: "task_token_usage", targetId: sessionId, sessionId,
+    }, (scoped) => this.requireAgentApi().taskTokenUsage(scoped, sessionId));
+  }
+
   @Post("/sessions/:sessionId/messages")
   async appendMessage(
     @Req() request: AuthenticatedRequest,
@@ -695,6 +707,25 @@ export class SupportViewController {
     return result;
   }
 
+  @Get("/files/:fileId/download-url")
+  async fileDownloadUrl(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("fileId") fileId: string,
+    @Res({ passthrough: true }) response: ServerResponse,
+  ) {
+    response.setHeader("Cache-Control", "private, no-store");
+    await this.requireAccess(request, tenantId, userId);
+    const parsedFileId = parseInput(UuidSchema, fileId);
+    const result = await this.files.downloadUrl(tenantId, userId, parsedFileId);
+    await this.recordRead(request, tenantId, userId, {
+      action: "support-view-file-download-requested", targetType: "file", targetId: parsedFileId,
+      metadata: { delivery: "signed-url" },
+    });
+    return result;
+  }
+
   @Get("/files/:fileId/content")
   async fileContent(
     @Req() request: AuthenticatedRequest,
@@ -714,6 +745,14 @@ export class SupportViewController {
       targetId: parsedFileId,
     });
     response.setHeader("Cache-Control", INVALID_FILE_CACHE_CONTROL);
+    if (isDownload && request.headers["sec-fetch-mode"] === "navigate") {
+      const { url } = await this.files.downloadUrl(tenantId, userId, parsedFileId);
+      response.statusCode = 302;
+      response.setHeader("Location", url);
+      response.setHeader("Referrer-Policy", "no-referrer");
+      response.end();
+      return;
+    }
     await this.files.streamContent(
       tenantId,
       userId,
@@ -820,7 +859,7 @@ export class SupportViewController {
     return scoped;
   }
 
-  private async subjectRead<T>(
+  async subjectRead<T>(
     request: AuthenticatedRequest,
     tenantId: string,
     userId: string,
@@ -839,7 +878,7 @@ export class SupportViewController {
     return result;
   }
 
-  private async subjectWrite<T>(
+  async subjectWrite<T>(
     request: AuthenticatedRequest,
     tenantId: string,
     userId: string,

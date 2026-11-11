@@ -1,99 +1,27 @@
 import * as React from "react";
 import {
-  Activity,
-  Check,
-  Copy,
-  Download,
-  Plus,
-  Save,
-  ShieldCheck,
-  Trash2,
-  Upload,
-} from "lucide-react";
-import {
-  ORGANIZATION_SKILL_PACKAGE_MAX_BYTES,
-  OrgPermissionSchema,
-  type OrgCapabilityAssignment,
-  type OrgPermission,
-  type PersonalSkillReview,
-} from "@berry/shared";
-import { readBrowserSkillImport } from "@/lib/skill-import";
-import {
   AsyncState,
-  Button,
-  Checkbox,
+  CellStack,
   DataTable,
   DefinitionList,
   DetailDrawer,
-  FilterSelect,
-  FormSelect,
-  Input,
-  ManagementDialog,
+  InlineNotice,
   ManagementPage,
   ManagementSwitch,
-  MetricGrid,
-  PermissionDenied,
-  SearchInput,
-  Section,
   StatusPill,
   SuccessMessage,
-  TabBar,
-  Textarea,
-  Toolbar,
   formatDate,
   formatDateTime,
-  formatNumber,
 } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
 
-/* ------------------------------------------------------------------ helpers */
-const ALL_PERMISSIONS = OrgPermissionSchema.options as OrgPermission[];
-const PERMISSION_DOMAINS: Array<{ id: string; label: string }> = [
-  { id: "org", label: "Organization" },
-  { id: "org_settings", label: "Organization settings" },
-  { id: "members", label: "People" },
-  { id: "departments", label: "Departments" },
-  { id: "rbac", label: "Roles" },
-  { id: "acl", label: "Resource access" },
-  { id: "models", label: "Models" },
-  { id: "skills", label: "Skills" },
-  { id: "mcp", label: "MCP" },
-  { id: "feature_flags", label: "Feature access" },
-  { id: "guardrails", label: "Execution & network" },
-  { id: "usage", label: "Usage" },
-  { id: "budgets", label: "Budgets" },
-  { id: "billing", label: "Billing" },
-  { id: "reports", label: "Reports" },
-  { id: "alerts", label: "Alerts" },
-  { id: "sso", label: "SSO & SCIM" },
-  { id: "policy", label: "Managed policy" },
-  { id: "auth_policy", label: "Authentication" },
-  { id: "data_policy", label: "Data governance" },
-  { id: "service_accounts", label: "Service accounts" },
-  { id: "audit", label: "Audit" },
-];
-function humanize(value: string) {
-  return value
-    .replaceAll("_", " ")
-    .replaceAll("-", " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
-}
-function domainOf(permission: string) {
-  return permission.split(":")[0];
-}
-function actionOf(permission: string) {
-  return permission.split(":")[1] ?? "read";
-}
-function copyText(value: string) {
-  void navigator.clipboard?.writeText(value).catch(() => {});
-}
-function formatPackageBytes(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+const drawerHeading = "text-xs font-medium text-muted-foreground";
+
+function sentence(value: string) {
+  const text = String(value ?? "").replaceAll("_", " ").replaceAll("-", " ").replaceAll(".", " ");
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
-/* -------------------------------------------------------------------- roles */
 export function AdminFeatureAccessScreen({
   client,
   config,
@@ -109,122 +37,120 @@ export function AdminFeatureAccessScreen({
         : config.featureFlags.filter((x) => x.tenantId === tenantId),
     [] as any[],
   );
-  const [query, setQuery] = React.useState("");
-  const [active, setActive] = React.useState<number | null>(null);
+  const [activeFlag, setActiveFlag] = React.useState<string | null>(null);
   const [message, setMessage] = React.useState("");
-  const rows = r.data.filter((f: any) =>
-    humanize(f.flag).toLowerCase().includes(query.toLowerCase()),
-  );
-  const detail = active != null ? rows[active] : null;
+  const [error, setError] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const rows = [...r.data].sort((left: any, right: any) => sentence(left.flag).localeCompare(sentence(right.flag)));
+  const activeIndex = rows.findIndex((f: any) => f.flag === activeFlag);
+  const detail = activeIndex >= 0 ? rows[activeIndex] : null;
+  const roleNames = (flag: any) => Object.keys(flag.roleDefaults ?? {});
   const setEnabled = async (flag: any, enabled: boolean) => {
-    await client?.upsertFeatureFlag(tenantId, flag.flag, {
-      enabled,
-      roleDefaults: flag.roleDefaults,
-    });
-    r.setData(
-      r.data.map((f: any) =>
-        f.flag === flag.flag
-          ? { ...f, enabled, updatedAt: new Date().toISOString() }
-          : f,
-      ),
-    );
-    setMessage(
-      `Feature “${humanize(flag.flag)}” turned ${enabled ? "on" : "off"} and recorded in the audit log.`,
-    );
+    setBusy(true);
+    setError("");
+    setMessage("");
+    try {
+      await client?.upsertFeatureFlag(tenantId, flag.flag, {
+        enabled,
+        roleDefaults: flag.roleDefaults,
+      });
+      r.setData(
+        r.data.map((f: any) =>
+          f.flag === flag.flag
+            ? { ...f, enabled, updatedAt: new Date().toISOString() }
+            : f,
+        ),
+      );
+      setMessage(
+        `“${sentence(flag.flag)}” turned ${enabled ? "on" : "off"} for the organization and recorded in the audit log.`,
+      );
+    } catch (cause) {
+      setError(cause instanceof Error && cause.message ? cause.message : "The feature could not be updated.");
+    } finally {
+      setBusy(false);
+    }
   };
   return (
     <ManagementPage
       title="Feature access"
-      description="Roll features out across the organization and refine access by role."
-      eyebrow="AI controls"
+      description="Turn Berry features on or off for the whole organization. Models, connectors, and skills have their own tabs."
+      eyebrow="AI & tools"
     >
-      <Toolbar>
-        <SearchInput
-          label="Search features"
-          value={query}
-          onChange={setQuery}
-          placeholder="Search features"
-        />
-      </Toolbar>
       {message ? <SuccessMessage>{message}</SuccessMessage> : null}
-      <div className={detail ? "min-w-0" : undefined}>
-        <AsyncState
-          loading={r.loading}
-          error={r.error}
-          onRetry={r.retry}
-          empty={rows.length === 0}
+      {error ? <InlineNotice tone="danger">{error}</InlineNotice> : null}
+      <AsyncState
+        loading={r.loading}
+        error={r.error}
+        onRetry={r.retry}
+        empty={rows.length === 0}
+        emptyTitle="No features to manage"
+        emptyText="Features that can be switched per organization appear here when the platform makes them available."
+      >
+        <DataTable
+          label="Features"
+          columns={["Feature", "Organization", "Role overrides", "Updated"]}
+          onRowSelect={(index) => setActiveFlag(rows[index]?.flag ?? null)}
+          activeRow={activeIndex >= 0 ? activeIndex : null}
+          rowLabel={(i) => sentence(rows[i].flag)}
+          rows={rows.map((f: any) => [
+            <CellStack primary={sentence(f.flag)} secondary={<span className="font-mono">{f.flag}</span>} />,
+            <StatusPill tone={f.enabled ? "good" : "neutral"}>
+              {f.enabled ? "On" : "Off"}
+            </StatusPill>,
+            roleNames(f).length ? roleNames(f).map(sentence).join(", ") : <span className="text-muted-foreground">—</span>,
+            formatDate(f.updatedAt),
+          ])}
+        />
+      </AsyncState>
+      {detail ? (
+        <DetailDrawer
+          title={sentence(detail.flag)}
+          subtitle={<code>{detail.flag}</code>}
+          badge={
+            <StatusPill tone={detail.enabled ? "good" : "neutral"}>
+              {detail.enabled ? "On" : "Off"}
+            </StatusPill>
+          }
+          onClose={() => setActiveFlag(null)}
         >
-          <DataTable
-            label="Feature access"
-            columns={[
-              "Feature",
-              "Organization default",
-              "Role overrides",
-              "Updated",
-            ]}
-            onRowSelect={setActive}
-            activeRow={active}
-            rowLabel={(i) => humanize(rows[i].flag)}
-            rows={rows.map((f: any) => [
-              <b>{humanize(f.flag)}</b>,
-              <StatusPill tone={f.enabled ? "good" : "neutral"}>
-                {f.enabled ? "On" : "Off"}
-              </StatusPill>,
-              formatNumber(Object.keys(f.roleDefaults ?? {}).length),
-              formatDate(f.updatedAt),
-            ])}
-          />
-        </AsyncState>
-        {detail ? (
-          <DetailDrawer
-            title={humanize(detail.flag)}
-            subtitle={detail.flag}
-            badge={
-              <StatusPill tone={detail.enabled ? "good" : "neutral"}>
-                {detail.enabled ? "On" : "Off"}
-              </StatusPill>
-            }
-            onClose={() => setActive(null)}
-          >
-            <label className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm">
-              <span>
-                Organization default
-                <small>Turn this feature on for the whole organization.</small>
-              </span>
-              <ManagementSwitch
-                checked={Boolean(detail.enabled)}
-                disabled={!canWrite}
-                onCheckedChange={(checked) => setEnabled(detail, checked)}
-                aria-label="Organization default"
-              />
-            </label>
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              Role overrides
-            </h3>
-            {Object.keys(detail.roleDefaults ?? {}).length ? (
-              <DefinitionList
-                items={Object.entries(detail.roleDefaults).map(
-                  ([role, perms]) => ({
-                    term: humanize(role),
-                    detail: (perms as string[]).join(", ") || "—",
-                  }),
-                )}
-              />
+          {error ? <InlineNotice tone="danger">{error}</InlineNotice> : null}
+          <div className="flex items-center justify-between gap-4">
+            <span className="grid gap-0.5">
+              <b className="text-md font-medium text-foreground">On for the organization</b>
+              <small className="text-xs leading-5 text-muted-foreground">
+                {canWrite ? "Applies to every member of the organization." : "Changing this needs the “Feature access: manage” permission."}
+              </small>
+            </span>
+            <ManagementSwitch
+              checked={Boolean(detail.enabled)}
+              disabled={!canWrite || busy}
+              onCheckedChange={(checked) => void setEnabled(detail, checked)}
+              aria-label={`${sentence(detail.flag)} on for the organization`}
+            />
+          </div>
+          <div className="grid gap-2">
+            <h3 className={drawerHeading}>Role overrides</h3>
+            {roleNames(detail).length ? (
+              <>
+                <DefinitionList
+                  items={Object.entries(detail.roleDefaults).map(
+                    ([role, perms]) => ({
+                      term: sentence(role),
+                      detail: (perms as string[]).length
+                        ? <span className="font-mono text-xs">{(perms as string[]).join(", ")}</span>
+                        : "—",
+                    }),
+                  )}
+                />
+                <p className="text-xs leading-5 text-muted-foreground">Permissions attached to this feature for each role. They cannot be edited on this screen.</p>
+              </>
             ) : (
-              <p className="text-xs text-muted-foreground">
-                No role overrides. All roles inherit the organization default.
-              </p>
+              <p className="text-xs leading-5 text-muted-foreground">None. Every role follows the organization setting.</p>
             )}
-            {!canWrite ? (
-              <p className="text-xs text-muted-foreground">
-                Read-only — feature_flags:write required to edit.
-              </p>
-            ) : null}
-          </DetailDrawer>
-        ) : null}
-      </div>
+          </div>
+          <DefinitionList items={[{ term: "Updated", detail: formatDateTime(detail.updatedAt) }]} />
+        </DetailDrawer>
+      ) : null}
     </ManagementPage>
   );
 }
-
-/* --------------------------------------------------------------- sso & scim */

@@ -161,8 +161,13 @@ def project_records(spec: dict[str, Any]) -> list[dict[str, Any]]:
     output = []
     for index, item in enumerate(source, start=1):
         name = require(item.get("name"), f"selected_projects[{index}].name")
+        use_shared = item.get("use_shared_description", False)
+        if not isinstance(use_shared, bool):
+            raise ValueError(f"selected_projects[{index}].use_shared_description must be a JSON boolean")
         description = require(
-            item.get("description"),
+            text(item.get("description")) or (
+                spec.get("shared_project_description") if use_shared else None
+            ),
             f"selected_projects[{index}].description",
         )
         duration = text(item.get("duration"))
@@ -197,6 +202,9 @@ def build_payload(spec: dict[str, Any], photo_path: Path) -> dict[str, Any]:
     photo = encode_photo(photo_path)
     experience = experience_records(spec)
     projects = project_records(spec)
+    omit_key_expertise = spec.get("omit_key_expertise", False)
+    if not isinstance(omit_key_expertise, bool):
+        raise ValueError("omit_key_expertise must be a JSON boolean")
     expertise = strings(spec.get("key_expertise"), "key_expertise")
     qualifications = strings(spec.get("qualifications"), "qualifications")
     memberships = strings(spec.get("memberships"), "memberships")
@@ -210,7 +218,7 @@ def build_payload(spec: dict[str, Any], photo_path: Path) -> dict[str, Any]:
                 work_experience=experience,
             )
         )
-    if expertise:
+    if expertise and not omit_key_expertise:
         sections.append(section("Core Competencies", items=expertise))
     if qualifications:
         sections.append(section("Qualifications", items=qualifications))
@@ -265,6 +273,7 @@ def build_payload(spec: dict[str, Any], photo_path: Path) -> dict[str, Any]:
         },
         "profile": {"name": name, "role": role},
         "profile_photo": photo,
+        "omit_key_expertise": omit_key_expertise,
         "sections": sections,
         "contacts": {
             "emails": strings(contacts.get("emails"), "contacts.emails"),

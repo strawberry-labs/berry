@@ -4,6 +4,7 @@ import { ProviderAttemptEventSchema } from "./provider-errors.ts";
 
 export { BUILT_IN_COMMANDS, builtInCommandManifests, parseSlashCommand, type BuiltInCommandDefinition } from "./commands.ts";
 export * from "./durable-context.ts";
+export * from "./context-budget.ts";
 export * from "./checkpoint.ts";
 export * from "./retrieval.ts";
 export * from "./memory.ts";
@@ -12,6 +13,8 @@ export * from "./durable-job-contracts.ts";
 export * from "./provider-errors.ts";
 export * from "./workflow-routing.ts";
 export * from "./operational-telemetry.ts";
+export * from "./mobile-pairing.ts";
+export * from "./browser-handoff.ts";
 
 /**
  * Pre-1.0 host protocol version shared by desktop, host, CLI, and future
@@ -957,6 +960,12 @@ export const MessageSchema = z.object({
   inputTokens: z.number().default(0),
   outputTokens: z.number().default(0),
   generationMs: z.number().default(0),
+  modelTiming: z.object({
+    requestMs: z.number().finite().nonnegative(),
+    firstTokenMs: z.number().finite().nonnegative().optional(),
+    decodeMs: z.number().finite().positive().optional(),
+    decodeTokens: z.number().finite().nonnegative().optional(),
+  }).optional(),
   createdAt: ISODateSchema,
   updatedAt: ISODateSchema,
 });
@@ -1013,7 +1022,7 @@ export const ApprovalRequestSchema = z.object({
 });
 export type ApprovalRequest = z.infer<typeof ApprovalRequestSchema>;
 
-export const MobileEndpointModeSchema = z.enum(["berry-account", "self-hosted", "custom-openai", "lan-local"]);
+export const MobileEndpointModeSchema = z.enum(["paired", "berry-account", "self-hosted", "custom-openai", "lan-local"]);
 export type MobileEndpointMode = z.infer<typeof MobileEndpointModeSchema>;
 
 export const MobileDevicePlatformSchema = z.enum(["ios", "android", "expo"]);
@@ -1045,6 +1054,13 @@ export const MobileDeviceRegistrationSchema = z.object({
   appVersion: z.string().nullable(),
   capabilities: z.array(z.string()),
   status: z.enum(["active", "disabled"]),
+  displayName: z.string().nullable().optional(),
+  model: z.string().nullable().optional(),
+  osVersion: z.string().nullable().optional(),
+  pairedAt: ISODateSchema.nullable().optional(),
+  revokedAt: ISODateSchema.nullable().optional(),
+  /** True when the device belongs to the session that made this request. */
+  current: z.boolean().optional(),
   createdAt: ISODateSchema,
   updatedAt: ISODateSchema,
   lastSeenAt: ISODateSchema,
@@ -2117,6 +2133,18 @@ export const ContextStatsSchema = z.object({
 });
 export type ContextStats = z.infer<typeof ContextStatsSchema>;
 
+export const TaskTokenUsageSchema = z.object({
+  taskId: z.string().min(1),
+  inputTokens: z.number().int().nonnegative(),
+  cachedInputTokens: z.number().int().nonnegative(),
+  uncachedInputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  totalTokens: z.number().int().nonnegative(),
+  /** Cached input tokens divided by all input tokens; null before any usage. */
+  cacheHitRate: z.number().min(0).max(1).nullable(),
+});
+export type TaskTokenUsage = z.infer<typeof TaskTokenUsageSchema>;
+
 export const GitChangedFileSchema = z.object({
   path: z.string(),
   indexStatus: z.string(),
@@ -2330,6 +2358,13 @@ export const AgentStreamEventSchema = z.discriminatedUnion("kind", [
     options: z.array(QuestionOptionSchema).default([]),
     multi: z.boolean().default(false),
     questions: z.array(QuestionPromptSchema).min(1).max(5).optional(),
+  }),
+  z.object({
+    kind: z.literal("browser.handoff"),
+    handoffId: z.string().uuid(),
+    browserSessionId: z.string().regex(/^bses_[A-Za-z0-9_-]{1,120}$/),
+    state: z.enum(["ready", "resumed"]),
+    reason: z.string().max(2000),
   }),
   z.object({ kind: z.literal("question.answered"), questionId: z.string() }),
   z.object({
@@ -3777,7 +3812,7 @@ export const FinancialMutationSchema = z.object({ amountMicros: z.string().regex
 
 export const ExecutionNetworkPolicySchema = z.object({ tenantId: z.string(), sandboxEnabled: z.boolean(), codeExecutionEnabled: z.boolean(), approvalRequired: z.boolean(), outboundNetwork: z.enum(["blocked", "allowlist", "unrestricted"]), allowedDomains: z.array(z.string()), blockedDomains: z.array(z.string()), allowedToolClasses: z.array(z.string()), maxRunSeconds: z.number().int().positive(), maxConcurrency: z.number().int().positive(), requestsPerMinute: z.number().int().positive(), tokenQuota: z.number().int().nonnegative().nullable(), sandboxMinuteQuota: z.number().nonnegative().nullable(), updatedAt: ISODateSchema });
 export type ExecutionNetworkPolicy = z.infer<typeof ExecutionNetworkPolicySchema>;
-export const AuthenticationPolicySchema = z.object({ tenantId: z.string(), mfaRequired: z.boolean(), sessionMaxAgeMinutes: z.number().int().positive(), idleTimeoutMinutes: z.number().int().positive(), trustedDevicesAllowed: z.boolean(), allowedLoginMethods: z.array(z.enum(["password", "magic_link", "oidc", "saml"])), allowedDomains: z.array(z.string()), emergencyLocalOwnerEnabled: z.boolean(), updatedAt: ISODateSchema });
+export const AuthenticationPolicySchema = z.object({ tenantId: z.string(), mfaRequired: z.boolean(), sessionMaxAgeMinutes: z.number().int().positive(), idleTimeoutMinutes: z.number().int().positive(), trustedDevicesAllowed: z.boolean(), allowedLoginMethods: z.array(z.enum(["password", "magic_link", "oidc", "saml"])), allowedDomains: z.array(z.string()), emergencyLocalOwnerEnabled: z.boolean(), mobileAppEnabled: z.boolean().default(true), updatedAt: ISODateSchema });
 export type AuthenticationPolicy = z.infer<typeof AuthenticationPolicySchema>;
 export const DataGovernancePolicySchema = z.object({ tenantId: z.string(), conversationRetentionDays: z.number().int().nonnegative(), temporaryChatHours: z.number().int().nonnegative(), retentionByDataType: z.record(z.number().int().nonnegative()), residency: z.string(), piiFilterMode: z.enum(["off", "warn", "block"]), credentialFilterMode: z.enum(["off", "warn", "block"]), moderationHookConfigured: z.boolean(), legalHoldEnabled: z.boolean(), updatedAt: ISODateSchema });
 export type DataGovernancePolicy = z.infer<typeof DataGovernancePolicySchema>;
@@ -3869,3 +3904,5 @@ export function nowIso(): string {
 export function createId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`;
 }
+
+export * from "./scheduled-tasks.ts";

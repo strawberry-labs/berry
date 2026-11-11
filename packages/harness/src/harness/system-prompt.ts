@@ -12,10 +12,19 @@ export function formatSkillsForSystemPrompt(skills: Skill[]): string {
 		DEFERRED_SKILL_RESOURCE_INSTRUCTIONS,
 		"Skills are instructions, not automatic permissions. Normal tool, filesystem, network, and execution policies still apply.",
 		"",
-		"<available_skills>",
 	];
 
-	for (const skill of visibleSkills) {
+	// Shared routing rules precede the catalogue, whose personal skills vary by user.
+	const aesgRouting = formatAesgArtifactRouting(visibleSkills);
+	if (aesgRouting) lines.push(aesgRouting, "");
+	lines.push("<available_skills>");
+	// Database row order is not guaranteed. Keep shared skills before personal
+	// additions, and render the same catalogue identically in every worker.
+	const compare = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
+	const personal = (skill: Skill) => Number(skill.filePath.replaceAll("\\", "/").includes("/personal-skills/"));
+	const catalogSkills = [...visibleSkills].sort((left, right) =>
+		personal(left) - personal(right) || compare(left.name, right.name) || compare(left.description, right.description));
+	for (const skill of catalogSkills) {
 		lines.push("  <skill>");
 		lines.push(`    <name>${escapeXml(skill.name)}</name>`);
 		lines.push(`    <description>${escapeXml(skill.description)}</description>`);
@@ -23,8 +32,6 @@ export function formatSkillsForSystemPrompt(skills: Skill[]): string {
 	}
 
 	lines.push("</available_skills>");
-	const aesgRouting = formatAesgArtifactRouting(visibleSkills);
-	if (aesgRouting) lines.push("", aesgRouting);
 	return lines.join("\n");
 }
 

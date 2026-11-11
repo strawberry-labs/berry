@@ -107,9 +107,23 @@ export class FilePlatformController {
     return this.files.abortUpload(tenant(), user(request), ids.fileId, ids.uploadId);
   }
 
+  @Get(":fileId/download-url")
+  downloadUrl(@Req() request: AuthenticatedRequest, @Param("fileId") fileId: string, @Res({ passthrough: true }) response: ServerResponse) {
+    response.setHeader("Cache-Control", "private, no-store");
+    return this.files.downloadUrl(tenant(), user(request), parse(z.string().uuid(), fileId));
+  }
+
   @Get(":fileId/content")
-  content(@Req() request: AuthenticatedRequest, @Param("fileId") fileId: string, @Query("download") download: string | undefined, @Res() response: ServerResponse) {
+  async content(@Req() request: AuthenticatedRequest, @Param("fileId") fileId: string, @Query("download") download: string | undefined, @Res() response: ServerResponse) {
     response.setHeader("Cache-Control", INVALID_FILE_CACHE_CONTROL);
+    if (download === "1" && request.headers["sec-fetch-mode"] === "navigate") {
+      const { url } = await this.files.downloadUrl(tenant(), user(request), parse(z.string().uuid(), fileId));
+      response.statusCode = 302;
+      response.setHeader("Location", url);
+      response.setHeader("Referrer-Policy", "no-referrer");
+      response.end();
+      return;
+    }
     return this.files.streamContent(
       tenant(),
       user(request),

@@ -37,6 +37,14 @@ describe("Better Auth runtime config", () => {
     ]);
     expect(query.mock.calls.find(([sql]) => sql.includes("UPDATE tenant_memberships"))?.[0]).toContain("status='pending'");
     expect(query.mock.calls.some(([sql]) => sql.includes("'user'"))).toBe(true);
+    // A fresh process runs recovery again; neither an increased org cap nor
+    // a custom/disabled member cap may be replaced by deployment defaults.
+    const budgetInserts = query.mock.calls.filter(([sql]) => sql.includes("INSERT INTO budget_limits"));
+    expect(budgetInserts).toHaveLength(2);
+    for (const [sql] of budgetInserts) {
+      expect(sql).toContain("DO NOTHING");
+      expect(sql).not.toContain("DO UPDATE");
+    }
   });
 
   it("authorizes sessions only while the configured organization membership is active", async () => {
@@ -453,7 +461,7 @@ describe("Better Auth runtime config", () => {
       "signup",
     ]);
     expect(query.mock.calls.some(([sql]) => sql.includes("UPDATE workspaces"))).toBe(false);
-    expect(orgBudgetSql).toContain("DO UPDATE");
+    expect(orgBudgetSql).toContain("DO NOTHING");
   });
 
   it("allows Google JIT provisioning while local signup is closed and records an SSO membership", async () => {
@@ -648,6 +656,12 @@ describe("Better Auth runtime config", () => {
       "00000000-0000-7000-8000-000000000111",
       SELF_HOST_WORKSPACE_ID,
     ]);
+    const organizationBudget = query.mock.calls.find(([sql]) => sql.includes("INSERT INTO budget_limits") && sql.includes("'org'"))?.[0];
+    expect(organizationBudget).toContain("WHERE budget_limits.status = 'disabled'");
+    expect(organizationBudget).toContain("budget_limits.soft_limit_micros = 0");
+    expect(organizationBudget).toContain("budget_limits.hard_limit_micros = 0");
+    const memberBudget = query.mock.calls.find(([sql]) => sql.includes("INSERT INTO budget_limits") && sql.includes("'user'"))?.[0];
+    expect(memberBudget).toContain("DO NOTHING");
     expect(query.mock.calls.at(-1)?.[0]).toBe("COMMIT");
     expect(release).toHaveBeenCalledOnce();
   });

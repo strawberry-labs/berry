@@ -57,7 +57,9 @@ describe("terminal tool labels", () => {
     );
 
     expect(html).not.toContain("berry-shimmer");
-    expect(html).toContain("Failed");
+    // Failures are a quiet lowercase note, never a red alarm.
+    expect(html).toContain("failed");
+    expect(html).not.toContain("text-destructive");
   });
 });
 
@@ -96,9 +98,11 @@ describe("vision tool labels", () => {
       }]} />,
     );
 
-    expect(html).toContain("Inspect Images");
+    expect(html).toContain("Looked at images");
     expect(html).not.toContain("Explore");
-    expect(html).toContain("19.0s");
-    expect(html).toContain("Failed");
+    // Collapsed rows leave out per-call durations; the turn header has the time.
+    expect(html).not.toContain("19.0s");
+    expect(html).toContain("failed");
+    expect(html).not.toContain("text-destructive");
   });
 });

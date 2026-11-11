@@ -9,6 +9,11 @@ import {
   classifyWorkflowCategory,
   WorkflowCategorySchema,
   WORKFLOW_CATEGORY_VERSION,
+  ESTIMATED_IMAGE_TOKENS,
+  contextEnvelopeKey,
+  estimateContextCharacterTokens,
+  estimateContextValueTokens,
+  measureContextEntries,
   type AttachmentInput,
   type AgentStreamEvent,
   type JsonValue,
@@ -698,29 +703,11 @@ active_entries AS (
   FROM session_entries
   WHERE tenant_id=$1::uuid AND session_id=$2::uuid
     AND entry_id IN (SELECT entry_id FROM ancestry)
-    AND entry_type='message'
+    AND entry_type IN ('message','context')
     AND sequence>COALESCE((SELECT sequence FROM covered),0)
-),
-current_run AS (
-  SELECT id
-  FROM turn_runs
-  WHERE tenant_id=$1::uuid AND session_id=$2::uuid
-  ORDER BY created_at DESC
-  LIMIT 1
-),
-latest_usage AS (
-  SELECT MAX(sequence) AS sequence
-  FROM active_entries
-  WHERE jsonb_typeof(payload->'message'->'usage')='object'
-    AND COALESCE(payload->'message'->>'stopReason','') NOT IN ('aborted','error')
-    AND run_id=(SELECT id FROM current_run)
 )
 SELECT entry_id,sequence,payload,run_id
 FROM active_entries
-WHERE sequence>=COALESCE(
-  (SELECT sequence FROM latest_usage),
-  (SELECT MIN(sequence) FROM active_entries)
-)
 ORDER BY sequence ASC
           `.trim(),
           [tenantId, sessionId],
@@ -751,7 +738,7 @@ LIMIT 1
         ),
         executor.query<DurableContextRunRow>(
           `
-SELECT r.id,r.state,
+SELECT r.id,r.state,r.runtime_request,
        COALESCE(
          NULLIF(r.prompt_manifest,'{}'::jsonb),
          (
@@ -798,40 +785,21 @@ LIMIT 1
         ? entries.findIndex((entry) => entry.entry_id === checkpoint.covered_entry_end)
         : -1;
       const activeEntries = coveredIndex >= 0 ? entries.slice(coveredIndex + 1) : entries;
-      const usageIndex = findLatestProviderUsageIndex(activeEntries);
-      const providerTokens = usageIndex >= 0
-        ? providerContextTokens(activeEntries[usageIndex]?.payload)
-        : null;
-      const trailingEntries = usageIndex >= 0 ? activeEntries.slice(usageIndex + 1) : activeEntries;
       const run = runs[0];
       const partialTokens = run && !isTerminalRunState(run.state)
         ? estimateCharacterTokens(Number(run.partial_chars))
         : 0;
       const pendingTokens = estimatePendingContextTokens(options.pendingInput, options.attachments);
 
-      if (providerTokens !== null) {
-        return {
-          usedTokens: Math.max(0, providerTokens + estimateDurableEntriesTokens(trailingEntries) + partialTokens + pendingTokens),
-          source: "provider-reported",
-        };
-      }
-
       const manifest = PromptManifestSchema.safeParse(run?.prompt_manifest);
       const stablePrefixTokens = manifest.success ? manifest.data.stablePrefixTokens : 0;
       const checkpointTokens = checkpoint ? estimateJsonTokens(checkpoint.checkpoint) : 0;
       const groundingTokens = run ? estimateJsonTokens(run.grounding_context) : 0;
-      return {
-        usedTokens: Math.max(
-          0,
-          stablePrefixTokens
-            + checkpointTokens
-            + groundingTokens
-            + estimateDurableEntriesTokens(activeEntries)
-            + partialTokens
-            + pendingTokens,
-        ),
-        source: "estimated",
-      };
+      const measured = measureContextEntries(activeEntries, {
+        envelopeKey: contextEnvelopeKey(run?.runtime_request, run?.prompt_manifest),
+        baseTokens: stablePrefixTokens + checkpointTokens + groundingTokens,
+      });
+      return { usedTokens: measured.usedTokens + partialTokens + pendingTokens, source: measured.source };
     });
   }
 
@@ -3267,58 +3235,6 @@ function durableProjectionText(value: unknown): string {
   return JSON.stringify(value ?? "");
 }
 
-function findLatestProviderUsageIndex(entries: readonly DurableContextEntryRow[]): number {
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    if (providerContextTokens(entries[index]?.payload) !== null) return index;
-  }
-  return -1;
-}
-
-function providerContextTokens(payload: unknown): number | null {
-  const message = recordValue(recordValue(payload)?.message);
-  const stopReason = stringValue(message?.stopReason);
-  if (!message || stopReason === "aborted" || stopReason === "error") return null;
-  const usage = recordValue(message.usage);
-  if (!usage) return null;
-  const total = nonnegativeNumber(usage.totalTokens);
-  if (total !== null && total > 0) return Math.round(total);
-  const input = nonnegativeNumber(usage.input) ?? 0;
-  const output = nonnegativeNumber(usage.output) ?? 0;
-  return input + output > 0 ? Math.round(input + output) : null;
-}
-
-function estimateDurableEntriesTokens(entries: readonly DurableContextEntryRow[]): number {
-  return entries.reduce((total, entry) => total + estimateDurableEntryTokens(entry.payload), 0);
-}
-
-function estimateDurableEntryTokens(payload: unknown): number {
-  const message = recordValue(recordValue(payload)?.message);
-  const role = stringValue(message?.role);
-  if (!message || !role) return 0;
-  if (role !== "user" && role !== "assistant" && role !== "toolResult") return 0;
-  const content = message.content;
-  if (typeof content === "string") return estimateCharacterTokens(content.length);
-  if (!Array.isArray(content)) return 0;
-  let characters = 0;
-  let imageTokens = 0;
-  for (const rawPart of content) {
-    const part = recordValue(rawPart);
-    if (!part) continue;
-    const text = typeof part.text === "string"
-      ? part.text
-      : typeof part.thinking === "string"
-        ? part.thinking
-        : "";
-    characters += text.length;
-    if (part.type === "toolCall") {
-      characters += (stringValue(part.name)?.length ?? 0) + jsonLength(part.arguments);
-    } else if (part.type === "image") {
-      imageTokens += 1_200;
-    }
-  }
-  return estimateCharacterTokens(characters) + imageTokens;
-}
-
 function estimatePendingContextTokens(
   input: string | undefined,
   attachments: readonly AttachmentInput[] = [],
@@ -3330,7 +3246,7 @@ function estimatePendingContextTokens(
         + attachment.mediaType.length
         + (attachment.textContent?.length ?? 0),
     );
-    if (attachment.mediaType.startsWith("image/")) tokens += 1_200;
+    if (attachment.mediaType.startsWith("image/")) tokens += ESTIMATED_IMAGE_TOKENS;
   }
   return tokens;
 }
@@ -3339,11 +3255,11 @@ function estimateJsonTokens(value: unknown): number {
   if (value === null || value === undefined) return 0;
   if (Array.isArray(value) && value.length === 0) return 0;
   if (typeof value === "object" && !Array.isArray(value) && Object.keys(value as object).length === 0) return 0;
-  return estimateCharacterTokens(jsonLength(value));
+  return estimateContextValueTokens(value);
 }
 
 function estimateCharacterTokens(characters: number): number {
-  return Number.isFinite(characters) && characters > 0 ? Math.ceil(characters / 4) : 0;
+  return estimateContextCharacterTokens(characters);
 }
 
 function jsonLength(value: unknown): number {
@@ -3720,7 +3636,7 @@ function supersededAdmissionConflict(): ConflictException {
   });
 }
 
-async function appendDurableEvents(
+export async function appendDurableEvents(
   executor: SqlExecutor,
   tenantId: string,
   runId: string,
@@ -3851,6 +3767,7 @@ interface DurableContextCheckpointRow {
 interface DurableContextRunRow {
   id: string;
   state: string;
+  runtime_request: unknown;
   prompt_manifest: unknown;
   grounding_context: unknown;
   partial_chars: number | string;

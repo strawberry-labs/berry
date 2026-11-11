@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { RouterClientError, type OpenAIChatCompletionsClient } from "@berry/router-client";
 import {
   SESSION_CHECKPOINT_MAX_BYTES,
+  applyCheckpointDeterminism,
   sessionCheckpointMetrics,
   type SessionCheckpointV2,
 } from "@berry/shared";
@@ -107,51 +108,207 @@ function modelResponse(content: string, usage = { inputTokens: 12, outputTokens:
 }
 
 describe("durable session compactor", () => {
-  it("uses the tool-capable compaction model instead of inheriting the chat default", () => {
+  it("reuses the exact conversation prefix and original tools for validated JSON compaction", async () => {
+    const complete = vi.fn().mockResolvedValue(modelResponse(JSON.stringify(checkpointOutput())));
+    const generator = new RouterCheckpointGenerator({ complete } as unknown as OpenAIChatCompletionsClient, "router", "checkpoint-test", { "checkpoint-test": { input: 1, output: 2 } });
+    const messages = [
+      { role: "system" as const, content: "Stable system and fixed rules" },
+      { role: "user" as const, content: "Original user request" },
+      { role: "assistant" as const, content: "Evidence and decisions" },
+    ];
+    const tools = [{ type: "function" as const, function: { name: "read", parameters: { type: "object" } } }];
+    const result = await generator.generate({
+      conversation: "Unused serialized transcript", deterministic: { generatedAt: "2026-07-28T12:00:00.000Z", coveredEntryStart: "entry-1", coveredEntryEnd: "entry-1", currentLeafId: "entry-2" },
+      previousRolling: null, maxTokens: 4_000, tokensBefore: 1_000, algorithmVersion: "checkpoint-v2-bounded",
+      request: { messages, tools, reasoningEffort: "low" },
+    });
+    expect(result.validationStatus).toBe("valid");
+    const sent = complete.mock.calls[0]![0];
+    expect(sent.messages.slice(0, messages.length)).toEqual(messages);
+    expect(sent.messages.at(-1).content).toContain("Return only JSON");
+    expect(sent.messages.at(-1).content).not.toContain("Unused serialized transcript");
+    expect(sent.tools).toEqual(tools);
+    expect(sent.toolChoice).toBe("none");
+    expect(sent.reasoningEffort).toBe("low");
+  });
+
+  it("does not let regenerated connector context evict recent user messages", async () => {
+    const entries = [
+      { role: "user", content: "Old request ".repeat(1_000) },
+      { role: "assistant", content: "Earlier completed work ".repeat(1_000) },
+      { role: "user", content: "for offices only" },
+      { type: "context", text: "Connector catalog ".repeat(20_000) },
+      { role: "user", content: "" },
+      { type: "context", text: "Connector catalog ".repeat(20_000) },
+    ].map((payload, index) => ({
+      entryId: `entry-${index + 1}`, parentEntryId: index ? `entry-${index}` : null,
+      entryType: "type" in payload ? "context" : "message", sequence: index + 1,
+      payload, isLeafMarker: index === 5, createdAt: "2026-07-28T12:00:00.000Z",
+    }));
+    const state = compactionState({ entries, sourceLeafId: "entry-6" });
+    const persist = vi.fn<SessionCompactionRepository["persist"]>(async () => ({ segmentCheckpointId: "segment", rollingCheckpointId: "rolling" }));
+    const compactor = new DurableSessionCompactor({
+      claim: async () => true, load: async () => state, persist, release: async () => {},
+    }, {
+      provider: "router", model: "checkpoint-test",
+      generate: async (input) => ({
+        checkpoint: applyCheckpointDeterminism(checkpointOutput(), input.deterministic),
+        validationStatus: "valid", attempts: 1,
+      }),
+    }, { keepRecentTokens: 100 });
+    await compactor.compactSession(job);
+    expect(persist.mock.calls[0]![0].segment.coveredEntryEnd).toBe("entry-1");
+    expect(entries.slice(1).some((entry) => "content" in entry.payload && entry.payload.content === "for offices only")).toBe(true);
+  });
+
+  it.each([undefined, 200_000])("never clips the middle or checkpoints entries it did not summarize (budget %s)", async (maxInputCharacters) => {
+    const entries = [
+      { role: "user", content: "A".repeat(150_000) },
+      { role: "assistant", content: "B".repeat(50_000) + "MIDDLE FACT MUST SURVIVE" + "B".repeat(50_000) },
+      { role: "user", content: "C".repeat(100_000) },
+      { role: "assistant", content: "Newest retained message" },
+    ].map((payload, index) => ({ entryId: `entry-${index + 1}`, parentEntryId: index ? `entry-${index}` : null, entryType: "message", sequence: index + 1, payload, isLeafMarker: index === 3, createdAt: "2026-07-28T12:00:00.000Z" }));
+    const state = compactionState({ entries, sourceLeafId: "entry-4" });
+    const persist = vi.fn<SessionCompactionRepository["persist"]>(async () => ({ segmentCheckpointId: "segment", rollingCheckpointId: "rolling" }));
+    const generate = vi.fn<CheckpointGenerator["generate"]>(async (input) => ({ checkpoint: { ...checkpointOutput(), ...JSON.parse(JSON.stringify(input.deterministic)) }, validationStatus: "valid", attempts: 1 }));
+    const compactor = new DurableSessionCompactor({ claim: async () => true, load: async () => state, persist, release: async () => {} }, {
+      provider: "router", model: "checkpoint-test", contextWindowTokens: 1_024_000, generate,
+    }, { keepRecentTokens: 1, ...(maxInputCharacters ? { maxInputCharacters } : {}) });
+    await compactor.compactSession(job);
+    const input = vi.mocked(generate).mock.calls[0]![0];
+    expect(input.conversation).not.toContain("middle omitted");
+    const covered = persist.mock.calls[0]![0].segment.coveredEntryEnd;
+    if (maxInputCharacters) {
+      expect(covered).toBe("entry-1");
+      expect(input.conversation).not.toContain("MIDDLE FACT MUST SURVIVE");
+      expect(entries[1]!.payload.content).toContain("MIDDLE FACT MUST SURVIVE");
+    } else {
+      expect(covered).toBe("entry-3");
+      expect(input.conversation).toContain("MIDDLE FACT MUST SURVIVE");
+      expect(input.conversation.length).toBeGreaterThan(350_000);
+    }
+  });
+
+  it("follows the deployment default for background compaction", () => {
     const generator = createCheckpointGenerator({
       BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
       BERRY_ROUTER_API_KEY: "test-key",
-      BERRY_ROUTER_DEFAULT_MODEL: "canopywave/deepseek/deepseek-v4-flash",
+      BERRY_ROUTER_DEFAULT_MODEL: "canopywave/zai/glm-5.3-flash",
       BERRY_ROUTER_PROVIDER_ID: "router",
+      BERRY_COMPACTION_MODEL: "  ",
       BERRY_ROUTER_MODELS_JSON: JSON.stringify([{
-        id: "canopywave/moonshotai/kimi-k2.6",
-        capabilities: { cost: { input: 1, output: 2 } },
+        id: "canopywave/zai/glm-5.3-flash",
+        capabilities: { cost: { input: 0.15, output: 0.5 } },
       }]),
     });
 
     expect(generator).toMatchObject({
       provider: "router",
-      model: "canopywave/moonshotai/kimi-k2.6",
+      model: "canopywave/zai/glm-5.3-flash",
     });
   });
 
-  it("allows an explicit compaction provider to override the router provider id", () => {
+  it("defaults background compaction to DeepSeek V4.1 Flash 1017", () => {
     const generator = createCheckpointGenerator({
       BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
       BERRY_ROUTER_API_KEY: "test-key",
-      BERRY_ROUTER_DEFAULT_MODEL: "chat-model",
-      BERRY_ROUTER_PROVIDER_ID: "router",
-      BERRY_COMPACTION_PROVIDER: "dedicated-compactor",
-      BERRY_COMPACTION_MODEL: "dedicated-compaction-model",
       BERRY_ROUTER_MODELS_JSON: JSON.stringify([{
-        id: "dedicated-compaction-model",
-        capabilities: { cost: { input: 1, output: 2 } },
+        id: "inference-net/deepseek-v4.1-flash-1017",
+        capabilities: { cost: { input: 0.3, output: 1.2 } },
       }]),
     });
 
+    expect(generator).toMatchObject({ model: "inference-net/deepseek-v4.1-flash-1017" });
+  });
+
+  it("uses the active conversation selection instead of a pinned compaction override", () => {
+    const generator = createCheckpointGenerator({
+      BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
+      BERRY_ROUTER_API_KEY: "test-key",
+      BERRY_ROUTER_DEFAULT_MODEL: "canopywave/deepseek/deepseek-v4.1-flash",
+      BERRY_ROUTER_PROVIDER_ID: "default-router",
+      BERRY_COMPACTION_PROVIDER: "legacy-compactor",
+      BERRY_COMPACTION_MODEL: "canopywave/moonshotai/kimi-k2.6",
+      BERRY_ROUTER_MODELS_JSON: JSON.stringify([{
+        id: "canopywave/zai/glm-5.3-flash",
+        capabilities: { cost: { input: 0.15, output: 0.5 } },
+      }]),
+    }, { provider: "conversation-router", model: "canopywave/zai/glm-5.3-flash" });
+
     expect(generator).toMatchObject({
-      provider: "dedicated-compactor",
-      model: "dedicated-compaction-model",
+      provider: "conversation-router",
+      model: "canopywave/zai/glm-5.3-flash",
     });
   });
 
-  it("falls back to deterministic compaction when the configured model has no price", () => {
+  it("falls back to deterministic compaction when the active model has no price", () => {
     expect(createCheckpointGenerator({
       BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
       BERRY_ROUTER_API_KEY: "test-key",
-      BERRY_COMPACTION_MODEL: "unpriced-compaction-model",
       BERRY_ROUTER_MODELS_JSON: "[]",
-    })).toBeNull();
+    }, { provider: "router", model: "unpriced-chat-model" })).toBeNull();
+  });
+
+  it.each([
+    "canopywave/deepseek/deepseek-v4.1-flash",
+    "canopywave/zai/glm-5.3-flash",
+  ])("uses the selected conversation model %s for compaction", async (model) => {
+    const legacyGenerate = vi.fn(async () => { throw new Error("Legacy summarizer must not run"); });
+    const generate = vi.fn(async () => ({
+      checkpoint: null,
+      validationStatus: "fallback" as const,
+      attempts: 1,
+      fallbackReason: "checkpoint_validation_failed",
+    }));
+    const factory = vi.fn((selection: { provider: string; model: string }) => ({ ...selection, generate }));
+    const load = vi.fn(async () => compactionState({ modelProviderId: "conversation-router", model }));
+    const persist = vi.fn(async () => ({ segmentCheckpointId: "segment-1", rollingCheckpointId: "rolling-1" }));
+    const repository: SessionCompactionRepository = {
+      claim: async () => true, load, persist, release: async () => {},
+    };
+    const compactor = new DurableSessionCompactor(repository, {
+      provider: "legacy-router", model: "canopywave/moonshotai/kimi-k2.6", generate: legacyGenerate,
+    }, { generatorForModel: factory, keepRecentTokens: 1 });
+
+    await compactor.compactSession(job);
+
+    expect(load).toHaveBeenCalledWith(job, expect.objectContaining({ followSessionModel: true }));
+    expect(factory).toHaveBeenCalledWith({ provider: "conversation-router", model });
+    expect(generate).toHaveBeenCalledTimes(1);
+    expect(legacyGenerate).not.toHaveBeenCalled();
+    expect(persist).toHaveBeenCalledWith(expect.objectContaining({ provider: "conversation-router", model }));
+  });
+
+  it("does not substitute another paid model when the active model cannot be used", async () => {
+    const generate = vi.fn(async () => { throw new Error("Do not call a different model"); });
+    const persist = vi.fn(async () => ({ segmentCheckpointId: "segment-1", rollingCheckpointId: "rolling-1" }));
+    const repository: SessionCompactionRepository = {
+      claim: async () => true,
+      load: async () => compactionState({ modelProviderId: "conversation-router", model: "unpriced-model" }),
+      persist, release: async () => {},
+    };
+    const compactor = new DurableSessionCompactor(repository, {
+      provider: "legacy-router", model: "legacy-model", generate,
+    }, { generatorForModel: () => null, keepRecentTokens: 1 });
+
+    const result = await compactor.compactSession(job);
+
+    expect(generate).not.toHaveBeenCalled();
+    expect(result.physicalAttempts).toBe(0);
+    expect(persist).toHaveBeenCalledWith(expect.objectContaining({ provider: "conversation-router", model: "unpriced-model", usage: null }));
+  });
+
+  it("checks active-model governance before constructing or calling its generator", async () => {
+    const factory = vi.fn(() => null);
+    const repository: SessionCompactionRepository = {
+      claim: async () => true,
+      load: async () => compactionState({ modelAllowed: false }),
+      persist: async () => { throw new Error("Do not persist denied compaction"); },
+      release: async () => {},
+    };
+    await expect(new DurableSessionCompactor(repository, null, { generatorForModel: factory }).compactSession(job))
+      .rejects.toMatchObject({ failure: { category: "governance_denied" } });
+    expect(factory).not.toHaveBeenCalled();
   });
 
   it("loads compaction prices from the worker model catalog", () => {
@@ -200,6 +357,25 @@ describe("durable session compactor", () => {
       },
     });
     expect(complete).toHaveBeenCalledWith(expect.objectContaining({ providerAttemptOrdinal: 1 }));
+    const firstMessages = complete.mock.calls[0]![0].messages;
+    expect(firstMessages[0].content).toContain("Required keys:");
+    expect(firstMessages[1].content).not.toContain("Required keys:");
+    await generator.generate({
+      conversation: '{"entryId":"other-project-entry"}',
+      algorithmVersion: "checkpoint-v2-bounded",
+      deterministic: {
+        generatedAt: "2026-10-19T12:00:00.000Z",
+        coveredEntryStart: "other-project-entry",
+        coveredEntryEnd: "other-project-entry",
+        currentLeafId: "other-project-leaf",
+      },
+      previousRolling: null,
+      maxTokens: 128,
+      tokensBefore: 128,
+    });
+    const nextMessages = complete.mock.calls[1]![0].messages;
+    expect(nextMessages[0]).toEqual(firstMessages[0]);
+    expect(nextMessages[1]).not.toEqual(firstMessages[1]);
     expect(reports).toEqual([]);
   });
 
@@ -363,18 +539,45 @@ describe("durable session compactor", () => {
     });
 
     const governance = queries.find((query) => query.sql.includes("model_governance_policies selected"));
-    expect(governance?.sql).toContain("selected.provider_id = $4");
-    expect(governance?.sql).toContain("selected.model = $5");
+    expect(governance?.sql).toContain("selected.provider_id = CASE WHEN $6::boolean THEN s.model_provider_id ELSE $4 END");
+    expect(governance?.sql).toContain("selected.model = CASE WHEN $6::boolean THEN s.model ELSE $5 END");
     expect(governance?.params).toEqual([
       job.tenantId,
       job.sessionId,
       job.taskId,
       "compaction-provider",
       "compaction-model",
+      false,
+      null,
     ]);
     const checkpoints = queries.find((query) => query.sql.includes("FROM session_checkpoints"));
     expect(checkpoints?.sql).toContain("algorithm_version = $3");
     expect(checkpoints?.params).toEqual([job.tenantId, job.sessionId, "algorithm-v3"]);
+  });
+
+  it("resolves the active run model with tenant, session and task isolation", async () => {
+    const queries: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const repository = new SqlSessionCompactionRepository({
+      execute: async () => undefined,
+      query: async <T>(sql: string, params: readonly unknown[] = []) => {
+        queries.push({ sql, params });
+        if (sql.includes("FROM sessions s")) {
+          return [{ id: job.sessionId, task_id: job.taskId, model_provider_id: "conversation-router", model: "conversation-model", model_allowed: true }] as T[];
+        }
+        return [] as T[];
+      },
+    });
+    const runId = "00000000-0000-7000-8000-000000000009";
+    const state = await repository.load({ ...job, runId }, {
+      provider: "default-router", model: "default-model", algorithmVersion: "checkpoint-v2-bounded", followSessionModel: true,
+    });
+    const query = queries[0]!;
+    expect(query.sql).toContain("active_run.runtime_request ->> 'model'");
+    expect(query.sql).toContain("active_run.tenant_id = s.tenant_id AND active_run.session_id = s.id");
+    expect(query.sql).toContain("active_run.task_id = s.task_id AND active_run.id = $7::uuid");
+    expect(query.sql).toContain("($7::uuid IS NULL OR active_run.id IS NOT NULL)");
+    expect(query.params.slice(-2)).toEqual([true, runId]);
+    expect(state).toMatchObject({ modelProviderId: "conversation-router", model: "conversation-model" });
   });
 
   it.each([

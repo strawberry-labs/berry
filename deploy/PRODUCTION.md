@@ -60,6 +60,27 @@ configured cost hints per million tokens are `0.150` input, `0.500` output, and
 `0.020` cache read. This route is available without changing the organization
 default model.
 
+AESG uses Inference.net through BerryRouter with two chat models:
+`inference-net/deepseek-v4.1-flash-1017` (default) and
+`inference-net/glm-5.3-flash`. Their verified context/output limits are
+1,040,000/393,216 and 1,048,576/262,144 tokens. Input/output/cached-input cost
+hints per million tokens are `0.30/1.00/0.007` and `0.10/0.45/0.03`.
+Both support tools, image input, reasoning and JSON. Expose `low` and `high`
+reasoning in Berry's current UI. Neither model advertises audio input.
+
+Register the encrypted Inference.net key, both model routes and their prices in
+BerryRouter before updating `BERRY_ROUTER_MODELS_JSON` and
+`BERRY_ROUTER_DEFAULT_MODEL` in place. Set the organization's saved chat/code
+defaults to DeepSeek, allow the two new routes, and block the retired chat routes
+so existing tasks resolve to an allowed current model on their next turn.
+Point the auxiliary vision default at DeepSeek as well.
+
+Project memory extraction and Mem0 personal memory use DeepSeek 1017 through
+`BERRY_MEMORY_MODEL` and `BERRY_MEM0_LLM_MODEL`. Recreate API, worker,
+worker-foreground and Mem0 for model configuration changes. Prompt improvement
+follows the deployment default. Compaction follows the active conversation model.
+Provider caching is automatic; do not invent cache-key or retention capabilities.
+
 Providers registered through Settings are inactive until an administrator runs the guarded health check. Add every permitted exact hostname to `BERRY_ORGANIZATION_PROVIDER_ALLOWED_HOSTS`; HTTPS is mandatory by default. Store additional credential references in the untracked `BERRY_ORGANIZATION_PROVIDER_CREDENTIALS_JSON` object or inject the referenced environment variable into the API container. Never place raw provider keys in the admin form.
 
 Code execution does not pass through BerryRouter. The API uses the official E2B JavaScript SDK with `E2B_API_KEY` to create and reconnect sandboxes, stream commands, read and write files, and resolve preview hosts. Sandboxes are created with authenticated inbound traffic, the Berry network policy, and an automatic filesystem-preserving pause after `BERRY_SANDBOX_TTL_SECONDS`. A later turn reconnects by stable tenant/request metadata, including after an API process restart. `BERRY_E2B_KEEP_MEMORY_ON_PAUSE=false` is the recommended default: it preserves the filesystem but cold-boots on resume instead of retaining process memory.
@@ -97,7 +118,7 @@ the bucket placeholder; do not apply this rule to the audit bucket.
 ```sh
 aws s3api put-bucket-cors \
   --bucket YOUR_ARTIFACT_BUCKET \
-  --cors-configuration '{"CORSRules":[{"AllowedOrigins":["https://ai.example.com"],"AllowedMethods":["PUT"],"AllowedHeaders":["*"],"ExposeHeaders":["ETag"],"MaxAgeSeconds":3600}]}'
+  --cors-configuration '{"CORSRules":[{"AllowedOrigins":["https://ai.example.com"],"AllowedMethods":["PUT","GET","HEAD"],"AllowedHeaders":["*"],"ExposeHeaders":["ETag","Content-Range"],"MaxAgeSeconds":3600}]}'
 ```
 
 Before enabling Google Workspace, Gmail, or Calendar in the admin UI, complete

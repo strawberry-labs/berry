@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSiteContentSecurityPolicy } from "./site-csp.ts";
+import { buildSiteContentSecurityPolicy, storageConnectOrigins } from "./site-csp.ts";
 
 describe("site CSP", () => {
   it("uses a per-response nonce and narrow production source lists", () => {
@@ -20,4 +20,16 @@ describe("site CSP", () => {
     expect(policy).not.toContain("script-src 'self' 'unsafe-inline'");
     expect(policy).not.toContain("connect-src 'self' https:;");
   });
+});
+
+it("allows only the configured storage origin for direct uploads and downloads", () => {
+  expect(storageConnectOrigins({ bucket: "private-files", region: "eu-west-1" })).toEqual(["https://private-files.s3.eu-west-1.amazonaws.com"]);
+  expect(storageConnectOrigins({ bucket: "private.files", region: "eu-west-1" })).toEqual(["https://s3.eu-west-1.amazonaws.com"]);
+  expect(storageConnectOrigins({ endpoint: "https://storage.test:9000/path" })).toEqual(["https://storage.test:9000"]);
+  expect(storageConnectOrigins({ endpoint: "javascript:alert(1)" })).toEqual([]);
+  expect(storageConnectOrigins({})).toEqual([]);
+});
+
+it("allows the exact accelerated bucket origin while retaining regular signed URLs", () => {
+  expect(storageConnectOrigins({ bucket: "private-files", region: "eu-west-1", accelerate: true })).toEqual(["https://private-files.s3.eu-west-1.amazonaws.com", "https://private-files.s3-accelerate.amazonaws.com"]);
 });

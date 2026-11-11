@@ -57,3 +57,12 @@ describe("s3ClientOptions", () => {
     }
   });
 });
+
+it("signs browser downloads and multipart uploads through the accelerated endpoint when enabled", async () => {
+  const client = new S3Client(s3PresignClientOptions({ region: "eu-west-1", accessKeyId: "test", secretAccessKey: "test", accelerate: true }));
+  try {
+    const url = await getSignedUrl(client, new UploadPartCommand({ Bucket: "private-files", Key: "upload", UploadId: "id", PartNumber: 1 }), { expiresIn: 60 });
+    expect(new URL(url).hostname).toBe("private-files.s3-accelerate.amazonaws.com");
+    expect(s3PresignClientOptions({ endpoint: "http://minio:9000", accelerate: true })).not.toHaveProperty("useAccelerateEndpoint");
+  } finally { client.destroy(); }
+});

@@ -88,7 +88,7 @@ test("management navigation uses the shared mobile sidebar sheet", async ({ page
   await page.goto("/settings/account");
   await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
   await expect(page.getByRole("heading", { name: "Account" })).toBeVisible();
-  const toggle = page.getByRole("button", { name: "Toggle sidebar" });
+  const toggle = page.getByRole("button", { name: "Open sidebar" });
   const mobileSidebar = page.locator('[data-slot="sidebar"][data-mobile="true"]');
   await toggle.click();
   await expect(mobileSidebar).toBeVisible();

@@ -14,6 +14,8 @@ import {
   BERRYCRAWL_TOOL_CATALOG,
 } from "./berrycrawl-tools.ts";
 
+export { BERRYCRAWL_TOOL_CATALOG, BERRYCRAWL_DEFAULT_TOOL_NAMES, BERRYCRAWL_NON_REPLAYABLE_TOOL_NAMES } from "./berrycrawl-tools.ts";
+
 export interface McpCachedTool {
   name: string;
   description: string | null;
@@ -152,7 +154,7 @@ export function mcpServerSpecsFromJson(
   });
 }
 
-function isOfficialBerryCrawlServer(server: {
+export function isOfficialBerryCrawlServer(server: {
   id: string;
   name: string;
   transport: McpServerSpec["transport"];
@@ -207,8 +209,21 @@ function contentToToolResult(content: unknown, structuredContent?: unknown): Age
   const texts = parts
     .filter((part): part is { type: "text"; text: string } => typeof part === "object" && part !== null && (part as { type?: string }).type === "text")
     .map((part) => part.text);
+  // Browser screenshots are MCP image blocks. Keep bounded raster data so
+  // vision-capable models can see the page instead of silently losing it.
+  const images = parts.flatMap((part): Array<{ type: "image"; data: string; mimeType: string }> => {
+    if (typeof part !== "object" || part === null) return [];
+    const image = part as { type?: unknown; data?: unknown; mimeType?: unknown };
+    if (image.type !== "image" || typeof image.data !== "string" || typeof image.mimeType !== "string"
+      || !["image/png", "image/jpeg", "image/webp", "image/gif"].includes(image.mimeType)
+      || image.data.length === 0 || image.data.length > 8 * 1024 * 1024
+      || !/^[A-Za-z0-9+/]*={0,2}$/.test(image.data)) return [];
+    return [{ type: "image", data: image.data, mimeType: image.mimeType }];
+  }).slice(0, 5);
+  const omittedImages = parts.filter((part) => typeof part === "object" && part !== null && (part as { type?: unknown }).type === "image").length - images.length;
+  const text = [texts.join("\n"), ...(omittedImages ? [`[${omittedImages} unsupported or oversized MCP image(s) omitted. Use a DOM snapshot or a smaller screenshot.]`] : [])].filter(Boolean).join("\n");
   return {
-    content: [{ type: "text", text: texts.join("\n") || "(no output)" }],
+    content: [{ type: "text", text: text || "(no output)" }, ...images],
     details: {
       raw: parts as unknown as Record<string, unknown>,
       ...(structuredContent !== undefined ? { structuredContent } : {}),
@@ -409,7 +424,7 @@ export class McpToolSource {
       }
       return [approved];
     });
-    const tools = cachedTools.map((tool) => cachedTool(spec, tool, async (name, args, signal) => this.#call(client, name, args, signal)));
+    const tools = cachedTools.map((tool) => cachedTool(spec, tool, async (name, args, signal) => this.#call(client, name, args, signal, spec)));
     return { spec, client, tools, cachedTools };
   }
 
@@ -418,12 +433,17 @@ export class McpToolSource {
     name: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
+    spec?: McpServerSpec,
   ): Promise<AgentToolResult<Record<string, unknown>>> {
     if (signal?.aborted) throw signal.reason;
+    // Reviewed browser action batches can run for 120 seconds. Give their
+    // response room to settle instead of timing out at the SDK's 60s default.
+    const browserCall = spec && isOfficialBerryCrawlServer(spec) && name.startsWith("berrycrawl_browser_");
+    const requestOptions = { ...(signal ? { signal } : {}), ...(browserCall ? { timeout: 150_000 } : {}) };
     const result = await client.callTool(
       { name, arguments: args },
       undefined,
-      signal ? { signal } : undefined,
+      requestOptions,
     );
     if (result.isError) {
       const structuredContent = (result as { structuredContent?: unknown }).structuredContent;
@@ -445,7 +465,7 @@ export class McpToolSource {
         if (spec.allowedTools && !server.cachedTools.some((candidate) => candidate.name === name)) {
           throw new Error(`MCP tool ${spec.name}:${name} is unavailable because its definition changed after administrator review`);
         }
-        return this.#call(server.client, name, args, signal);
+        return this.#call(server.client, name, args, signal, spec);
       }));
     });
   }

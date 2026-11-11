@@ -14,18 +14,30 @@ afterEach(() => {
 });
 
 describe("memory operation generator model selection", () => {
-  it("uses the tool-capable Kimi default instead of the router default", async () => {
+  it("uses DeepSeek for separate memory extraction independently of the chat default", async () => {
     const requests: Array<Record<string, unknown>> = [];
     vi.stubGlobal("fetch", completionFetch(requests));
     const generator = createMemoryOperationGenerator({
       BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example/v1",
       BERRY_ROUTER_API_KEY: "router-key",
-      BERRY_ROUTER_DEFAULT_MODEL: "canopywave/deepseek/deepseek-v4-flash",
+      BERRY_ROUTER_DEFAULT_MODEL: "canopywave/zai/glm-5.3-flash",
+      BERRY_MEMORY_MODEL: "  ",
     });
 
     await expect(generator?.generate(payload())).resolves.toEqual([]);
-    expect(requests[0]?.model).toBe(DEFAULT_MEMORY_MODEL);
-    expect(requests[0]?.model).not.toBe("canopywave/deepseek/deepseek-v4-flash");
+    expect(requests[0]?.model).toBe("inference-net/deepseek-v4.1-flash-1017");
+  });
+
+  it("uses DeepSeek V4.1 Flash when no memory model is configured", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", completionFetch(requests));
+    const generator = createMemoryOperationGenerator({
+      BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example/v1",
+      BERRY_ROUTER_API_KEY: "router-key",
+    });
+
+    await expect(generator?.generate(payload())).resolves.toEqual([]);
+    expect(requests[0]?.model).toBe("inference-net/deepseek-v4.1-flash-1017");
   });
 
   it("honors an explicit memory model override", async () => {

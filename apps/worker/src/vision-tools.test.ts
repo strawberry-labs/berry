@@ -235,6 +235,12 @@ describe("DurableVisionToolExecutor", () => {
     expect(firstBody).not.toHaveProperty("reasoning_effort");
     expect(secondBody).not.toHaveProperty("reasoning");
     expect(secondBody).not.toHaveProperty("reasoning_effort");
+    // Retrying an empty answer must retain the complete system/image prefix.
+    expect(secondBody.messages.slice(0, firstBody.messages.length)).toEqual(firstBody.messages);
+    expect(secondBody.messages.at(-1)).toEqual({
+      role: "user",
+      content: "The previous provider response had empty final content. Return a non-empty final observation now.",
+    });
     expect(modelContent).toHaveBeenCalledTimes(1);
   });
 

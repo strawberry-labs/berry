@@ -75,6 +75,8 @@ describe("AgentStreamEventSchema", () => {
       { kind: "usage", inputTokens: 100, outputTokens: 25, model: "berry/router-auto" },
       { kind: "session.note", note: "compacting", detail: "Context auto-compacting" },
       { kind: "session.note", note: "compacted" },
+      { kind: "browser.handoff", handoffId: "d0c7b861-422b-4cec-a728-411eab91d254", browserSessionId: "bses_1", state: "ready", reason: "Complete sign-in" },
+      { kind: "browser.handoff", handoffId: "d0c7b861-422b-4cec-a728-411eab91d254", browserSessionId: "bses_1", state: "resumed", reason: "Complete sign-in" },
       { kind: "question.reminded", questionId: "question_1", reminderCount: 1 },
       { kind: "question.expired", questionId: "question_1" },
       { kind: "approval.reminded", approvalId: "approval_1", reminderCount: 1 },

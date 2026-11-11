@@ -27,8 +27,10 @@ const taskOnlyAssetPrefixes = [
   "message-history-benchmark-",
 ];
 const routeBudgets = {
-  home: { route: "/", variants: [{ name: "home", directPrefixes: [] }], rawBytes: 1_500_000, encodedBytes: 450_000, gzipBytes: 500_000, requestCount: 65 },
-  task: { route: "/tasks/$taskId", variants: [{ name: "task", directPrefixes: [] }], rawBytes: 2_200_000, encodedBytes: 650_000, gzipBytes: 700_000, requestCount: 75 },
+  // home 67 / task 76: the skills screen lazy-loads its import dialog and Markdown renderer, so two shared
+  // vendor pieces the home page already used are now separate small chunks (home bytes unchanged).
+  home: { route: "/", variants: [{ name: "home", directPrefixes: [] }], rawBytes: 1_500_000, encodedBytes: 450_000, gzipBytes: 500_000, requestCount: 67 },
+  task: { route: "/tasks/$taskId", variants: [{ name: "task", directPrefixes: [] }], rawBytes: 2_200_000, encodedBytes: 650_000, gzipBytes: 700_000, requestCount: 76 },
   settings: {
     route: "/settings/$tab",
     variants: [
@@ -38,6 +40,7 @@ const routeBudgets = {
       { name: "connectors", directPrefixes: ["personal-connectors-screen-"] },
       { name: "skills", directPrefixes: ["personal-skills-screen-"] },
       { name: "mcp", directPrefixes: ["personal-mcp-screen-"] },
+      { name: "schedules", directPrefixes: ["scheduled-tasks-screen-"] },
       { name: "usage", directPrefixes: ["personal-usage-screen-"] },
       { name: "archived", directPrefixes: ["archived-chats-screen-"] },
     ],
@@ -58,7 +61,7 @@ const routeBudgets = {
     rawBytes: 1_800_000,
     encodedBytes: 500_000,
     gzipBytes: 550_000,
-    requestCount: 65,
+    requestCount: 70, // more, smaller shared chunks after the management UI rework; byte budgets unchanged
   },
   admin: {
     route: "/admin/$tab",
@@ -87,7 +90,7 @@ const routeBudgets = {
     rawBytes: 1_900_000,
     encodedBytes: 525_000,
     gzipBytes: 575_000,
-    requestCount: 70,
+    requestCount: 72, // see platform
   },
 };
 

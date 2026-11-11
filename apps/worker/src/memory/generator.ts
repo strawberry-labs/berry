@@ -30,7 +30,7 @@ export interface MemoryOperationGenerator {
   ): Promise<readonly ExtractedMemoryOperation[]>;
 }
 
-export const DEFAULT_MEMORY_MODEL = "canopywave/moonshotai/kimi-k2.6";
+export const DEFAULT_MEMORY_MODEL = "inference-net/deepseek-v4.1-flash-1017";
 
 export class RouterMemoryOperationGenerator implements MemoryOperationGenerator {
   constructor(

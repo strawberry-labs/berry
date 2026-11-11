@@ -1,3 +1,7 @@
+import { SCHEDULED_TASKS_MIGRATION } from "./scheduled-tasks-migration.ts";
+export { SCHEDULED_TASKS_MIGRATION } from "./scheduled-tasks-migration.ts";
+export * from "./task-schedule.ts";
+export * from "./scheduled-tasks.ts";
 import { sql } from "drizzle-orm";
 import {
   bigint,
@@ -108,11 +112,13 @@ export const authSessions = pgTable("auth_sessions", {
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   ipAddress: text("ip_address"),
   userAgent: text("user_agent"),
+  clientKind: text("client_kind").notNull().default("web"),
   createdAt,
   updatedAt,
 }, (table) => [
   uniqueIndex("auth_sessions_token_unique").on(table.token),
   index("auth_sessions_user_idx").on(table.userId),
+  check("auth_sessions_client_kind_check", sql`${table.clientKind} IN ('web', 'mobile')`),
 ]);
 
 export const authAccounts = pgTable("auth_accounts", {
@@ -889,6 +895,7 @@ export const turnRuns = pgTable("turn_runs", {
   recoveryToolCallId: uuid("recovery_tool_call_id"),
   nextAction: text("next_action"),
   waitingReason: text("waiting_reason"),
+  browserHandoff: jsonb("browser_handoff"),
   heartbeatAt: timestamp("heartbeat_at", { withTimezone: true }),
   error: text("error"),
   runtimeRequest: jsonObject("runtime_request"),
@@ -905,6 +912,7 @@ export const turnRuns = pgTable("turn_runs", {
 }, (table) => [
   index("turn_runs_claim_idx").on(table.tenantId, table.state, table.leaseExpiresAt),
   index("turn_runs_session_idx").on(table.tenantId, table.sessionId, table.createdAt),
+  index("turn_runs_tenant_task_idx").on(table.tenantId, table.taskId),
   uniqueIndex("turn_runs_tenant_request_unique").on(table.tenantId, table.requestId),
   index("turn_runs_terminal_sandbox_cleanup_idx")
     .on(table.tenantId, table.updatedAt)
@@ -1303,6 +1311,7 @@ export const usageEvents = pgTable("usage_events", {
 }, (table) => [
   uniqueIndex("usage_events_tenant_request_unique").on(table.tenantId, table.requestId),
   index("usage_events_tenant_ts_idx").on(table.tenantId, table.ts),
+  index("usage_events_tenant_task_idx").on(table.tenantId, table.taskId),
   index("usage_events_tenant_feature_ts_idx").on(table.tenantId, table.feature, table.ts),
   index("usage_events_tenant_user_ts_idx").on(table.tenantId, table.userId, table.ts),
   index("usage_events_tenant_department_ts_idx").on(table.tenantId, table.departmentId, table.ts),
@@ -1592,16 +1601,55 @@ export const mobileDevices = pgTable("mobile_devices", {
   appVersion: text("app_version"),
   capabilities: jsonArray("capabilities"),
   status: text("status").notNull().default("active"),
+  authSessionId: uuid("auth_session_id").references(() => authSessions.id, { onDelete: "set null" }),
+  displayName: text("display_name"),
+  model: text("model"),
+  osVersion: text("os_version"),
+  pairedAt: timestamp("paired_at", { withTimezone: true }),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  revokedByUserId: uuid("revoked_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  lastIp: text("last_ip"),
   lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
   createdAt,
   updatedAt,
 }, (table) => [
   uniqueIndex("mobile_devices_tenant_device_unique").on(table.tenantId, table.deviceId),
+  uniqueIndex("mobile_devices_auth_session_unique").on(table.authSessionId).where(sql`${table.authSessionId} IS NOT NULL`),
   index("mobile_devices_tenant_user_idx").on(table.tenantId, table.userId),
   index("mobile_devices_tenant_status_idx").on(table.tenantId, table.status),
   check("mobile_devices_platform_check", sql`${table.platform} IN ('ios', 'android', 'expo')`),
   check("mobile_devices_push_provider_check", sql`${table.pushProvider} IN ('expo', 'apns', 'fcm', 'none')`),
-  check("mobile_devices_endpoint_mode_check", sql`${table.endpointMode} IN ('berry-account', 'self-hosted', 'custom-openai', 'lan-local')`),
+  check("mobile_devices_endpoint_mode_check", sql`${table.endpointMode} IN ('paired', 'berry-account', 'self-hosted', 'custom-openai', 'lan-local')`),
+]);
+
+export const mobilePairings = pgTable("mobile_pairings", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  creatorSessionId: uuid("creator_session_id").notNull().references(() => authSessions.id, { onDelete: "cascade" }),
+  secretHash: text("secret_hash").notNull(),
+  manualCodeHash: text("manual_code_hash").notNull(),
+  claimTokenHash: text("claim_token_hash"),
+  status: text("status").notNull().default("pending"),
+  deviceModel: text("device_model"),
+  devicePlatform: text("device_platform"),
+  deviceOsVersion: text("device_os_version"),
+  deviceAppVersion: text("device_app_version"),
+  claimedIp: text("claimed_ip"),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  claimedAt: timestamp("claimed_at", { withTimezone: true }),
+  decidedAt: timestamp("decided_at", { withTimezone: true }),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  mobileSessionId: uuid("mobile_session_id").references(() => authSessions.id, { onDelete: "set null" }),
+  mobileDeviceId: uuid("mobile_device_id").references(() => mobileDevices.id, { onDelete: "set null" }),
+  createdAt,
+  updatedAt,
+}, (table) => [
+  index("mobile_pairings_tenant_user_status_idx").on(table.tenantId, table.userId, table.status),
+  index("mobile_pairings_expires_idx").on(table.expiresAt),
+  uniqueIndex("mobile_pairings_pending_manual_code_unique").on(table.tenantId, table.manualCodeHash).where(sql`${table.status} = 'pending'`),
+  check("mobile_pairings_status_check", sql`${table.status} IN ('pending', 'claimed', 'approved', 'denied', 'expired', 'completed', 'cancelled')`),
+  check("mobile_pairings_device_platform_check", sql`${table.devicePlatform} IS NULL OR ${table.devicePlatform} IN ('ios', 'android')`),
 ]);
 
 export const allowanceProfiles = pgTable("allowance_profiles", {
@@ -1957,6 +2005,12 @@ export const MOBILE_COMPANION_TABLES = [
 ] as const;
 
 export const MOBILE_COMPANION_TENANT_SCOPED_TABLES = MOBILE_COMPANION_TABLES;
+
+export const MOBILE_PAIRING_TABLES = [
+  "mobile_pairings",
+] as const;
+
+export const MOBILE_PAIRING_TENANT_SCOPED_TABLES = MOBILE_PAIRING_TABLES;
 
 export const MANAGEMENT_ADMIN_TABLES = [
   "allowance_profiles", "allowance_default_assignments", "allowance_bulk_operations", "billing_auto_refill_configs", "saved_analytics_views", "report_schedules", "report_runs",
@@ -2921,6 +2975,61 @@ CREATE INDEX IF NOT EXISTS mobile_devices_tenant_status_idx ON mobile_devices (t
 ${MOBILE_COMPANION_TENANT_SCOPED_TABLES.map((tableName) => tenantRlsSql(tableName)).join("\n\n")}
 `.trim();
 
+// QR pairing for the native companion app. Mobile sessions are ordinary
+// Better Auth sessions marked client_kind='mobile'; only those may be used as
+// bearer tokens. Pairing rows hold hashes of the QR secret, manual code, and
+// claim token, never a session token.
+export const MOBILE_PAIRING_MIGRATION = `
+ALTER TABLE auth_sessions ADD COLUMN IF NOT EXISTS client_kind text NOT NULL DEFAULT 'web';
+DO $$ BEGIN
+  ALTER TABLE auth_sessions ADD CONSTRAINT auth_sessions_client_kind_check CHECK (client_kind IN ('web', 'mobile'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+ALTER TABLE mobile_devices DROP CONSTRAINT IF EXISTS mobile_devices_endpoint_mode_check;
+ALTER TABLE mobile_devices ADD CONSTRAINT mobile_devices_endpoint_mode_check
+  CHECK (endpoint_mode IN ('paired', 'berry-account', 'self-hosted', 'custom-openai', 'lan-local'));
+ALTER TABLE mobile_devices
+  ADD COLUMN IF NOT EXISTS auth_session_id uuid REFERENCES auth_sessions(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS display_name text,
+  ADD COLUMN IF NOT EXISTS model text,
+  ADD COLUMN IF NOT EXISTS os_version text,
+  ADD COLUMN IF NOT EXISTS paired_at timestamptz,
+  ADD COLUMN IF NOT EXISTS revoked_at timestamptz,
+  ADD COLUMN IF NOT EXISTS revoked_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS last_ip text;
+CREATE UNIQUE INDEX IF NOT EXISTS mobile_devices_auth_session_unique ON mobile_devices (auth_session_id) WHERE auth_session_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS mobile_pairings (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  creator_session_id uuid NOT NULL REFERENCES auth_sessions(id) ON DELETE CASCADE,
+  secret_hash text NOT NULL,
+  manual_code_hash text NOT NULL,
+  claim_token_hash text,
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'claimed', 'approved', 'denied', 'expired', 'completed', 'cancelled')),
+  device_model text,
+  device_platform text CHECK (device_platform IS NULL OR device_platform IN ('ios', 'android')),
+  device_os_version text,
+  device_app_version text,
+  claimed_ip text,
+  expires_at timestamptz NOT NULL,
+  claimed_at timestamptz,
+  decided_at timestamptz,
+  completed_at timestamptz,
+  mobile_session_id uuid REFERENCES auth_sessions(id) ON DELETE SET NULL,
+  mobile_device_id uuid REFERENCES mobile_devices(id) ON DELETE SET NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS mobile_pairings_tenant_user_status_idx ON mobile_pairings (tenant_id, user_id, status);
+CREATE INDEX IF NOT EXISTS mobile_pairings_expires_idx ON mobile_pairings (expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS mobile_pairings_pending_manual_code_unique ON mobile_pairings (tenant_id, manual_code_hash) WHERE status = 'pending';
+
+${MOBILE_PAIRING_TENANT_SCOPED_TABLES.map((tableName) => tenantRlsSql(tableName)).join("\n\n")}
+`.trim();
+
 export const CONVERSATION_KIND_AND_GENERAL_WORKSPACES_MIGRATION = `
 DO $$ BEGIN
   CREATE TYPE conversation_kind AS ENUM ('chat', 'code');
@@ -3145,6 +3254,15 @@ export const ENTERPRISE_COLLECTION_PAGINATION_STATEMENTS = [
      WHERE deleted_at IS NULL`,
 ] as const;
 export const ENTERPRISE_COLLECTION_PAGINATION_MIGRATION = ENTERPRISE_COLLECTION_PAGINATION_STATEMENTS.join(";\n");
+
+/** Keep task token reads scoped to the task as tenant usage history grows. */
+export const TASK_TOKEN_USAGE_INDEX_STATEMENTS = [
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS usage_events_tenant_task_idx
+     ON usage_events (tenant_id, task_id)`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS turn_runs_tenant_task_idx
+     ON turn_runs (tenant_id, task_id)`,
+] as const;
+export const TASK_TOKEN_USAGE_INDEX_MIGRATION = TASK_TOKEN_USAGE_INDEX_STATEMENTS.join(";\n");
 
 export const SANDBOX_WORKSPACES_MIGRATION = `
 CREATE TABLE IF NOT EXISTS sandbox_workspaces (
@@ -5697,6 +5815,16 @@ export const cloudMigrations = [
     sql: MEMORY_ITEM_VERSION_SOURCE_MESSAGE_PROVENANCE_MIGRATION,
     transactional: false,
   },
+  { id: 71, name: "scheduled_agent_tasks_v1", sql: SCHEDULED_TASKS_MIGRATION },
+  {
+    id: 72,
+    name: "task_token_usage_indexes_v1",
+    sql: TASK_TOKEN_USAGE_INDEX_MIGRATION,
+    transactional: false,
+    onlineIndexNames: ["usage_events_tenant_task_idx", "turn_runs_tenant_task_idx"],
+    onlineSql: TASK_TOKEN_USAGE_INDEX_STATEMENTS,
+  },
+  { id: 73, name: "mobile_pairing_v1", sql: MOBILE_PAIRING_MIGRATION },
   {
     // 71-73 are taken by migrations in progress elsewhere; ids are tracked
     // alone, so a reused id would be skipped silently on deploy.
@@ -5706,5 +5834,9 @@ export const cloudMigrations = [
     transactional: false,
     onlineIndexName: "tasks_creation_idempotency_unique",
     onlineSql: TASK_CREATION_IDEMPOTENCY_STATEMENTS,
+  },
+  {
+    id: 75, name: "browser_human_handoff_v1",
+    sql: "ALTER TABLE turn_runs ADD COLUMN IF NOT EXISTS browser_handoff jsonb",
   },
 ] as const;

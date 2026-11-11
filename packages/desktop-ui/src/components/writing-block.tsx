@@ -1,10 +1,11 @@
 import * as React from "react";
 import {
-  MessageDraftSchema,
   activeMessageDraftVariantIndex,
   type MessageDraft,
   type MessageVariant,
 } from "@berry/shared";
+// Moved to @berry/client-core so the native thread reads drafts the same way.
+export { messageDraftFromToolResult } from "@berry/client-core/thread-turns";
 import { ArrowUpRight01Icon, Check, Copy, Pencil } from "@berry/desktop-ui/lib/icons";
 import { Markdown } from "@berry/desktop-ui/components/berry-markdown";
 import { Button } from "@berry/desktop-ui/components/ui/button";
@@ -379,17 +380,6 @@ export function reconcileMessageDraftState(
     },
     conflicts,
   };
-}
-
-export function messageDraftFromToolResult(content: unknown): MessageDraft | null {
-  if (!content || typeof content !== "object" || Array.isArray(content)) return null;
-  const record = content as Record<string, unknown>;
-  if (record.name !== "compose_message" || record.status === "failed" || record.status === "denied" || record.status === "cancelled") return null;
-  const output = record.output;
-  if (!output || typeof output !== "object" || Array.isArray(output)) return null;
-  const outputRecord = output as Record<string, unknown>;
-  const parsed = MessageDraftSchema.safeParse(outputRecord.draft ?? outputRecord);
-  return parsed.success ? parsed.data : null;
 }
 
 export function composeWritingBlockText(

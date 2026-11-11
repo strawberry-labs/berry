@@ -244,6 +244,16 @@ describe("McpToolSource", () => {
       "berrycrawl_get_brand",
       "berrycrawl_start_crawl",
       "berrycrawl_get_job",
+      "berrycrawl_browser_open",
+      "berrycrawl_browser_navigate",
+      "berrycrawl_browser_snapshot",
+      "berrycrawl_browser_click",
+      "berrycrawl_browser_type",
+      "berrycrawl_browser_press",
+      "berrycrawl_browser_scroll",
+      "berrycrawl_browser_screenshot",
+      "berrycrawl_browser_read",
+      "berrycrawl_browser_close",
     ]);
     expect(server.nonReplayableTools).toEqual([
       "berrycrawl_scrape_url",
@@ -251,6 +261,14 @@ describe("McpToolSource", () => {
       "berrycrawl_map_site",
       "berrycrawl_search_web",
       "berrycrawl_get_brand",
+      "berrycrawl_browser_open",
+      "berrycrawl_browser_navigate",
+      "berrycrawl_browser_click",
+      "berrycrawl_browser_type",
+      "berrycrawl_browser_press",
+      "berrycrawl_browser_scroll",
+      "berrycrawl_browser_act",
+      "berrycrawl_browser_close",
     ]);
     expect(server.trustReadOnlyAnnotations).toBe(true);
     expect(source.approvalHints("mcp__BerryCrawl__berrycrawl_search_web"))
@@ -263,6 +281,16 @@ describe("McpToolSource", () => {
       "mcp__BerryCrawl__berrycrawl_get_brand",
       "mcp__BerryCrawl__berrycrawl_start_crawl",
       "mcp__BerryCrawl__berrycrawl_get_job",
+      "mcp__BerryCrawl__berrycrawl_browser_open",
+      "mcp__BerryCrawl__berrycrawl_browser_navigate",
+      "mcp__BerryCrawl__berrycrawl_browser_snapshot",
+      "mcp__BerryCrawl__berrycrawl_browser_click",
+      "mcp__BerryCrawl__berrycrawl_browser_type",
+      "mcp__BerryCrawl__berrycrawl_browser_press",
+      "mcp__BerryCrawl__berrycrawl_browser_scroll",
+      "mcp__BerryCrawl__berrycrawl_browser_screenshot",
+      "mcp__BerryCrawl__berrycrawl_browser_read",
+      "mcp__BerryCrawl__berrycrawl_browser_close",
     ]);
   });
 

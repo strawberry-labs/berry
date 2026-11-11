@@ -16,9 +16,10 @@ export function s3ClientOptions(input: {
   };
 }
 
-export function s3PresignClientOptions(input: Parameters<typeof s3ClientOptions>[0]): S3ClientConfig {
+export function s3PresignClientOptions(input: Parameters<typeof s3ClientOptions>[0] & { accelerate?: boolean }): S3ClientConfig {
   return {
     ...s3ClientOptions(input),
+    ...(input.accelerate && !input.endpoint ? { useAccelerateEndpoint: true } : {}),
     requestChecksumCalculation: "WHEN_REQUIRED",
   };
 }

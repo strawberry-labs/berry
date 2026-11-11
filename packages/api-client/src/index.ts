@@ -1,8 +1,26 @@
+import { BrowserConnectionSchema, BrowserControlStateSchema, type BrowserControlState, type BrowserConnection } from "@berry/shared";
+import { ScheduledTaskSchema, ScheduledTaskRunSchema, type ScheduledTask, type ScheduledTaskCreate, type ScheduledTaskUpdate, type ScheduledTaskRun } from "@berry/shared";
+import {
+  MobilePairingClaimRequestSchema,
+  MobilePairingClaimResponseSchema,
+  MobilePairingCreateResponseSchema,
+  MobilePairingPollResponseSchema,
+  MobilePairingStatusSchema,
+  MobileServerInfoSchema,
+  type MobilePairingClaimRequest,
+  type MobilePairingClaimResponse,
+  type MobilePairingCreateResponse,
+  type MobilePairingPollRequest,
+  type MobilePairingPollResponse,
+  type MobilePairingStatus,
+  type MobileServerInfo,
+} from "@berry/shared";
 import {
   AgentStreamEventSchema,
   ApprovalRequestSchema,
   ArtifactLibraryItemSchema,
   ContextStatsSchema,
+  TaskTokenUsageSchema,
   MultipartUploadInitiateSchema,
   MultipartUploadPartUrlsSchema,
   StoredFilePageSchema,
@@ -201,6 +219,7 @@ import {
   type CloudGitState,
   type CloudPreview,
   type ContextStats,
+  type TaskTokenUsage,
   type PersonalSkill,
   type PersonalSkillReview,
   type PersonalSkillPackage,
@@ -290,11 +309,28 @@ const ProjectOutcomeSchema = z.object({
 });
 export type ProjectOutcome = z.infer<typeof ProjectOutcomeSchema>;
 
+/** The subset of `EventSource` the client relies on, so non-browser runtimes can supply their own. */
+export interface BerryEventSourceLike {
+  onopen: ((event: unknown) => void) | null;
+  onerror: ((event: unknown) => void) | null;
+  onmessage: ((event: { data: string; lastEventId: string }) => void) | null;
+  close(): void;
+}
+
+export type BerryEventSourceFactory = (url: string, init: { withCredentials: boolean; headers: Headers }) => BerryEventSourceLike;
+
+/** A live server-sent event subscription; call `close` to stop it. */
+export type BerryEventStream = { close(): void };
+
 export interface BerryApiClientOptions {
   baseUrl: string;
   fetchImpl?: typeof fetch | undefined;
   headers?: HeadersInit | undefined;
   supportView?: { tenantId: string; userId: string } | undefined;
+  /** Browsers send the session cookie ("include"); bearer-token clients pass "omit". */
+  credentials?: RequestCredentials | undefined;
+  /** Defaults to the browser `EventSource`, which cannot send custom headers. */
+  eventSource?: BerryEventSourceFactory | undefined;
 }
 
 export interface CreateTaskRequest {
@@ -330,6 +366,7 @@ export interface UpdateTaskRequest {
 }
 
 interface StartTurnRequestBase {
+  timezone?: string | undefined;
   /** Stable key for retrying this exact turn admission without duplicating work or spend. */
   operationId?: string | undefined;
   workspacePath: string;
@@ -594,6 +631,8 @@ export class BerryApiClient {
   readonly #headers: HeadersInit | undefined;
   readonly #useXhrUploads: boolean;
   readonly #supportView: { tenantId: string; userId: string } | undefined;
+  readonly #credentials: RequestCredentials;
+  readonly #eventSource: BerryEventSourceFactory;
 
   constructor(options: BerryApiClientOptions) {
     this.#baseUrl = options.baseUrl.replace(/\/+$/, "");
@@ -604,6 +643,9 @@ export class BerryApiClient {
     this.#fetch = (...args) => fetchImpl(...args);
     this.#headers = options.headers;
     this.#supportView = options.supportView;
+    this.#credentials = options.credentials ?? "include";
+    this.#eventSource = options.eventSource
+      ?? ((url, init) => new EventSource(url, { withCredentials: init.withCredentials }) as unknown as BerryEventSourceLike);
     this.#useXhrUploads = options.fetchImpl === undefined && typeof globalThis.XMLHttpRequest !== "undefined";
   }
 
@@ -1032,11 +1074,12 @@ export class BerryApiClient {
     return this.#resolveFileUrls(await this.#request(`/v1/files/${encodeURIComponent(fileId)}`, StoredFileSchema));
   }
 
-  async initiateFileUpload(input: { name: string; mediaType: string; size: number; taskId?: string; sessionId?: string; workspaceId?: string; workspaceVisibility?: "project" | "task_only"; sha256?: string; origin?: "user_upload" | "image_generation" | "browser_capture"; associationRole?: "input" | "output" | "reference" }): Promise<MultipartUploadInitiate> {
-    return this.#request("/v1/files/uploads", MultipartUploadInitiateSchema, { method: "POST", body: input });
+  async initiateFileUpload(input: { name: string; mediaType: string; size: number; taskId?: string; sessionId?: string; workspaceId?: string; workspaceVisibility?: "project" | "task_only"; sha256?: string; origin?: "user_upload" | "image_generation" | "browser_capture"; associationRole?: "input" | "output" | "reference" }, signal?: AbortSignal): Promise<MultipartUploadInitiate> {
+    return this.#request("/v1/files/uploads", MultipartUploadInitiateSchema, { method: "POST", body: input, ...(signal ? { signal } : {}) });
   }
 
   async uploadFile(file: File, input: { taskId?: string; sessionId?: string; workspaceId?: string; workspaceVisibility?: "project" | "task_only"; origin?: "user_upload" | "image_generation" | "browser_capture"; associationRole?: "input" | "output" | "reference"; concurrency?: number; partTimeoutMs?: number; onProgress?: (progress: { uploadedBytes: number; totalBytes: number; ratio: number }) => void; signal?: AbortSignal } = {}): Promise<StoredFile> {
+    input.signal?.throwIfAborted();
     const upload = await this.initiateFileUpload({
       name: file.name,
       mediaType: file.type || "application/octet-stream",
@@ -1047,14 +1090,9 @@ export class BerryApiClient {
       ...(input.workspaceVisibility ? { workspaceVisibility: input.workspaceVisibility } : {}),
       ...(input.origin ? { origin: input.origin } : {}),
       ...(input.associationRole ? { associationRole: input.associationRole } : {}),
-    });
+    }, input.signal);
     const partNumbers = Array.from({ length: upload.partCount }, (_, index) => index + 1);
-    const signedBatches = await Promise.all(chunk(partNumbers, 100).map((batch) => this.#request(
-      `/v1/files/${encodeURIComponent(upload.fileId)}/uploads/${encodeURIComponent(upload.uploadId)}/parts`,
-      MultipartUploadPartUrlsSchema,
-      { method: "POST", body: { partNumbers: batch } },
-    )));
-    const urls = new Map(signedBatches.flatMap((signed) => signed.parts).map((part) => [part.partNumber, part.url]));
+    const urls = new Map<number, string>();
     const completed: Array<{ partNumber: number; etag: string }> = [];
     const partProgress = new Map<number, number>();
     let cursor = 0;
@@ -1083,59 +1121,79 @@ export class BerryApiClient {
         if (controller.signal.aborted) throw new DOMException("Upload aborted", "AbortError");
         const start = (partNumber - 1) * upload.partSize;
         const end = Math.min(file.size, start + upload.partSize);
-        const partController = new AbortController();
-        const abortPart = () => partController.abort(controller.signal.reason);
-        const timeoutError = new Error("File upload timed out. Check your connection and try again.");
-        controller.signal.addEventListener("abort", abortPart, { once: true });
-        const timeout = globalThis.setTimeout(() => partController.abort(timeoutError), partTimeoutMs);
-        let response: { ok: boolean; status: number; etag: string | null; body: string };
-        try {
-          const body = file.slice(start, end);
-          if (this.#useXhrUploads) {
-            response = await uploadBlobWithXhr(
-              urls.get(partNumber)!,
-              body,
-              partController.signal,
-              partTimeoutMs,
-              (bytes) => reportPartProgress(partNumber, bytes),
-            );
-          } else {
-            const fetched = await this.#fetch(urls.get(partNumber)!, {
-              method: "PUT",
-              body,
-              signal: partController.signal,
-            });
-            response = {
-              ok: fetched.ok,
-              status: fetched.status,
-              etag: fetched.headers.get("etag"),
-              body: fetched.ok ? "" : await fetched.text(),
-            };
+        for (let attempt = 0; ; attempt++) {
+          controller.signal.throwIfAborted();
+          const partController = new AbortController();
+          const abortPart = () => partController.abort(controller.signal.reason);
+          const timeoutError = new Error("File upload timed out. Check your connection and try again.");
+          controller.signal.addEventListener("abort", abortPart, { once: true });
+          const timeout = globalThis.setTimeout(() => partController.abort(timeoutError), partTimeoutMs);
+          let response: { ok: boolean; status: number; etag: string | null; body: string };
+          try {
+            const body = file.slice(start, end);
+            if (this.#useXhrUploads) {
+              response = await uploadBlobWithXhr(
+                urls.get(partNumber)!,
+                body,
+                partController.signal,
+                partTimeoutMs,
+                (bytes) => reportPartProgress(partNumber, bytes),
+              );
+            } else {
+              const fetched = await this.#fetch(urls.get(partNumber)!, {
+                method: "PUT",
+                body,
+                signal: partController.signal,
+              });
+              response = {
+                ok: fetched.ok,
+                status: fetched.status,
+                etag: fetched.headers.get("etag"),
+                body: fetched.ok ? "" : await fetched.text(),
+              };
+            }
+            if (!response.ok) throw new BerryApiError(`File part ${partNumber} failed with ${response.status}`, response.status, response.body);
+            if (!response.etag) throw new Error("Object storage did not expose the ETag response header");
+            completed.push({ partNumber, etag: response.etag });
+            reportPartProgress(partNumber, end - start);
+            break;
+          } catch (error) {
+            const cause = partController.signal.reason === timeoutError ? timeoutError : error;
+            const retryable = cause === timeoutError || (cause instanceof BerryApiError
+              ? [408, 429, 500, 502, 503, 504].includes(cause.status)
+              : cause instanceof TypeError || (cause instanceof Error && cause.message === "File upload failed while sending data to object storage."));
+            if (controller.signal.aborted || !retryable || attempt >= 2) throw cause;
+            // Only resend the failed part; completed parts stay in S3.
+            reportPartProgress(partNumber, 0);
+            globalThis.clearTimeout(timeout);
+            controller.signal.removeEventListener("abort", abortPart);
+            await waitForUploadRetry(500 * 2 ** attempt, controller.signal);
+          } finally {
+            globalThis.clearTimeout(timeout);
+            controller.signal.removeEventListener("abort", abortPart);
           }
-        } catch (error) {
-          if (partController.signal.reason === timeoutError) throw timeoutError;
-          throw error;
-        } finally {
-          globalThis.clearTimeout(timeout);
-          controller.signal.removeEventListener("abort", abortPart);
         }
-        if (!response.ok) throw new BerryApiError(`File part ${partNumber} failed with ${response.status}`, response.status, response.body);
-        const etag = response.etag;
-        if (!etag) throw new Error("Object storage did not expose the ETag response header");
-        completed.push({ partNumber, etag });
-        reportPartProgress(partNumber, end - start);
       }
     };
     try {
+      controller.signal.throwIfAborted();
+      const signedBatches = await Promise.all(chunk(partNumbers, 100).map((batch) => this.#request(
+        `/v1/files/${encodeURIComponent(upload.fileId)}/uploads/${encodeURIComponent(upload.uploadId)}/parts`,
+        MultipartUploadPartUrlsSchema,
+        { method: "POST", body: { partNumbers: batch }, signal: controller.signal },
+      )));
+      for (const part of signedBatches.flatMap((signed) => signed.parts)) urls.set(part.partNumber, part.url);
+      controller.signal.throwIfAborted();
       await Promise.all(Array.from({ length: Math.min(Math.max(1, input.concurrency ?? 4), upload.partCount) }, worker));
+      controller.signal.throwIfAborted();
       return this.#resolveFileUrls(await this.#request(
         `/v1/files/${encodeURIComponent(upload.fileId)}/uploads/${encodeURIComponent(upload.uploadId)}/complete`,
         StoredFileSchema,
-        { method: "POST", body: { parts: completed.sort((left, right) => left.partNumber - right.partNumber) } },
+        { method: "POST", body: { parts: completed.sort((left, right) => left.partNumber - right.partNumber) }, signal: controller.signal },
       ));
     } catch (error) {
       controller.abort(error);
-      await this.#rawRequest(`/v1/files/${encodeURIComponent(upload.fileId)}/uploads/${encodeURIComponent(upload.uploadId)}`, { method: "DELETE" }).catch(() => undefined);
+      await this.#rawRequest(`/v1/files/${encodeURIComponent(upload.fileId)}/uploads/${encodeURIComponent(upload.uploadId)}`, { method: "DELETE", signal: AbortSignal.timeout(10_000) }).catch(() => undefined);
       throw error;
     } finally {
       input.signal?.removeEventListener("abort", abortFromCaller);
@@ -1214,6 +1272,19 @@ export class BerryApiClient {
     return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}`, SessionSchema);
   }
 
+  async browserState(sessionId: string): Promise<BrowserControlState> {
+    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/browser`, BrowserControlStateSchema);
+  }
+  async takeBrowserControl(sessionId: string, browserId: string): Promise<BrowserControlState> {
+    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/browser/take-control`, BrowserControlStateSchema, { method: "POST", body: { browserId } });
+  }
+  async browserConnection(sessionId: string, browserId: string, control: boolean): Promise<BrowserConnection> {
+    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/browser/connection`, BrowserConnectionSchema, { method: "POST", body: { browserId, control } });
+  }
+  async resumeBrowserAgent(sessionId: string, browserId: string, handoffId: string): Promise<BrowserControlState> {
+    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/browser/resume`, BrowserControlStateSchema, { method: "POST", body: { browserId, handoffId } });
+  }
+
   async turnState(sessionId: string): Promise<TurnState> {
     return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/turn-state`, TurnStateSchema);
   }
@@ -1229,6 +1300,10 @@ export class BerryApiClient {
     });
   }
 
+  async taskTokenUsage(sessionId: string, options: { signal?: AbortSignal } = {}): Promise<TaskTokenUsage> {
+    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/task-token-usage`, TaskTokenUsageSchema, options);
+  }
+
   async appendMessage(sessionId: string, input: { messageId?: string | undefined; role?: "system" | "user" | "assistant" | "tool" | undefined; parts: Array<{ kind: string; content: unknown }> }): Promise<Message> {
     return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/messages`, MessageSchema, {
       method: "POST",
@@ -1241,11 +1316,31 @@ export class BerryApiClient {
     input: StartTurnRequest,
     options: { signal?: AbortSignal } = {},
   ): Promise<StartTurnResponse> {
+    const timezone = input.timezone ?? (typeof window !== "undefined" ? Intl.DateTimeFormat().resolvedOptions().timeZone : undefined);
     return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/turns`, StartTurnResponseSchema, {
       method: "POST",
-      body: input,
+      body: { ...input, ...(timezone ? { timezone } : {}) },
       ...options,
     });
+  }
+
+  async listScheduledTasks(options: { signal?: AbortSignal } = {}): Promise<ScheduledTask[]> {
+    return this.#request("/v1/scheduled-tasks", z.array(ScheduledTaskSchema), options);
+  }
+  async createScheduledTask(input: ScheduledTaskCreate): Promise<ScheduledTask> {
+    return this.#request("/v1/scheduled-tasks", ScheduledTaskSchema, { method: "POST", body: input });
+  }
+  async updateScheduledTask(id: string, changes: ScheduledTaskUpdate, operationId?: string): Promise<ScheduledTask> {
+    return this.#request(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, ScheduledTaskSchema, { method: "PATCH", body: { changes, ...(operationId ? { operationId } : {}) } });
+  }
+  async deleteScheduledTask(id: string): Promise<{ removed: boolean }> {
+    return this.#request(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, z.object({ removed: z.boolean() }), { method: "DELETE" });
+  }
+  async runScheduledTask(id: string, operationId: string): Promise<ScheduledTaskRun> {
+    return this.#request(`/v1/scheduled-tasks/${encodeURIComponent(id)}/run`, ScheduledTaskRunSchema, { method: "POST", body: { operationId } });
+  }
+  async listScheduledTaskRuns(id: string, limit = 30, options: { signal?: AbortSignal } = {}): Promise<ScheduledTaskRun[]> {
+    return this.#request(`/v1/scheduled-tasks/${encodeURIComponent(id)}/runs?limit=${encodeURIComponent(limit)}`, z.array(ScheduledTaskRunSchema), options);
   }
 
   async listQueuedFollowUps(sessionId: string, input: { cursor?: string; limit?: number } = {}): Promise<QueuedFollowUpPage> {
@@ -1338,6 +1433,66 @@ export class BerryApiClient {
       method: "POST",
       body: input,
     });
+  }
+
+  getMobileServerInfo(): Promise<MobileServerInfo> {
+    return this.#request("/v1/mobile/server-info", MobileServerInfoSchema);
+  }
+
+  /** Shows a QR code on the web; only browser sessions may create one. */
+  createMobilePairing(): Promise<MobilePairingCreateResponse> {
+    return this.#request("/v1/mobile/pairings", MobilePairingCreateResponseSchema, { method: "POST" });
+  }
+
+  getMobilePairing(id: string, signal?: AbortSignal): Promise<MobilePairingStatus> {
+    return this.#request(`/v1/mobile/pairings/${encodeURIComponent(id)}`, MobilePairingStatusSchema, signal ? { signal } : {});
+  }
+
+  approveMobilePairing(id: string): Promise<MobilePairingStatus> {
+    return this.#request(`/v1/mobile/pairings/${encodeURIComponent(id)}/approve`, MobilePairingStatusSchema, { method: "POST" });
+  }
+
+  denyMobilePairing(id: string): Promise<MobilePairingStatus> {
+    return this.#request(`/v1/mobile/pairings/${encodeURIComponent(id)}/deny`, MobilePairingStatusSchema, { method: "POST" });
+  }
+
+  async cancelMobilePairing(id: string): Promise<void> {
+    await this.#request(`/v1/mobile/pairings/${encodeURIComponent(id)}`, z.object({ ok: z.literal(true) }), { method: "DELETE" });
+  }
+
+  claimMobilePairing(input: MobilePairingClaimRequest): Promise<MobilePairingClaimResponse> {
+    return this.#request("/v1/mobile/pairings/claim", MobilePairingClaimResponseSchema, { method: "POST", body: MobilePairingClaimRequestSchema.parse(input) });
+  }
+
+  /** Long-polls (about 25 seconds) until the web user approves or denies the phone. */
+  pollMobilePairing(input: MobilePairingPollRequest, signal?: AbortSignal): Promise<MobilePairingPollResponse> {
+    return this.#request("/v1/mobile/pairings/poll", MobilePairingPollResponseSchema, { method: "POST", body: input, ...(signal ? { signal } : {}) });
+  }
+
+  /** Paired phones for the signed-in user; `current` marks the caller's own phone. */
+  listPairedMobileDevices(): Promise<MobileDeviceRegistration[]> {
+    return this.#request("/v1/mobile/devices", z.array(MobileDeviceRegistrationSchema));
+  }
+
+  async revokePairedMobileDevice(deviceId: string): Promise<void> {
+    await this.#request(`/v1/mobile/devices/${encodeURIComponent(deviceId)}`, z.object({ ok: z.literal(true) }), { method: "DELETE" });
+  }
+
+  /** Signs out the phone making the request. */
+  async signOutMobileSession(): Promise<void> {
+    await this.#request("/v1/mobile/session", z.object({ ok: z.literal(true) }), { method: "DELETE" });
+  }
+
+  listMemberMobileDevices(tenantId: string, userId: string): Promise<MobileDeviceRegistration[]> {
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/members/${encodeURIComponent(userId)}/mobile-devices`, z.array(MobileDeviceRegistrationSchema));
+  }
+
+  async revokeMemberMobileDevice(tenantId: string, userId: string, deviceId: string): Promise<void> {
+    await this.#request(
+      `/v1/orgs/${encodeURIComponent(tenantId)}/members/${encodeURIComponent(userId)}/mobile-devices/${encodeURIComponent(deviceId)}`,
+      z.object({ ok: z.literal(true) }),
+      { method: "DELETE" },
+    );
   }
 
   async listMobileDevices(): Promise<MobileDeviceRegistration[]> {
@@ -1542,8 +1697,8 @@ export class BerryApiClient {
     return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/allowances/members/${encodeURIComponent(userId)}/base`, AllowanceBalanceSchema, { method: "PUT", body: input });
   }
 
-  async myAllowanceBalance(tenantId: string): Promise<AllowanceBalance> {
-    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/allowances/me`, AllowanceBalanceSchema);
+  async myAllowanceBalance(tenantId: string, options: { signal?: AbortSignal } = {}): Promise<AllowanceBalance> {
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/allowances/me`, AllowanceBalanceSchema, options);
   }
 
   async allowanceAdjustments(tenantId: string, userId?: string): Promise<AllowanceAdjustment[]> {
@@ -1849,10 +2004,10 @@ export class BerryApiClient {
     onEvent: (event: AgentStreamEvent, cursor: string | null) => void;
     onError?: (error: unknown) => void;
     onOpen?: () => void;
-  }, cursor?: string | null): EventSource {
+  }, cursor?: string | null): BerryEventStream {
     const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
     const path = this.#supportPath(`/v1/sessions/${encodeURIComponent(sessionId)}/events${query}`);
-    const source = new EventSource(`${this.#baseUrl}${path}`, { withCredentials: true });
+    const source = this.#openEventSource(path);
     source.onopen = () => callbacks.onOpen?.();
     source.onerror = (event) => callbacks.onError?.(event);
     source.onmessage = (event) => {
@@ -1871,9 +2026,9 @@ export class BerryApiClient {
     onEvent: (event: HostPushEvent) => void;
     onError?: (error: unknown) => void;
     onOpen?: () => void;
-  }): EventSource {
+  }): BerryEventStream {
     const path = this.#supportPath(`/v1/tasks/${encodeURIComponent(taskId)}/events`);
-    const source = new EventSource(`${this.#baseUrl}${path}`, { withCredentials: true });
+    const source = this.#openEventSource(path);
     source.onopen = () => callbacks.onOpen?.();
     source.onerror = (event) => callbacks.onError?.(event);
     source.onmessage = (event) => {
@@ -1907,6 +2062,12 @@ export class BerryApiClient {
         });
       }
     }
+  }
+
+  #openEventSource(path: string): BerryEventSourceLike {
+    const headers = new Headers(this.#headers);
+    headers.set("Accept", "text/event-stream");
+    return this.#eventSource(`${this.#baseUrl}${path}`, { withCredentials: this.#credentials === "include", headers });
   }
 
   async #request<TSchema extends z.ZodTypeAny>(path: string, schema: TSchema, init: { method?: string | undefined; body?: unknown; headers?: Record<string, string>; signal?: AbortSignal } = {}): Promise<z.output<TSchema>> {
@@ -1968,7 +2129,7 @@ export class BerryApiClient {
     const headers = new Headers(this.#headers);
     for (const [name, value] of Object.entries(init.headers ?? {})) headers.set(name, value);
     headers.set("Accept", "application/json");
-    const request: RequestInit = { method, headers, credentials: "include", ...(init.signal ? { signal: init.signal } : {}) };
+    const request: RequestInit = { method, headers, credentials: this.#credentials, ...(init.signal ? { signal: init.signal } : {}) };
     if (init.body !== undefined) {
       headers.set("Content-Type", "application/json");
       request.body = JSON.stringify(init.body);
@@ -1983,19 +2144,32 @@ export class BerryApiClient {
     const support = this.#supportView;
     if (!support) return path;
     const pathname = path.split("?", 1)[0] ?? path;
+    const prefix = `/v1/orgs/${encodeURIComponent(support.tenantId)}/support/users/${encodeURIComponent(support.userId)}`;
+    const organizationPrefix = `/v1/orgs/${encodeURIComponent(support.tenantId)}`;
+    if (pathname.startsWith(`${organizationPrefix}/`)) {
+      const relative = pathname.slice(organizationPrefix.length);
+      if (isSupportWorkspacePath(relative)) return `${prefix}${path.slice(organizationPrefix.length)}`;
+    }
     if (!isSupportPath(pathname)) {
       throw new BerryApiError("This resource is not available in support view.", 403, { code: "support_view_read_not_available" });
     }
-    return `/v1/orgs/${encodeURIComponent(support.tenantId)}/support/users/${encodeURIComponent(support.userId)}${path.slice(3)}`;
+    return `${prefix}${path.slice(3)}`;
   }
 }
 
+function isSupportWorkspacePath(pathname: string): boolean {
+  return /^\/(?:allowances\/me|usage\/me(?:\/requests|\/export\.csv)?|capabilities\/effective\/me|capabilities\/skills\/[^/]+\/package(?:\/file)?)$/.test(pathname);
+}
+
 function isSupportPath(pathname: string): boolean {
+  if (/^\/v1\/sessions\/[^/]+\/browser(?:\/(?:take-control|connection|resume))?$/.test(pathname)) return true;
+  if (/^\/v1\/scheduled-tasks(?:\/[^/]+(?:\/run|\/runs)?)?$/.test(pathname)) return true;
+  if (/^\/v1\/me\/skills(?:\/(?:review|packages|[^/]+(?:\/package)?))?$/.test(pathname)) return true;
   if (/^\/v1\/(?:workspaces|projects)(?:\/page)?$/.test(pathname)) return true;
   if (/^\/v1\/workspaces\/[^/]+$/.test(pathname)) return true;
   if (pathname === "/v1/tasks" || pathname === "/v1/tasks/page" || pathname === "/v1/tasks/summary") return true;
   if (/^\/v1\/tasks\/[^/]+(?:\/restore|\/sessions|\/events)?$/.test(pathname)) return true;
-  if (/^\/v1\/sessions\/[^/]+(?:\/messages(?:\/[^/]+)?|\/context-stats|\/turns|\/turn-state|\/cancel|\/steer|\/events|\/follow-ups)?$/.test(pathname)) return true;
+  if (/^\/v1\/sessions\/[^/]+(?:\/messages(?:\/[^/]+)?|\/context-stats|\/task-token-usage|\/turns|\/turn-state|\/cancel|\/steer|\/events|\/follow-ups)?$/.test(pathname)) return true;
   if (/^\/v1\/follow-ups\/[^/]+$/.test(pathname)) return true;
   if (/^\/v1\/(?:approvals|questions\/[^/]+\/answer|runs\/[^/]+\/recovery)$/.test(pathname)) return true;
   if (/^\/v1\/approvals\/[^/]+\/decision$/.test(pathname)) return true;
@@ -2003,6 +2177,15 @@ function isSupportPath(pathname: string): boolean {
   if (pathname === "/v1/files" || pathname === "/v1/files/uploads") return true;
   if (/^\/v1\/files\/[^/]+$/.test(pathname) || /^\/v1\/files\/[^/]+\/content$/.test(pathname)) return true;
   return /^\/v1\/files\/[^/]+\/uploads\/[^/]+(?:\/parts|\/complete)?$/.test(pathname);
+}
+
+function waitForUploadRetry(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const abort = () => { clearTimeout(timer); reject(signal.reason); };
+    const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, ms);
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+  });
 }
 
 function uploadBlobWithXhr(

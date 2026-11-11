@@ -20,10 +20,12 @@ export type TimezoneOption = {
   searchValue: string;
 };
 
-export function TimezoneSelect({ value, onChange, disabled = false }: {
+export function TimezoneSelect({ value, onChange, disabled = false, ariaLabel = "Choose organization timezone" }: {
   value: string;
   onChange: (value: string) => void;
   disabled?: boolean;
+  /** The organization profile owns the default; other forms name their own field. */
+  ariaLabel?: string;
 }) {
   const [open, setOpen] = React.useState(false);
   const options = React.useMemo(() => timezoneOptions(value), [value]);
@@ -36,14 +38,14 @@ export function TimezoneSelect({ value, onChange, disabled = false }: {
           type="button"
           variant="outline"
           disabled={disabled}
-          aria-label="Choose organization timezone"
+          aria-label={ariaLabel}
           aria-haspopup="listbox"
           aria-expanded={open}
-          className="h-9 w-full justify-between gap-2 px-3 font-normal shadow-none"
+          className="w-full justify-between gap-2 px-3 font-normal shadow-none"
         >
           <span className="flex min-w-0 items-center gap-2">
             <Globe className="size-4 shrink-0 text-[var(--berry-text-tertiary)]" aria-hidden />
-            <span className="truncate text-sm text-[var(--berry-text-primary)]">{selected.city}</span>
+            <span className="truncate text-md text-foreground">{selected.city}</span>
             <span className="shrink-0 text-xs tabular-nums text-[var(--berry-text-tertiary)]">{selected.offset}</span>
           </span>
           <ChevronDown className="size-4 shrink-0 text-[var(--berry-text-tertiary)]" aria-hidden />
@@ -66,7 +68,7 @@ export function TimezoneSelect({ value, onChange, disabled = false }: {
                   className="min-h-11"
                 >
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate text-sm">{option.city}</span>
+                    <span className="block truncate text-md">{option.city}</span>
                     <span className="block truncate text-xs text-[var(--berry-text-tertiary)]">{option.region}</span>
                   </span>
                   <span className="shrink-0 text-xs tabular-nums text-[var(--berry-text-secondary)]">{option.offset}</span>

@@ -9,22 +9,33 @@ import {
 import {
   AsyncState,
   Button,
+  CellStack,
   DataTable,
+  DefinitionList,
   DetailDrawer,
   FormSelect,
+  InlineNotice,
   ManagementPage,
   MetricGrid,
+  Num,
   Section,
+  SegmentedControl,
   StatusPill,
-  Toolbar,
+  formatCompact,
+  formatCompactMoney,
+  formatDateTime,
+  formatDuration,
   formatMoney,
   formatNumber,
+  formatPercent,
 } from "./management-primitives";
 import {
   BreakdownBars,
   DualTrend,
   HealthRings,
   OutcomeBars,
+  ShareDonut,
+  aggregateModelSpendRows,
 } from "./management-charts";
 import { useResource, type ManagementScreenProps } from "./management-context";
 import {
@@ -36,14 +47,7 @@ import {
   type UsageRangePreset,
 } from "./usage-controls";
 
-const VIEWS = [
-  "overview",
-  "people",
-  "models",
-  "agents",
-  "requests",
-  "reports",
-] as const;
+const VIEWS = ["overview", "people", "models", "agents", "requests"] as const;
 type View = (typeof VIEWS)[number];
 
 type UsageFilters = {
@@ -128,12 +132,6 @@ export function AnalyticsScreen({
         : null,
     null as any,
   );
-  const savedViews = useResource(
-    `analytics-views:${tenantId}`,
-    async () =>
-      client && view === "reports" ? client.savedAnalyticsViews(tenantId) : [],
-    [] as any[],
-  );
   const directory = useResource(
     `usage-directory:${tenantId}`,
     async () =>
@@ -182,11 +180,13 @@ export function AnalyticsScreen({
     cacheHitRequests: Number(data?.performance.cacheHitRequests ?? 0),
   });
   const cacheHitRate = cacheMetric.value;
+  const totalTokens = Number(data?.totals.tokens ?? 0) || Number(data?.totals.inputTokens ?? 0) + Number(data?.totals.outputTokens ?? 0);
+  const memberRows: any[] = data?.breakdowns.members ?? data?.breakdowns.users ?? [];
   const [members, departments] = directory.data as [any[], any[]];
   const activeFilterCount = Object.values(filters).filter(Boolean).length;
 
   return (
-    <ManagementPage
+    <ManagementPage width="wide"
       title="Usage"
       description="Inspect organization spend, tokens, cache behavior, models, people, and individual redacted requests from one filterable view."
       eyebrow="Usage & billing"
@@ -226,342 +226,271 @@ export function AnalyticsScreen({
         </>
       }
     >
-      <Toolbar>
-        <div
-          className="inline-flex flex-wrap gap-1 rounded-lg border border-border bg-muted/40 p-1"
-          role="tablist"
-          aria-label="Analytics view"
-        >
-          {VIEWS.map((item) => (
-            <Button
-              key={item}
-              variant="ghost"
-              role="tab"
-              aria-selected={view === item}
-              onClick={() => update(item)}
-            >
-              {label(item)}
-            </Button>
-          ))}
-        </div>
-      </Toolbar>
+      <SegmentedControl
+        label="Analytics view"
+        value={view}
+        onChange={(next) => update(next)}
+        options={VIEWS.map((item) => ({ value: item, label: label(item) }))}
+      />
       <AsyncState
         loading={analytics.loading}
         error={analytics.error}
         onRetry={analytics.retry}
         empty={!data || data.totals.requests === 0}
         emptyTitle="No usage in this period"
+        emptyText="Widen the date range or clear the filters to see activity."
       >
         {data ? (
           <>
-            <MetricGrid
-              items={[
-                {
-                  label: "Total cost",
-                  value: formatMoney(data.totals.billedCostMicros),
-                },
-                {
-                  label: "Requests",
-                  value: formatNumber(data.totals.requests),
-                },
-                {
-                  label: "Input tokens",
-                  value: formatNumber(data.totals.inputTokens),
-                },
-                {
-                  label: "Output tokens",
-                  value: formatNumber(data.totals.outputTokens),
-                },
-                {
-                  label: "Cache-read tokens",
-                  value: formatNumber(data.performance.cacheReadTokens),
-                },
-                {
-                  label: "Cache-write tokens",
-                  value: formatNumber(data.performance.cacheWriteTokens),
-                },
-                {
-                  label: cacheMetric.label,
-                  value:
-                    cacheHitRate == null
-                      ? "—"
-                      : `${Math.round(cacheHitRate * 100)}%`,
-                  hint: cacheMetric.hint,
-                },
-                {
-                  label: "Success rate",
-                  value:
-                    data.totals.successRate == null
-                      ? "—"
-                      : `${Math.round(data.totals.successRate * 100)}%`,
-                  status:
-                    (data.totals.successRate ?? 1) < 0.9 ? "warning" : "good",
-                },
-              ]}
-            />
             {data.unavailableDimensions.length ? (
-              <p
-                className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
-                role="status"
-              >
-                Partially unavailable:{" "}
+              <InlineNotice tone="info">
+                Some breakdowns are unavailable for this range:{" "}
                 {data.unavailableDimensions.map(label).join(", ")}.
-              </p>
-            ) : null}
-            {data.anomalies.length ? (
-              <Section
-                title="Needs attention"
-                description="Each anomaly compares the observed value with its stated baseline."
-              >
-                {data.anomalies.map((item: any) => (
-                  <article
-                    className="flex gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs text-muted-foreground"
-                    key={item.id}
-                  >
-                    <StatusPill
-                      tone={item.severity === "error" ? "danger" : "warning"}
-                    >
-                      {item.severity}
-                    </StatusPill>
-                    <div>
-                      <b>{item.label}</b>
-                      <p>{item.explanation}</p>
-                      <small>
-                        Baseline {item.baseline} · observed {item.observed}{" "}
-                        {item.unit} · {item.dimension.label}
-                      </small>
-                    </div>
-                  </article>
-                ))}
-              </Section>
+              </InlineNotice>
             ) : null}
             {view === "overview" ? (
               <>
-                <Section title="Spend and request trend">
+                <MetricGrid
+                  items={[
+                    {
+                      label: "Billed spend",
+                      value: formatCompactMoney(data.totals.billedCostMicros),
+                      exactValue: formatMoney(data.totals.billedCostMicros),
+                      trend: data.series.map((point: any) => Number(point.billedCostMicros) / 1e6),
+                      ...(data.totals.projectedMonthEndMicros
+                        ? { hint: `Projected ${formatCompactMoney(data.totals.projectedMonthEndMicros)} by month end` }
+                        : {}),
+                    },
+                    {
+                      label: "Requests",
+                      value: formatCompact(data.totals.requests),
+                      exactValue: formatNumber(data.totals.requests),
+                      trend: data.series.map((point: any) => Number(point.requests ?? 0)),
+                      hint: `${formatCompactMoney(Number(data.totals.billedCostMicros) / Math.max(1, data.totals.requests) * 1000)} per 1K requests`,
+                    },
+                    {
+                      label: "Tokens",
+                      value: formatCompact(totalTokens),
+                      exactValue: formatNumber(totalTokens),
+                      trend: data.series.map((point: any) => Number(point.tokens ?? 0)),
+                      hint: `${formatCompact(data.totals.inputTokens)} in · ${formatCompact(data.totals.outputTokens)} out`,
+                    },
+                    {
+                      label: "Success rate",
+                      value: formatPercent(data.totals.successRate),
+                      status: (data.totals.successRate ?? 1) < 0.95 ? "warning" : "good",
+                      trend: data.series.map((point: any) => {
+                        const total = Number(point.successes ?? 0) + Number(point.failures ?? 0);
+                        return total > 0 ? Number(point.successes ?? 0) / total : 1;
+                      }),
+                      hint: `P95 latency ${formatDuration(data.performance.latencyP95Ms)}`,
+                    },
+                  ]}
+                />
+                {data.anomalies.length ? (
+                  <div className="grid gap-2">
+                    {data.anomalies.map((item: any) => (
+                      <InlineNotice
+                        key={item.id}
+                        tone={item.severity === "error" ? "danger" : item.severity === "info" ? "info" : "warning"}
+                        title={`${item.label} · ${item.dimension.label}`}
+                      >
+                        {item.explanation}{" "}
+                        <span className="whitespace-nowrap">
+                          Observed {formatCompact(item.observed)} {item.unit} against a baseline of {formatCompact(item.baseline)}.
+                        </span>
+                      </InlineNotice>
+                    ))}
+                  </div>
+                ) : null}
+                <Section title="Spend and requests" description="Daily billed spend beside request volume for the selected range.">
                   <DualTrend
                     label="Billed spend"
                     points={data.series.map((point: any) => ({
-                      label: point.ts.slice(0, 10),
+                      label: point.ts,
                       spend: Number(point.billedCostMicros) / 1e6,
                       requests: Number(point.requests ?? 0),
                     }))}
                     spendFormat={(value) => formatMoney(value * 1e6)}
                   />
                 </Section>
-                <div className="grid gap-4 xl:grid-cols-2">
-                  <Section
-                    title="Request outcomes"
-                    description="Successful and failed requests by day reveal reliability shifts before they become aggregate incidents."
-                  >
+                <div className="grid gap-5 xl:grid-cols-2">
+                  <Section title="Token volume" description="Where the tokens went. Cache reads are billed at a fraction of fresh input.">
+                    <ShareDonut
+                      caption="Token volume by type"
+                      centerLabel="Tokens"
+                      rows={[
+                        { label: "Fresh input", value: Math.max(0, Number(data.totals.inputTokens) - Number(data.performance.cacheReadTokens)) },
+                        { label: "Cache read", value: Number(data.performance.cacheReadTokens) },
+                        { label: "Output", value: Number(data.totals.outputTokens) },
+                        { label: "Cache write", value: Number(data.performance.cacheWriteTokens) },
+                      ].filter((row) => row.value > 0)}
+                      format={formatCompact}
+                    />
+                  </Section>
+                  <Section title="Reliability" description="Share of requests that failed each day.">
                     <OutcomeBars
                       points={data.series.map((point: any) => ({
-                        label: point.ts.slice(0, 10),
+                        label: point.ts,
                         successes: Number(point.successes ?? 0),
                         failures: Number(point.failures ?? 0),
                       }))}
                     />
                   </Section>
-                  <Section
-                    title="Quality signals"
-                    description="Hover each ring to compare reliability, cache reuse, and request attribution."
-                  >
+                </div>
+                <div className="grid gap-5 xl:grid-cols-2">
+                  <Section title="Spend by department">
+                    <BreakdownBars
+                      label="Department"
+                      rows={(data.breakdowns.departments ?? []).map((row: any) => ({
+                        label: row.label,
+                        value: Number(row.billedCostMicros) / 1e6,
+                      }))}
+                      format={(value) => formatCompactMoney(value * 1e6)}
+                      limit={6}
+                    />
+                  </Section>
+                  <Section title="Spend by model">
+                    <ShareDonut
+                      caption="Spend by model"
+                      centerLabel="Spend"
+                      rows={aggregateModelSpendRows(
+                        (data.breakdowns.models ?? []).map((row: any) => ({
+                          label: row.label,
+                          value: Number(row.billedCostMicros) / 1e6,
+                        })),
+                        6,
+                      )}
+                      format={(value) => formatCompactMoney(value * 1e6)}
+                    />
+                  </Section>
+                </div>
+                <Section title="Efficiency" description="Cache reuse and attribution show how much of the volume is working for you.">
+                  <div className="grid items-center gap-x-8 gap-y-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
                     <HealthRings
                       successRate={data.totals.successRate}
                       cacheRate={cacheHitRate}
-                      attributionRate={
-                        data.totals.requests
-                          ? attributedRequests / data.totals.requests
-                          : null
-                      }
+                      attributionRate={data.totals.requests ? attributedRequests / data.totals.requests : null}
                     />
-                  </Section>
-                </div>
-                <div className="grid gap-4 xl:grid-cols-2">
-                  <Section title="Department spend concentration">
-                    <BreakdownBars
-                      label="Billed spend"
-                      rows={(data.breakdowns.departments ?? []).map(
-                        (row: any) => ({
-                          label: row.label,
-                          value: Number(row.billedCostMicros) / 1e6,
-                        }),
-                      )}
-                      format={(value) => formatMoney(value * 1e6)}
+                    <DefinitionList
+                      items={[
+                        { term: cacheMetric.label, detail: <>{formatPercent(cacheHitRate)} <span className="text-muted-foreground">· {cacheMetric.hint}</span></> },
+                        { term: "Cache-write tokens", detail: <Num value={data.performance.cacheWriteTokens} /> },
+                        { term: "Latency", detail: <>{formatDuration(data.performance.latencyP50Ms)} median <span className="text-muted-foreground">· {formatDuration(data.performance.latencyP95Ms)} P95</span></> },
+                        { term: "Time to first token", detail: <>{formatDuration(data.performance.ttftP50Ms)} median <span className="text-muted-foreground">· {formatDuration(data.performance.ttftP95Ms)} P95</span></> },
+                      ]}
                     />
-                  </Section>
-                  <Section title="Model request mix">
-                    <BreakdownBars
-                      label="Requests"
-                      rows={(data.breakdowns.models ?? []).map((row: any) => ({
-                        label: row.label,
-                        value: Number(row.requests),
-                      }))}
-                    />
-                  </Section>
-                </div>
-                <Breakdown
-                  title="Top departments"
-                  rows={data.breakdowns.departments ?? []}
-                />
-                <Breakdown
-                  title="Top members"
-                  rows={data.breakdowns.members ?? data.breakdowns.users ?? []}
-                />
+                  </div>
+                </Section>
               </>
             ) : null}
             {view === "people" ? (
               <>
-                <div className="grid gap-4 xl:grid-cols-2">
-                  <Section title="Member spend">
+                <div className="grid gap-5 xl:grid-cols-2">
+                  <Section title="Top spenders">
                     <BreakdownBars
-                      label="Billed spend"
-                      rows={(
-                        data.breakdowns.members ??
-                        data.breakdowns.users ??
-                        []
-                      ).map((row: any) => ({
-                        label: row.label,
+                      label="Member"
+                      rows={memberRows.filter((row: any) => row.id != null).map((row: any) => ({
+                        label: row.name ?? row.label,
                         value: Number(row.billedCostMicros) / 1e6,
                       }))}
-                      format={(value) => formatMoney(value * 1e6)}
+                      format={(value) => formatCompactMoney(value * 1e6)}
                     />
                   </Section>
-                  <Section title="Department adoption">
+                  <Section title="Requests by department">
                     <BreakdownBars
-                      label="Requests"
-                      rows={(data.breakdowns.departments ?? []).map(
-                        (row: any) => ({
-                          label: row.label,
-                          value: Number(row.requests),
-                        }),
-                      )}
+                      label="Department"
+                      rows={(data.breakdowns.departments ?? []).map((row: any) => ({
+                        label: row.label,
+                        value: Number(row.requests),
+                      }))}
+                      format={formatCompact}
                     />
                   </Section>
                 </div>
-                <Breakdown
-                  title="People"
-                  rows={data.breakdowns.members ?? data.breakdowns.users ?? []}
-                />
-                <Breakdown
-                  title="Departments"
-                  rows={data.breakdowns.departments ?? []}
-                />
+                <Breakdown title="Members" noun="Member" rows={memberRows} />
+                <Breakdown title="Departments" noun="Department" rows={data.breakdowns.departments ?? []} />
               </>
             ) : null}
             {view === "models" ? (
               <>
-                <div className="grid gap-4 xl:grid-cols-2">
-                  <Section title="Model spend">
-                    <BreakdownBars
-                      label="Billed spend"
-                      rows={(data.breakdowns.models ?? []).map((row: any) => ({
-                        label: row.label,
-                        value: Number(row.billedCostMicros) / 1e6,
-                      }))}
-                      format={(value) => formatMoney(value * 1e6)}
+                <MetricGrid
+                  compact
+                  items={[
+                    { label: "Median latency", value: formatDuration(data.performance.latencyP50Ms) },
+                    { label: "P95 latency", value: formatDuration(data.performance.latencyP95Ms) },
+                    { label: "Median time to first token", value: formatDuration(data.performance.ttftP50Ms) },
+                    { label: "P95 time to first token", value: formatDuration(data.performance.ttftP95Ms) },
+                  ]}
+                />
+                <div className="grid gap-5 xl:grid-cols-2">
+                  <Section title="Spend by model">
+                    <ShareDonut
+                      caption="Spend by model"
+                      centerLabel="Spend"
+                      rows={aggregateModelSpendRows(
+                        (data.breakdowns.models ?? []).map((row: any) => ({
+                          label: row.label,
+                          value: Number(row.billedCostMicros) / 1e6,
+                        })),
+                        6,
+                      )}
+                      format={(value) => formatCompactMoney(value * 1e6)}
                     />
                   </Section>
-                  <Section title="Provider traffic">
+                  <Section title="Requests by provider">
                     <BreakdownBars
-                      label="Requests"
-                      rows={(data.breakdowns.providers ?? []).map(
-                        (row: any) => ({
-                          label: row.label,
-                          value: Number(row.requests),
-                        }),
-                      )}
+                      label="Provider"
+                      rows={(data.breakdowns.providers ?? []).map((row: any) => ({
+                        label: row.label,
+                        value: Number(row.requests),
+                      }))}
+                      format={formatCompact}
                     />
                   </Section>
                 </div>
-                <Breakdown
-                  title="Models"
-                  rows={data.breakdowns.models ?? []}
-                  performance
-                />
-                <Breakdown
-                  title="Features"
-                  rows={data.breakdowns.features ?? []}
-                  performance
-                />
-                <Section title="Performance">
-                  <MetricGrid
-                    items={[
-                      {
-                        label: "P50 latency",
-                        value: duration(data.performance.latencyP50Ms),
-                      },
-                      {
-                        label: "P95 latency",
-                        value: duration(data.performance.latencyP95Ms),
-                      },
-                      {
-                        label: "P50 TTFT",
-                        value: duration(data.performance.ttftP50Ms),
-                      },
-                      {
-                        label: "Cached tokens",
-                        value: formatNumber(data.performance.cachedTokens),
-                      },
-                    ]}
-                  />
-                </Section>
+                <Breakdown title="Models" noun="Model" rows={data.breakdowns.models ?? []} performance />
+                <Breakdown title="Features" noun="Feature" rows={data.breakdowns.features ?? []} performance />
               </>
             ) : null}
             {view === "agents" ? (
               <>
-                <div className="grid gap-4 xl:grid-cols-2">
-                  <Section title="Agent traffic">
+                <MetricGrid
+                  compact
+                  items={[
+                    {
+                      label: "Agent requests",
+                      value: formatCompact((data.breakdowns.agents ?? []).reduce((sum: number, row: any) => sum + row.requests, 0)),
+                    },
+                    { label: "Sandbox time", value: `${formatCompact(Math.round(data.performance.sandboxMinutes / 60))} h`, exactValue: `${formatNumber(Math.round(data.performance.sandboxMinutes))} minutes` },
+                    { label: "Agents active", value: formatNumber((data.breakdowns.agents ?? []).length) },
+                    { label: "Workspaces active", value: formatNumber((data.breakdowns.workspaces ?? []).length) },
+                  ]}
+                />
+                <div className="grid gap-5 xl:grid-cols-2">
+                  <Section title="Requests by agent">
                     <BreakdownBars
-                      label="Requests"
+                      label="Agent"
                       rows={(data.breakdowns.agents ?? []).map((row: any) => ({
                         label: row.label,
                         value: Number(row.requests),
                       }))}
+                      format={formatCompact}
                     />
                   </Section>
-                  <Section title="Workspace spend">
+                  <Section title="Spend by workspace">
                     <BreakdownBars
-                      label="Billed spend"
-                      rows={(data.breakdowns.workspaces ?? []).map(
-                        (row: any) => ({
-                          label: row.label,
-                          value: Number(row.billedCostMicros) / 1e6,
-                        }),
-                      )}
-                      format={(value) => formatMoney(value * 1e6)}
+                      label="Workspace"
+                      rows={(data.breakdowns.workspaces ?? []).map((row: any) => ({
+                        label: row.label,
+                        value: Number(row.billedCostMicros) / 1e6,
+                      }))}
+                      format={(value) => formatCompactMoney(value * 1e6)}
                     />
                   </Section>
                 </div>
-                <Breakdown
-                  title="Agents"
-                  rows={data.breakdowns.agents ?? []}
-                  performance
-                />
-                <Breakdown
-                  title="Workspaces"
-                  rows={data.breakdowns.workspaces ?? []}
-                />
-                <Section title="Sandbox activity">
-                  <MetricGrid
-                    items={[
-                      {
-                        label: "Sandbox minutes",
-                        value: formatNumber(
-                          Math.round(data.performance.sandboxMinutes),
-                        ),
-                      },
-                      {
-                        label: "Attributed requests",
-                        value: formatNumber(
-                          (data.breakdowns.agents ?? []).reduce(
-                            (sum: number, row: any) => sum + row.requests,
-                            0,
-                          ),
-                        ),
-                      },
-                    ]}
-                  />
-                </Section>
+                <Breakdown title="Agents" noun="Agent" rows={data.breakdowns.agents ?? []} performance />
+                <Breakdown title="Workspaces" noun="Workspace" rows={data.breakdowns.workspaces ?? []} />
               </>
             ) : null}
             {view === "requests" ? (
@@ -570,16 +499,17 @@ export function AnalyticsScreen({
                 error={requests.error}
                 onRetry={requests.retry}
                 empty={!requests.data?.items.length}
+                emptyTitle="No requests match"
+                emptyText="Request records hold metadata only. Prompts and responses are never stored here."
               >
                 <DataTable
-                  label="Redacted request records"
+                  label="Requests"
+                  initialPageSize={25}
                   columns={[
                     "Time",
-                    "Person",
-                    "Department",
-                    "Request",
+                    "Member",
+                    "Model",
                     "Feature",
-                    "Model / provider",
                     "Status",
                     "Input",
                     "Output",
@@ -587,94 +517,68 @@ export function AnalyticsScreen({
                     "Billed",
                     "Latency",
                   ]}
+                  onRowSelect={(index) => {
+                    const row = requests.data?.items[index];
+                    if (row) void openRequest(row.id);
+                  }}
+                  rowLabel={(index) => `Request ${requests.data?.items[index]?.requestId ?? ""}`}
                   rows={(requests.data?.items ?? []).map((row: any) => [
-                    new Date(row.ts).toLocaleString(),
-                    <span>
-                      <b>{row.userName || row.userEmail || "Unattributed"}</b>
-                      <small>{row.userEmail ?? compactId(row.userId)}</small>
-                    </span>,
-                    row.departmentName ?? compactId(row.departmentId),
-                    <Button
-                      variant="ghost"
-                      className="grid h-auto max-w-80 justify-start gap-0.5 p-0 text-left [&_b]:truncate [&_small]:truncate [&_small]:text-xs [&_small]:text-muted-foreground"
-                      onClick={() => openRequest(row.id)}
-                    >
-                      <b>{row.requestId}</b>
-                      <small>
-                        {row.agentId ?? row.workspaceId ?? "Unattributed"}
-                      </small>
-                    </Button>,
-                    row.feature,
-                    <span>
-                      <b>{row.model ?? "Unknown model"}</b>
-                      <small>{row.provider ?? "Unknown provider"}</small>
-                    </span>,
-                    <StatusPill
-                      tone={
-                        ["completed", "success", "succeeded"].includes(
-                          row.status,
-                        )
-                          ? "good"
-                          : "danger"
-                      }
-                    >
-                      {row.status}
+                    <span data-sort={new Date(row.ts).getTime()} className="whitespace-nowrap text-muted-foreground">{formatDateTime(row.ts)}</span>,
+                    <CellStack
+                      primary={row.userName || row.userEmail || "Unattributed"}
+                      secondary={row.departmentName ?? undefined}
+                    />,
+                    <CellStack primary={row.model ?? "Unknown model"} secondary={row.provider ?? undefined} />,
+                    label(String(row.feature ?? "—")),
+                    <StatusPill tone={["completed", "success", "succeeded"].includes(row.status) ? "good" : "danger"}>
+                      {label(String(row.status))}
                     </StatusPill>,
-                    formatNumber(row.tokensIn),
-                    formatNumber(row.tokensOut),
-                    formatNumber(row.cacheReadTokens),
-                    formatMoney(row.billedCostMicros),
-                    duration(row.latencyMs),
+                    <Num value={row.tokensIn} />,
+                    <Num value={row.tokensOut} />,
+                    <Num value={row.cacheReadTokens} />,
+                    <Num value={row.billedCostMicros} kind="money" />,
+                    <span data-sort={Number(row.latencyMs ?? 0)}>{formatDuration(row.latencyMs)}</span>,
                   ])}
                 />
               </AsyncState>
-            ) : null}
-            {view === "reports" ? (
-              <Section
-                title="Saved analytic views"
-                description="Schedules and delivery configuration live under Reports & alerts."
-              >
-                <DataTable
-                  label="Saved views"
-                  columns={["Name", "Visibility", "Owner", "Updated"]}
-                  rows={savedViews.data.map((row: any) => [
-                    row.name,
-                    row.visibility,
-                    row.ownerUserId,
-                    new Date(row.updatedAt).toLocaleString(),
-                  ])}
-                />
-              </Section>
             ) : null}
           </>
         ) : null}
       </AsyncState>
       {detail ? (
         <DetailDrawer
-          title={detail.requestId}
-          subtitle="Redacted request"
+          title="Request"
+          subtitle={<code>{detail.requestId}</code>}
+          badge={
+            <StatusPill tone={["completed", "success", "succeeded"].includes(detail.status) ? "good" : "danger"}>
+              {label(String(detail.status))}
+            </StatusPill>
+          }
           onClose={() => setDetail(null)}
         >
-          {
-            <dl>
-              {Object.entries(detail)
-                .filter(([key]) => !["safeMetadata"].includes(key))
-                .map(([key, value]) => (
-                  <div key={key}>
-                    <dt>{label(key)}</dt>
-                    <dd>{value == null ? "—" : String(value)}</dd>
-                  </div>
-                ))}
-            </dl>
-          }
-          <Section title="Safe metadata">
-            <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words bg-transparent font-mono text-xs leading-5 text-muted-foreground">
-              {JSON.stringify(detail.safeMetadata, null, 2)}
-            </pre>
-          </Section>
-          <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-            Prompts, responses, credentials, signatures, and unrestricted
-            metadata are never returned by this endpoint.
+          <DefinitionList
+            items={Object.entries(detail)
+              .filter(([key]) => !["safeMetadata", "requestId", "status", "id", "tenantId"].includes(key))
+              .map(([key, value]) => ({
+                term: label(key.replace(/([a-z])([A-Z])/g, "$1 $2")),
+                detail: value == null || value === ""
+                  ? <span className="text-muted-foreground">—</span>
+                  : /Micros$/.test(key) ? formatMoney(value as string)
+                  : /^(ts|.*At)$/.test(key) ? formatDateTime(value as string)
+                  : typeof value === "number" ? formatNumber(value)
+                  : String(value),
+              }))}
+          />
+          {Object.keys(detail.safeMetadata ?? {}).length ? (
+            <div className="grid gap-1.5">
+              <h3 className="text-xs font-medium text-muted-foreground">Metadata</h3>
+              <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-[var(--berry-surface-under)] p-3 font-mono text-xs leading-5 text-foreground">
+                {JSON.stringify(detail.safeMetadata, null, 2)}
+              </pre>
+            </div>
+          ) : null}
+          <p className="text-xs leading-5 text-muted-foreground">
+            Prompts, responses and credentials are never returned here.
           </p>
         </DetailDrawer>
       ) : null}
@@ -717,7 +621,7 @@ function UsageFiltersPopover({
           <Filter />
           Filters
           {activeCount ? (
-            <span className="inline-flex size-5 items-center justify-center rounded-full bg-foreground text-[11px] tabular-nums text-background">
+            <span className="inline-flex size-5 items-center justify-center rounded-full bg-foreground text-xs tabular-nums text-background">
               {activeCount}
             </span>
           ) : null}
@@ -848,26 +752,24 @@ function emptyUsageFilters(): UsageFilters {
   };
 }
 
-function compactId(value: string | null): string {
-  if (!value) return "Unattributed";
-  return value.length <= 8 ? value : `${value.slice(0, 8)}…`;
-}
-
 function Breakdown({
   title,
+  noun,
   rows,
   performance = false,
 }: {
   title: string;
+  noun: string;
   rows: any[];
   performance?: boolean;
 }) {
+  if (!rows.length) return null;
   return (
-    <Section title={title}>
+    <Section title={title} flush>
       <DataTable
         label={title}
         columns={[
-          title.slice(0, -1),
+          noun,
           "Requests",
           "Input",
           "Output",
@@ -876,34 +778,22 @@ function Breakdown({
           ...(performance ? ["Error rate", "P95 latency"] : []),
         ]}
         rows={rows.map((row) => [
-          <span>
-            <b>{row.name ?? row.label}</b>
-            {row.email ? <small>{row.email}</small> : null}
-          </span>,
-          formatNumber(row.requests),
-          formatNumber(row.inputTokens),
-          formatNumber(row.outputTokens),
-          formatNumber(row.cacheReadTokens),
-          formatMoney(row.billedCostMicros),
+          <CellStack primary={row.name ?? row.label} secondary={row.email} />,
+          <Num value={row.requests} />,
+          <Num value={row.inputTokens} />,
+          <Num value={row.outputTokens} />,
+          <Num value={row.cacheReadTokens} />,
+          <Num value={row.billedCostMicros} kind="money" />,
           ...(performance
             ? [
-                row.errorRate == null
-                  ? "—"
-                  : `${Math.round(row.errorRate * 100)}%`,
-                duration(row.latencyP95Ms),
+                <span data-sort={Number(row.errorRate ?? 0)}>{formatPercent(row.errorRate, 1)}</span>,
+                <span data-sort={Number(row.latencyP95Ms ?? 0)}>{formatDuration(row.latencyP95Ms)}</span>,
               ]
             : []),
         ])}
       />
     </Section>
   );
-}
-function duration(value: number | null) {
-  return value == null
-    ? "—"
-    : value < 1000
-      ? `${Math.round(value)} ms`
-      : `${(value / 1000).toFixed(1)} s`;
 }
 function label(value: string) {
   return value

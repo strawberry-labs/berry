@@ -1,4 +1,5 @@
 import { ArrowLeft } from "lucide-react";
+import { SUPPORT_VIEW_SETTINGS_TABS } from "@/lib/support-view";
 import type { OrgPermission } from "@berry/shared";
 import {
   SidebarContent,
@@ -22,6 +23,7 @@ export function WebSettingsNavigation({
   tab,
   permissions,
   platformAuthorized,
+  supportView = false,
   onNavigate,
   onBack,
 }: {
@@ -29,10 +31,14 @@ export function WebSettingsNavigation({
   tab: string;
   permissions: OrgPermission[];
   platformAuthorized: boolean;
+  supportView?: boolean;
   onNavigate: (kind: ManagementKind, tab: string) => void;
   onBack: () => void;
 }) {
-  const adminGroups = visibleAdministrationGroups(permissions);
+  const adminGroups = supportView ? [] : visibleAdministrationGroups(permissions);
+  const personalGroups = supportView
+    ? PERSONAL_NAV.map((group) => ({ ...group, items: group.items.filter((item) => SUPPORT_VIEW_SETTINGS_TABS.includes(item.id)) }))
+    : PERSONAL_NAV;
 
   return (
     <>
@@ -48,7 +54,7 @@ export function WebSettingsNavigation({
       </SidebarHeader>
       <SidebarContent className="scroll-fade berry-settings-sidebar-content">
         <nav aria-label="Settings and administration">
-          {PERSONAL_NAV.map((group) => (
+          {personalGroups.map((group) => (
             <NavigationGroup
               key={`settings:${group.label}`}
               group={group}
@@ -70,7 +76,7 @@ export function WebSettingsNavigation({
               startsConsole={index === 0}
             />
           ))}
-          {platformAuthorized
+          {platformAuthorized && !supportView
             ? PLATFORM_NAV.map((group, index) => (
               <NavigationGroup
                 key={`platform:${group.label}`}

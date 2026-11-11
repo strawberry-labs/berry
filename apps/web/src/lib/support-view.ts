@@ -63,3 +63,6 @@ function removeStoredSupportView(): void {
     // A blocked storage API must not strand the authenticated shell or prevent sign-out.
   }
 }
+
+/** Personal pages available through the audited support workspace API. */
+export const SUPPORT_VIEW_SETTINGS_TABS: readonly string[] = ["skills", "schedules", "usage"];

@@ -569,7 +569,10 @@ test("web composer keeps model and reasoning controls and opens the mobile sideb
   await page.setViewportSize({ width: 390, height: 844 });
   await page.reload();
   await page.waitForFunction(() => window.matchMedia("(max-width: 767px)").matches);
-  const sidebarTrigger = page.getByRole("button", { name: "Toggle Sidebar" });
+  // The home composer focuses itself once it mounts; let that settle so it
+  // can't take focus back after the sheet returns it to the trigger.
+  await expect(page.locator(".berry-prompt-editor")).toBeFocused();
+  const sidebarTrigger = page.getByRole("button", { name: "Open sidebar" });
   await sidebarTrigger.click();
   await expect(page.getByRole("dialog", { name: "Sidebar" })).toBeVisible();
   await expect(page.getByRole("button", { name: "New task", exact: true })).toBeVisible();
@@ -578,9 +581,115 @@ test("web composer keeps model and reasoning controls and opens the mobile sideb
   await expect(sidebarTrigger).toBeFocused();
 });
 
+test("phone header keeps the toggle alone on the left and brands the open sidebar", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/");
+  await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
+  await expect(page.locator(".berry-prompt-editor")).toBeFocused();
+
+  const chrome = page.locator(".berry-web-window-chrome");
+  const toggle = chrome.getByRole("button", { name: "Open sidebar" });
+  await expect(toggle).toBeVisible();
+  await expect(chrome.getByRole("button", { name: "Berry home" })).toHaveCount(0);
+  await expect(chrome.getByRole("button", { name: "Toggle sidebar" })).toHaveCount(0);
+  const toggleBox = await toggle.boundingBox();
+  const searchBox = await chrome.getByRole("button", { name: "Search", exact: true }).boundingBox();
+  expect(toggleBox!.x).toBeLessThan(16);
+  expect(searchBox!.x).toBeGreaterThan(300);
+
+  await toggle.click();
+  const sheet = page.getByRole("dialog", { name: "Sidebar" });
+  await expect(sheet).toBeVisible();
+  const brand = sheet.locator(".berry-web-sheet-brand");
+  await expect(brand).toHaveText("Berry");
+  const brandBox = await brand.boundingBox();
+  expect(brandBox!.y + brandBox!.height).toBeLessThanOrEqual(56);
+  const closeBox = await sheet.getByRole("button", { name: "Close sidebar" }).boundingBox();
+  const sheetSearchBox = await sheet.getByRole("button", { name: "Search", exact: true }).boundingBox();
+  expect(sheetSearchBox!.x).toBeGreaterThan(brandBox!.x + brandBox!.width);
+  expect(closeBox!.x).toBeGreaterThan(sheetSearchBox!.x);
+  expect(closeBox!.y + closeBox!.height).toBeLessThanOrEqual(56);
+
+  await sheet.getByRole("button", { name: "Close sidebar" }).click();
+  await expect(sheet).toHaveCount(0);
+  await expect(toggle).toBeFocused();
+
+  await toggle.click();
+  await page.getByRole("dialog", { name: "Sidebar" }).getByRole("button", { name: "Search", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "Search Berry" })).toBeVisible();
+  await expect(page.getByPlaceholder("Search tasks and actions…")).toBeFocused();
+  await page.keyboard.press("Escape");
+
+  await openTask(page);
+  const taskToggle = page.locator(".berry-web-window-chrome").getByRole("button", { name: "Open sidebar" });
+  await expect(taskToggle).toBeVisible();
+  const taskToggleBox = await taskToggle.boundingBox();
+  const titleBox = await page.locator(".berry-task-title").boundingBox();
+  expect(taskToggleBox!.x).toBeLessThan(16);
+  expect(titleBox!.x).toBeGreaterThanOrEqual(taskToggleBox!.x + taskToggleBox!.width);
+});
+
+test("get the mobile app shows a QR code, asks for approval, and lists the phone", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
+  const entry = page.getByRole("button", { name: "Get the mobile app" });
+  const profile = page.getByRole("button", { name: "Open account" });
+  expect((await entry.boundingBox())!.y).toBeLessThan((await profile.boundingBox())!.y);
+  await entry.click();
+
+  const dialog = page.getByRole("dialog", { name: "Get the Berry app" });
+  await expect(dialog.getByRole("img", { name: "Sign-in QR code" })).toBeVisible();
+  await expect(dialog.getByText(/Code refreshes in \d:\d\d/)).toBeVisible();
+  await dialog.getByRole("button", { name: "Enter a code instead" }).click();
+  await expect(dialog.getByText(/^[0-9A-Z]{4}-[0-9A-Z]{4}$/)).toBeVisible();
+
+  // Demo mode simulates the phone scanning the code.
+  await expect(dialog.getByText("Sign in on iPhone 17 Pro?")).toBeVisible();
+  await dialog.getByRole("button", { name: "Approve" }).click();
+  await expect(dialog.getByText("Berry is signed in on iPhone 17 Pro.")).toBeVisible();
+  await dialog.getByRole("button", { name: "Manage devices" }).click();
+
+  await expect(page).toHaveURL(/\/settings\/account$/);
+  const devices = page.getByRole("list", { name: "Mobile devices" });
+  await expect(devices.getByText("iPhone 17 Pro")).toBeVisible();
+  await devices.getByRole("button", { name: "Sign out iPhone 17 Pro" }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Sign out" }).click();
+  await expect(page.getByText("No phones signed in")).toBeVisible();
+});
+
+test("a denied phone sign-in can be retried with a new code", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
+  await page.getByRole("button", { name: "Get the mobile app" }).click();
+  const dialog = page.getByRole("dialog", { name: "Get the Berry app" });
+  await dialog.getByRole("button", { name: "Deny" }).click();
+  await expect(dialog.getByText("That sign-in request was denied.")).toBeVisible();
+  await dialog.getByRole("button", { name: "Show a new code" }).click();
+  await expect(dialog.getByRole("img", { name: "Sign-in QR code" })).toBeVisible();
+});
+
+test("the phone and desktop sidebar layouts switch at the same 768px breakpoint", async ({ page }) => {
+  for (const [width, phone] of [[767, true], [768, false]] as const) {
+    await page.setViewportSize({ width, height: 1024 });
+    await page.goto("/");
+    await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
+    const chrome = page.locator(".berry-web-window-chrome");
+    if (phone) {
+      await expect(chrome.getByRole("button", { name: "Open sidebar" })).toBeVisible();
+      await expect(chrome.getByRole("button", { name: "Berry home" })).toHaveCount(0);
+      await expect(page.locator('[data-slot="sidebar"][data-state]')).toHaveCount(0);
+    } else {
+      await expect(chrome.getByRole("button", { name: "Berry home" })).toBeVisible();
+      await expect(chrome.getByRole("button", { name: "Toggle sidebar" })).toBeVisible();
+      await expect(page.locator('[data-slot="sidebar"][data-state="expanded"]')).toBeVisible();
+    }
+  }
+});
+
 test("primary shell workflows and settings are keyboard reachable", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
+  await expect(page.locator(".berry-prompt-editor")).toBeFocused();
 
   const search = page.getByRole("button", { name: "Search", exact: true });
   await search.focus();

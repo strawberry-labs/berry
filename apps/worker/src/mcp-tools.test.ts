@@ -4,6 +4,7 @@ import { McpToolSource, type McpServerSpec } from "@berry/local-agent/mcp";
 import type { ChatToolDefinition } from "@berry/router-client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DurableTurnSnapshot, DurableTurnStep, DurableTurnToolExecutor } from "./turn-runner.js";
+import type { ToolResultStore } from "./tool-result-store.js";
 import {
   boundedMcpText,
   connectorArtifactText,
@@ -467,6 +468,53 @@ describe("durable MCP tool exposure", () => {
 });
 
 describe("durable MCP journal serialization", () => {
+  it("archives before truncation and exposes complete omitted evidence through a stable read tool", async () => {
+    const text = "prefix " + "x".repeat(130_000) + " MIDDLE FACT 42 " + "y".repeat(130_000);
+    let complete = "";
+    const store: ToolResultStore = {
+      put: vi.fn(async (_scope, _stepId, value) => { complete = value; return { id: "a".repeat(64), characters: value.length, sha256: "b".repeat(64) }; }),
+      get: vi.fn(async () => complete),
+    };
+    const name = "mcp__Google_Calendar__list_events";
+    const list = McpToolSource.prototype.listTools;
+    const spy = vi.spyOn(McpToolSource.prototype, "listTools").mockImplementation(function (this: McpToolSource) {
+      return list.call(this).map((tool) => tool.name === name ? { ...tool, execute: async () => ({ content: [{ type: "text" as const, text }], details: { structuredContent: { fact: 42, values: Array.from({ length: 400 }, (_, i) => i) } } }) } : tool);
+    });
+    try {
+      const tools = new DurableMcpToolExecutor({ execute: async () => ({ output: {}, summary: "base" }) }, connectorServers(), undefined, 10_000, {}, store);
+      const snapshot = mcpSnapshot("List my Google Calendar events");
+      const definitions = await tools.definitions(snapshot);
+      const result = await tools.execute(snapshot, { id: "long-result", type: `tool.${name}`, input: { toolName: name, arguments: {} } } as unknown as DurableTurnStep);
+      const preview = (result.output as { content: string }).content;
+      expect(preview.length).toBeLessThan(18_000);
+      expect(preview).toContain("read_tool_result");
+      expect(complete).toContain("MIDDLE FACT 42");
+      expect(JSON.parse(complete).details.structuredContent.values).toHaveLength(400);
+      const recovered = await tools.execute(snapshot, { type: "tool.read_tool_result", input: { toolName: "read_tool_result", arguments: { result_id: "a".repeat(64), search: "MIDDLE FACT" } } } as unknown as DurableTurnStep);
+      expect((recovered.output as { content: string }).content).toContain("MIDDLE FACT 42");
+      expect(await tools.definitions(snapshot)).toEqual(definitions);
+      expect(definitions.map((tool) => tool.function.name)).toContain("read_tool_result");
+      await tools.close();
+    } finally { spy.mockRestore(); }
+  });
+
+  it("reports a storage failure without losing a successful connector call or inventing a recovery reference", async () => {
+    const name = "mcp__Google_Calendar__list_events";
+    const list = McpToolSource.prototype.listTools;
+    const remote = vi.fn(async () => ({ content: [{ type: "text" as const, text: "x".repeat(30_000) }], details: {} }));
+    const spy = vi.spyOn(McpToolSource.prototype, "listTools").mockImplementation(function (this: McpToolSource) {
+      return list.call(this).map((tool) => tool.name === name ? { ...tool, execute: remote } : tool);
+    });
+    try {
+      const tools = new DurableMcpToolExecutor({ execute: async () => ({ output: {}, summary: "base" }) }, connectorServers(), undefined, 10_000, {}, { put: async () => { throw new Error("unavailable"); }, get: async () => "" });
+      const result = await tools.execute(mcpSnapshot("List my Google Calendar events"), { id: "long-result", type: `tool.${name}`, input: { toolName: name, arguments: {} } } as unknown as DurableTurnStep);
+      expect((result.output as { content: string }).content).toContain("Full-result storage was unavailable");
+      expect((result.output as { content: string }).content).not.toContain("result_id=");
+      expect(remote).toHaveBeenCalledTimes(1);
+      await tools.close();
+    } finally { spy.mockRestore(); }
+  });
+
   it("says what it left out when a value exceeds the journal limits (H-070)", () => {
     const fields = Object.fromEntries(Array.from({ length: 130 }, (_, index) => [`field${index}`, index]));
     const value = sanitizeMcpJournalValue({
@@ -544,7 +592,7 @@ describe("durable MCP approval policy", () => {
     expect(policy).toMatchObject({ retryClass: "read_only", requiresApproval: false });
   });
 
-  it("does not replay billed Berry-owned reads after an ambiguous interruption", () => {
+  it("lets billed Berry-owned read failures return to the model while deduplicating success", () => {
     const policy = durableMcpToolPolicy(
       { trustReadOnlyAnnotations: true },
       {
@@ -559,9 +607,35 @@ describe("durable MCP approval policy", () => {
     );
 
     expect(policy).toMatchObject({
-      retryClass: "non_idempotent_manual",
+      retryClass: "read_only",
+      repeatPolicy: "block_after_success",
       requiresApproval: false,
     });
+  });
+
+  it.each(["untrusted", "destructive"] as const)("keeps %s billed operations subject to recovery", (kind) => {
+    const policy = durableMcpToolPolicy(
+      { trustReadOnlyAnnotations: true },
+      {
+        readOnly: true, nonReplayable: true, idempotent: false, openWorld: true,
+        ...(kind === "destructive" ? { trustedReadOnly: true as const } : {}),
+        destructive: kind === "destructive",
+      },
+      "full-access",
+    );
+    expect(policy.retryClass).toBe("non_idempotent_manual");
+  });
+
+  it("preserves explicit approval for billed read tools", () => {
+    const policy = durableMcpToolPolicy(
+      { trustReadOnlyAnnotations: true },
+      {
+        readOnly: true, trustedReadOnly: true, nonReplayable: true,
+        requiresApproval: true, destructive: false, idempotent: true, openWorld: true,
+      },
+      "default",
+    );
+    expect(policy).toMatchObject({ retryClass: "read_only", requiresApproval: true });
   });
 
   it("allows high-impact Berry-owned connector actions under full access", () => {

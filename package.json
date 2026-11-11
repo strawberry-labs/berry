@@ -57,6 +57,9 @@
       "protobufjs@^7.0.0": "7.6.5",
       "tar@^7.0.0": "7.5.22",
       "undici@^7.0.0": "7.29.0"
+    },
+    "patchedDependencies": {
+      "expo-modules-jsi@57.1.1": "patches/expo-modules-jsi@57.1.1.patch"
     }
   }
 }

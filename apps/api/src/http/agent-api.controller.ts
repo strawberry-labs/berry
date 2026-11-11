@@ -9,6 +9,7 @@ import {
   ApprovalDecisionSchema,
   AttachmentInputSchema,
   ContextStatsSchema,
+  TaskTokenUsageSchema,
   ConversationKindSchema,
   classifyWorkflowCategory,
   DURABLE_BASE_BUILT_IN_TOOLS,
@@ -23,6 +24,7 @@ import {
   PermissionModeSchema,
   PromptImprovementRequestSchema,
   ReasoningLevelSchema,
+  ScheduleTimezoneSchema,
   resolveModelCapabilities,
   safeOperationalLog,
   sealDurableSecret,
@@ -85,7 +87,6 @@ import {
 import { CONNECTORS, ConnectorsService } from "../connectors/connectors.service.ts";
 import { QueuedFollowUpService } from "../runtime/queued-follow-up.service.js";
 
-export const PROMPT_IMPROVEMENT_MODEL = "canopywave/deepseek/deepseek-v4-flash";
 
 const PROMPT_IMPROVEMENT_SYSTEM_PROMPT = `You improve a user's draft prompt for another AI assistant.
 
@@ -250,6 +251,7 @@ async function retryInlineFinalization(write: () => Promise<void>): Promise<void
 }
 
 const StartTurnRequestSchema = z.object({
+  timezone: ScheduleTimezoneSchema.optional(),
   operationId: z.string().uuid().optional(),
   input: z.string().min(1).optional(),
   messageInput: z.string().min(1).optional(),
@@ -783,9 +785,9 @@ export class AgentApiController {
     const departmentId = await this.#primaryDepartmentId(tenantId, userId);
     const runtime = await this.runtimeConfig.resolve(tenantId, {
       provider: { id: "router" },
-      model: PROMPT_IMPROVEMENT_MODEL,
     });
-    const model = runtime.provider.models?.find((candidate) => candidate.id === PROMPT_IMPROVEMENT_MODEL);
+    const improvementModel = runtime.provider.defaultModel;
+    const model = runtime.provider.models?.find((candidate) => candidate.id === improvementModel);
     if (!model) {
       throw new ServiceUnavailableException({
         code: "prompt_improvement_model_unavailable",
@@ -797,7 +799,7 @@ export class AgentApiController {
       tenantId,
       mode: "chat",
       providerId: runtime.provider.id,
-      model: PROMPT_IMPROVEMENT_MODEL,
+      model: improvementModel,
       userId,
       departmentId,
     });
@@ -822,7 +824,7 @@ export class AgentApiController {
     const estimatedOutputTokens = maxOutputTokens;
     const estimatedCostMicros = budgetEstimateFromRequest({
       provider: runtime.provider,
-      model: PROMPT_IMPROVEMENT_MODEL,
+      model: improvementModel,
       estimatedInputTokens,
       estimatedOutputTokens,
     });
@@ -835,7 +837,7 @@ export class AgentApiController {
       sessionId: null,
       feature: "prompt.improve",
       provider: runtime.provider.id,
-      model: PROMPT_IMPROVEMENT_MODEL,
+      model: improvementModel,
       estimatedCostMicros,
       estimatedTokens: estimatedInputTokens + estimatedOutputTokens,
       metadata: { promptLength: request.prompt.length },
@@ -850,14 +852,14 @@ export class AgentApiController {
         apiKey: runtime.apiKey,
         appName: "Berry Prompt Improver",
       }).complete({
-        model: PROMPT_IMPROVEMENT_MODEL,
+        model: improvementModel,
         messages: [
           { role: "system", content: PROMPT_IMPROVEMENT_SYSTEM_PROMPT },
           { role: "user", content: modelInput },
         ],
         temperature: 0.2,
         maxTokens: maxOutputTokens,
-        reasoningEffort: "minimal",
+        reasoningEffort: "low",
         signal: controller.signal,
       });
     } catch (error) {
@@ -868,8 +870,8 @@ export class AgentApiController {
           userId,
           departmentId,
           provider: runtime.provider.id,
-          model: PROMPT_IMPROVEMENT_MODEL,
-          requestedModel: PROMPT_IMPROVEMENT_MODEL,
+          model: improvementModel,
+          requestedModel: improvementModel,
           promptLength: request.prompt.length,
           resultLength: 0,
           usage: estimatedPromptImprovementUsage(0, 0),
@@ -914,7 +916,7 @@ export class AgentApiController {
         cacheWriteTokens: usage.cacheWriteTokens ?? 0,
         cacheCreationTokens1h: usage.cacheCreationTokens1h ?? 0,
         cacheCreationTokens5m: usage.cacheCreationTokens5m ?? 0,
-        requestedModel: PROMPT_IMPROVEMENT_MODEL,
+        requestedModel: improvementModel,
         model: result.model,
         servedProvider: result.attribution?.servedProvider ?? runtime.provider.id,
         servedModel: result.attribution?.servedModel ?? result.model,
@@ -939,7 +941,7 @@ export class AgentApiController {
           departmentId,
           provider: usageEvent.servedProvider ?? runtime.provider.id,
           model: usageEvent.servedModel ?? result.model,
-          requestedModel: PROMPT_IMPROVEMENT_MODEL,
+          requestedModel: improvementModel,
           promptLength: request.prompt.length,
           resultLength,
           usage,
@@ -963,7 +965,7 @@ export class AgentApiController {
       throw error;
     }
     await recordResultUsage("completed", improvedPrompt.length);
-    return { prompt: improvedPrompt, model: PROMPT_IMPROVEMENT_MODEL };
+    return { prompt: improvedPrompt, model: improvementModel };
   }
 
   @Post("/images/generations")
@@ -1109,24 +1111,14 @@ export class AgentApiController {
     });
     await this.modelGovernance.synchronizeRuntimeCatalog(tenantId, runtime.provider);
     const departmentId = await this.#primaryDepartmentId(tenantId, userId);
-    let modelDecision = await this.modelGovernance.resolve({
+    const modelDecision = await this.modelGovernance.resolveTaskModel({
       tenantId,
       mode,
       providerId: explicitModel ? requestedProviderId ?? runtime.provider.id : null,
       model: explicitModel,
       userId,
       departmentId,
-    });
-    if (!explicitModel && modelDecision.reason === "no_model_selected") {
-      modelDecision = await this.modelGovernance.resolve({
-        tenantId,
-        mode,
-        providerId: runtime.provider.id,
-        model: runtime.provider.defaultModel,
-        userId,
-        departmentId,
-      });
-    }
+    }, runtime.provider);
     if (!modelDecision.allowed) {
       throw new ForbiddenException({
         code: "model_governance_blocked",
@@ -1487,6 +1479,12 @@ export class AgentApiController {
     });
   }
 
+  @Get("/sessions/:sessionId/task-token-usage")
+  async taskTokenUsage(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string) {
+    const { task } = await this.ownedSession(httpRequest, sessionId);
+    return TaskTokenUsageSchema.parse(await this.usageRepository.taskTokenUsage(tenantIdFromRequest(httpRequest), task.id));
+  }
+
   @Post("/sessions/:sessionId/messages")
   async appendMessage(@Req() request: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Body() body: unknown) {
     await this.ownedSession(request, sessionId);
@@ -1678,14 +1676,14 @@ export class AgentApiController {
     ]);
     await this.modelGovernance.synchronizeRuntimeCatalog(tenantId, baseRuntime.provider);
     const mode = "chat" as const;
-    const modelDecision = await this.modelGovernance.resolve({
+    const modelDecision = await this.modelGovernance.resolveTaskModel({
       tenantId,
       mode,
       providerId: selectedProviderId ?? null,
       model: selectedModel ?? null,
       userId,
       departmentId,
-    });
+    }, baseRuntime.provider);
     if (!modelDecision.allowed) {
       throw new ForbiddenException({
         code: "model_governance_blocked",
@@ -1989,6 +1987,7 @@ export class AgentApiController {
         });
         const runtimeRequest = DurableTurnRuntimeRequestSchema.parse({
           capabilityVersion: 1,
+          ...(request.timezone ? { timezone: request.timezone } : {}),
           admissionFingerprint: operationFingerprint,
           ...(request.intent ? { intent: request.intent } : {}),
           providerId,

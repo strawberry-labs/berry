@@ -1,5 +1,6 @@
 import * as React from "react";
 import type { ManagementScreenProps } from "./management-context";
+import { ManagementScreenFallback } from "./management-screen-skeletons";
 
 const PlatformRolloutScreen = React.lazy(async () => ({
   default: (await import("./platform-rollout-screen")).PlatformRolloutScreen,
@@ -17,17 +18,7 @@ const PlatformBillingOperationsScreen = React.lazy(async () => ({
   default: (await import("./platform-billing-operations-screen")).PlatformBillingOperationsScreen,
 }));
 
-function PlatformScreenFallback() {
-  return (
-    <div
-      className="flex min-h-24 items-center justify-center text-sm text-muted-foreground"
-      role="status"
-      aria-live="polite"
-    >
-      Loading platform section…
-    </div>
-  );
-}
+const PLATFORM_TABS = new Set(["overview", "organizations", "feature-rollout", "router-health", "billing-operations"]);
 
 export function PlatformScreen({
   tab,
@@ -40,5 +31,5 @@ export function PlatformScreen({
   else if (tab === "router-health") screen = <PlatformRouterHealthScreen {...props} />;
   else if (tab === "billing-operations") screen = <PlatformBillingOperationsScreen {...props} />;
   else screen = <PlatformBillingOperationsScreen {...props} />;
-  return <React.Suspense fallback={<PlatformScreenFallback />}>{screen}</React.Suspense>;
+  return <React.Suspense fallback={<ManagementScreenFallback area="platform" tab={PLATFORM_TABS.has(tab) ? tab : "billing-operations"} />}>{screen}</React.Suspense>;
 }

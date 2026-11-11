@@ -135,8 +135,22 @@ export class ModelGovernanceService {
     }
 
     const runtimeModelIds = new Set(runtimeModels.map((model) => model.id));
-    const staleAlias = policiesByModel.get("berry/auto");
-    if (!runtimeModelIds.has("berry/auto") && staleAlias) {
+    const runtimeDefault = runtimeModelIds.has(provider.defaultModel)
+      ? provider.defaultModel
+      : runtimeModels[0]!.id;
+    const replacements = new Map<string, string>();
+    if (!runtimeModelIds.has("berry/auto")) replacements.set("berry/auto", runtimeDefault);
+    // Retire this route only after its replacement is deployed. Other models
+    // and administrator-selected defaults keep their existing policy.
+    const previousDeepSeek = "canopywave/deepseek/deepseek-v4-flash";
+    const nextDeepSeek = "canopywave/deepseek/deepseek-v4.1-flash";
+    if (!runtimeModelIds.has(previousDeepSeek) && runtimeModelIds.has(nextDeepSeek)) {
+      replacements.set(previousDeepSeek, nextDeepSeek);
+    }
+
+    for (const [retiredModel, replacementModel] of replacements) {
+      const staleAlias = policiesByModel.get(retiredModel);
+      if (!staleAlias) continue;
       const desired = {
         tenantId,
         providerId: provider.id,
@@ -152,6 +166,7 @@ export class ModelGovernanceService {
           ...jsonObject(staleAlias.metadata),
           source: "runtime-catalog",
           retiredReason: "not-in-runtime-catalog",
+          replacementModel,
         },
       };
       if (!runtimePolicyMatches(staleAlias, desired)) {
@@ -159,17 +174,15 @@ export class ModelGovernanceService {
       }
     }
 
-    if (runtimeModelIds.has("berry/auto")) return;
-    const runtimeDefault = runtimeModelIds.has(provider.defaultModel)
-      ? provider.defaultModel
-      : runtimeModels[0]!.id;
     for (const modelDefault of defaults) {
-      if (modelDefault.providerId !== provider.id || modelDefault.model !== "berry/auto") continue;
+      if (modelDefault.providerId !== provider.id) continue;
+      const replacementModel = replacements.get(modelDefault.model);
+      if (!replacementModel) continue;
       await this.upsertDefault({
         tenantId,
         mode: modelDefault.mode,
         providerId: provider.id,
-        model: runtimeDefault,
+        model: replacementModel,
         enforce: modelDefault.enforce,
       });
     }
@@ -317,6 +330,52 @@ export class ModelGovernanceService {
     if (!policy && enforcedAllowList) return decision(input, providerId, model, false, true, "not_in_enforced_allowlist", null, modeDefault, null);
 
     return this.#resolveAccess(input, providerId, model, policy, modeDefault);
+  }
+
+  /**
+   * Saved task and browser selections can outlive an enabled model. Resolve
+   * their replacement against the current runtime catalog and the same access
+   * rules as an explicit selection; never re-enable the retired model.
+   */
+  async resolveTaskModel(
+    input: Parameters<ModelGovernanceService["resolve"]>[0],
+    provider: BerryModelProviderInfo,
+  ): Promise<ModelGovernanceDecision> {
+    const selected = await this.resolve(input);
+    const available = provider.models
+      ? new Set(provider.models.map((model) => model.id))
+      : null;
+    const isAvailable = (model: string): boolean => available === null || available.has(model);
+    if (selected.allowed && (selected.providerId !== provider.id || isAvailable(selected.model))) {
+      return selected;
+    }
+    // Legacy non-chat callers still have to honor an enforced mode default.
+    if (selected.reason === "mode_default_enforced") return selected;
+
+    const unavailable = selected.allowed
+      ? { ...selected, allowed: false, reason: "model_unavailable" }
+      : selected;
+    const candidates = new Set([
+      ...(selected.default?.providerId === provider.id ? [selected.default.model] : []),
+      provider.defaultModel,
+      ...(provider.models?.map((model) => model.id)
+        ?? (await this.repository.listPolicies(input.tenantId))
+          .filter((policy) => policy.providerId === provider.id && policy.status === "allowed")
+          .sort(comparePolicy)
+          .map((policy) => policy.model)),
+    ]);
+    for (const model of candidates) {
+      if (!model || !isAvailable(model)) continue;
+      if (selected.providerId === provider.id && selected.model === model) continue;
+      const replacement = await this.resolve({ ...input, providerId: provider.id, model });
+      if (!replacement.allowed) continue;
+      return {
+        ...replacement,
+        requestedProviderId: input.providerId ?? null,
+        requestedModel: input.model ?? null,
+      };
+    }
+    return unavailable;
   }
 
   async #resolveAccess(

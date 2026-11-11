@@ -423,8 +423,7 @@ function configFromEnv(env: NodeJS.ProcessEnv) {
     llmApiKey,
     llmModel: env.BERRY_MEM0_LLM_MODEL?.trim()
       || env.BERRY_MEMORY_MODEL?.trim()
-      || env.BERRY_ROUTER_DEFAULT_MODEL?.trim()
-      || "gpt-5-mini",
+      || "inference-net/deepseek-v4.1-flash-1017",
     embeddingBaseUrl: env.BERRY_MEM0_EMBEDDING_BASE_URL?.trim()
       || env.BERRY_EMBEDDING_BASE_URL?.trim()
       || env.BERRY_ROUTER_INFERENCE_BASE_URL?.trim()

@@ -1,6 +1,5 @@
 module.exports = function berryMobileBabel(api) {
   api.cache(true);
-  return {
-    presets: [["babel-preset-expo", { jsxImportSource: "nativewind" }], "nativewind/babel"]
-  };
+  // babel-preset-expo adds the Reanimated/Worklets plugin automatically.
+  return { presets: ["babel-preset-expo"] };
 };

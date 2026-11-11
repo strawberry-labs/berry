@@ -1,3 +1,4 @@
+import { DurableScheduledTaskToolExecutor } from "./schedules/tools.ts";
 import { lookup } from "node:dns/promises";
 import { hostname, networkInterfaces } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -147,12 +148,13 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
   });
   const compactor = new DurableSessionCompactor(
     new SqlSessionCompactionRepository(executor),
-    createCheckpointGenerator(env),
+    null,
     {
       leaseOwner: `${hostname()}:${process.pid}:${randomUUID()}:compactor`,
       leaseSeconds: durableConfig.runLeaseSeconds,
-      fallbackProvider: env.BERRY_COMPACTION_PROVIDER ?? "deterministic",
-      fallbackModel: env.BERRY_COMPACTION_MODEL ?? "checkpoint-v2",
+      generatorForModel: (selection) => createCheckpointGenerator(env, selection),
+      fallbackProvider: env.BERRY_ROUTER_PROVIDER_ID?.trim() || "router",
+      fallbackModel: env.BERRY_ROUTER_DEFAULT_MODEL?.trim() || "inference-net/deepseek-v4.1-flash-1017",
     },
   );
   const personalMemory = createPersonalMemoryProviderFromEnv(env);
@@ -169,7 +171,8 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
     durableConfig.memoryEnabled,
   );
   const personalSkillTools = new DurablePersonalSkillToolExecutor(memoryTools, executor);
-  const durableTools = createDurableTurnToolsFromEnv(env, personalSkillTools);
+  const scheduledTaskTools = new DurableScheduledTaskToolExecutor(personalSkillTools, executor);
+  const durableTools = createDurableTurnToolsFromEnv(env, scheduledTaskTools);
   const fileDeleter = S3FileObjectDeleter.fromEnv(env, new SqlFileDeletionReceiptStore(executor));
   const fileBlobs = SqlFileBlobProcessor.fromEnv(env, executor);
   const dependencies: Parameters<typeof createBerryWorker>[0] = {

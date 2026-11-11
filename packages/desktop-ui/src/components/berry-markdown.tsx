@@ -6,7 +6,7 @@ import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { copyText } from "@berry/desktop-ui/lib/copy-text";
-import { directedLines, markdownDirection, rehypeTextDirection, type ScriptWords } from "@berry/desktop-ui/lib/text-direction";
+import { directedLines, markdownDirection, rehypeTextDirection } from "@berry/desktop-ui/lib/text-direction";
 import type { BundledLanguage, BundledTheme, ThemedToken } from "shiki";
 import type { HighlightResponse } from "./berry-markdown-highlight.worker";
 
@@ -83,6 +83,34 @@ function useWordReveal(text: string, streaming: boolean): string {
 
   const current = stateRef.current;
   return current.visible >= current.units.length ? current.content : current.units.slice(0, current.visible).join("");
+}
+
+/** Coalesce parser work, without postponing every update until the stream stops. */
+function useMarkdownSource(source: string, streaming: boolean): string {
+  const [parsed, setParsed] = React.useState(source);
+  const latest = React.useRef(source);
+  latest.current = source;
+  const timer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  React.useEffect(() => {
+    if (!streaming) {
+      if (timer.current !== null) globalThis.clearTimeout(timer.current);
+      timer.current = null;
+      if (parsed !== source) setParsed(source);
+      return;
+    }
+    if (parsed === source || timer.current !== null) return;
+    // Longer answers get more time between parses; highlighting remains idle work.
+    const interval = Math.min(240, Math.max(64, Math.ceil(source.length / 500)));
+    timer.current = globalThis.setTimeout(() => {
+      timer.current = null;
+      React.startTransition(() => setParsed(latest.current));
+    }, interval);
+  }, [source, streaming, parsed]);
+  React.useEffect(() => () => {
+    if (timer.current !== null) globalThis.clearTimeout(timer.current);
+  }, []);
+  // Settling and non-prefix replacements must never show stale content.
+  return !streaming || !source.startsWith(parsed) ? source : parsed;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -189,40 +217,25 @@ export const Markdown = memo(function Markdown({
 }: {
   children: string;
   className?: string;
-  /** Live decode: reveal streamed words with Berry's catch-up lag on a cheap
-   * accessible text surface; full Markdown parsing resumes after settling. */
+  /** Live decode: formatted Markdown with coalesced parser updates. */
   streaming?: boolean;
 }) {
-  const settings = useCodePreviewSettings();
   const revealed = useWordReveal(children, streaming);
-  const source = revealed;
+  const source = useMarkdownSource(revealed, streaming);
+  return <MarkdownBody source={source} className={className} streaming={streaming} />;
+});
+
+// Reveal ticks do not reparse unchanged text. Settled messages also retain their
+// memo boundary while another message is receiving tokens.
+const MarkdownBody = memo(function MarkdownBody({ source, className, streaming }: {
+  source: string; className: string | undefined; streaming: boolean;
+}) {
+  const settings = useCodePreviewSettings();
   // Mixed Arabic/English text needs an explicit direction per block (H-047).
-  const [lineWords] = React.useState(() => new Map<string, ScriptWords>());
-  const direction = React.useMemo(() => (streaming ? null : markdownDirection(source)), [source, streaming]);
-  if (streaming) {
-    // Markdown parsing and syntax highlighting are deliberately deferred until
-    // the response settles. A plain, accessible live surface keeps token
-    // updates cheap while the final render still uses the full GFM/KaTeX path.
-    const live = directedLines(source, lineWords);
-    return (
-      <div
-        data-markdown-live="true"
-        dir={live.direction}
-        className={cn(
-          "font-sans min-w-0 whitespace-pre-wrap text-[13px] leading-[1.75] tracking-wide wrap-break-word",
-          className,
-        )}
-      >
-        {live.lines.map((line, index) => (
-          <div key={index} data-markdown-line="" dir={line.dir}>
-            {line.text || "\n"}
-          </div>
-        ))}
-      </div>
-    );
-  }
+  const direction = React.useMemo(() => markdownDirection(source), [source]);
   return (
     <div
+      {...(streaming ? { "data-markdown-live": "true" } : {})}
       dir={direction ?? undefined}
       className={cn(
         // Berry AP prose: 13px, 1.75 leading, wide tracking, trimmed ends.
@@ -445,7 +458,7 @@ export function scheduleIdleWork(work: () => void, timeout = 500): () => void {
   };
 }
 
-function useHighlightedCode(code: string, language: string, theme: string): HighlightedCode {
+function useHighlightedCode(code: string, language: string, theme: string, enabled = true): HighlightedCode {
   const lines = React.useMemo(() => code.split("\n"), [code]);
   const cacheKey = React.useMemo(() => `${theme}\0${language}\0${code}`, [code, language, theme]);
   const [highlighted, setHighlighted] = React.useState<HighlightedCode>(() => {
@@ -453,6 +466,7 @@ function useHighlightedCode(code: string, language: string, theme: string): High
   });
 
   React.useEffect(() => {
+    if (!enabled) return;
     const cached = HIGHLIGHT_CACHE.get(cacheKey);
     if (cached) {
       setHighlighted(cached);
@@ -534,7 +548,7 @@ function useHighlightedCode(code: string, language: string, theme: string): High
       worker?.terminate();
       worker = null;
     };
-  }, [cacheKey, code, language, lines, theme]);
+  }, [cacheKey, code, language, lines, theme, enabled]);
 
   return highlighted;
 }
@@ -556,7 +570,7 @@ function CodeBlock({
   streaming?: boolean;
 }) {
   const language = /language-([\w-]+)/.exec(className ?? "")?.[1]?.toLowerCase() ?? "text";
-  const highlighted = useHighlightedCode(code, language, settings.theme);
+  const highlighted = useHighlightedCode(code, language, settings.theme, !streaming);
   return (
     <div
       dir="ltr"

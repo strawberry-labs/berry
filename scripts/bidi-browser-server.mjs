@@ -51,6 +51,7 @@ const USER_PROMPT = "اكتب ملخصاً قصيراً عن منصة Berry وك
 const tasks = [
   { id: "00000000-0000-7000-8000-0000000000c1", sessionId: "00000000-0000-7000-8000-0000000000d1", title: "Arabic summary", answer: SETTLED_ANSWER, streaming: false },
   { id: "00000000-0000-7000-8000-0000000000c2", sessionId: "00000000-0000-7000-8000-0000000000d2", title: "Arabic summary (streaming)", answer: STREAMING_ANSWER, streaming: true },
+  { id: "00000000-0000-7000-8000-0000000000c3", sessionId: "00000000-0000-7000-8000-0000000000d3", title: "Markdown while streaming", answer: "## Live formatted answer\n\nThis is **bold** with [a source](https://example.com).\n\n- First item\n- Second item\n\n| Model | Speed |\n| --- | --- |\n| DeepSeek | Fast |\n\nMath: $E = mc^2$.\n\n```ts\nconst total = 42;", streaming: true },
 ];
 
 const taskRecord = (task) => ({

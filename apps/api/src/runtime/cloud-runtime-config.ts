@@ -199,6 +199,8 @@ export class CloudRuntimeConfigService {
     const stream = input.stream === true && Boolean(onPartial);
     const referenceImageUrls = input.referenceImageUrls?.filter(Boolean).slice(0, 16) ?? [];
     const endpoint = referenceImageUrls.length > 0 ? image.editsEndpoint : image.endpoint;
+    const imageHost = new URL(endpoint).hostname;
+    const usesOpenRouterImageApi = imageHost === "openrouter.ai" || imageHost.endsWith(".openrouter.ai");
     const upstreamModel = image.model.split("/").at(-1) ?? image.model;
     const isGptImageModel = upstreamModel.startsWith("gpt-image-");
     const isGptImage2Model = upstreamModel.startsWith("gpt-image-2");
@@ -206,10 +208,12 @@ export class CloudRuntimeConfigService {
       model: image.model,
       prompt: input.prompt,
       ...(referenceImageUrls.length > 0
-        ? {
-            images: referenceImageUrls.map((imageUrl) => ({ image_url: imageUrl })),
-            ...(!isGptImage2Model ? { input_fidelity: "high" } : {}),
-          }
+        ? usesOpenRouterImageApi
+          ? { input_references: referenceImageUrls.map((url) => ({ type: "image_url", image_url: { url } })) }
+          : {
+              images: referenceImageUrls.map((imageUrl) => ({ image_url: imageUrl })),
+              ...(!isGptImage2Model ? { input_fidelity: "high" } : {}),
+            }
         : {}),
       n: 1,
       size,

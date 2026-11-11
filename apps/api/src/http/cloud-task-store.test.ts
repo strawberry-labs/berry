@@ -196,7 +196,12 @@ describe("cloud message history pagination", () => {
           return [{ id: sessionId, task_id: "00000000-0000-7000-8000-000000000012", parent_session_id: null, status: "active", model_provider_id: null, model: null, permission_mode: "full-access", created_at: new Date(), updated_at: new Date() }] as T[];
         }
         if (sql.includes("FROM messages") && sql.includes("LIMIT")) {
-          return [{ id: messageId, session_id: sessionId, sequence_id: "7", role: "user", status: "complete", input_tokens: 0, output_tokens: 0, generation_ms: 0, created_at: new Date(), updated_at: new Date() }] as T[];
+          return [{ id: messageId, session_id: sessionId, sequence_id: "7", role: "assistant", status: "complete", input_tokens: 0, output_tokens: 0, generation_ms: 0, created_at: new Date(), updated_at: new Date() }] as T[];
+        }
+        if (sql.includes("FROM turn_runs r")) {
+          expect(sql).toContain("r.tenant_id = $1::uuid AND r.session_id = ANY($2::uuid[])");
+          expect(sql).toContain("s.session_entry_id = ANY($3::text[])");
+          return [{ message_id: messageId, diagnostics: { latencyMs: 7_000, firstTokenMs: 5_000, decodeMs: 2_000, decodeTokens: 200 } }] as T[];
         }
         if (sql.includes("FROM message_parts")) {
           return [{ id: "00000000-0000-7000-8000-000000000013", message_id: messageId, type: "text", content: "batched", ordinal: 0, created_at: new Date() }] as T[];
@@ -212,6 +217,8 @@ describe("cloud message history pagination", () => {
 
     const page = await store.listMessagePage(sessionId, { limit: 1 });
     expect(page.messages[0]?.parts[0]?.content).toBe("batched");
+    expect(page.messages[0]?.modelTiming).toEqual({ requestMs: 7_000, firstTokenMs: 5_000, decodeMs: 2_000, decodeTokens: 200 });
+    expect(calls.filter((sql) => sql.includes("FROM turn_runs r"))).toHaveLength(1);
     expect(calls.some((sql) => sql.includes("FOR SHARE"))).toBe(true);
     expect(calls.some((sql) => sql.includes("ANY($2::uuid[])"))).toBe(true);
     expect(page.historyRevision).toBe("9");

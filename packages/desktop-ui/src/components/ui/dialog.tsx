@@ -56,6 +56,7 @@ function DialogContent({
   children,
   showCloseButton = true,
   container,
+  onPointerDownOutside,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean
@@ -68,11 +69,29 @@ function DialogContent({
    */
   container?: HTMLElement | null
 }) {
+  // Whether a menu, select or popover was open when the current press began.
+  // Pressing that menu's own trigger to close it dismisses the menu first,
+  // which leaves the dialog on top for the same press; without this the
+  // dialog closed as well.
+  const popupOpenAtPress = React.useRef(false)
+  React.useEffect(() => {
+    const record = () => {
+      popupOpenAtPress.current = Boolean(
+        document.querySelector("[data-radix-popper-content-wrapper]")
+      )
+    }
+    document.addEventListener("pointerdown", record, true)
+    return () => document.removeEventListener("pointerdown", record, true)
+  }, [])
   return (
     <DialogPortal data-slot="dialog-portal" container={container}>
       <DialogOverlay absolute={Boolean(container)} />
       <DialogPrimitive.Content
         data-slot="dialog-content"
+        onPointerDownOutside={(event) => {
+          if (popupOpenAtPress.current) event.preventDefault()
+          onPointerDownOutside?.(event)
+        }}
         className={cn(
           "top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-lg border bg-background p-6 shadow-lg duration-[var(--duration-fast)] outline-none data-[state=closed]:animate-out data-[state=closed]:duration-[var(--duration-quick)] data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=open]:animate-in data-[state=open]:duration-[var(--duration-fast)] data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95 sm:max-w-lg",
           container ? "absolute" : "fixed",

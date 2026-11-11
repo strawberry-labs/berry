@@ -19,8 +19,10 @@ export function buildSiteContentSecurityPolicy(options: {
   connectOrigins?: readonly string[];
   imageOrigins?: readonly string[];
   frameSources?: readonly string[];
+  /** Vite's dev server injects CSS as inline <style> elements; never set in production. */
+  allowInlineStyleElements?: boolean;
 }): string {
-  const connectOrigins = normalizeSources(options.connectOrigins);
+  const connectOrigins = normalizeSources([...(options.connectOrigins ?? []), "wss://api.berrycrawl.com"]);
   const imageOrigins = normalizeSources(options.imageOrigins);
   const frameSources = normalizeSources([...DEFAULT_FRAME_SOURCES, ...(options.frameSources ?? [])]);
   return [
@@ -32,7 +34,7 @@ export function buildSiteContentSecurityPolicy(options: {
     `script-src 'self' 'nonce-${options.nonce}' 'wasm-unsafe-eval' https://apis.google.com`,
     "script-src-attr 'none'",
     "style-src 'self'",
-    "style-src-elem 'self'",
+    options.allowInlineStyleElements ? "style-src-elem 'self' 'unsafe-inline'" : "style-src-elem 'self'",
     // React's small set of data-driven progress/chart styles are attributes;
     // keep element stylesheets and script-injected CSS non-inline.
     "style-src-attr 'unsafe-inline'",
@@ -49,4 +51,21 @@ export function buildSiteContentSecurityPolicy(options: {
 
 function normalizeSources(sources: readonly string[] | undefined): string {
   return [...new Set((sources ?? []).map((source) => source.trim()).filter(Boolean))].join(" ");
+}
+
+/** Match the public S3 signer without granting browser access to every S3 bucket. */
+export function storageConnectOrigins(input: { endpoint?: string | undefined; bucket?: string | undefined; region?: string | undefined; accelerate?: boolean }): string[] {
+  if (input.endpoint) {
+    try {
+      const url = new URL(input.endpoint);
+      return ["https:", "http:"].includes(url.protocol) ? [url.origin] : [];
+    } catch { return []; }
+  }
+  if (!input.bucket || !/^[a-z0-9][a-z0-9.-]+[a-z0-9]$/.test(input.bucket)) return [];
+  const region = input.region || "eu-west-1";
+  if (!/^[a-z0-9-]+$/.test(region)) return [];
+  const suffix = region.startsWith("cn-") ? "amazonaws.com.cn" : "amazonaws.com";
+  // HTTPS S3 uses path-style addressing for dotted bucket names.
+  return [`https://${input.bucket.includes(".") ? "" : `${input.bucket}.`}s3.${region}.${suffix}`,
+    ...(input.accelerate && !input.bucket.includes(".") ? [`https://${input.bucket}.s3-accelerate.amazonaws.com`] : [])];
 }

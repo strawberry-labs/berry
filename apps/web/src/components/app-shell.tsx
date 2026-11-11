@@ -1,8 +1,11 @@
+import { BrowserControl } from "./tasks/browser-control";
+import { CanvasFileDropZone } from "./tasks/canvas-file-drop";
 import * as React from "react";
+import { useQuery } from "@tanstack/react-query";
 import { ArrowUp, CreditCard, Plus, Settings, Square, X } from "lucide-react";
-import { BerryApiClient, BerryApiError, type CreateTaskRequest, type ImageGenerationCapabilityStatus, type StartTurnRequest } from "@berry/api-client";
+import { BerryApiClient, BerryApiError, type BerryEventStream, type CreateTaskRequest, type ImageGenerationCapabilityStatus, type StartTurnRequest } from "@berry/api-client";
 import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
-import { IMAGE_ASPECT_RATIO_DIMENSIONS, MessageAttachmentContentSchema, PersonalizationProfileSchema, messageAttachmentContent, resolveModelCapabilities, type AllowanceBalance, type AttachmentInput, type ImageAspectRatio, type Message, type MessageHistoryPage, type MessagePart, type OrgMembership, type OrgPermission, type PermissionMode, type PersonalizationProfile, type ReasoningLevel, type Task, type TurnIntent, type TurnState, type Workspace } from "@berry/shared";
+import { IMAGE_ASPECT_RATIO_DIMENSIONS, MessageAttachmentContentSchema, PersonalizationProfileSchema, messageAttachmentContent, resolveModelCapabilities, type AttachmentInput, type ImageAspectRatio, type Message, type MessageHistoryPage, type MessagePart, type OrgMembership, type OrgPermission, type PermissionMode, type PersonalizationProfile, type ReasoningLevel, type Task, type TurnIntent, type TurnState, type Workspace } from "@berry/shared";
 import { toast } from "sonner";
 import { BerryShellFrame } from "@berry/desktop-ui/components/berry-shell";
 import { BerryTaskHeaderFrame } from "@berry/desktop-ui/components/berry-task-header";
@@ -29,9 +32,11 @@ import {
 import { FileSearch as FileSearchIcon } from "lucide-react";
 import { AtSign, Brain, Check, CircleHelp, ChevronDown, Ellipsis, FileText, GitBranch, Hand, Hash, ImagePlus, NotebookPen, PencilLine, Pin, PinOff, ShieldCheck, SlashSquare, Zap } from "@berry/desktop-ui/lib/icons";
 import { fixtureMessages, message } from "@/lib/fixtures";
+import { startDemoLiveTurn } from "@/lib/demo-live-turn";
 import { confirmOptimisticMessage, OPTIMISTIC_MESSAGE_ID_PREFIX, reconcileDurableEventCursor, reconcileFetchedSessionMessages, type DurableEventSequences } from "@/lib/message-reconciliation";
 import { useModelCatalog } from "@/lib/model-catalog";
 import { WebConfigSchema } from "@/lib/config";
+import { createLazyDemoManagementClient } from "@/lib/demo-management-client.lazy";
 import type { ShellData } from "@/lib/shell-data";
 import { parseCloudShellLocation, type ArtifactLibraryTab, type UserSettingsTab } from "@/lib/cloud-shell-state";
 import { MentionMenu, useStaticMentions } from "./mention-menu";
@@ -41,7 +46,7 @@ import { DeploymentBrandLogo } from "./shell/deployment-brand";
 import { ProjectSwitcher } from "./projects/project-switcher";
 import { applyDocumentTheme, watchSystemTheme } from "@/lib/theme";
 import { ManagementRouteProvider } from "./management/management-route-context";
-import { armCompletionSound, notifyBackgroundProgress, notifyTaskCompleted } from "@/lib/task-notifications";
+import { armCompletionSound, notifyBackgroundProgress, notifyBrowserNeedsHelp, notifyTaskCompleted } from "@/lib/task-notifications";
 import { assertImagePreviewBounds } from "./library/image-preview-bounds";
 import { PREVIEW_LIMITS } from "./library/file-preview-policy";
 import { readResponseBytes } from "./library/preview-stream";
@@ -74,7 +79,7 @@ function generatedImageExtension(mediaType: string): string {
   return "png";
 }
 
-import { WebSidebar, WebWindowChrome, taskHasUnreadActivity, taskIsInProgress, type SettingsTab } from "./shell/web-sidebar";
+import { SupportViewFallback, WebSidebar, WebWindowChrome, taskHasUnreadActivity, taskIsInProgress, type SettingsTab } from "./shell/web-sidebar";
 import type { ManagementKind } from "./management/management-navigation";
 import { WebCommandPalette } from "./shell/web-command-palette";
 import { WebHelpMenu } from "./shell/web-help-menu";
@@ -90,7 +95,12 @@ import {
   type QueuedFollowUp,
 } from "@/lib/queued-follow-ups";
 import { sessionStreamStore } from "@/lib/session-stream-store";
-import { readSupportView, stopSupportView, SUPPORT_VIEW_EVENT, SUPPORT_VIEW_STORAGE_KEY, type SupportViewSubject } from "@/lib/support-view";
+import { readSupportView, stopSupportView, SUPPORT_VIEW_EVENT, SUPPORT_VIEW_STORAGE_KEY, SUPPORT_VIEW_SETTINGS_TABS, type SupportViewSubject } from "@/lib/support-view";
+import { mobilePairingApi } from "@/lib/mobile-pairing";
+import { shouldUpdateDurableStateForEvent, mergeMessagePage, mergeRefreshedMessagePage, historyRevisionChanged, historyDeletionRevisionChanged, isLegacyMessageHistoryPage, replayDurableStreamState, reduceDurableTurnState, reconcileAcceptedTurnState, durableTurnPhase, mergeTaskSnapshots, greetingForHour, greetingForDate } from "@berry/client-core/thread-history";
+
+// Shared with the native app; re-exported for existing importers and tests.
+export { shouldUpdateDurableStateForEvent, mergeMessagePage, mergeRefreshedMessagePage, historyRevisionChanged, historyDeletionRevisionChanged, isLegacyMessageHistoryPage, replayDurableStreamState, reduceDurableTurnState, reconcileAcceptedTurnState, durableTurnPhase, mergeTaskSnapshots, greetingForHour, greetingForDate };
 
 const ArtifactLibrary = React.lazy(async () => ({
   default: (await import("./library/artifact-library")).ArtifactLibrary,
@@ -110,18 +120,11 @@ const TaskRouteState = React.lazy(async () => ({
 const MessageHistoryBenchmark = React.lazy(async () => ({
   default: (await import("./message-history-benchmark")).MessageHistoryBenchmark,
 }));
+const MobileAppDialog = React.lazy(async () => ({
+  default: (await import("./shell/mobile-app-dialog")).MobileAppDialog,
+}));
 
 type StreamEvent = Parameters<typeof reduceStream>[1];
-
-/** Durable run metadata changes at lifecycle/tool boundaries, not per token or
- * progressive tool/image output. Those high-frequency payloads belong only in
- * the per-session stream store; updating shell state for them would wake the
- * navigation, management, and dialog trees. */
-export function shouldUpdateDurableStateForEvent(event: StreamEvent): boolean {
-  return event.kind !== "message.delta"
-    && event.kind !== "tool.update"
-    && event.kind !== "image.partial";
-}
 
 export function shouldMountTaskSurface(surface: "task" | "settings" | "library"): boolean {
   return surface === "task";
@@ -180,190 +183,6 @@ export async function findPersistedMessagesByIds(
   return results.map(({ messageId, message }) => message ?? byId.get(messageId));
 }
 
-export function mergeMessagePage(
-  current: Message[],
-  incoming: Message[],
-  direction: "replace" | "prepend" | "append",
-): Message[] {
-  const ordered = direction === "prepend" ? [...incoming, ...current] : direction === "append" ? [...current, ...incoming] : incoming;
-  const byId = new Map<string, Message>();
-  // Keep the server copy for duplicate IDs. This matters when a settled page
-  // overlaps an optimistic/stream projection while older rows are prepended.
-  for (const message of direction === "prepend" ? [...current, ...incoming] : ordered) byId.set(message.id, message);
-  const seen = new Set<string>();
-  return ordered.filter((message) => {
-    if (seen.has(message.id)) return false;
-    if (byId.get(message.id) !== message) return false;
-    seen.add(message.id);
-    return true;
-  });
-}
-
-/**
- * Replace the bounded newest page without discarding older pages already
- * materialized in the shell. The first overlap identifies the retained prefix;
- * a zero-row server page is authoritative and drops every settled row except
- * still-pending optimistic submissions.
- */
-export function mergeRefreshedMessagePage(
-  current: Message[],
-  serverMessages: Message[],
-  reconciledMessages: Message[],
-  options: { preserveNoOverlap?: boolean } = {},
-): Message[] {
-  if (serverMessages.length === 0) return reconciledMessages;
-  const serverIds = new Set(serverMessages.map((message) => message.id));
-  const firstOverlap = current.findIndex((message) => serverIds.has(message.id));
-  // A page with no overlap is normally a new bounded snapshot (for example
-  // after an external truncate). Revisit loads can also legitimately have no
-  // overlap when a large append moved the newest window past the cached tail;
-  // callers opt into retaining that known cached prefix for that case.
-  const retainedPrefix = firstOverlap < 0
-    ? (options.preserveNoOverlap ? current : [])
-    : current.slice(0, firstOverlap);
-  return mergeMessagePage(retainedPrefix, reconciledMessages, "append");
-}
-
-export function historyRevisionChanged(previous: string | null, next: string | null): boolean {
-  return previous !== next;
-}
-
-export function historyDeletionRevisionChanged(previous: string | null, next: string | null): boolean {
-  return previous !== next;
-}
-
-/**
- * Older API instances return the original unbounded message array. The API
- * client wraps it as a page with no sequence metadata; it must be treated as
- * a complete compatibility snapshot, never as an after-cursor delta.
- */
-export function isLegacyMessageHistoryPage(page: MessageHistoryPage): boolean {
-  return page.newestSequence === null && page.cursorPresent === null;
-}
-
-export function replayDurableStreamState(state: TurnState): StreamState {
-  const parsedStartedAt = state.startedAt ? Date.parse(state.startedAt) : Number.NaN;
-  const initialState: StreamState = state.active
-    && state.turnId
-    && Number.isFinite(parsedStartedAt)
-    ? { ...IDLE, turnId: state.turnId, turnStartedAt: parsedStartedAt }
-    : IDLE;
-  const replayEvents = state.active
-    && state.turnId
-    && !state.bufferedEvents.some((event) => event.kind === "turn.start")
-    ? [{
-        kind: "turn.start" as const,
-        turnId: state.turnId,
-        ...(state.continuation ? { continuation: true } : {}),
-      }, ...state.bufferedEvents]
-    : state.bufferedEvents;
-  return replayEvents.reduce(
-    (streamState, event) => reduceStream(streamState, event),
-    initialState,
-  );
-}
-
-export function reduceDurableTurnState(
-  previous: TurnState | undefined,
-  event: StreamEvent,
-): TurnState | null {
-  const turnId = event.kind === "turn.start" ? event.turnId : previous?.turnId ?? null;
-  if (!turnId) return null;
-  const base: TurnState = previous ?? {
-    active: true,
-    turnId,
-    bufferedEvents: [],
-    replayOnly: false,
-    owner: null,
-    runState: "queued",
-    waitingReason: null,
-    nextAction: null,
-    error: null,
-  };
-  if (event.kind === "turn.start") {
-    return {
-      ...base,
-      active: true,
-      turnId,
-      continuation: event.continuation === true,
-      runState: "queued",
-      nextAction: "Waiting for worker",
-      error: null,
-    };
-  }
-  if (event.kind === "message.start" || event.kind === "message.delta" || event.kind === "message.end") {
-    return { ...base, active: true, runState: "calling_model", waitingReason: null, nextAction: "Calling model" };
-  }
-  if (event.kind === "tool.start" || event.kind === "tool.update" || event.kind === "tool.end") {
-    return { ...base, active: true, runState: "executing_tool", waitingReason: null, nextAction: "Running tool" };
-  }
-  if (event.kind === "approval.request") {
-    return { ...base, active: true, runState: "waiting", waitingReason: "approval", nextAction: "Review the pending action to continue" };
-  }
-  if (event.kind === "question.request") {
-    return { ...base, active: true, runState: "waiting", waitingReason: "user_input", nextAction: "Answer the question below to continue" };
-  }
-  if (event.kind === "approval.resolved" || event.kind === "question.answered") {
-    return { ...base, active: true, runState: "executing_tool", waitingReason: null, nextAction: "Resuming the durable run" };
-  }
-  if (event.kind === "session.note" && event.note === "compacted") {
-    return { ...base, active: true, runState: "calling_model", waitingReason: null, nextAction: "Continuing with compacted context" };
-  }
-  if (event.kind === "error") {
-    return { ...base, error: event.message };
-  }
-  if (event.kind === "turn.end") {
-    return {
-      ...base,
-      active: false,
-      runState: event.status,
-      waitingReason: null,
-      nextAction: null,
-    };
-  }
-  return base;
-}
-
-export function reconcileAcceptedTurnState(
-  previous: TurnState | undefined,
-  pendingTurnId: string,
-  acceptedTurnId: string,
-  continuation: boolean,
-): TurnState {
-  const queued: TurnState = {
-    active: true,
-    turnId: acceptedTurnId,
-    continuation,
-    bufferedEvents: [],
-    replayOnly: false,
-    owner: null,
-    runState: "queued",
-    waitingReason: null,
-    nextAction: "Waiting for worker",
-    error: null,
-  };
-  if (!previous?.active) return queued;
-  if (previous.turnId !== pendingTurnId && previous.turnId !== acceptedTurnId) return queued;
-  if (!previous.runState || previous.runState === "queued" || previous.runState === "assembling_context") {
-    return queued;
-  }
-  return {
-    ...previous,
-    turnId: acceptedTurnId,
-    continuation,
-  };
-}
-
-export function durableTurnPhase(state: TurnState | undefined): string | undefined {
-  if (!state?.active) return undefined;
-  if (state.nextAction === "Submitting the turn") return "Submitting";
-  if (state.nextAction === "Preparing context" || state.runState === "assembling_context") return "Preparing context";
-  if (state.runState === "queued") return "Waiting for worker";
-  if (state.runState === "calling_model") return "Calling model";
-  if (state.runState === "executing_tool") return "Running tool";
-  return state.nextAction ?? undefined;
-}
-
 export type { ShellData } from "@/lib/shell-data";
 
 export function initialCloudContent(initial: ShellData): Pick<ShellData, "tasks" | "messages"> {
@@ -374,15 +193,6 @@ export function initialCloudContent(initial: ShellData): Pick<ShellData, "tasks"
 
 export function shouldRefreshAdministration(permissions: readonly OrgPermission[]): boolean {
   return permissions.includes("org:admin");
-}
-
-export function mergeTaskSnapshots(current: Task[], server: Task[]): Task[] {
-  const serverById = new Map(server.map((task) => [task.id, task]));
-  const currentIds = new Set(current.map((task) => task.id));
-  return [
-    ...current.map((task) => serverById.get(task.id) ?? task),
-    ...server.filter((task) => !currentIds.has(task.id)),
-  ];
 }
 
 export function shouldConfirmTurnAdmission(cause: unknown): boolean {
@@ -703,8 +513,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         setTaskFilesOpen(false);
         setCreatingProject(false);
         setEditingTitle(false);
-        setAllowance(null);
-        setAllowanceLoading(false);
+        setPersonalization(PersonalizationProfileSchema.parse({}));
         setResourceErrors({ workspaces: "", tasks: "", messages: "", stream: "", settings: "" });
         setTaskRouteError(null);
         setTasksLoaded(false);
@@ -732,16 +541,24 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     bootstrapSessionId ? [[bootstrapSessionId, Date.now()]] : [],
   ));
   const requestedSurface = shellLocation.kind === "settings" || shellLocation.kind === "admin" || shellLocation.kind === "platform" ? "settings" : shellLocation.kind === "library" ? "library" : "task";
-  const surface = supportView && requestedSurface !== "task" ? "task" : requestedSurface;
+  const supportRouteUnavailable = Boolean(supportView && (
+    shellLocation.kind === "admin" || shellLocation.kind === "platform"
+    || (shellLocation.kind === "settings" && !SUPPORT_VIEW_SETTINGS_TABS.includes(shellLocation.tab))
+  ));
+  const surface = supportRouteUnavailable ? "task" : requestedSurface;
   const managementKind: ManagementKind = shellLocation.kind === "admin" ? "admin" : shellLocation.kind === "platform" ? "platform" : "settings";
   const managementTab = shellLocation.kind === "settings" || shellLocation.kind === "admin" || shellLocation.kind === "platform" ? shellLocation.tab : "general";
   React.useEffect(() => {
     if (surface !== "task") setTaskFilesOpen(false);
   }, [surface]);
   React.useEffect(() => {
-    if (!supportView || requestedSurface === "task") return;
-    void navigate({ to: "/", replace: true });
-  }, [navigate, requestedSurface, supportView]);
+    if (!supportRouteUnavailable) return;
+    if (shellLocation.kind === "settings") {
+      void navigate({ to: "/settings/$tab", params: { tab: "skills" }, replace: true });
+    } else {
+      void navigate({ to: "/", replace: true });
+    }
+  }, [navigate, shellLocation.kind, supportRouteUnavailable]);
   const [durableStatesBySession, setDurableStatesBySession] = React.useState<Record<string, TurnState>>({});
   const [imageGenerationBySession, setImageGenerationBySession] = React.useState<Record<string, ImageGenerationState | null>>({});
   const [imageGenerationCapability, setImageGenerationCapability] = React.useState<ImageGenerationCapabilityStatus>(() => initial.config.demoMode
@@ -755,6 +572,8 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const [tasksLoaded, setTasksLoaded] = React.useState(initial.config.demoMode);
   const [taskRouteError, setTaskRouteError] = React.useState<"not-found" | "forbidden" | "failed" | null>(null);
   const [creatingProject, setCreatingProject] = React.useState(false);
+  const [mobileAppOpen, setMobileAppOpen] = React.useState(false);
+  const mobilePairing = React.useMemo(() => mobilePairingApi(client), [client]);
   const mainPanelRef = React.useRef<HTMLDivElement>(null);
   React.useEffect(() => () => {
     // The store is module-scoped so task subscribers can stay narrow. Clear
@@ -822,20 +641,25 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     if (!client) return undefined;
     return findPersistedMessageById(client, sessionId, messageId);
   }, [client]);
-  const [allowance, setAllowance] = React.useState<AllowanceBalance | null>(null);
-  const [allowanceLoading, setAllowanceLoading] = React.useState(false);
-  const refreshAllowance = React.useCallback(() => {
-    if (!client || !activeOrganizationId || !user || supportView) {
-      setAllowance(null);
-      return;
-    }
-    setAllowanceLoading(true);
-    void client.myAllowanceBalance(activeOrganizationId)
-      .then(setAllowance)
-      .catch(() => setAllowance(null))
-      .finally(() => setAllowanceLoading(false));
-  }, [activeOrganizationId, client, supportView, user]);
-  React.useEffect(() => refreshAllowance(), [refreshAllowance]);
+  const workspaceTenantId = supportView?.tenantId ?? activeOrganizationId;
+  const workspaceUserId = supportView?.userId ?? user?.id ?? null;
+  const workspaceScope = `${workspaceTenantId}:${workspaceUserId ?? "anonymous"}:${supportView ? "support" : "self"}`;
+  // Demo mode has no API, so the settings screens read generated organization
+  // data instead of empty states. Chat, tasks and streaming keep `client`.
+  const managementClient = React.useMemo(
+    () => client ?? (config.demoMode ? createLazyDemoManagementClient(config, workspaceTenantId) : null),
+    [client, config, workspaceTenantId],
+  );
+  const allowanceQuery = useQuery({
+    queryKey: ["allowance", initial.config.apiBaseUrl, workspaceScope],
+    queryFn: ({ signal }) => client!.myAllowanceBalance(workspaceTenantId, { signal }),
+    enabled: Boolean(client && workspaceTenantId && workspaceUserId),
+    refetchInterval: 60_000,
+    refetchOnWindowFocus: true,
+  });
+  const allowance = allowanceQuery.data ?? null;
+  const allowanceLoading = Boolean(client && allowanceQuery.isPending);
+  const refreshAllowance = () => { if (client) void allowanceQuery.refetch(); };
   React.useEffect(() => {
     if (!client || supportView) return;
     let cancelled = false;
@@ -1148,7 +972,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       if (event.altKey) return;
       if (event.key === ",") {
         event.preventDefault();
-        if (!supportView) navigateToSettings("general");
+        navigateToSettings(supportView ? "skills" : "general");
       } else if (key === "b") {
         event.preventDefault();
         document.querySelector<HTMLElement>("[data-sidebar='trigger']")?.click();
@@ -1200,6 +1024,33 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       .finally(() => { if (!cancelled) setTasksLoaded(true); });
     return () => { cancelled = true; };
   }, [client, fixtureWorkspace, supportView]);
+
+  // Discover chats created by server schedules while the workspace is open.
+  // Refresh one bounded page and retain older chats already loaded by the user.
+  React.useEffect(() => {
+    if (!client || !tasksLoaded) return;
+    const abort = new AbortController();
+    let refreshing = false;
+    const refresh = async () => {
+      if (refreshing || abort.signal.aborted || document.visibilityState !== "visible") return;
+      refreshing = true;
+      try {
+        const page = await client.listTaskPage({ state: "all", limit: 100 }, { signal: abort.signal });
+        if (!abort.signal.aborted) setTasks((current) => mergeTaskSnapshots(current, page.items));
+      } catch {
+        // Retry discovery on the next poll or when the window is focused.
+      } finally { refreshing = false; }
+    };
+    const interval = window.setInterval(() => { void refresh(); }, 30_000);
+    const onFocus = () => { void refresh(); };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onFocus);
+    return () => {
+      abort.abort(); window.clearInterval(interval);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onFocus);
+    };
+  }, [client, tasksLoaded, supportView]);
 
   // A task can finish while its route is closed or while an EventSource is
   // reconnecting. Poll only while a task claims to be active, then stop as
@@ -1467,7 +1318,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   // is visible; it never owns or cancels server-side execution.
   const trackedSessionsRef = React.useRef(new Set<string>());
   const sessionConnectionsRef = React.useRef(new Map<string, {
-    source: EventSource;
+    source: BerryEventStream;
     reconnectTimer: number | null;
     attempts: number;
     ready: Promise<void>;
@@ -1877,7 +1728,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         resolveReady = resolve;
         rejectReady = reject;
       });
-      let source!: EventSource;
+      let source!: BerryEventStream;
       const isCurrentConnection = () => (
         trackedSessionsRef.current.has(sessionId)
         && sessionConnectionsRef.current.get(sessionId)?.source === source
@@ -1909,7 +1760,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           if (cursor) lastEventCursorBySessionRef.current.set(sessionId, cursor);
           updateSessionStream(sessionId, event);
           if (shouldUpdateDurableStateForEvent(event)) updateDurableStateFromEvent(sessionId, event);
-          const needsTaskMetadata = event.kind === "tool.start" || event.kind === "turn.end";
+          const needsTaskMetadata = event.kind === "tool.start" || event.kind === "turn.end" || event.kind === "browser.handoff";
           const streamedTask = needsTaskMetadata
             ? tasksRef.current.find((task) => task.activeSessionId === sessionId)
             : undefined;
@@ -1920,6 +1771,9 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               taskTitle: streamedTask.title,
               detail: event.title || event.name || "Berry started the next step.",
             });
+          }
+          if (event.kind === "browser.handoff" && event.state === "ready" && streamedTask) {
+            notifyBrowserNeedsHelp({ handoffId: event.handoffId, taskId: streamedTask.id, taskTitle: streamedTask.title, reason: event.reason });
           }
           if (event.kind !== "turn.end") return;
           if (event.status === "completed" && streamedTask) {
@@ -2024,7 +1878,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     if (!client) {
       replaceSessionMessages(sessionId, (current) => current.length > 0 ? current : fixtureMessages(sessionId));
       setMessageHistoryState(sessionId, { hasOlder: false, hasNewer: false, oldestSequence: null, newestSequence: null, historyRevision: null, historyDeletionRevision: null, loadingOlder: false });
-      return;
+      return sessionId === "session_cloud" ? startDemoLiveTurn(sessionId, updateSessionStream, resetSessionStream) : undefined;
     }
     let cancelled = false;
     const epoch = historyEpochRef.current.get(sessionId) ?? 0;
@@ -3291,33 +3145,21 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     return <div className="berry-web-shell bg-background" data-testid="web-app-shell" data-hydrated={false} />;
   }
 
+  const openSearchFromChrome = () => {
+    searchReturnFocusRef.current = document.querySelector<HTMLElement>("[data-web-search-trigger]");
+    setSearchOpen(true);
+  };
+
   return (
     <div className="berry-web-shell flex flex-col" data-testid="web-app-shell" data-hydrated={hydrated}>
       <Toaster position="bottom-right" />
-      {supportView ? (
-        <div className="relative z-[70] flex min-h-12 shrink-0 items-center justify-between gap-3 bg-[var(--berry-danger)] px-3 py-1.5 text-sm text-white sm:px-4" role="status" data-testid="support-view-banner">
-          <span className="min-w-0 truncate">
-            Viewing as <strong>{supportView.name || supportView.email}</strong>. Prompts, edits, and task changes apply to this member’s account.
-          </span>
-          <Button
-            type="button"
-            onClick={exitSupportView}
-            className="h-10 shrink-0 bg-white px-4 text-sm font-semibold text-black transition-transform hover:bg-white/90 active:scale-[0.96] motion-reduce:transform-none"
-          >
-            Exit support view
-          </Button>
-        </div>
-      ) : null}
       <BerryShellFrame
         className="berry-web-shell-frame"
-        sidebarWidth="min(20vw, 18rem)"
+        sidebarWidth="clamp(15rem, 20vw, 18rem)"
         chrome={
           <WebWindowChrome
             onHome={navigateHome}
-            onSearch={() => {
-              searchReturnFocusRef.current = document.querySelector<HTMLElement>("[data-web-search-trigger]");
-              setSearchOpen(true);
-            }}
+            onSearch={openSearchFromChrome}
           />
         }
         sidebar={(
@@ -3329,8 +3171,10 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             activeTaskId={activeTask?.id ?? null}
             loadError={resourceErrors.workspaces || resourceErrors.tasks}
             user={sidebarUser}
-            allowance={supportView ? null : allowance}
-            allowanceLoading={supportView ? false : allowanceLoading}
+            allowance={allowance}
+            allowanceLoading={allowanceLoading}
+            supportView={supportView}
+            onExitSupportView={exitSupportView}
             onRefreshAllowance={refreshAllowance}
             onNewTask={() => {
               navigateHome();
@@ -3365,20 +3209,25 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             management={surface === "settings" ? {
               kind: managementKind,
               tab: managementTab,
-              permissions: effectiveOrgPermissions,
-              platformAuthorized: config.platformAuthorized,
+              permissions: supportView ? [] : effectiveOrgPermissions,
+              platformAuthorized: !supportView && config.platformAuthorized,
+              supportView: Boolean(supportView),
               onNavigate: navigateManagement,
               onBack: navigateBackToWorkspace,
             } : null}
             onSkills={() => navigateToSettings("skills")}
+            onSchedules={() => navigateToSettings("schedules")}
             onLibrary={() => navigateToLibrary("all")}
             onUsage={() => navigateToSettings("usage")}
-            onSettings={() => navigateToSettings("general")}
+            onSettings={() => navigateToSettings(supportView ? "skills" : "general")}
+            onSearch={openSearchFromChrome}
+            {...(!supportView ? { onOpenMobileApp: () => setMobileAppOpen(true) } : {})}
             onSignOut={() => void signOut()}
           />
         )}
       >
-      <div ref={mainPanelRef} className="berry-web-main flex h-full min-h-0 flex-col">
+      {supportView ? <SupportViewFallback subject={supportView} onExit={exitSupportView} /> : null}
+      <CanvasFileDropZone panelRef={mainPanelRef} className="berry-web-main relative flex h-full min-h-0 flex-col">
         <React.Suspense fallback={shouldMountTaskSurface(surface) ? <LazySurfaceFallback label="Loading task" /> : null}>
         <div className={shouldMountTaskSurface(surface) ? "contents" : "hidden"}>
         {shouldMountTaskSurface(surface) && activeTask && !activeTask.deletedAt ? (
@@ -3483,6 +3332,10 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         />
         <div className="workspace">
           <section className="thread-pane berry-task-thread" aria-label="Task">
+            {client && activeSessionId ? <BrowserControl key={activeSessionId} client={client} sessionId={activeSessionId} active={Boolean(durableState?.active || stream.turnActive || turnBusy)} onChanged={() => {
+              void client.turnState(activeSessionId).then((state) => applyDurableState(activeSessionId, state, true)).catch(() => undefined);
+              void refreshSessionMessages(activeSessionId).catch(() => undefined);
+            }} /> : null}
             <Thread
               sessionId={activeTask.activeSessionId ?? activeTask.id}
               taskId={activeTask.id}
@@ -3648,7 +3501,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         {surface === "settings" ? (
           <div className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain">
             <React.Suspense fallback={<LazySurfaceFallback label="Loading settings" />}>
-              <ManagementRouteProvider value={{ config, client, tenantId: activeOrganizationId, userId: user?.id ?? null, user, personalization, onPersonalizationChange: setPersonalization, permissions: effectiveOrgPermissions, tasks, workspaces, onArchiveTask: archiveTask, onDeleteTask: deleteTask, onRestoreTask: restoreTask }}>
+              <ManagementRouteProvider key={workspaceScope} value={{ config, client: managementClient, tenantId: workspaceTenantId, userId: workspaceUserId, user: sidebarUser, supportView: Boolean(supportView), personalization, onPersonalizationChange: setPersonalization, permissions: effectiveOrgPermissions, tasks, workspaces, onArchiveTask: archiveTask, onDeleteTask: deleteTask, onRestoreTask: restoreTask }}>
                 <Outlet />
               </ManagementRouteProvider>
             </React.Suspense>
@@ -3658,6 +3511,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           <div className="min-h-0 flex-1 overflow-auto">
             <React.Suspense fallback={<LazySurfaceFallback label="Loading library" />}>
               <ArtifactLibrary
+                key={workspaceScope}
                 client={client}
                 tab={shellLocation.kind === "library" ? shellLocation.tab : "all"}
                 onTabChange={navigateToLibrary}
@@ -3666,7 +3520,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             </React.Suspense>
           </div>
         ) : null}
-      </div>
+      </CanvasFileDropZone>
       <ProjectCreationDialog
         container={mainPanelRef.current}
         open={creatingProject}
@@ -3683,7 +3537,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         tasks={tasks}
         workspaces={workspaces}
         onOpenTask={navigateToTask}
-        onSettings={supportView ? undefined : () => navigateToSettings("general")}
+        onSettings={() => navigateToSettings(supportView ? "skills" : "general")}
         onHelp={() => toast.info("Berry help and diagnostics are available from the ? button.")}
       />
       {shouldMountTaskSurface(surface) && activeTask && taskFilesOpen ? (
@@ -3695,6 +3549,17 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             taskId={activeTask.id}
             projectWorkspaceId={activeTask.workspaceId}
             projectName={workspaces.find((workspace) => workspace.id === activeTask.workspaceId)?.name ?? "this project"}
+          />
+        </React.Suspense>
+      ) : null}
+      {mobileAppOpen ? (
+        <React.Suspense fallback={null}>
+          <MobileAppDialog
+            open
+            onOpenChange={setMobileAppOpen}
+            api={mobilePairing}
+            storeLinks={config.mobileApp}
+            onManageDevices={() => navigateToSettings("account")}
           />
         </React.Suspense>
       ) : null}
@@ -3758,18 +3623,6 @@ function optimisticUserMessage(sessionId: string, text: string, attachments: Att
     })),
   ];
   return user;
-}
-
-
-export function greetingForHour(hour: number): string {
-  if (hour < 5) return "Good evening";
-  if (hour < 12) return "Good morning";
-  if (hour < 17) return "Good afternoon";
-  return "Good evening";
-}
-
-export function greetingForDate(date: Date): string {
-  return greetingForHour(date.getHours());
 }
 
 function LazySurfaceFallback({ label }: { label: string }) {

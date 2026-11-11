@@ -6,12 +6,14 @@ import {
   UsageAnalyticsSchema,
   UsageRequestDetailSchema,
   UsageRequestPageSchema,
+  TaskTokenUsageSchema,
   type CloudUsageDashboard,
   type CloudUsageEventRecord,
   type CloudUsageIngestRequest,
   type CloudUsageRollup,
   type UsageAnalyticsQuery,
   type JsonValue,
+  type TaskTokenUsage,
 } from "@berry/shared";
 import type { CloudDatabaseService, SqlExecutor } from "../db/cloud-database.service.ts";
 
@@ -45,6 +47,7 @@ export interface UsageRepository {
   analytics(tenantId: string, query: UsageAnalyticsQuery): Promise<UsageAnalytics>;
   requestPage(tenantId: string, query: UsageAnalyticsQuery, forceUserId?: string | undefined): Promise<UsageRequestPage>;
   requestDetail(tenantId: string, id: string, forceUserId?: string | undefined): Promise<UsageRequestDetail | null>;
+  taskTokenUsage(tenantId: string, taskId: string): Promise<TaskTokenUsage>;
 }
 
 export class InMemoryUsageRepository implements UsageRepository {
@@ -136,10 +139,55 @@ export class InMemoryUsageRepository implements UsageRepository {
     const event = [...this.#events.values()].find((candidate) => candidate.tenantId === tenantId && candidate.id === id && (!forceUserId || candidate.userId === forceUserId));
     return event ? requestDetailFromEvent(event) : null;
   }
+
+  async taskTokenUsage(tenantId: string, taskId: string): Promise<TaskTokenUsage> {
+    const events = [...this.#events.values()].filter((event) => event.tenantId === tenantId && event.taskId === taskId);
+    return taskTokenUsageFromTotals(taskId, {
+      input_tokens: events.reduce((sum, event) => sum + event.tokensIn, 0),
+      output_tokens: events.reduce((sum, event) => sum + event.tokensOut, 0),
+      cached_input_tokens: events.reduce((sum, event) => sum + Math.min(event.tokensIn, Math.max(event.cacheReadTokens, event.tokensCached)), 0),
+    });
+  }
 }
 
 export class PostgresUsageRepository implements UsageRepository {
   constructor(private readonly database: CloudDatabaseService) {}
+
+  async taskTokenUsage(tenantId: string, taskId: string): Promise<TaskTokenUsage> {
+    return this.database.withTenant(tenantId, async (executor) => {
+      // Settled turns have one idempotent ledger record. Until settlement, use
+      // their committed provider usage events, including intermediate calls.
+      // One statement gives a consistent snapshot across the handover.
+      const [totals] = await executor.query<TaskTokenTotals>(`
+WITH recorded AS (
+  SELECT tokens_in AS input_tokens, tokens_out AS output_tokens,
+         LEAST(tokens_in,GREATEST(cache_read_tokens,tokens_cached)) AS cached_input_tokens
+  FROM usage_events
+  WHERE tenant_id=$1::uuid AND task_id=$2::uuid
+), unsettled AS (
+  SELECT r.id FROM turn_runs r
+  WHERE r.tenant_id=$1::uuid AND r.task_id=$2::uuid
+    AND NOT EXISTS (
+      SELECT 1 FROM usage_events u
+      WHERE u.tenant_id=r.tenant_id
+        AND u.request_id=COALESCE(NULLIF(r.runtime_request->>'requestId',''),'turn_' || r.id::text)
+    )
+), live AS (
+  SELECT COALESCE((e.payload->>'inputTokens')::bigint,0) AS input_tokens,
+         COALESCE((e.payload->>'outputTokens')::bigint,0) AS output_tokens,
+         LEAST(COALESCE((e.payload->>'inputTokens')::bigint,0),
+               COALESCE((e.payload->>'cacheReadTokens')::bigint,0)) AS cached_input_tokens
+  FROM turn_events e JOIN unsettled r ON r.id=e.run_id
+  WHERE e.tenant_id=$1::uuid AND e.event_type='usage'
+)
+SELECT COALESCE(SUM(input_tokens),0) AS input_tokens,
+       COALESCE(SUM(output_tokens),0) AS output_tokens,
+       COALESCE(SUM(cached_input_tokens),0) AS cached_input_tokens
+FROM (SELECT * FROM recorded UNION ALL SELECT * FROM live) totals
+      `.trim(), [tenantId, taskId]);
+      return taskTokenUsageFromTotals(taskId, totals);
+    });
+  }
 
   async ingest(tenantId: string, input: CloudUsageIngestRequest): Promise<CloudUsageEventRecord> {
     return this.database.withTenant(tenantId, async (executor) => {
@@ -291,6 +339,24 @@ type UsageWriteInput = Omit<CloudUsageIngestRequest, "source" | "signature"> & {
   source: CloudUsageEventRecord["source"];
   signature: CloudUsageEventRecord["signature"];
 };
+
+type TaskTokenTotals = {
+  input_tokens: number | string;
+  output_tokens: number | string;
+  cached_input_tokens: number | string;
+};
+
+function taskTokenUsageFromTotals(taskId: string, totals?: TaskTokenTotals): TaskTokenUsage {
+  const inputTokens = numberFromDb(totals?.input_tokens);
+  const outputTokens = numberFromDb(totals?.output_tokens);
+  const cachedInputTokens = Math.min(inputTokens, numberFromDb(totals?.cached_input_tokens));
+  return TaskTokenUsageSchema.parse({
+    taskId, inputTokens, outputTokens, cachedInputTokens,
+    uncachedInputTokens: inputTokens - cachedInputTokens,
+    totalTokens: inputTokens + outputTokens,
+    cacheHitRate: inputTokens > 0 ? cachedInputTokens / inputTokens : null,
+  });
+}
 
 export function usageEventsCsv(events: CloudUsageEventRecord[]): string {
   const headers = [

@@ -1,4 +1,5 @@
 import * as React from "react";
+import { reasoningLabel, reasoningLevelsForModel } from "@berry/client-core/models";
 import { ArrowUp, LoaderCircle, Play, Plus, Square, WandSparkles } from "lucide-react";
 import { BerryApiError, type BerryApiClient, type ImageGenerationCapabilityStatus } from "@berry/api-client";
 import { parseSlashCommand, type AttachmentInput, type ContextStats, type Message, type PersonalizationProfile, type ReasoningLevel, type Task, type TurnIntent, type Workspace } from "@berry/shared";
@@ -10,7 +11,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel,
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@berry/desktop-ui/components/ui/tooltip";
 import { reduceStream, type QuestionPrompt } from "@berry/desktop-ui/components/thread-stream";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
-import { AtSign, Brain, Check, ChevronDown, FileText, Hash, ImagePlus, SlashSquare } from "@berry/desktop-ui/lib/icons";
+import { AtSign, Brain, Check, ChevronDown, Hash, ImagePlus, SlashSquare } from "@berry/desktop-ui/lib/icons";
 import type { WebConfig } from "@/lib/config";
 import { splitEmptyUploads } from "@/lib/empty-uploads";
 import { MentionMenu, useStaticMentions } from "../mention-menu";
@@ -22,6 +23,8 @@ import { QueuedMessageList } from "./queued-message-list";
 import { createQueuedFollowUp, type QueuedFollowUp } from "@/lib/queued-follow-ups";
 import { resolveComposerSubmitIntent } from "@/lib/composer-submit-intent";
 import { sessionStreamStore, useSessionStream } from "@/lib/session-stream-store";
+import { ContextWindowRing } from "./context-window-ring";
+import { filesFromDataTransfer, useCanvasFileDropTarget } from "./canvas-file-drop";
 
 interface PendingFileUpload {
   id: string;
@@ -223,12 +226,10 @@ export function Composer({
   const [uploadError, setUploadError] = React.useState("");
   const [promptImproveError, setPromptImproveError] = React.useState("");
   const [improvingPrompt, setImprovingPrompt] = React.useState(false);
-  const [fileDragActive, setFileDragActive] = React.useState(false);
   const [createImageMode, setCreateImageMode] = React.useState(false);
   const [contextStatsResult, setContextStatsResult] = React.useState<{ sessionId: string; stats: ContextStats } | undefined>();
   const [editingFollowUp, setEditingFollowUp] = React.useState<QueuedFollowUp | null>(null);
   const [savingQueuedEdit, setSavingQueuedEdit] = React.useState(false);
-  const fileDragDepthRef = React.useRef(0);
   const editorRef = React.useRef<PromptEditorHandle>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const pastedTextCountRef = React.useRef(0);
@@ -803,34 +804,8 @@ export function Composer({
     }
   }, [activeTask, client, pastedTextDraft]);
 
-  const handleDragEnter = React.useCallback<React.DragEventHandler<HTMLDivElement>>((event) => {
-    if (!hasFilePayload(event.dataTransfer)) return;
-    event.preventDefault();
-    fileDragDepthRef.current += 1;
-    setFileDragActive(true);
-  }, []);
-
-  const handleDragOver = React.useCallback<React.DragEventHandler<HTMLDivElement>>((event) => {
-    if (!hasFilePayload(event.dataTransfer)) return;
-    event.preventDefault();
-    event.dataTransfer.dropEffect = "copy";
-  }, []);
-
-  const handleDragLeave = React.useCallback<React.DragEventHandler<HTMLDivElement>>((event) => {
-    if (fileDragDepthRef.current === 0) return;
-    event.preventDefault();
-    fileDragDepthRef.current = Math.max(0, fileDragDepthRef.current - 1);
-    if (fileDragDepthRef.current === 0) setFileDragActive(false);
-  }, []);
-
-  const handleDrop = React.useCallback<React.DragEventHandler<HTMLDivElement>>((event) => {
-    if (!hasFilePayload(event.dataTransfer)) return;
-    event.preventDefault();
-    event.stopPropagation();
-    fileDragDepthRef.current = 0;
-    setFileDragActive(false);
-    void addFiles(filesFromDataTransfer(event.dataTransfer));
-  }, [addFiles]);
+  // The task canvas owns the drop overlay; a drop anywhere on it lands here.
+  useCanvasFileDropTarget(React.useCallback((files: File[]) => { void addFiles(files); }, [addFiles]), !savingQueuedEdit);
 
   const removeAttachment = React.useCallback((attachment: AttachmentInput, index: number) => {
     setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index));
@@ -863,13 +838,6 @@ export function Composer({
     <div className={variant === "thread" ? "berry-thread-composer-wrap mx-auto max-w-full pb-5" : "w-full"}>
       <BerryComposerFrame
         variant={variant}
-        {...(fileDragActive ? { className: "outline outline-2 -outline-offset-2 outline-[var(--berry-border-strong)]" } : {})}
-        shellProps={{
-          onDragEnter: handleDragEnter,
-          onDragOver: handleDragOver,
-          onDragLeave: handleDragLeave,
-          onDrop: handleDrop,
-        }}
         before={
           <>
             <MentionMenu controller={mentions} />
@@ -907,12 +875,6 @@ export function Composer({
           ) : null
         }
       >
-        {fileDragActive ? (
-          <div className="pointer-events-none absolute inset-2 z-30 flex items-center justify-center gap-2 rounded-[18px] bg-card/95 text-sm font-medium text-card-foreground shadow-[var(--berry-ring-strong)]" role="status">
-            <FileText />
-            <span>Drop files to attach</span>
-          </div>
-        ) : null}
         <div className="berry-composer-input flex min-h-[96px] flex-1 flex-col">
         {editingFollowUp ? (
           <div className="flex items-center justify-between gap-3 px-3 pt-2 text-xs text-muted-foreground">
@@ -972,7 +934,7 @@ export function Composer({
           <input ref={fileInputRef} className="visually-hidden" type="file" multiple tabIndex={-1} aria-hidden="true" onChange={(event) => void addFiles(event.currentTarget.files)} />
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="icon-lg" className="berry-composer-icon-button size-8 rounded-[9px]" aria-label="Add context"><Plus /></Button></DropdownMenuTrigger><DropdownMenuContent align="start" className="w-64"><DropdownMenuItem className="berry-create-image-menu-item" disabled={!imageGenerationCapability.available} onClick={enableCreateImageMode} title={imageGenerationCapability.available ? undefined : imageGenerationCapability.message ?? "Image generation is unavailable"}><ImagePlus /><strong className="berry-create-image-menu-label">Create image</strong>{!imageGenerationCapability.available ? <span className="ml-auto text-xs text-muted-foreground">Unavailable</span> : null}</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onClick={() => fileInputRef.current?.click()}><ImagePlus /> Add attachment</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onClick={() => editorRef.current?.insertText("@")}><AtSign /> Insert @ mention</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("#")}><Hash /> Insert # task</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("/")}><SlashSquare /> Insert / command</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
           <span className="min-w-0 flex-1" />
-          {contextSessionId ? <ContextWindowRing stats={contextStats} /> : null}
+          {contextSessionId ? <ContextWindowRing key={contextSessionId} stats={contextStats} client={client} sessionId={contextSessionId} working={working} /> : null}
           {showImprovePrompt ? (
             <TooltipProvider delayDuration={250}>
               <Tooltip>
@@ -1067,76 +1029,7 @@ function pastedTextTitle(text: string): string {
   return firstLine.replace(/\s+/g, " ").slice(0, 120);
 }
 
-export function reasoningLevelsForModel(model: {
-  id: string;
-  label?: string | undefined;
-  capabilities?: { reasoning?: boolean | undefined; reasoningEfforts?: ReasoningLevel[] | undefined } | undefined;
-} | undefined): ReasoningLevel[] {
-  if (!model) return ["off", "low", "medium", "high"];
-  if (model.capabilities?.reasoningEfforts?.length) return [...model.capabilities.reasoningEfforts];
-  if (model.capabilities?.reasoning === false) return ["off"];
-  if (/glm[-_. ]?5(?:\.2|[-_.]?2)/i.test(`${model.id} ${model.label ?? ""}`)) return ["high", "xhigh"];
-  return ["off", "low", "medium", "high"];
-}
-
-function reasoningLabel(level: ReasoningLevel): string {
-  return level === "xhigh" ? "Extra high" : level[0]!.toUpperCase() + level.slice(1);
-}
-
-function ContextWindowRing({ stats }: { stats: ContextStats | undefined }) {
-  const percent = stats?.percentUsed ?? null;
-  const used = stats ? formatContextTokens(stats.usedTokens) : null;
-  const total = stats?.contextWindow ? formatContextTokens(stats.contextWindow) : null;
-  const left = stats?.tokensLeft !== null && stats?.tokensLeft !== undefined
-    ? formatContextTokens(stats.tokensLeft)
-    : null;
-  const leftPercent = percent === null ? null : Math.max(0, 100 - percent);
-  const usedPercent = formatContextPercent(percent);
-  const leftPercentLabel = formatContextPercent(leftPercent);
-  const tooltipLabel = stats && usedPercent !== null
-    ? `Active context: ${usedPercent}% used (${leftPercentLabel ?? "0"}% left)${used && total ? `, ${used} / ${total} tokens used` : ""}`
-    : "Calculating active context usage";
-
-  return (
-    <TooltipProvider delayDuration={250}>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <button
-            type="button"
-            aria-label={tooltipLabel}
-            className="berry-context-ring"
-            data-state={stats?.thresholdState ?? "unknown"}
-          >
-            <CircularProgressIndicator
-              value={percent ?? 0}
-              size={20}
-              strokeWidth={2.4}
-              label="Context window usage"
-              trackClassName="opacity-30"
-              formatValueText={(percentage) => `${Math.round(percentage)}% of context used`}
-              aria-busy={!stats}
-              title={undefined}
-            />
-          </button>
-        </TooltipTrigger>
-        <TooltipContent side="top" className="berry-context-tooltip" showArrow={false}>
-          <div className="berry-context-tooltip-content">
-            {stats && usedPercent !== null ? (
-              <>
-                <span className="berry-context-tooltip-label">Active context</span>
-                <span>{usedPercent}% used ({leftPercentLabel ?? "0"}% left)</span>
-                {used && total ? <span>{used} / {total} tokens used</span> : null}
-                {left ? <span className="berry-context-tooltip-label">{left} tokens remaining</span> : null}
-              </>
-            ) : (
-              <span className="berry-context-tooltip-label">Calculating context usage…</span>
-            )}
-          </div>
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
-  );
-}
+export { reasoningLevelsForModel };
 
 function UploadProgressRing({ ratio }: { ratio: number }) {
   return (
@@ -1148,18 +1041,6 @@ function UploadProgressRing({ ratio }: { ratio: number }) {
       formatValueText={(percentage) => `${Math.round(percentage)}% uploaded`}
     />
   );
-}
-
-function formatContextTokens(tokens: number): string {
-  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
-  if (tokens >= 1_000) return `${Math.round(tokens / 100) / 10}K`;
-  return String(tokens);
-}
-
-function formatContextPercent(percent: number | null): string | null {
-  if (percent === null) return null;
-  if (percent > 0 && percent < 10) return percent.toFixed(1);
-  return String(Math.round(percent));
 }
 
 function formatFileSize(bytes: number): string {
@@ -1183,21 +1064,7 @@ function promptImprovementErrorMessage(cause: unknown): string {
   return "Berry could not improve this prompt. Please try again.";
 }
 
-export function filesFromDataTransfer(dataTransfer: Pick<DataTransfer, "files" | "items"> | null): File[] {
-  if (!dataTransfer) return [];
-  const directFiles = Array.from(dataTransfer.files);
-  if (directFiles.length > 0) return directFiles;
-  return Array.from(dataTransfer.items)
-    .filter((item) => item.kind === "file")
-    .flatMap((item) => {
-      const file = item.getAsFile();
-      return file ? [file] : [];
-    });
-}
-
-function hasFilePayload(dataTransfer: DataTransfer): boolean {
-  return Array.from(dataTransfer.types).includes("Files") || filesFromDataTransfer(dataTransfer).length > 0;
-}
+export { filesFromDataTransfer };
 
 async function fileToAttachment(file: File): Promise<AttachmentInput> {
   const textLike = file.type.startsWith("text/") || /\.(md|mdx|txt|json|yaml|yml|csv|tsv|js|jsx|ts|tsx|py|rb|go|rs|java|css|html|xml|sql|sh)$/i.test(file.name);

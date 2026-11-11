@@ -10,6 +10,7 @@ export type ManagementScreenProps = {
   config: WebConfig;
   tenantId: string;
   userId: string | null;
+  supportView?: boolean;
   user: { id: string; email: string; name?: string | null; image?: string | null } | null;
   personalization: PersonalizationProfile;
   onPersonalizationChange: (profile: PersonalizationProfile) => void;
@@ -20,14 +21,18 @@ export type ManagementScreenProps = {
   onDeleteTask: (task: Task) => Promise<void>;
   onRestoreTask: (task: Task) => Promise<void>;
 };
+export const ManagementResourceScope = React.createContext("self");
+
 export function useResource<T>(
   key: string,
   loader: (signal?: AbortSignal) => Promise<T>,
   fallback: T,
 ) {
   const queryClient = useQueryClient();
-  const query = useQuery<T, Error, T, ReturnType<typeof managementQueryKeys.resource>>({
-    queryKey: managementQueryKeys.resource(key),
+  const scope = React.useContext(ManagementResourceScope);
+  const queryKey = [...managementQueryKeys.resource(key), scope] as const;
+  const query = useQuery<T, Error>({
+    queryKey,
     queryFn: ({ signal }) => loader(signal),
   });
   return {
@@ -36,10 +41,10 @@ export function useResource<T>(
     error: query.error ? actionErrorMessage(query.error, "Could not load this page. Please try again.") : null,
     retry: () => { void query.refetch(); },
     invalidate: () => {
-      void queryClient.invalidateQueries({ queryKey: managementQueryKeys.resource(key) });
+      void queryClient.invalidateQueries({ queryKey });
     },
     setData: (next: T | ((current: T) => T)) => {
-      queryClient.setQueryData<T>(managementQueryKeys.resource(key), (current) => {
+      queryClient.setQueryData<T>(queryKey, (current) => {
         const value = current ?? fallback;
         return typeof next === "function" ? (next as (current: T) => T)(value) : next;
       });
