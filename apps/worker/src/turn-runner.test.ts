@@ -617,7 +617,14 @@ describe("durable turn runner", () => {
     expect(names).toEqual([
       "read", "bash", "edit", "write", "grep", "find", "ls",
       "ask_user_question", "compose_message", "persist_artifact", "save_personal_skill",
+      "check_environment", "upload_file",
     ]);
+  });
+
+  it("keeps workspace upload and environment checks outside read-only admissions", () => {
+    const current = providerSnapshot("openai-responses");
+    current.runtimeRequest = { ...current.runtimeRequest, builtInTools: ["read", "ls"] };
+    expect(durableBuiltInToolDefinitions(current).map((tool) => tool.function.name)).toEqual(["read", "ls"]);
   });
 
   it("uses the queued prompt intent instead of inheriting its predecessor intent", () => {
@@ -4493,6 +4500,7 @@ describe("durable turn runner", () => {
     let writePolicy: unknown;
     let editPolicy: unknown;
     let bashPolicy: unknown;
+    let uploadPolicy: unknown;
     let toolNames: string[] = [];
     const runner = new DurableTurnRunner(repository, {
       call: async (_snapshot, _step, context) => {
@@ -4502,13 +4510,20 @@ describe("durable turn runner", () => {
         writePolicy = context.policyForTool("write");
         editPolicy = context.policyForTool("edit");
         bashPolicy = context.policyForTool("bash");
+        uploadPolicy = context.policyForTool("upload_file");
         return { text: "Done.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
       },
     }, noTools(), { owner: "worker-compose-definition" });
 
     await runner.execute({ tenantId, runId, reason: "continue" });
 
-    expect(toolNames).toEqual(DURABLE_BASE_BUILT_IN_TOOLS);
+    expect(toolNames).toEqual([...DURABLE_BASE_BUILT_IN_TOOLS, "check_environment", "upload_file"]);
+    expect(uploadPolicy).toEqual({
+      retryClass: "non_idempotent_manual",
+      repeatPolicy: "block_after_success",
+      requiresApproval: true,
+      approvalKind: "shell",
+    });
     expect(composePolicy).toEqual({
       retryClass: "read_only",
       repeatPolicy: "block_after_success",

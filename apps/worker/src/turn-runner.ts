@@ -1,3 +1,5 @@
+import { environmentCheckDefinition, environmentCheckFromBash } from "./environment-check.js";
+import { fileUploadDefinition } from "./file-upload.js";
 import { CONTEXT_LIMIT_MESSAGE, isContextLimitFailure } from "./context-limit.js";
 import { BROWSER_HANDOFF_TOOL, BrowserHandoffArgumentsSchema, BrowserHandoffSchema, browserSessionsFromSteps, type BrowserHandoff } from "@berry/shared";
 import { limitModelImagePayload, modelImageLabelPath } from "./model-image.js";
@@ -1316,11 +1318,29 @@ export class DurableTurnRunner {
     const permissionModeForTools = stringValue(snapshot.runtimeRequest.permissionMode) ?? "ask";
     result = {
       ...result,
-      toolCalls: result.toolCalls.map((call) => unwrapToolInvocation(
-        call,
-        (name) => this.tools.policy?.(snapshot, name, permissionModeForTools) ?? durableToolPolicy(name, permissionModeForTools),
-        snapshot.id,
-      )),
+      toolCalls: result.toolCalls.map((call) => {
+        const unwrapped = unwrapToolInvocation(
+          call,
+          (name) => this.tools.policy?.(snapshot, name, permissionModeForTools) ?? durableToolPolicy(name, permissionModeForTools),
+          snapshot.id,
+        );
+        // Translate only complete recognised probes, before they acquire
+        // bash's mutation/recovery semantics. The original provider call and
+        // arguments stay in the conversation for exact replay.
+        const check = unwrapped.name === "bash"
+          && definitions.some((definition) => definition.function.name === "check_environment")
+          ? environmentCheckFromBash(unwrapped.input) : null;
+        return check ? {
+          ...unwrapped,
+          name: "check_environment",
+          input: check,
+          retryClass: "read_only" as const,
+          repeatPolicy: "compare_result" as const,
+          requiresApproval: false,
+          idempotencyKey: null,
+          invocation: unwrapped.invocation ?? { name: unwrapped.name, arguments: unwrapped.input },
+        } : unwrapped;
+      }),
     };
     const providerDiagnostics = successfulProviderDiagnostics(snapshot, result, modelStartedAt);
     workerRuntimeMetrics.providerRequest(providerDiagnostics);
@@ -1529,11 +1549,12 @@ export class DurableTurnRunner {
     }];
     const nextSequence = nextStepSequence(snapshot.steps);
     const declaredSchemas = new Map(definitions.map((definition) => [definition.function.name, definition.function.parameters]));
-    const argumentErrors = result.toolCalls.map((call) => toolArgumentError(
-      call,
-      declaredSchemas,
-      (name) => this.tools.argumentSchema?.(snapshot, name),
-    ));
+    const argumentErrors = result.toolCalls.map((call) => {
+      if (requiresAdmittedBash(call.name) && !declaredSchemas.has(call.name)) {
+        return notRunMessage(call.name, "This tool was not admitted for this turn");
+      }
+      return toolArgumentError(call, declaredSchemas, (name) => this.tools.argumentSchema?.(snapshot, name));
+    });
     const toolSteps = result.toolCalls.map((call, index): DurableStepMutation => ({
       id: randomUUID(),
       sequence: nextSequence + index,
@@ -1815,7 +1836,10 @@ export class DurableTurnRunner {
       }
     }
     const questionProblem = toolName === "ask_user_question" ? questionBatchProblem(step.input.arguments) : null;
-    const argumentError = questionProblem ? null : storedArgumentError;
+    const argumentError = questionProblem ? null : storedArgumentError
+      ?? (requiresAdmittedBash(toolName) && !durableBuiltInToolDefinitions(snapshot).some((tool) => tool.function.name === toolName)
+        ? notRunMessage(toolName, "This tool was not admitted for this turn")
+        : null);
     if (toolName === "ask_user_question" && !questionProblem && !argumentError) {
       const questions = durableQuestionItems(step.input.arguments);
       const first = questions[0];
@@ -6525,6 +6549,10 @@ function approvalKind(value: unknown): NonNullable<TurnModelToolIntent["approval
     : "shell";
 }
 
+function requiresAdmittedBash(name: string): boolean {
+  return name === "check_environment" || name === "upload_file";
+}
+
 function durableToolPolicy(name: string, permissionMode: string): {
   retryClass: ToolRetryClass;
   repeatPolicy: ToolRepeatPolicy;
@@ -6533,6 +6561,7 @@ function durableToolPolicy(name: string, permissionMode: string): {
 } {
   if (
     name === "read"
+    || name === "check_environment"
     || name === "find"
     || name === "ls"
     || name === "grep"
@@ -6575,6 +6604,15 @@ function durableToolPolicy(name: string, permissionMode: string): {
       repeatPolicy: "block_after_success",
       requiresApproval: false,
       approvalKind: "file-edit",
+    };
+  }
+  if (name === "upload_file") {
+    // A signed PUT can create a version of a remote object. Review ambiguous uploads.
+    return {
+      retryClass: "non_idempotent_manual",
+      repeatPolicy: "block_after_success",
+      requiresApproval: permissionMode !== "full-access",
+      approvalKind: "shell",
     };
   }
   if (name === "inspect_images") {
@@ -6751,6 +6789,8 @@ function durableBuiltInToolGuidance(toolNames: readonly string[]): string {
     guidance.push([
       "Coding tools: read (read text and extract supported documents and archives), bash (execute Bash commands), edit (precise exact-text replacements, including multiple disjoint edits), write (create or overwrite files), grep (search file contents and respect .gitignore), find (find files by glob and respect .gitignore), and ls (list directory contents). Empty or unchanged output is not progress; do not repeat identical completed calls. Change inputs or strategy, and poll only when supported.",
       "Use read to examine files instead of cat or sed.",
+      ...(toolNames.includes("bash") ? ["Use check_environment for installed executable names and Python module availability. A missing optional dependency is a normal result: choose an available alternative. It does not execute programs or import module code, so availability alone does not verify that an import works."] : []),
+      ...(toolNames.includes("bash") ? ["To send a workspace file to an upload URL that a connector returned, use upload_file with the URL and headers exactly as returned, not curl."] : []),
       "For an uploaded PDF, Word document, spreadsheet, presentation, or ZIP, call read on the exact Sandbox path first. For a ZIP, read its inventory and then read only the extracted documents relevant to the task. For PDFs, use page_start/page_end instead of guessing line ranges. Use the matching format skill when visual layout, formulas, rendering, or editing matter. Use shell-based extraction only when read reports that the format is unsupported or has no extractable text.",
       "Use edit for precise changes; every edits[].oldText must match exactly and uniquely in the original file.",
       "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls.",
@@ -7741,6 +7781,7 @@ export function durableBuiltInToolDefinitions(snapshot: DurableTurnSnapshot): Ch
     const definition = definitionsByName.get(name);
     return definition ? [definition] : [];
   });
+  if (enabled.has("bash")) definitions.push(environmentCheckDefinition, fileUploadDefinition);
   const skills = durableSkills(snapshot);
   if (enabled.has("activate_skill") && skills.length > 0) {
     definitions.push({
@@ -7771,6 +7812,8 @@ export function durableBuiltInToolDefinitions(snapshot: DurableTurnSnapshot): Ch
 }
 
 export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
+  environmentCheckDefinition,
+  fileUploadDefinition,
   {
     type: "function" as const,
     function: {
