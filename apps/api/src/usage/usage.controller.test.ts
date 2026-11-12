@@ -141,7 +141,7 @@ describe("Usage API", () => {
       .expect(200)
       .expect(({ body }) => {
         expect(body.totals).toMatchObject({ requests: 6, billedCostMicros: "10500" });
-        expect(body.totals.projectedMonthEndMicros).toBeTruthy();
+        expect(body.totals.projectedMonthEndMicros).toBeNull();
         expect(body.breakdowns.agents[0]).toMatchObject({ id: "agent-review", requests: 6 });
         expect(body.anomalies.some((entry: { explanation: string }) => entry.explanation.includes("baseline"))).toBe(true);
       });

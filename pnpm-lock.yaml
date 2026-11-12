@@ -19,6 +19,7 @@ overrides:
   tar@^7.0.0: 7.5.22
   undici@^7.0.0: 7.29.1
   seroval: 1.7.0
+  seroval-plugins@^1.6.7: 1.6.12
   source-map-js: 1.2.2
   proxy-addr@^2.0.0: 2.0.8
   multer@^2.0.0: 2.3.0
@@ -9106,15 +9107,9 @@ packages:
     resolution: {integrity: sha512-ghgmKt5o4Tly5yEG/UJp8qTd0AN7Xalw4XBtDEKP655B699qMEtra1WlXeE6WIvdEG481JvRxULKsInq/iNysw==}
     engines: {node: '>=0.10.0'}
 
-  seroval-plugins@1.5.4:
-    resolution: {integrity: sha512-S0xQPhUTefAhNvNWFg0c1J8qJArHt5KdtJ/cFAofo06KD1MVSeFWyl4iiu+ApDIuw0WhjpOfCdgConOfAnLgkw==}
+  seroval-plugins@1.6.12:
+    resolution: {integrity: sha512-+reiwp/lYxiyctSrdvX7OQ1YLrcbWYgBiZrhSFL+V43b0/DGRLNVSDyZINbQe+tWplPOI2fw2dPrdv6hcc09kQ==}
     engines: {node: '>=10'}
-    peerDependencies:
-      seroval: 1.7.0
-
-  seroval-plugins@1.8.0:
-    resolution: {integrity: sha512-96vBb12rDvPPwdKUgWw1op3fGq8AVBFOr0IllbnM72yR5J9WWXF18cQ4g1XfDO7HCyh2dt70P3XdtyRayP8FWg==}
-    engines: {node: '>=20'}
     peerDependencies:
       seroval: 1.7.0
 
@@ -14370,14 +14365,14 @@ snapshots:
       '@tanstack/history': 1.162.0
       cookie-es: 3.1.1
       seroval: 1.7.0
-      seroval-plugins: 1.5.4(seroval@1.7.0)
+      seroval-plugins: 1.6.12(seroval@1.7.0)
 
   '@tanstack/router-core@1.171.34':
     dependencies:
       '@tanstack/history': 1.162.4
       cookie-es: 3.1.1
       seroval: 1.7.0
-      seroval-plugins: 1.8.0(seroval@1.7.0)
+      seroval-plugins: 1.6.12(seroval@1.7.0)
 
   '@tanstack/router-generator@1.167.40':
     dependencies:
@@ -19763,11 +19758,7 @@ snapshots:
 
   serialize-error@2.1.0: {}
 
-  seroval-plugins@1.5.4(seroval@1.7.0):
-    dependencies:
-      seroval: 1.7.0
-
-  seroval-plugins@1.8.0(seroval@1.7.0):
+  seroval-plugins@1.6.12(seroval@1.7.0):
     dependencies:
       seroval: 1.7.0
 
