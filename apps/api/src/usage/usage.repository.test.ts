@@ -13,14 +13,14 @@ function query() {
   });
 }
 
-function repository() {
+function repository(rows: Record<string, unknown>[] = []) {
   const statements: Array<{ sql: string; params: readonly unknown[] }> = [];
   const database = {
     withTenant: async (_tenantId: string, operation: (executor: unknown) => Promise<unknown>) => operation({
       execute: async () => undefined,
       query: async (sql: string, params: readonly unknown[] = []) => {
         statements.push({ sql, params });
-        return [];
+        return rows;
       },
     }),
   };
@@ -58,6 +58,46 @@ describe("PostgresUsageRepository pagination", () => {
     expect(statements[0]?.sql).toContain("ts <");
     expect(statements[0]?.sql).toContain("id <");
     expect(statements[0]?.params).toContain("2026-07-31T12:00:00.000Z");
+  });
+
+  it("includes worker usage and carries the exact database timestamp into the next page", async () => {
+    const cursorTs = "2026-07-31T12:00:00.123456Z";
+    const workerEvent = {
+      id: "00000000-0000-7000-8000-000000000099",
+      tenant_id: TENANT_ID,
+      request_id: "compaction-1",
+      source: "worker",
+      user_id: null,
+      task_id: null,
+      session_id: null,
+      tool_call_id: null,
+      feature: "session.compaction",
+      provider: null,
+      model: null,
+      tokens_in: 200,
+      tokens_out: 20,
+      tokens_cached: 0,
+      cost_raw_micros: "550",
+      cost_billed_micros: "550",
+      latency_ms: null,
+      ttft_ms: null,
+      status: "completed",
+      ts: new Date(cursorTs),
+      created_at: new Date(cursorTs),
+      cursor_ts: cursorTs,
+    };
+    const { usage, statements } = repository([
+      workerEvent,
+      { ...workerEvent, id: "00000000-0000-7000-8000-000000000098", cursor_ts: "2026-07-31T12:00:00.123455Z" },
+    ]);
+
+    const page = await usage.requestPage(TENANT_ID, { ...query(), limit: 1 });
+    expect(page.items).toMatchObject([{ feature: "session.compaction", billedCostMicros: "550" }]);
+    expect(page.nextCursor).toBe(`${cursorTs}|${workerEvent.id}`);
+    expect(statements[0]?.sql).toContain("AS cursor_ts");
+
+    await usage.requestPage(TENANT_ID, { ...query(), limit: 1, cursor: page.nextCursor ?? undefined });
+    expect(statements[1]?.params).toContain(cursorTs);
   });
 });
 

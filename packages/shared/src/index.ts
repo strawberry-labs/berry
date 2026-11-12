@@ -656,7 +656,7 @@ export const CloudUsageEventRecordSchema = z.object({
   id: z.string(),
   tenantId: z.string(),
   requestId: z.string(),
-  source: z.enum(["api", "router", "sandbox", "fixture"]).default("api"),
+  source: z.enum(["api", "router", "sandbox", "fixture", "worker"]).default("api"),
   userId: z.string().nullable(),
   departmentId: z.string().nullable().default(null),
   workspaceId: z.string().nullable(),
