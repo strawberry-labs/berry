@@ -49,6 +49,7 @@ const calls: Record<(typeof DEMO_MANAGEMENT_METHODS)[number], () => Promise<unkn
   listAllowanceDefaults: () => client.listAllowanceDefaults(TENANT),
   allowanceCycle: () => client.allowanceCycle(TENANT),
   allowanceBalances: () => client.allowanceBalances(TENANT),
+  myAllowanceBalance: () => client.myAllowanceBalance(TENANT),
   allowanceBalance: () => client.allowanceBalance(TENANT, "usr_0001"),
   allowanceAdjustments: () => client.allowanceAdjustments(TENANT),
   billingSummary: () => client.billingSummary(TENANT),
