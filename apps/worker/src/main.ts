@@ -145,6 +145,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
       dimensions: durableConfig.embeddingDimensions,
       version: durableConfig.embeddingProfileVersion,
     }),
+    maxEmbeddedChunks: durableConfig.knowledgeMaxEmbeddedChunks,
   });
   const compactor = new DurableSessionCompactor(
     new SqlSessionCompactionRepository(executor),

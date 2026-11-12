@@ -2111,6 +2111,11 @@ function validateAdmissionReplay(
   return { runId: replayed.id, sessionId: input.sessionId };
 }
 
+// Shell commands and edits act inside the task's sandbox; the worker returns
+// their interruptions to the model (turn-runner holdsForReview), so they
+// never make a run wait for review.
+const HELD_TOOL_STEP_SQL = "COALESCE(NULLIF(btrim(s.input->>'toolName'),''),substr(s.step_type,6)) NOT IN ('bash','edit')";
+
 async function cancelActiveDurableRun(
   transaction: SqlExecutor,
   tenantId: string,
@@ -2130,6 +2135,7 @@ FROM turn_steps s
 LEFT JOIN tool_calls tc ON tc.tenant_id=s.tenant_id AND tc.step_id=s.id
 WHERE s.tenant_id=$1::uuid AND s.run_id=$2::uuid
   AND s.state='running' AND s.retry_class='non_idempotent_manual'
+  AND ${HELD_TOOL_STEP_SQL}
 ORDER BY s.sequence DESC
 LIMIT 1
 FOR UPDATE OF s
@@ -2328,6 +2334,7 @@ JOIN tool_calls tc ON tc.tenant_id=s.tenant_id AND tc.run_id=s.run_id AND tc.ste
 WHERE s.tenant_id=$1::uuid AND s.run_id=$2::uuid
   AND ($3::uuid IS NULL OR s.id<>$3::uuid)
   AND s.state='running' AND s.retry_class='non_idempotent_manual'
+  AND ${HELD_TOOL_STEP_SQL}
   AND tc.status='running'
 ORDER BY s.sequence DESC,s.id DESC
 LIMIT 1

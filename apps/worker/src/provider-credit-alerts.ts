@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { OperationalWorkerRole } from "@berry/shared";
 import { ProviderCreditAlertJobPayloadSchema, type ProviderCreditAlertJobPayload } from "./jobs.js";
 import type { SqlExecutor } from "./sql-repositories.js";
-import { emailErrorMessage, isEmailAddress, type EmailMessage, type EmailSender } from "./email.js";
+import { EmailNotSentError, emailErrorMessage, emailSendRejected, isEmailAddress, type EmailMessage, type EmailSender } from "./email.js";
 import { emitWorkerOperationalEvent } from "./operational-telemetry.js";
 import {
   PROVIDER_CREDIT_EXHAUSTED_MESSAGE,
@@ -18,7 +18,9 @@ import {
  * raises an alert by writing one `runtime_outbox` row. The background worker
  * delivers it: one `alert_events` row per tenant, provider and problem in any
  * 24 hours, and one `delivery_attempts` row per send, so retries never resend
- * a delivered email. No schema change is needed: the event's rule and the
+ * a delivered email. A send whose result is unknown (SES may have accepted it)
+ * stays `pending` with the reason in `error`, and is never sent again
+ * automatically. No schema change is needed: the event's rule and the
  * administrators' fallback destination are per-tenant rows with fixed IDs.
  */
 
@@ -122,7 +124,10 @@ export type AlertRecipients = {
 
 export type DeliveryClaim =
   | { claimed: true; attemptId: string; attempt: number }
-  | { claimed: false; reason: "already_delivered" | "in_flight" | "attempts_exhausted" };
+  | { claimed: false; reason: "already_delivered" | "in_flight" | "unresolved" | "attempts_exhausted" };
+
+/** Kept on a pending attempt whose email may have been sent. */
+const UNKNOWN_OUTCOME = "The email may have been sent; Berry did not receive the result and will not send it again automatically";
 
 export interface ProviderCreditAlertStore {
   ensureRule(tenantId: string): Promise<{ id: string; enabled: boolean }>;
@@ -140,7 +145,7 @@ export interface ProviderCreditAlertStore {
   recordDelivery(input: {
     tenantId: string;
     attemptId: string;
-    status: "delivered" | "failed";
+    status: "delivered" | "failed" | "pending";
     providerMessageId: string | null;
     error: string | null;
   }): Promise<void>;
@@ -286,8 +291,10 @@ LIMIT $2
 
   /**
    * Reserves the next attempt for one destination unless it was delivered, is
-   * being sent by another worker, or has used its attempts. The unique attempt
-   * number makes two concurrent claims resolve to one sender.
+   * unresolved, or has used its attempts. The unique attempt number makes two
+   * concurrent claims resolve to one sender. A pending attempt is never
+   * claimed past: it is being sent now, or its email may have been sent (a
+   * lost SES response, or a worker that stopped before recording the result).
    */
   async claimDelivery(input: { tenantId: string; eventId: string; destinationId: string; maxAttempts: number }): Promise<DeliveryClaim> {
     const rows = await withTenantTransaction(this.executor, input.tenantId, (executor) => executor.query<{
@@ -295,37 +302,40 @@ LIMIT $2
       attempt: number | null;
       attempts: number | string;
       delivered: boolean;
+      unresolved: boolean;
     }>(
       `
 WITH previous AS (
   SELECT COALESCE(max(attempt),0) AS last_attempt,
          count(*) AS attempts,
          COALESCE(bool_or(status='delivered'),false) AS delivered,
-         COALESCE(bool_or(status='pending' AND created_at > now() - interval '10 minutes'),false) AS in_flight
+         COALESCE(bool_or(status='pending'),false) AS pending,
+         COALESCE(bool_or(status='pending' AND (error IS NOT NULL OR created_at <= now() - interval '10 minutes')),false) AS unresolved
   FROM delivery_attempts
   WHERE tenant_id=$1::uuid AND alert_event_id=$2::uuid AND destination_id=$3::uuid
 ), interrupted AS (
   UPDATE delivery_attempts
-  SET status='failed',error='The worker stopped before recording the result; the email may have been sent'
+  SET error=$5
   WHERE tenant_id=$1::uuid AND alert_event_id=$2::uuid AND destination_id=$3::uuid
-    AND status='pending' AND created_at <= now() - interval '10 minutes'
+    AND status='pending' AND error IS NULL AND created_at <= now() - interval '10 minutes'
   RETURNING id
 ), claimed AS (
   INSERT INTO delivery_attempts (tenant_id,alert_event_id,destination_id,attempt,status)
   SELECT $1::uuid,$2::uuid,$3::uuid,previous.last_attempt+1,'pending'
   FROM previous
-  WHERE NOT previous.delivered AND NOT previous.in_flight AND previous.attempts < $4
+  WHERE NOT previous.delivered AND NOT previous.pending AND previous.attempts < $4
   ON CONFLICT DO NOTHING
   RETURNING id,attempt
 )
-SELECT claimed.id,claimed.attempt,previous.attempts,previous.delivered
+SELECT claimed.id,claimed.attempt,previous.attempts,previous.delivered,previous.unresolved
 FROM previous LEFT JOIN claimed ON true
       `.trim(),
-      [input.tenantId, input.eventId, input.destinationId, input.maxAttempts],
+      [input.tenantId, input.eventId, input.destinationId, input.maxAttempts, `${UNKNOWN_OUTCOME} (the worker stopped before recording it)`],
     ));
     const row = rows[0];
     if (row?.id) return { claimed: true, attemptId: row.id, attempt: Number(row.attempt) };
     if (row?.delivered) return { claimed: false, reason: "already_delivered" };
+    if (row?.unresolved) return { claimed: false, reason: "unresolved" };
     if (row && Number(row.attempts) >= input.maxAttempts) return { claimed: false, reason: "attempts_exhausted" };
     // A recent pending attempt, or a concurrent claim that won the same attempt number.
     return { claimed: false, reason: "in_flight" };
@@ -334,7 +344,7 @@ FROM previous LEFT JOIN claimed ON true
   async recordDelivery(input: {
     tenantId: string;
     attemptId: string;
-    status: "delivered" | "failed";
+    status: "delivered" | "failed" | "pending";
     providerMessageId: string | null;
     error: string | null;
   }): Promise<void> {
@@ -345,7 +355,7 @@ FROM previous LEFT JOIN claimed ON true
   }
 }
 
-export type DeliveryOutcome = "sent" | "failed" | "already_delivered" | "in_flight" | "attempts_exhausted";
+export type DeliveryOutcome = "sent" | "failed" | "unknown" | "already_delivered" | "in_flight" | "unresolved" | "attempts_exhausted";
 
 /** Sends one alert email to one destination and records the attempt. */
 export async function deliverAlertEmail(
@@ -367,23 +377,29 @@ export async function deliverAlertEmail(
     maxAttempts: input.maxAttempts ?? MAX_ATTEMPTS_PER_DESTINATION,
   });
   if (!claim.claimed) return claim.reason;
-  let outcome: { status: "delivered" | "failed"; providerMessageId: string | null; error: string | null };
+  let outcome: { status: "delivered" | "failed" | "pending"; providerMessageId: string | null; error: string | null };
   try {
-    if (input.recipients.length === 0) throw new Error("The destination has no email recipients");
+    if (input.recipients.length === 0) throw new EmailNotSentError("The destination has no email recipients");
     const sent = await sender.send({ ...input.message, to: input.recipients });
     outcome = { status: "delivered", providerMessageId: sent.messageId, error: null };
   } catch (error) {
-    outcome = { status: "failed", providerMessageId: null, error: emailErrorMessage(error) };
+    outcome = emailSendRejected(error)
+      ? { status: "failed", providerMessageId: null, error: emailErrorMessage(error) }
+      // Not "failed": that would allow another send. The attempt stays
+      // unresolved until an administrator checks it.
+      : { status: "pending", providerMessageId: null, error: `${UNKNOWN_OUTCOME}: ${emailErrorMessage(error)}` };
   }
   await store.recordDelivery({ tenantId: input.tenantId, attemptId: claim.attemptId, ...outcome });
-  return outcome.status === "delivered" ? "sent" : "failed";
+  return outcome.status === "delivered" ? "sent" : outcome.status === "failed" ? "failed" : "unknown";
 }
 
 export type ProviderCreditAlertResult = {
-  outcome: "email_disabled" | "rule_disabled" | "no_recipients" | "delivered" | "duplicate" | "failed";
+  outcome: "email_disabled" | "rule_disabled" | "no_recipients" | "delivered" | "duplicate" | "failed" | "unknown";
   eventId: string | null;
   sent: number;
   failed: number;
+  /** Sends whose result is unknown; retrying cannot resolve them. */
+  unknown: number;
   skipped: number;
 };
 
@@ -403,7 +419,7 @@ export class ProviderCreditAlertProcessor {
     sourceRevision?: string;
   }) {}
 
-  /** Delivers one raised alert. Throws when a send failed, so the job is retried. */
+  /** Delivers one raised alert. Throws when a send failed, so the job is retried; an unknown result is not retried. */
   async deliver(payload: ProviderCreditAlertJobPayload): Promise<ProviderCreditAlertResult> {
     const result = await this.#deliver(ProviderCreditAlertJobPayloadSchema.parse(payload));
     emitWorkerOperationalEvent(
@@ -415,7 +431,7 @@ export class ProviderCreditAlertProcessor {
         outcome: result.outcome,
         completedCount: result.sent,
         failedCount: result.failed,
-        itemCount: result.sent + result.failed + result.skipped,
+        itemCount: result.sent + result.failed + result.unknown + result.skipped,
       },
     );
     if (result.failed > 0) throw new ProviderCreditAlertDeliveryError(result);
@@ -423,7 +439,7 @@ export class ProviderCreditAlertProcessor {
   }
 
   async #deliver(alert: ProviderCreditAlertJobPayload): Promise<ProviderCreditAlertResult> {
-    const empty = { eventId: null, sent: 0, failed: 0, skipped: 0 };
+    const empty = { eventId: null, sent: 0, failed: 0, unknown: 0, skipped: 0 };
     const sender = this.options.sender;
     if (!sender) return { outcome: "email_disabled", ...empty };
     const { store } = this.options;
@@ -448,6 +464,7 @@ export class ProviderCreditAlertProcessor {
     });
     let sent = 0;
     let failed = 0;
+    let unknown = 0;
     let skipped = 0;
     for (const destination of recipients.destinations) {
       const outcome = await deliverAlertEmail(store, sender, {
@@ -460,13 +477,15 @@ export class ProviderCreditAlertProcessor {
       });
       if (outcome === "sent") sent += 1;
       else if (outcome === "failed") failed += 1;
+      else if (outcome === "unknown") unknown += 1;
       else skipped += 1;
     }
     return {
-      outcome: failed > 0 ? "failed" : sent > 0 ? "delivered" : "duplicate",
+      outcome: failed > 0 ? "failed" : unknown > 0 ? "unknown" : sent > 0 ? "delivered" : "duplicate",
       eventId: event.id,
       sent,
       failed,
+      unknown,
       skipped,
     };
   }

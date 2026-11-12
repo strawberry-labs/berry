@@ -352,7 +352,7 @@ describe("MemoryService", () => {
       personal: [],
       personalDegraded: true,
     });
-    expect(observedSignal).toBe(controller.signal);
+    expect(observedSignal).toMatchObject({ aborted: true, reason: controller.signal.reason });
   });
 });
 

@@ -135,24 +135,13 @@ export class KnowledgeService {
     if (!this.#config.projectKnowledgeEnabled || !query) {
       return emptyGrounding(queryHash, tokenBudget, "knowledge_disabled");
     }
-    let queryVector: readonly number[] | null = null;
-    let degradedReason: GroundingContext["retrieval"]["degradedReason"] = "none";
-    if (this.embeddings) {
-      try {
-        queryVector = (await this.embeddings.embed(
-          [query],
-          input.signal ? { signal: input.signal } : {},
-        ))[0] ?? null;
-      } catch {
-        degradedReason = "embeddings_unavailable";
-      }
-    } else {
-      degradedReason = "embeddings_unavailable";
-    }
+    // Keyword search runs while the query is embedded.
+    const embedding = this.embedQuery(query, input.signal);
     return this.database.withTenant(input.tenantId, async (executor) => {
       await requireWorkspace(executor, input);
       const exactRows = await this.exact(executor, input, query);
       const fullTextRows = await this.fullText(executor, input, query);
+      const { queryVector, degradedReason } = await embedding;
       if (queryVector) await executor.execute("SET LOCAL hnsw.iterative_scan = 'strict_order'");
       const vectorRows = queryVector ? await this.vector(executor, input, queryVector) : [];
       // Relevance gates (H-040). Vector hits below the similarity floor are
@@ -260,6 +249,27 @@ export class KnowledgeService {
         },
       });
     });
+  }
+
+  /**
+   * A query embedding takes tens of milliseconds on an idle embedding service.
+   * When it is busy, retrieval continues with keyword results after
+   * retrievalEmbeddingTimeoutMs instead of holding the turn.
+   */
+  private async embedQuery(query: string, signal: AbortSignal | undefined): Promise<{
+    queryVector: readonly number[] | null;
+    degradedReason: GroundingContext["retrieval"]["degradedReason"];
+  }> {
+    if (!this.embeddings) return { queryVector: null, degradedReason: "embeddings_unavailable" };
+    const timeout = AbortSignal.timeout(this.#config.retrievalEmbeddingTimeoutMs);
+    try {
+      const [queryVector] = await this.embeddings.embed([query], {
+        signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+      });
+      return { queryVector: queryVector ?? null, degradedReason: "none" };
+    } catch {
+      return { queryVector: null, degradedReason: "embeddings_unavailable" };
+    }
   }
 
   private async exact(executor: SqlExecutor, input: {

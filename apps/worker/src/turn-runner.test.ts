@@ -182,7 +182,7 @@ describe("durable turn runner", () => {
       journal(current, await pendingContextEntries(current));
       const before = modelMessages(current).messages;
       expect(String(before[0]!.content)).not.toContain("Read PDFs");
-      current.runtimeRequest.extraSkills = [{ ...skill, description: "Updated PDF description " + "x".repeat(2_000) }];
+      current.runtimeRequest.extraSkills = [{ ...skill, description: "Updated PDF description " + "x".repeat(1_500) }];
       journal(current, await pendingContextEntries(current));
       const after = modelMessages(current).messages;
       expect(after.slice(0, before.length)).toEqual(before);
@@ -572,10 +572,25 @@ describe("durable turn runner", () => {
   });
 
   it("keeps a queued prompt's billing identity across delivery retries", () => {
-    const runtime = queuedFollowUpRuntimeRequest({ queuedBudgetRequestId: "queued:browser-key", budgetReservationRequired: true }, {
+    const runtime = queuedFollowUpRuntimeRequest({
+      queuedBudgetRequestId: "queued:browser-key",
+      budgetReservationRequired: true,
+      continuationSourceRunId: randomUUID(),
+      continuationHeadEntryId: randomUUID(),
+      budgetBaseRequestId: "older-turn",
+      budgetGeneration: 2,
+      budgetUsageAfterSequence: 100,
+      budgetBaselineCostMicros: "1000",
+    }, {
       id: "row-id", attempt_count: 3, input: "Rewrite this email", intent: null, attachments: [],
     });
-    expect(runtime).toMatchObject({ requestId: "queued:browser-key", budgetReservationRequired: true, continueInterruptedTurn: false });
+    expect(runtime).toEqual({
+      requestId: "queued:browser-key",
+      budgetReservationRequired: true,
+      continueInterruptedTurn: false,
+      input: "Rewrite this email",
+      attachments: [],
+    });
   });
 
   it("guides ordinary image-edit turns toward the admitted image tool", () => {
@@ -714,6 +729,46 @@ describe("durable turn runner", () => {
   it("starts in live mode without a global router for snapshot-admitted providers", () => {
     expect(createDurableTurnModel({ BERRY_API_MODEL_MODE: "live" }))
       .toBeInstanceOf(SnapshotProviderDurableTurnModel);
+  });
+
+  it("preserves the admitted provider on recovery and refuses malformed versioned requests", async () => {
+    const current = providerSnapshot("openai-responses");
+    const legacy = { call: vi.fn(async () => ({ text: "legacy", inputTokens: 1, outputTokens: 1, toolCalls: [] })) };
+    const fetch = vi.fn(async (_input: RequestInfo | URL) => new Response(
+      'data: {"type":"response.output_text.delta","delta":"ok"}\n\ndata: {"type":"response.completed","response":{"id":"resp-1","model":"test-model","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}\n\ndata: [DONE]\n\n',
+      { headers: { "content-type": "text/event-stream" } },
+    ));
+    vi.stubGlobal("fetch", fetch);
+    const model = new SnapshotProviderDurableTurnModel({}, legacy);
+    const step = modelStep("pending", 1);
+    const context = {
+      messageId: randomUUID(),
+      tools: [],
+      emitDelta: async () => undefined,
+      policyForTool: () => ({
+        retryClass: "read_only" as const,
+        repeatPolicy: "compare_result" as const,
+        requiresApproval: false,
+        approvalKind: "mcp" as const,
+      }),
+    };
+    current.runtimeRequest = {
+      ...current.runtimeRequest,
+      continuationSourceRunId: randomUUID(),
+      continuationHeadEntryId: randomUUID(),
+      queuedBudgetRequestId: "queued:recovery",
+      budgetBaseRequestId: "original-request",
+      budgetGeneration: 2,
+      budgetUsageAfterSequence: 22,
+      budgetBaselineCostMicros: "100",
+    };
+    await expect(model.call(current, step, context)).resolves.toMatchObject({ text: "ok" });
+    expect(String(fetch.mock.calls[0]?.[0])).toBe("https://provider.example.test/v1/responses");
+
+    current.runtimeRequest = { ...current.runtimeRequest, budgetGeneration: "unexpected" };
+    await expect(model.call(current, step, context)).rejects.toThrow("budgetGeneration");
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(legacy.call).not.toHaveBeenCalled();
   });
 
   it("measures the time to the first streamed output (H-013)", async () => {
@@ -1968,14 +2023,14 @@ describe("durable turn runner", () => {
 
   describe("model-directed MCP failure recovery", () => {
     const mcpCases = [
-      { name: "mcp__CustomServer__lookup", retryClass: "non_idempotent_manual", error: "403: proxy access denied" },
-      { name: "mcp__Google_Workspace__update_record", retryClass: "non_idempotent_manual", error: "socket hang up" },
-      { name: "mcp__Internal__get_report", retryClass: "read_only", error: "MCP tool returned isError: upstream unavailable" },
-      { name: "mcp__Records__upsert", retryClass: "idempotent_with_key", error: "MCP error: service unavailable" },
+      { name: "mcp__CustomServer__lookup", retryClass: "non_idempotent_manual", error: "403: proxy access denied", phase: "rejected" },
+      { name: "mcp__Google_Workspace__update_record", retryClass: "non_idempotent_manual", error: "socket hang up", phase: "not_sent" },
+      { name: "mcp__Internal__get_report", retryClass: "read_only", error: "MCP tool returned isError: upstream unavailable", phase: "dispatched" },
+      { name: "mcp__Records__upsert", retryClass: "idempotent_with_key", error: "MCP error: service unavailable", phase: "dispatched" },
     ] as const;
 
     for (const choice of ["retry", "change arguments", "switch tools", "move on"] as const) {
-      it.each(mcpCases)(`lets the model ${choice} after $name fails`, async ({ name, retryClass, error }) => {
+      it.each(mcpCases)(`lets the model ${choice} after $name fails`, async ({ name, retryClass, error, phase }) => {
         const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
         const executed: string[] = [];
         let modelCalls = 0;
@@ -2006,7 +2061,7 @@ describe("durable turn runner", () => {
         }, {
           execute: async (_current, step) => {
             executed.push(String(step.input.toolName));
-            if (executed.length === 1) throw Object.assign(new Error(error), { toolCallPhase: "dispatched" });
+            if (executed.length === 1) throw Object.assign(new Error(error), { toolCallPhase: phase });
             return { output: { ok: true }, summary: "Succeeded" };
           },
         });
@@ -2021,7 +2076,7 @@ describe("durable turn runner", () => {
     }
 
     it.each(["read_only", "idempotent_with_key", "non_idempotent_manual"] as const)(
-      "reports an interrupted %s MCP call to the model without replaying it",
+      "handles an interrupted %s MCP call without replaying it",
       async (retryClass) => {
         const tool = toolStep("running", retryClass, false);
         tool.type = "tool.mcp__AnyServer__operation";
@@ -2036,9 +2091,16 @@ describe("durable turn runner", () => {
         const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), ...history, tool]));
         const execute = vi.fn(async () => ({ output: {}, summary: "Must not execute" }));
         const runner = new DurableTurnRunner(repository, unusedModel(), { execute });
-        await expect(runner.execute({ tenantId, runId, reason: "lease-recovery" }))
-          .resolves.toMatchObject({ state: "calling_model" });
+        const result = await runner.execute({ tenantId, runId, reason: "lease-recovery" });
         expect(execute).not.toHaveBeenCalled();
+        if (retryClass === "non_idempotent_manual") {
+          expect(result.state).toBe("recovery_required");
+          expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
+            state: "recovery_required", outcomeCertainty: "unknown",
+          });
+          return;
+        }
+        expect(result.state).toBe("calling_model");
         expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
           state: "failed",
           output: { failure: { outcome: retryClass === "read_only" ? "not_applied" : "unknown" } },
@@ -2072,7 +2134,7 @@ describe("durable turn runner", () => {
     });
 
     it.each(["read_only", "idempotent_with_key", "non_idempotent_manual"] as const)(
-      "returns a timed-out %s MCP call to the model without recovery",
+      "handles a timed-out %s MCP call according to its retry policy",
       async (retryClass) => {
         const tool = toolStep("pending", retryClass, false);
         tool.type = "tool.mcp__AnyServer__operation";
@@ -2085,9 +2147,16 @@ describe("durable turn runner", () => {
         const runner = new DurableTurnRunner(repository, unusedModel(), { execute }, {
           toolIdleTimeoutMs: 5, toolMaxDurationMs: 1_000,
         });
-        await expect(runner.execute({ tenantId, runId, reason: "continue" }))
-          .resolves.toMatchObject({ state: "calling_model" });
+        const result = await runner.execute({ tenantId, runId, reason: "continue" });
         expect(execute).toHaveBeenCalledTimes(1);
+        if (retryClass === "non_idempotent_manual") {
+          expect(result.state).toBe("recovery_required");
+          expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
+            state: "recovery_required", timedOut: true, outcomeCertainty: "unknown",
+          });
+          return;
+        }
+        expect(result.state).toBe("calling_model");
         expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
           state: "failed", timedOut: true,
           outcomeCertainty: retryClass === "read_only" ? "known" : "unknown",
@@ -3479,7 +3548,7 @@ describe("durable turn runner", () => {
       let attempts = 0;
       const result = await driveCalls(Array.from({ length: 7 }, () => [call]), () => {
         attempts += 1;
-        if (attempts <= 6) throw new Error("socket hang up");
+        if (attempts <= 6) throw Object.assign(new Error("socket hang up"), { toolCallPhase: "not_sent" });
         return { found: true };
       });
       expect(countOf(result.executed, call.name)).toBe(7);
@@ -3501,7 +3570,7 @@ describe("durable turn runner", () => {
       expect(result.toolSteps[1]?.state).toBe("completed");
     });
 
-    it("lets the model check an uncertain MCP write and then choose to retry it", async () => {
+    it("holds an uncertain MCP write before the model can issue it again", async () => {
       const create = { name: "mcp__Connect_Aesg_MCP__create_record", args: { title: "Tender A" }, retryClass: "non_idempotent_manual" as const };
       let creates = 0;
       const result = await driveCalls([
@@ -3516,11 +3585,25 @@ describe("durable turn runner", () => {
         return { ok: true };
       });
 
-      expect(countOf(result.executed, create.name)).toBe(2);
+      expect(result.executed).toHaveLength(1);
       expect(result.failure(0)).toMatchObject({ category: "unknown_outcome", outcome: "unknown" });
-      expect(result.modelText(0)).toContain("may already have changed something");
-      expect(result.modelText(0)).toContain("Check the target state");
-      expect(result.toolSteps[2]?.state).toBe("completed");
+      expect(result.toolSteps[0]).toMatchObject({ state: "recovery_required", outcomeCertainty: "unknown" });
+      expect(result.state).toBe("recovery_required");
+    });
+
+    it("holds a later connector write after a dispatched failure with an uncertain outcome", async () => {
+      const create = { name: "mcp__Records__create", args: { title: "first" }, retryClass: "non_idempotent_manual" as const };
+      const result = await driveCalls([[create], [{ ...create, args: { title: "second" } }]], () => {
+        throw Object.assign(new Error("403: access denied during receipt generation"), { toolCallPhase: "dispatched" });
+      });
+
+      expect(result.executed).toHaveLength(1);
+      expect(result.failure(0)).toMatchObject({ outcome: "unknown" });
+      expect(result.toolSteps[1]).toMatchObject({
+        state: "recovery_required",
+        input: { heldBy: [result.toolSteps[0]?.id] },
+      });
+      expect(result.state).toBe("recovery_required");
     });
 
     it("refuses an unchanged deterministic repeat inside a parallel read batch", async () => {

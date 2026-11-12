@@ -9,7 +9,7 @@ import {
 import {
   BROWSER_HANDOFF_TOOL,
   BrowserSessionReceiptSchema,
-  DurableTurnRuntimeRequestSchema,
+  parseAdmittedRuntimeRequest,
   NetworkPolicySchema,
   normalizeWorkerRole,
   openDurableSecret,
@@ -227,8 +227,8 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       return boundaries.length ? Math.max(...boundaries) : undefined;
     }
     if (!toolName.startsWith("mcp__")) return this.base.repeatContextSince?.(snapshot, step);
-    const runtime = DurableTurnRuntimeRequestSchema.safeParse(snapshot.runtimeRequest);
-    const servers = this.#turnContexts.get(snapshot.id)?.servers ?? (runtime.success ? runtime.data.mcpServers : this.#allowedServers(snapshot));
+    const runtime = parseAdmittedRuntimeRequest(snapshot.runtimeRequest);
+    const servers = this.#turnContexts.get(snapshot.id)?.servers ?? (runtime ? runtime.mcpServers : this.#allowedServers(snapshot));
     const server = servers.find((server) => server.enabled && server.trusted && isOfficialBerryCrawlServer(server)
       && toolName.startsWith(`mcp__${sanitizeName(server.name)}__berrycrawl_browser_`));
     if (!server) return undefined;
@@ -408,14 +408,14 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   }
 
   async #prepareContext(snapshot: DurableTurnSnapshot): Promise<DurableMcpTurnContext> {
-    const runtime = DurableTurnRuntimeRequestSchema.safeParse(snapshot.runtimeRequest);
-    if (!runtime.success) {
+    const runtime = parseAdmittedRuntimeRequest(snapshot.runtimeRequest);
+    if (!runtime) {
       return { source: this.#source, servers: this.#allowedServers(snapshot), unavailable: [] };
     }
     // Each connector opens its own credentials: one that cannot be opened is
     // unavailable for this turn without blocking healthy connectors or a
     // request that needs none (H-077).
-    const enabled = runtime.data.mcpServers.filter((server) => server.enabled && server.trusted);
+    const enabled = runtime.mcpServers.filter((server) => server.enabled && server.trusted);
     const prepared = await Promise.allSettled(enabled
       .map(async (server): Promise<McpServerSpec> => {
         const credential = await durableMcpCredential(server.credential, server.credentialRef, this.env);
@@ -453,7 +453,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
           reason: `its credentials could not be opened (${(result.reason instanceof Error ? result.reason.message : String(result.reason)).replace(/\s+/g, " ").slice(0, 200)}). An administrator or the connection owner should reconnect it.`,
         }]
       : []);
-    const policy = NetworkPolicySchema.safeParse(runtime.data.networkPolicy);
+    const policy = NetworkPolicySchema.safeParse(runtime.networkPolicy);
     const source = new McpToolSource({
       servers: [...servers],
       ...(policy.success ? { networkPolicy: policy.data } : {}),

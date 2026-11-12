@@ -18,6 +18,7 @@ import { PROVIDER_CREDIT_EXHAUSTED_MESSAGE } from "./provider-credits.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 
 const tenantId = "00000000-0000-7000-8000-000000000001";
+const MINUTE = 60_000;
 const HOUR = 3_600_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
@@ -45,7 +46,7 @@ class MemoryAlertStore implements ProviderCreditAlertStore {
     destinations: [{ id: administratorDestinationId(tenantId), label: "Organization owners and admins (automatic)", emails: ["owner@example.com"] }],
   };
   readonly events: Array<{ id: string; windowKey: string; createdAt: number }> = [];
-  readonly attempts: Array<{ id: string; eventId: string; destinationId: string; attempt: number; status: string; providerMessageId: string | null; error: string | null }> = [];
+  readonly attempts: Array<{ id: string; eventId: string; destinationId: string; attempt: number; status: string; providerMessageId: string | null; error: string | null; createdAt: number }> = [];
   readonly calls: string[] = [];
 
   async ensureRule(id: string) {
@@ -74,14 +75,17 @@ class MemoryAlertStore implements ProviderCreditAlertStore {
   async claimDelivery(input: { eventId: string; destinationId: string; maxAttempts: number }): Promise<DeliveryClaim> {
     const previous = this.attempts.filter((row) => row.eventId === input.eventId && row.destinationId === input.destinationId);
     if (previous.some((row) => row.status === "delivered")) return { claimed: false, reason: "already_delivered" };
-    if (previous.some((row) => row.status === "pending")) return { claimed: false, reason: "in_flight" };
+    // An unresolved attempt may have been sent: never claim past it.
+    const pending = previous.filter((row) => row.status === "pending");
+    if (pending.some((row) => row.error !== null || this.now - row.createdAt >= 10 * MINUTE)) return { claimed: false, reason: "unresolved" };
+    if (pending.length > 0) return { claimed: false, reason: "in_flight" };
     if (previous.length >= input.maxAttempts) return { claimed: false, reason: "attempts_exhausted" };
-    const row = { id: `attempt-${this.attempts.length + 1}`, eventId: input.eventId, destinationId: input.destinationId, attempt: previous.length + 1, status: "pending", providerMessageId: null, error: null };
+    const row = { id: `attempt-${this.attempts.length + 1}`, eventId: input.eventId, destinationId: input.destinationId, attempt: previous.length + 1, status: "pending", providerMessageId: null, error: null, createdAt: this.now };
     this.attempts.push(row);
     return { claimed: true, attemptId: row.id, attempt: row.attempt };
   }
 
-  async recordDelivery(input: { attemptId: string; status: "delivered" | "failed"; providerMessageId: string | null; error: string | null }) {
+  async recordDelivery(input: { attemptId: string; status: "delivered" | "failed" | "pending"; providerMessageId: string | null; error: string | null }) {
     Object.assign(this.attempts.find((row) => row.id === input.attemptId)!, {
       status: input.status,
       providerMessageId: input.providerMessageId,
@@ -253,6 +257,105 @@ describe("delivering a provider credit alert (H-005)", () => {
     await expect(processor.deliver(alert())).rejects.toBeInstanceOf(ProviderCreditAlertDeliveryError);
     await expect(processor.deliver(alert())).resolves.toMatchObject({ outcome: "duplicate", skipped: 1 });
     expect(sender.send).toHaveBeenCalledTimes(2);
+  });
+
+  describe("a send whose result is unknown", () => {
+    const timeout = () => new DOMException("The operation was aborted due to timeout", "TimeoutError");
+
+    it("is not sent again after SES accepted it and the response was lost", async () => {
+      const store = new MemoryAlertStore();
+      let accepted = 0;
+      const sender: EmailSender = { provider: "ses", send: vi.fn(async () => {
+        accepted += 1;
+        throw timeout();
+      }) };
+      const processor = new ProviderCreditAlertProcessor({ store, sender });
+
+      await expect(processor.deliver(alert())).resolves.toMatchObject({ outcome: "unknown", sent: 0, failed: 0, unknown: 1 });
+      expect(store.attempts).toEqual([expect.objectContaining({ attempt: 1, status: "pending", providerMessageId: null })]);
+      expect(store.attempts[0]!.error).toContain("may have been sent");
+      expect(store.attempts[0]!.error).toContain("TimeoutError");
+
+      // The repeated job, and later ones, leave it for an administrator to resolve.
+      await expect(processor.deliver(alert())).resolves.toMatchObject({ outcome: "duplicate", sent: 0, skipped: 1 });
+      store.now += HOUR;
+      await expect(processor.deliver(alert())).resolves.toMatchObject({ outcome: "duplicate", sent: 0, skipped: 1 });
+      expect(accepted).toBe(1);
+      expect(store.attempts).toHaveLength(1);
+    });
+
+    it.each([
+      [500, "InternalFailure"],
+      [503, "ServiceUnavailable"],
+    ])("is not sent again after SES accepted it and answered HTTP %s", async (status, name) => {
+      const store = new MemoryAlertStore();
+      let accepted = 0;
+      const sender: EmailSender = { provider: "ses", send: vi.fn(async () => {
+        accepted += 1;
+        // SES can accept a message and still answer with a server error.
+        if (accepted === 1) throw Object.assign(new Error("SES server error"), { name, $metadata: { httpStatusCode: status } });
+        return { messageId: `ses-${accepted}` };
+      }) };
+      const processor = new ProviderCreditAlertProcessor({ store, sender });
+
+      const first = await processor.deliver(alert()).catch((error: unknown) => error);
+      await processor.deliver(alert()).catch(() => undefined);
+      store.now += 11 * MINUTE;
+      await processor.deliver(alert()).catch(() => undefined);
+
+      expect({ accepted, statuses: store.attempts.map((row) => row.status) }).toEqual({ accepted: 1, statuses: ["pending"] });
+      expect(first).toMatchObject({ outcome: "unknown", sent: 0, failed: 0, unknown: 1 });
+      expect(store.attempts[0]!.error).toContain("may have been sent");
+      expect(store.attempts[0]!.error).toContain(`${name}:`);
+    });
+
+    it("is not sent again when the worker could not record the receipt", async () => {
+      const store = new MemoryAlertStore();
+      const { sender, sent } = recordingSender();
+      const record = store.recordDelivery.bind(store);
+      store.recordDelivery = vi.fn(async () => { throw new Error("Connection terminated unexpectedly"); });
+      const processor = new ProviderCreditAlertProcessor({ store, sender });
+
+      await expect(processor.deliver(alert())).rejects.toThrow("Connection terminated unexpectedly");
+      store.recordDelivery = record;
+      await expect(processor.deliver(alert())).resolves.toMatchObject({ sent: 0, skipped: 1 });
+      // Long after the worker died, the attempt is still unresolved rather than failed.
+      store.now += 11 * MINUTE;
+      await expect(processor.deliver(alert())).resolves.toMatchObject({ sent: 0, skipped: 1 });
+      expect(sent).toHaveLength(1);
+      expect(store.attempts.map((row) => row.status)).toEqual(["pending"]);
+    });
+
+    it("is sent by one of two concurrent workers only", async () => {
+      const store = new MemoryAlertStore();
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const sender: EmailSender = { provider: "ses", send: vi.fn(async () => { await gate; return { messageId: "ses-1" }; }) };
+      const first = new ProviderCreditAlertProcessor({ store, sender }).deliver(alert());
+      const second = new ProviderCreditAlertProcessor({ store, sender }).deliver(alert());
+      release();
+      await expect(Promise.all([first, second])).resolves.toEqual([
+        expect.objectContaining({ sent: 1 }),
+        expect.objectContaining({ sent: 0, skipped: 1 }),
+      ]);
+      expect(sender.send).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ["SES throttling", Object.assign(new Error("Maximum sending rate exceeded."), { name: "TooManyRequestsException", $metadata: { httpStatusCode: 429 } })],
+      ["a refused connection", Object.assign(new Error("connect ECONNREFUSED 10.0.0.1:443"), { code: "ECONNREFUSED" })],
+    ])("still retries %s until the attempts are used", async (_label, rejection) => {
+      const store = new MemoryAlertStore();
+      const sender: EmailSender = { provider: "ses", send: vi.fn(async () => { throw rejection; }) };
+      const processor = new ProviderCreditAlertProcessor({ store, sender, maxAttemptsPerDestination: 3 });
+
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await expect(processor.deliver(alert())).rejects.toBeInstanceOf(ProviderCreditAlertDeliveryError);
+      }
+      await expect(processor.deliver(alert())).resolves.toMatchObject({ outcome: "duplicate", skipped: 1 });
+      expect(sender.send).toHaveBeenCalledTimes(3);
+      expect(store.attempts.map((row) => row.status)).toEqual(["failed", "failed", "failed"]);
+    });
   });
 
   it("sends nothing when email is not configured or the organization turned the alert off", async () => {

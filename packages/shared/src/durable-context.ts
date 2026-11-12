@@ -1,4 +1,3 @@
-import { ScheduleTimezoneSchema } from "./scheduled-tasks.ts";
 import { z } from "zod";
 import { WorkflowCategorySchema, WORKFLOW_CATEGORY_VERSION } from "./workflow-routing.ts";
 
@@ -650,7 +649,8 @@ export const DurableTurnRuntimeRequestSchema = z.object({
   provider: DurableProviderTransportSchema,
   model: z.string().min(1).nullable(),
   conversationKind: z.enum(["chat", "code"]).default("chat"),
-  timezone: ScheduleTimezoneSchema.optional(),
+  /** Stored turns may have an old/invalid zone; date rendering falls back to UTC. Schedule inputs are validated separately. */
+  timezone: z.string().min(1).max(100).optional(),
   workspacePath: z.string().min(1),
   workspaceId: z.string().min(1),
   permissionMode: z.string().min(1),
@@ -684,6 +684,19 @@ export const DurableTurnRuntimeRequestSchema = z.object({
     capability: z.enum(["connectors", "vision", "image_generation"]),
     reason: z.string().min(1).max(500),
   }).strict()).max(10).optional(),
+  /** Queued prompts: the budget identity reserved when the prompt was queued (H-001). */
+  queuedBudgetRequestId: z.string().min(1).optional(),
+  /** Continue: the interrupted run and the journal head admitted for it (H-051, H-072). */
+  continuationSourceRunId: z.string().min(1).optional(),
+  continuationHeadEntryId: z.string().min(1).optional(),
+  /**
+   * Operator recovery: the budget generation this run now bills under, and the
+   * event sequence and cost already settled by earlier generations (H-066).
+   */
+  budgetBaseRequestId: z.string().min(1).optional(),
+  budgetGeneration: z.number().int().positive().optional(),
+  budgetUsageAfterSequence: z.number().int().nonnegative().optional(),
+  budgetBaselineCostMicros: z.string().regex(/^\d+$/).optional(),
 }).strict().superRefine((request, context) => {
   const noticed = new Set((request.capabilityNotices ?? []).map((notice) => notice.capability));
   const hasImageTool = request.builtInTools.includes("create_image");
@@ -708,6 +721,36 @@ export const DurableTurnRuntimeRequestSchema = z.object({
   }
 });
 export type DurableTurnRuntimeRequest = z.infer<typeof DurableTurnRuntimeRequestSchema>;
+
+/** A stored runtime request that declares a capability version but does not match it. */
+export class InvalidRuntimeRequestError extends Error {
+  readonly fields: readonly string[];
+
+  constructor(issues: readonly z.ZodIssue[]) {
+    // Field paths only: values can include provider settings and headers.
+    const fields = [...new Set(issues.flatMap((issue) => issue.code === z.ZodIssueCode.unrecognized_keys
+      ? issue.keys.map((key) => [...issue.path, key].join("."))
+      : [issue.path.join(".") || "(request)"]))];
+    super(`This turn's admitted model configuration is invalid (${fields.slice(0, 5).join(", ")}${fields.length > 5 ? ", ..." : ""}). Berry stopped instead of sending the task to a different provider or with different tools.`);
+    this.name = "InvalidRuntimeRequestError";
+    this.fields = fields;
+  }
+}
+
+/**
+ * Reads a run's stored runtime request. Runs admitted before capability
+ * snapshots carry no capabilityVersion and return null; only those may use a
+ * deployment-wide fallback. A versioned request that fails validation throws:
+ * treating it as legacy would silently change the admitted provider, model or
+ * tools.
+ */
+export function parseAdmittedRuntimeRequest(value: unknown): DurableTurnRuntimeRequest | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if ((value as Record<string, unknown>).capabilityVersion === undefined) return null;
+  const parsed = DurableTurnRuntimeRequestSchema.safeParse(value);
+  if (!parsed.success) throw new InvalidRuntimeRequestError(parsed.error.issues);
+  return parsed.data;
+}
 
 export const TurnRunStateSchema = z.enum([
   "queued",
@@ -804,6 +847,14 @@ export const DurableContextConfigSchema = z.object({
   // because they are Berry's own output, not source material (H-040).
   retrievalMinSimilarity: z.coerce.number().min(0).max(1).default(0.15),
   retrievalTaskOutcomeMinSimilarity: z.coerce.number().min(0).max(1).default(0.45),
+  // Query embeddings and personal memory recall take tens of milliseconds on
+  // an idle embedding service. Past these limits a turn continues with keyword
+  // results and Berry's own memories instead of waiting.
+  retrievalEmbeddingTimeoutMs: EnvPositiveIntegerSchema.default(400),
+  personalMemoryRecallTimeoutMs: EnvPositiveIntegerSchema.default(800),
+  // Chunks past this count stay keyword-searchable without vectors, so one
+  // huge file cannot hold the embedding service for hours.
+  knowledgeMaxEmbeddedChunks: EnvPositiveIntegerSchema.default(5000),
   runLeaseSeconds: EnvPositiveIntegerSchema.default(90),
   sandboxSnapshotIntervalSeconds: EnvPositiveIntegerSchema.default(900),
   knowledgeMaxInputBytes: EnvPositiveIntegerSchema.default(104857600),
@@ -855,6 +906,9 @@ export function durableContextConfigFromEnv(env: Record<string, string | undefin
     retrievalTokenBudget: env.BERRY_RETRIEVAL_TOKEN_BUDGET,
     retrievalMinSimilarity: env.BERRY_RETRIEVAL_MIN_SIMILARITY,
     retrievalTaskOutcomeMinSimilarity: env.BERRY_RETRIEVAL_TASK_OUTCOME_MIN_SIMILARITY,
+    retrievalEmbeddingTimeoutMs: env.BERRY_RETRIEVAL_EMBEDDING_TIMEOUT_MS,
+    personalMemoryRecallTimeoutMs: env.BERRY_PERSONAL_MEMORY_RECALL_TIMEOUT_MS,
+    knowledgeMaxEmbeddedChunks: env.BERRY_KNOWLEDGE_MAX_EMBEDDED_CHUNKS,
     runLeaseSeconds: env.BERRY_RUN_LEASE_SECONDS,
     sandboxSnapshotIntervalSeconds: env.BERRY_SANDBOX_SNAPSHOT_INTERVAL_SECONDS,
     knowledgeMaxInputBytes: env.BERRY_KNOWLEDGE_MAX_INPUT_BYTES,

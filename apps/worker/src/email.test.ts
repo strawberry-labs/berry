@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { SendEmailCommand } from "@aws-sdk/client-sesv2";
-import { SesEmailSender, createEmailSender, emailConfigFromEnv, emailErrorMessage, type SesSendClient } from "./email.js";
+import { SesEmailSender, createEmailSender, emailConfigFromEnv, emailErrorMessage, emailSendRejected, type SesSendClient } from "./email.js";
 
 describe("administrator email configuration (H-005)", () => {
   it("sends nothing by default", () => {
@@ -90,5 +90,45 @@ describe("SES email sender (H-005)", () => {
     expect(emailErrorMessage(failure)).toBe("MessageRejected: Email address is not verified. The following identities failed the check in region EU-WEST-1: alerts@example.com");
     expect(emailErrorMessage(new Error("signed with AKIAABCDEFGHIJKLMNOP and Bearer sk-secret-value\nnext line")))
       .toBe("signed with [redacted] and Bearer [redacted] next line");
+  });
+
+  it("never lets the SDK retry a send on its own", async () => {
+    const sender = createEmailSender({ provider: "ses", from: "alerts@example.com", region: "eu-west-1", configurationSet: null });
+    const client = (sender as unknown as { client: { config: { maxAttempts: () => Promise<number> } } }).client;
+    await expect(client.config.maxAttempts()).resolves.toBe(1);
+  });
+
+  it("tells a definite rejection from a send whose result is unknown", async () => {
+    const sender = new SesEmailSender({ send: vi.fn() }, { from: "alerts@example.com" });
+    const noRecipients = await sender.send({ to: ["nobody"], subject: "s", text: "t", html: "h" }).catch((error: unknown) => error);
+    for (const rejected of [
+      noRecipients,
+      Object.assign(new Error("Email address is not verified"), { name: "MessageRejected", $metadata: { httpStatusCode: 400 } }),
+      Object.assign(new Error("Rate exceeded"), { name: "TooManyRequestsException", $metadata: { httpStatusCode: 429 } }),
+      Object.assign(new Error("User is not authorized to perform ses:SendEmail"), { name: "AccessDeniedException", $metadata: { httpStatusCode: 403 } }),
+      Object.assign(new Error("Account sending paused"), { name: "SendingPausedException" }),
+      Object.assign(new Error("Could not load credentials from any providers"), { name: "CredentialsProviderError" }),
+      Object.assign(new Error("getaddrinfo ENOTFOUND email.eu-west-1.amazonaws.com"), { code: "ENOTFOUND" }),
+    ]) {
+      expect(emailSendRejected(rejected)).toBe(true);
+    }
+    for (const unknown of [
+      // SES can accept a message and still answer with a server or gateway error.
+      Object.assign(new Error("We encountered an internal error"), { name: "InternalFailure", $metadata: { httpStatusCode: 500 } }),
+      Object.assign(new Error("Bad gateway"), { $metadata: { httpStatusCode: 502 } }),
+      Object.assign(new Error("Service unavailable"), { name: "ServiceUnavailable", $metadata: { httpStatusCode: 503 } }),
+      Object.assign(new Error("Gateway timeout"), { $metadata: { httpStatusCode: 504 } }),
+      Object.assign(new Error("Request timeout"), { name: "RequestTimeout", $metadata: { httpStatusCode: 408 } }),
+      Object.assign(new Error("We encountered an internal error"), { name: "InternalFailure" }),
+      new DOMException("The operation was aborted due to timeout", "TimeoutError"),
+      Object.assign(new Error("Request aborted"), { name: "AbortError" }),
+      Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }),
+      // SES answered 200 but the body could not be read: it accepted the message.
+      Object.assign(new Error("Deserialization error"), { $metadata: { httpStatusCode: 200 } }),
+      new Error("Unexpected failure"),
+      "not an error",
+    ]) {
+      expect(emailSendRejected(unknown)).toBe(false);
+    }
   });
 });

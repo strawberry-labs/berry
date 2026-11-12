@@ -345,7 +345,11 @@ export class MemoryService {
             // silently dropped every personal memory for long requests (H-040).
             query: input.query.slice(0, 4_000),
             limit: 40,
-            ...(input.signal ? { signal: input.signal } : {}),
+            // A slow memory service degrades personal recall only; Berry's
+            // own memories above still reach the turn.
+            signal: input.signal
+              ? AbortSignal.any([input.signal, AbortSignal.timeout(this.#config.personalMemoryRecallTimeoutMs)])
+              : AbortSignal.timeout(this.#config.personalMemoryRecallTimeoutMs),
           }))
         : Promise.resolve({ items: [], degraded: false }),
     ]);

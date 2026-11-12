@@ -24,7 +24,7 @@ import {
   AgentStreamEventSchema,
   classifyProviderFailure,
   DURABLE_BASE_BUILT_IN_TOOLS,
-  DurableTurnRuntimeRequestSchema,
+  parseAdmittedRuntimeRequest,
   normalizeWorkerRole,
   routedBuiltInToolNames,
   VISION_ADAPTER_MAX_ATTEMPTS,
@@ -92,7 +92,7 @@ import {
   operationalDuration,
   persistWorkerOperationalEvent,
 } from "./operational-telemetry.js";
-import { classifyToolFailure, storedToolFailure, type ToolFailure } from "./tool-failures.js";
+import { classifyToolFailure, storedToolFailure, TOOL_FAILURE_OUTCOME_VERSION, toolFailureAction, type ToolFailure } from "./tool-failures.js";
 import {
   PROVIDER_CREDIT_EXHAUSTED_MESSAGE,
   raiseProviderCreditAlert,
@@ -115,6 +115,8 @@ const TERMINAL_STATES = new Set<TurnRunState>([
   "recovery_required",
 ]);
 const IDENTICAL_TOOL_FAILURE_LIMIT = 5;
+// Characters of a tool error a failed step stores; uncertainFailure reads them back.
+const STORED_TOOL_ERROR_LIMIT = 4_000;
 
 export type ToolRepeatPolicy =
   | "compare_result"
@@ -727,6 +729,8 @@ export class DurableTurnRunner {
         });
         return { runId: snapshot.id, state: "waiting" };
       }
+      // Validate before running any model or tools, including resumed tool steps.
+      if (snapshot.state !== "waiting") durableRuntimeRequest(snapshot);
       if (snapshot.state === "queued" || snapshot.state === "assembling_context") {
         await this.assemble(snapshot);
         return { runId: snapshot.id, state: "calling_model" };
@@ -754,7 +758,7 @@ export class DurableTurnRunner {
       return { runId: snapshot.id, state: snapshot.state, noOp: true };
     } catch (error) {
       if (error instanceof DurableTurnCancellationError) {
-        if (hasAmbiguousNonIdempotentTool(snapshot)) {
+        if (hasRunningHeldTool(snapshot)) {
           try {
             await this.transitionAmbiguousToolToRecovery(
               snapshot,
@@ -785,9 +789,9 @@ export class DurableTurnRunner {
           status: 402,
         });
       }
-      if (hasAmbiguousNonIdempotentTool(snapshot)) {
+      if (hasRunningHeldTool(snapshot)) {
         try {
-          await this.transitionAmbiguousToolToRecovery(snapshot, message);
+          await this.transitionAmbiguousToolToRecovery(snapshot, message, { outcomeCertainty: "unknown" });
           return { runId: snapshot.id, state: "recovery_required" };
         } catch (persistenceError) {
           if (persistenceError instanceof DurableTurnRetryableError) throw persistenceError;
@@ -801,7 +805,7 @@ export class DurableTurnRunner {
           ? error
           : new DurableTurnRetryableError(message, error);
       }
-      if (hasAmbiguousNonIdempotentTool(snapshot)) {
+      if (hasRunningHeldTool(snapshot)) {
         await this.repository.release(snapshot, message);
         throw new DurableTurnRetryableError(
           "A non-idempotent tool failed after its durable running marker; recovery classification is required.",
@@ -837,30 +841,44 @@ export class DurableTurnRunner {
       timedOut?: boolean;
       outcomeCertainty?: "known" | "unknown" | "not_applicable";
       abortAcknowledged?: boolean;
+      /** The class of the failure that left the outcome unknown (H-003). */
+      failure?: ToolFailure;
+      /** Usage the interrupted call already incurred. */
+      usage?: Extract<AgentStreamEvent, { kind: "usage" }>;
+      /** A pending call held before it runs, in place of an interrupted one. */
+      held?: DurableTurnStep;
+      /** The earlier calls whose unknown outcome holds it; kept in its input, which recovery leaves unchanged. */
+      heldBy?: readonly string[];
     } = {},
   ): Promise<void> {
-    const step = snapshot.steps.find((candidate) =>
+    const step = details.held ?? snapshot.steps.find((candidate) =>
       candidate.type.startsWith("tool.")
       && candidate.state === "running"
-      && candidate.retryClass === "non_idempotent_manual"
+      && holdsForReview(candidate)
     );
     if (!step) throw new DurableTurnRetryableError("The interrupted tool reference was not available");
     const toolCallId = toolCallIdForStep(step);
+    const notice = details.held
+      ? "Berry paused before this step because an earlier one didn't reply, so it can't tell whether that one went through. Check it, then press Continue."
+      : "Berry didn't get a reply from this action, so it can't tell whether it went through. Check it, then press Continue to run it again.";
     await this.repository.commit(snapshot, {
       expectedState: "executing_tool",
       nextState: "recovery_required",
       steps: [{
         ...step,
+        ...(details.heldBy ? { input: { ...step.input, heldBy: [...details.heldBy] } } : {}),
         state: "recovery_required",
         error: reason.slice(0, 4_000),
         cancellationAcknowledged: true,
+        ...(details.failure ? { output: { failure: toolFailureJson(details.failure) } } : {}),
         ...(details.timedOut !== undefined ? { timedOut: details.timedOut } : {}),
         ...(details.outcomeCertainty ? { outcomeCertainty: details.outcomeCertainty } : {}),
         ...(details.abortAcknowledged !== undefined ? { abortAcknowledged: details.abortAcknowledged } : {}),
       }],
       events: [
-        { kind: "tool.end", toolCallId, status: "failed", summary: "The external mutation outcome is uncertain." },
-        { kind: "error", message: "The external mutation outcome is uncertain. Operator review is required before retry." },
+        { kind: "tool.end", toolCallId, status: "failed", summary: "No reply came back, so this may or may not have gone through." },
+        ...(details.usage ? [AgentStreamEventSchema.parse(details.usage)] : []),
+        { kind: "error", message: notice },
         { kind: "turn.end", turnId: snapshot.id, status: "failed" },
       ],
       toolResultMessage: {
@@ -869,11 +887,11 @@ export class DurableTurnRunner {
         name: toolNameForStep(step),
         input: (step.input.arguments ?? {}) as JsonValue,
         status: "failed",
-        summary: "The external mutation outcome is uncertain. Operator review is required before retry.",
+        summary: notice,
       },
       terminalAssistant: {
         status: "failed",
-        error: "The external mutation outcome is uncertain. Operator review is required before retry.",
+        error: notice,
       },
       error: "ambiguous_external_operation",
       nextAction: "Review the external operation outcome before choosing retry or completion",
@@ -1735,6 +1753,26 @@ export class DurableTurnRunner {
       identicalFailureLimit,
       Math.max(1, this.options.maxToolRepairAttempts ?? identicalFailureLimit),
     );
+    // An earlier call of this tool may have taken effect: no further call of it
+    // runs until an explicit recovery decision (H-003, H-014). Shell commands
+    // and edits are never held; the model sees their results (holdsForReview).
+    const uncertain = step.state === "pending" && holdsForReview(step)
+      ? uncertainEarlierCalls(snapshot, step)
+      : [];
+    const latestUncertain = uncertain[0];
+    if (latestUncertain) {
+      await this.transitionAmbiguousToolToRecovery(snapshot, [
+        `Not run: ${uncertain.length === 1 ? `an earlier ${toolName} call` : `${uncertain.length} earlier ${toolName} calls`} may already have taken effect.`,
+        `${uncertain.length === 1 ? "Its" : "The latest"} error: ${toolFailureIdentity(latestUncertain.previous.error).split("\n")[0]?.slice(0, 500) ?? ""}`,
+        "Review it before this call runs.",
+      ].join(" "), {
+        held: step,
+        heldBy: uncertain.map(({ previous }) => previous.id),
+        failure: latestUncertain.failure,
+        outcomeCertainty: "not_applicable",
+      });
+      return "recovery_required";
+    }
     if (!isMcpToolStep(step) && repairBudget < IDENTICAL_TOOL_FAILURE_LIMIT && priorRepairAttempts >= repairBudget) {
       return this.stopToolUse(snapshot, step, {
         error: "repair_budget_exhausted",
@@ -1830,13 +1868,20 @@ export class DurableTurnRunner {
       });
       return "waiting";
     }
-    // A recovered MCP call is reported to the model; never replay it implicitly.
-    const interruptedMcp = step.state === "running" && isMcpToolStep(step) && !argumentError;
-    if (step.state === "running" && step.retryClass === "non_idempotent_manual" && !isMcpToolStep(step) && !argumentError) {
+    // The worker running this call stopped before it reported back. A sandbox
+    // tool goes back to the model as interrupted; any other waits for review.
+    // Neither is run again on its own.
+    const interrupted = step.state === "running" && (step.retryClass === "non_idempotent_manual" || isMcpToolStep(step)) && !argumentError;
+    if (interrupted && holdsForReview(step)) {
       await this.repository.commit(snapshot, {
         expectedState: "executing_tool",
         nextState: "recovery_required",
-        steps: [{ ...step, state: "recovery_required", error: "The worker stopped after this non-idempotent tool began; its outcome is ambiguous." }],
+        steps: [{
+          ...step,
+          state: "recovery_required",
+          error: "The worker stopped after this non-idempotent tool began; its outcome is ambiguous.",
+          outcomeCertainty: "unknown",
+        }],
         events: [
           {
             kind: "tool.end",
@@ -1879,7 +1924,7 @@ export class DurableTurnRunner {
     }
 
     const approval = snapshot.approvals.find((candidate) => candidate.stepId === step.id);
-    const requiresApproval = step.input.requiresApproval === true && !argumentError;
+    const requiresApproval = step.input.requiresApproval === true && !argumentError && !interrupted;
     if (requiresApproval && approval?.status !== "approved") {
       if (approval?.status === "denied" || approval?.status === "expired") {
         const entryId = randomUUID();
@@ -2015,7 +2060,7 @@ export class DurableTurnRunner {
       && this.tools.supportsAbort?.(snapshot, step) === true;
     let result: TurnToolResult;
     try {
-      if (interruptedMcp) throw new InterruptedMcpToolCallError(toolName);
+      if (interrupted) throw new InterruptedToolCallError(toolName);
       // A malformed question batch is a repairable argument error, never a
       // silently reduced question shown to the user (H-057).
       if (argumentError) throw new ToolArgumentError(argumentError);
@@ -2061,10 +2106,11 @@ export class DurableTurnRunner {
               maxDurationMs: toolLimits.maxDurationMs,
             });
     } catch (error) {
-      if (error instanceof DurableToolTimeoutError && step.retryClass === "non_idempotent_manual" && !isMcpToolStep(step)) {
+      if (error instanceof DurableToolTimeoutError && holdsForReview(step)) {
         await this.transitionAmbiguousToolToRecovery(snapshot, error.message, {
           timedOut: true,
           outcomeCertainty: "unknown",
+          abortAcknowledged: error.abortAcknowledged,
         });
         return "recovery_required";
       }
@@ -2076,7 +2122,7 @@ export class DurableTurnRunner {
         throw error;
       }
       const failureUsage = error instanceof DurableToolExecutionError ? error.usage : undefined;
-      const message = (error instanceof Error ? error.message : String(error)).slice(0, 4_000).replace(/\u0000/g, "\uFFFD");
+      const message = (error instanceof Error ? error.message : String(error)).slice(0, STORED_TOOL_ERROR_LIMIT).replace(/\u0000/g, "\uFFFD");
       const repairAttempt = priorRepairAttempts + 1;
       const timedOut = error instanceof DurableToolTimeoutError;
       const failureDurationMs = Math.max(0, Date.now() - toolStartedAt);
@@ -2093,12 +2139,27 @@ export class DurableTurnRunner {
         ? `; same error ${sameError} times in a row with changed arguments: check that the target exists and the input is valid, change approach, or tell the user what is blocking`
         : "";
       // The class and recovery action travel with the step, independent of wording (H-003).
-      const failure = error instanceof InterruptedMcpToolCallError
-        ? interruptedMcpToolFailure(step)
+      const failure = error instanceof InterruptedToolCallError
+        ? interruptedToolFailure(step)
         : classifyToolFailure(error, {
             changesState: toolMayChangeState(step),
             timedOut,
           });
+      // A change outside the sandbox that the target may have applied before
+      // the connection dropped or it answered with a server error is never
+      // repeated automatically. Like a timeout, it waits for an explicit
+      // recovery decision (H-003, H-014). Another failure whose effects are
+      // unknown (an unrecognised error) is shown to the model; the next call
+      // of the tool is held instead (uncertainEarlierCalls). Sandbox tools are
+      // never held: the model sees what happened and continues.
+      if (failure.category === "unknown_outcome" && holdsForReview(step)) {
+        await this.transitionAmbiguousToolToRecovery(snapshot, message, {
+          outcomeCertainty: "unknown",
+          failure,
+          ...(failureUsage ? { usage: failureUsage } : {}),
+        });
+        return "recovery_required";
+      }
       const typedRepairMessage = isMcpToolStep(step)
         ? `Tool failed. ${message}`
         : `Tool failed (repair attempt ${repairAttempt}/${repairBudget}${sameErrorGuidance}). ${message}`;
@@ -5049,10 +5110,11 @@ export class DurableTurnRetryableError extends Error {
   }
 }
 
-class InterruptedMcpToolCallError extends Error {
+/** A tool whose worker stopped before reporting a result. */
+class InterruptedToolCallError extends Error {
   constructor(toolName: string) {
-    super(`The worker stopped before ${toolName} returned a result. The call was not replayed; decide how to continue.`);
-    this.name = "InterruptedMcpToolCallError";
+    super(`${toolName} was interrupted: the worker running it stopped before it reported a result.`);
+    this.name = "InterruptedToolCallError";
   }
 }
 
@@ -5238,7 +5300,12 @@ function providerFailureDiagnostics(
 
 /** The run's admitted provider; legacy runs fall back to the deployment's router in the sink. */
 function creditAlertProvider(snapshot: DurableTurnSnapshot): Pick<ProviderCreditAlert, "providerId" | "providerName" | "providerHost"> {
-  const provider = durableRuntimeRequest(snapshot)?.provider;
+  let provider: DurableProviderTransport | undefined;
+  try {
+    provider = durableRuntimeRequest(snapshot)?.provider;
+  } catch {
+    // Reporting a failure must not raise another one.
+  }
   return provider
     ? { providerId: provider.id, providerName: provider.name, providerHost: urlHost(provider.baseUrl) }
     : {};
@@ -5514,14 +5581,27 @@ function toolFailureJson(failure: ToolFailure): Record<string, JsonValue> {
   return { ...failure };
 }
 
-function toolFailureNote(failure: ToolFailure, step?: DurableTurnStep): string {
-  if (step && isMcpToolStep(step)) {
+// Sandbox tools are never held, so their note says what may already have
+// happened rather than announcing a review.
+const SANDBOX_INTERRUPTED_ACTION = "It stopped before it finished, so it may have done some, all or none of its work. Check the workspace and continue.";
+const SANDBOX_EARLIER_EFFECTS = " Whatever it did before the error has already happened. Fix the problem and continue; do not repeat a step that sent or changed something outside the sandbox (for example an API request) unless you know it did not happen.";
+
+function toolFailureNote(failure: ToolFailure, step: DurableTurnStep): string {
+  if (isMcpToolStep(step) && (!holdsForReview(step) || failure.outcome === "not_applied")) {
     const outcome = failure.outcome === "unknown"
       ? " This call may already have changed something. Check the target state before repeating a change-making call."
       : "";
     return `Failure class: ${failure.category}.${outcome} ${MCP_FAILURE_ACTION}`;
   }
-  return `Failure class: ${failure.category}. ${failure.action}`;
+  if (!holdsForReview(step)) {
+    const action = failure.category === "unknown_outcome" ? SANDBOX_INTERRUPTED_ACTION : failure.action;
+    const earlier = failure.outcome === "unknown" ? SANDBOX_EARLIER_EFFECTS : "";
+    return `Failure class: ${failure.category}. ${action}${earlier}`;
+  }
+  const held = failure.outcome === "unknown" && failure.category !== "unknown_outcome"
+    ? " This call may already have changed something, so the next call of this tool waits for the user to review it."
+    : "";
+  return `Failure class: ${failure.category}. ${failure.action}${held}`;
 }
 
 /**
@@ -5569,11 +5649,89 @@ function unchangedFailedRetry(snapshot: DurableTurnSnapshot, step: DurableTurnSt
   }
 }
 
+/**
+ * Earlier calls of this tool that may already have taken effect and that no
+ * explicit decision has resolved, latest first (H-003, H-014). A call held
+ * because of them lists them in its input; an operator's retry releases that
+ * call, and once it completes, or the operator marks it complete, they are
+ * resolved. Nothing else resolves them, not even another completed call.
+ */
+function uncertainEarlierCalls(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Array<{ previous: DurableTurnStep; failure: ToolFailure }> {
+  const resolved = new Set([
+    // This call was held, and the operator released it.
+    ...heldByIds(step),
+    ...snapshot.steps.flatMap((candidate) => candidate.type === step.type && candidate.state === "completed" ? heldByIds(candidate) : []),
+  ]);
+  return snapshot.steps
+    .filter((candidate) => candidate.sequence < step.sequence
+      && candidate.type === step.type
+      && candidate.state === "failed"
+      && !resolved.has(candidate.id))
+    .sort((left, right) => right.sequence - left.sequence)
+    .flatMap((candidate) => {
+      const failure = uncertainFailure(candidate);
+      return failure ? [{ previous: candidate, failure }] : [];
+    });
+}
+
+/** The uncertain calls a held call was waiting for. */
+function heldByIds(step: DurableTurnStep): string[] {
+  const value = step.input.heldBy;
+  return Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
+}
+
+/**
+ * The class of a failed step whose change may have been applied, or null.
+ * An unknown outcome, stored or recorded on the step, is never weakened. A
+ * stored "not applied" is trusted only when this classifier set it: earlier
+ * ones called some executed changes not applied, and older workers stored no
+ * class at all. Missing or older metadata does not show that nothing was
+ * applied, so such a step's stored error is classified again; it is cleared
+ * only if it never started or its whole error is evidence that it was not
+ * applied. An error cut at the stored limit may have lost the end that showed
+ * the call ran, so it proves nothing. Sandbox tools never reach here
+ * (holdsForReview).
+ */
+function uncertainFailure(step: DurableTurnStep): ToolFailure | null {
+  const stored = record(record(step.output)?.failure);
+  if (stored?.refusedUnchangedRetry === true) return null;
+  const typed = storedToolFailure(step.output);
+  if (typed?.outcome === "unknown") return typed;
+  if (typed?.outcomeVersion === TOOL_FAILURE_OUTCOME_VERSION && step.outcomeCertainty !== "unknown") return null;
+  if (step.retryClass !== "non_idempotent_manual" || !step.attempt) return null;
+  const text = toolFailureIdentity(step.error);
+  const toolName = toolNameForStep(step);
+  // Older connector statuses/wording do not distinguish a refused request from
+  // a failed sub-operation after a write. Image failures also lost the fact
+  // that generation preceded delivery. Only Berry's own argument-validation
+  // report proves these old calls were not dispatched; otherwise hold them.
+  const localArgumentRefusal = text.startsWith(`${toolName} was not run: `);
+  const mayHaveRun = (toolName.startsWith("mcp__") || toolName === "create_image") && !localArgumentRefusal;
+  const error = Object.assign(
+    new Error(text),
+    typed?.status !== undefined ? { status: typed.status } : {},
+    mayHaveRun ? { toolCallPhase: "dispatched" } : {},
+  );
+  const failure = classifyToolFailure(error, { changesState: true });
+  const uncertain = step.outcomeCertainty === "unknown" || storedErrorMayBeCut(step.error);
+  return failure.outcome === "unknown" || uncertain ? { ...failure, outcome: "unknown" } : null;
+}
+
+/**
+ * Whether a failed step's stored error may have been cut. Every worker kept
+ * at most STORED_TOOL_ERROR_LIMIT characters of the message, after the
+ * "Tool failed (repair attempt …)." prefix that later ones add.
+ */
+function storedErrorMayBeCut(error: unknown): boolean {
+  return typeof error === "string"
+    && error.replace(/^Tool failed \(repair attempt \d+\/\d+[^)]*\)\. /, "").length >= STORED_TOOL_ERROR_LIMIT;
+}
+
 function unchangedRetryMessage(retry: UnchangedFailedRetry): string {
   return [
     "Not run: this exact call already failed in this task, and nothing since could make it succeed.",
     `Previous error: ${retry.previousError}`,
-    toolFailureNote(retry.failure),
+    toolFailureNote(retry.failure, retry.previous),
   ].join("\n");
 }
 
@@ -6278,24 +6436,31 @@ function toolMayChangeState(step: DurableTurnStep): boolean {
     : step.retryClass === "non_idempotent_manual";
 }
 
-function interruptedMcpToolFailure(step: DurableTurnStep): ToolFailure {
+function interruptedToolFailure(step: DurableTurnStep): ToolFailure {
   const changesState = toolMayChangeState(step);
   return {
     category: changesState ? "unknown_outcome" : "transient",
     deterministic: false,
     outcome: changesState ? "unknown" : "not_applied",
-    action: MCP_FAILURE_ACTION,
+    outcomeVersion: TOOL_FAILURE_OUTCOME_VERSION,
+    action: toolFailureAction(changesState ? "unknown_outcome" : "transient"),
   };
 }
 
-function hasAmbiguousNonIdempotentTool(snapshot: DurableTurnSnapshot): boolean {
+// Shell commands and edits act inside the task's sandbox, and the model sees
+// what they did. Their failures, timeouts and interruptions go back to the
+// model and the task continues; they never stop it for review or hold later
+// calls. A change outside the sandbox (a connector write, image generation)
+// whose reply was lost still waits for review, so it is not made twice.
+const SANDBOX_TOOLS = new Set(["bash", "edit"]);
+
+function holdsForReview(step: DurableTurnStep): boolean {
+  return step.retryClass === "non_idempotent_manual" && !SANDBOX_TOOLS.has(toolNameForStep(step));
+}
+
+function hasRunningHeldTool(snapshot: DurableTurnSnapshot): boolean {
   return snapshot.state === "executing_tool"
-    && snapshot.steps.some((step) =>
-      step.type.startsWith("tool.")
-      && step.state === "running"
-      && step.retryClass === "non_idempotent_manual"
-      && !isMcpToolStep(step)
-    );
+    && snapshot.steps.some((step) => step.type.startsWith("tool.") && step.state === "running" && holdsForReview(step));
 }
 
 function isUnfinishedStep(step: DurableTurnStep): boolean {
@@ -7394,8 +7559,7 @@ export function modelMessages(
 }
 
 function durableRuntimeRequest(snapshot: DurableTurnSnapshot): DurableTurnRuntimeRequest | null {
-  const parsed = DurableTurnRuntimeRequestSchema.safeParse(snapshot.runtimeRequest);
-  return parsed.success ? parsed.data : null;
+  return parseAdmittedRuntimeRequest(snapshot.runtimeRequest);
 }
 
 function durableSkills(snapshot: DurableTurnSnapshot): DurableSkill[] {
@@ -8579,10 +8743,23 @@ export function queuedFollowUpRuntimeRequest(
   // Runtime capabilities remain the admission snapshot captured when the row
   // was queued, but turn intent belongs to this prompt. Never inherit the
   // predecessor's image intent or drop an explicit queued image request.
-  const { intent: _previousIntent, ...runtime } = record(previousRuntime) ?? {};
+  // Continuation anchors and recovery budget generations describe the
+  // predecessor run: a new run that kept them would skip its own first usage
+  // events when settling, or reuse the predecessor's recovery request ids.
+  const {
+    intent: _previousIntent,
+    queuedBudgetRequestId,
+    continuationSourceRunId: _continuationSourceRunId,
+    continuationHeadEntryId: _continuationHeadEntryId,
+    budgetBaseRequestId: _budgetBaseRequestId,
+    budgetGeneration: _budgetGeneration,
+    budgetUsageAfterSequence: _budgetUsageAfterSequence,
+    budgetBaselineCostMicros: _budgetBaselineCostMicros,
+    ...runtime
+  } = record(previousRuntime) ?? {};
   return {
     ...runtime,
-    requestId: typeof runtime.queuedBudgetRequestId === "string" ? runtime.queuedBudgetRequestId : `queued:${queued.id}:${queued.attempt_count}`,
+    requestId: typeof queuedBudgetRequestId === "string" ? queuedBudgetRequestId : `queued:${queued.id}:${queued.attempt_count}`,
     input: queued.input,
     ...(queued.intent ? { intent: queued.intent } : {}),
     continueInterruptedTurn: false,
