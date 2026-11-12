@@ -69,11 +69,11 @@ test("personal Usage keeps month-to-date and allowance cycles distinct", async (
   await expect(page.getByRole("heading", { name: "Usage", exact: true })).toBeVisible();
   const period = page.getByRole("combobox", { name: "Period" });
   await expect(period).toContainText("Month to date (UTC)");
-  await expect(page.getByText("Available allowance", { exact: true })).toBeVisible();
+  await expect(page.getByText("No limit", { exact: true })).toBeVisible();
   await period.click();
   await page.getByRole("option", { name: "Current allowance cycle", exact: true }).click();
   await expect(period).toContainText("Current allowance cycle");
-  await expect(page.getByText(/settled.*reserved.*available/)).toBeVisible();
+  await expect(page.getByText(/used this cycle/)).toBeVisible();
 });
 
 test("organization admin routes support direct navigation and validated analytics search", async ({ page }) => {

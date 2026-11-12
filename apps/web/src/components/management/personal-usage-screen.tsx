@@ -29,9 +29,8 @@ import {
 import { DualTrend, ShareDonut, aggregateModelSpendRows } from "./management-charts";
 import { useResource, type ManagementScreenProps } from "./management-context";
 import { PersonalUsageSkeleton } from "./management-screen-skeletons";
-import { InfiniteScrollTrigger } from "../infinite-scroll-trigger";
 import { downloadUsageCsv, usageReportBounds, usageRangeForPreset, usageTokenBreakdown } from "./usage-controls";
-import { useUsageRequestPages } from "./usage-request-pages";
+import { UsageRequestPager, useUsageRequestPages } from "./usage-request-pages";
 
 export type PromptCacheSummary = { eligibleRequests: number; hits: number; misses: number; hitRate: number | null };
 
@@ -236,9 +235,7 @@ export function PersonalUsageScreen({ client, tenantId }: ManagementScreenProps)
                 {request.finishReason && !ROUTINE_FINISH_REASONS.has(request.finishReason) ? <span className="text-xs text-muted-foreground">{humanize(request.finishReason)}</span> : null}
               </span>,
             ])} />
-            <InfiniteScrollTrigger
-              className="border-t border-border"
-              autoLoad={false}
+            <UsageRequestPager
               hasMore={requests.hasNextPage}
               loading={requests.isFetchingNextPage}
               error={requests.isFetchNextPageError ? "Older requests could not be loaded." : null}

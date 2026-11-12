@@ -1714,6 +1714,7 @@ export function createDemoManagementClient(config: WebConfig, tenantId: string):
     ],
     allowanceCycle: async () => ({ tenantId, timezone: "Europe/London", anchorDay: 1, updatedBy: self().userId, updatedAt: ago(96) }),
     allowanceBalances: async () => balances(),
+    myAllowanceBalance: async () => balances().find((balance) => balance.userId === self().userId) as AllowanceBalance,
     allowanceBalance: async (_tenantId, userId) => balances().find((balance) => balance.userId === userId) ?? (balances()[0] as AllowanceBalance),
     allowanceAdjustments: async (_tenantId, userId) => adjustments().filter((adjustment) => !userId || adjustment.userId === userId),
 
@@ -2086,7 +2087,7 @@ export const DEMO_MANAGEMENT_METHODS = [
   "listOrgMembers", "listOrgMembersPage", "listDepartments", "listDepartmentsPage", "listMemberMobileDevices", "memberSkills", "authConfig", "effectivePermissions", "organizationProfile",
   "listRolePermissions", "listFeatureFlags", "listResourceAcls", "listSsoConnections", "listPolicyVersions", "listAuditEvents", "serviceAccounts", "createServiceAccount",
   "executionPolicy", "authenticationPolicy", "dataGovernancePolicy",
-  "listBudgetLimits", "listAllowanceProfiles", "listAllowanceDefaults", "allowanceCycle", "allowanceBalances", "allowanceBalance", "allowanceAdjustments",
+  "listBudgetLimits", "listAllowanceProfiles", "listAllowanceDefaults", "allowanceCycle", "allowanceBalances", "allowanceBalance", "myAllowanceBalance", "allowanceAdjustments",
   "billingSummary", "billingHealth", "billingLedger", "autoRefill",
   "listOrganizationModelProviders", "testOrganizationModelProvider", "listOrgTaskModels", "listOrgModelDefaults", "listOrgAuxiliaryModelDefaults", "listOrgAiAccessRules",
   "listOrganizationCapabilities", "organizationCapabilitySettings", "effectiveCapabilities", "organizationSkillPackage", "organizationSkillPackageFile",
