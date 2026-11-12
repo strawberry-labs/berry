@@ -159,7 +159,9 @@ export class AgentApiModule {
         options.organizationCapabilities ? { provide: ORGANIZATION_CAPABILITIES, useValue: options.organizationCapabilities.useValue } : { provide: ORGANIZATION_CAPABILITIES, inject: [PERSONAL_CAPABILITIES], useFactory: (personal: PersonalCapabilitiesService) => new OrganizationCapabilitiesService(personal) },
         { provide: DURABLE_TURN_RUNNER_ENABLED, useValue: options.durableRunnerEnabled ?? false },
         TurnCancellationPublisher,
-        QueuedFollowUpService,
+        durableContextEnabled
+          ? QueuedFollowUpService
+          : { provide: QueuedFollowUpService, useValue: null },
         ScheduledTasksService,
         ...(options.durableRunnerEnabled ? [ScheduledTaskDispatcher] : []),
         ...(durableContextEnabled

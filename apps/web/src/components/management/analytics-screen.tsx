@@ -26,6 +26,7 @@ import {
   formatDateTime,
   formatDuration,
   formatMoney,
+  formatMoneyWithCents,
   formatNumber,
   formatPercent,
 } from "./management-primitives";
@@ -40,12 +41,19 @@ import {
 import { useResource, type ManagementScreenProps } from "./management-context";
 import {
   calculateCacheMetric,
+  downloadUsageCsv,
+  usageCsvFilter,
+  usageReportBounds,
+  validDateInput,
+  usageTokenBreakdown,
   inferUsageRangePreset,
   UsageRangeControl,
   usageRangeForPreset,
   type UsageDateRange,
   type UsageRangePreset,
 } from "./usage-controls";
+import { InfiniteScrollTrigger } from "../infinite-scroll-trigger";
+import { useUsageRequestPages } from "./usage-request-pages";
 
 const VIEWS = ["overview", "people", "models", "agents", "requests"] as const;
 type View = (typeof VIEWS)[number];
@@ -76,11 +84,10 @@ export function AnalyticsScreen({
     VIEWS.find((item) => item === search.get("view")) ?? "overview",
   );
   const initialRange = React.useMemo<UsageDateRange>(() => {
-    const preset = usageRangeForPreset("month");
-    return {
-      from: (search.get("from") ?? preset.from).slice(0, 10),
-      to: (search.get("to") ?? preset.to).slice(0, 10),
-    };
+    const preset = usageRangeForPreset("month-to-date", new Date(), undefined, "UTC");
+    const from = search.get("from")?.slice(0, 10) ?? preset.from;
+    const to = search.get("to")?.slice(0, 10) ?? preset.to;
+    return validDateInput(from) && validDateInput(to) && from <= to ? { from, to } : preset;
   }, [search]);
   const [range, setRange] = React.useState(initialRange);
   const [rangePreset, setRangePreset] = React.useState<UsageRangePreset>(() => inferUsageRangePreset(initialRange));
@@ -92,9 +99,9 @@ export function AnalyticsScreen({
     feature: search.get("feature") ?? "",
     status: search.get("status") ?? "",
   });
+  const bounds = React.useMemo(() => usageReportBounds(range), [range]);
   const query: UsageAnalyticsQuery = {
-    from: `${range.from}T00:00:00.000Z`,
-    to: `${range.to}T23:59:59.999Z`,
+    ...bounds,
     ...Object.fromEntries(
       Object.entries(filters).filter(([, value]) => value.length > 0),
     ),
@@ -109,9 +116,9 @@ export function AnalyticsScreen({
   };
   const analytics = useResource(
     `analytics:${tenantId}:${queryKey}`,
-    async () =>
+    async (signal) =>
       client
-        ? client.usageAnalytics(tenantId, query)
+        ? client.usageAnalytics(tenantId, query, signal ? { signal } : {})
         : demoAnalytics(
             config.usageDashboards.find((item) => item.tenantId === tenantId),
           ),
@@ -119,19 +126,12 @@ export function AnalyticsScreen({
   );
   const facetAnalytics = useResource(
     `analytics-facets:${tenantId}:${range.from}:${range.to}:${hasUsageFilters}`,
-    async () => client && hasUsageFilters
-      ? client.usageAnalytics(tenantId, facetQuery)
+    async (signal) => client && hasUsageFilters
+      ? client.usageAnalytics(tenantId, facetQuery, signal ? { signal } : {})
       : null,
     null as any,
   );
-  const requests = useResource(
-    `requests:${tenantId}:${view}:${queryKey}`,
-    async () =>
-      client && view === "requests"
-        ? client.usageRequests(tenantId, query)
-        : null,
-    null as any,
-  );
+  const { pages: requests, items: requestItems } = useUsageRequestPages(client, tenantId, "organization", query, view === "requests");
   const directory = useResource(
     `usage-directory:${tenantId}`,
     async () =>
@@ -144,6 +144,8 @@ export function AnalyticsScreen({
     [[], []] as any,
   );
   const [detail, setDetail] = React.useState<UsageRequestDetail | null>(null);
+  const [exporting, setExporting] = React.useState(false);
+  const [exportError, setExportError] = React.useState("");
 
   function update(
     nextView: View,
@@ -153,6 +155,7 @@ export function AnalyticsScreen({
     setView(nextView);
     setRange(nextRange);
     setFilters(nextFilters);
+    setExportError("");
     const params = new URLSearchParams();
     params.set("view", nextView);
     params.set("from", `${nextRange.from}T00:00:00.000Z`);
@@ -161,6 +164,18 @@ export function AnalyticsScreen({
       if (value) params.set(key, value);
     }
     history.replaceState(null, "", `${location.pathname}?${params}`);
+  }
+  async function exportCsv() {
+    if (!client) return;
+    setExportError("");
+    setExporting(true);
+    try {
+      downloadUsageCsv(await client.exportUsageCsv(tenantId, usageCsvFilter(query)), "organization-usage.csv");
+    } catch {
+      setExportError("Usage could not be exported. Try again.");
+    } finally {
+      setExporting(false);
+    }
   }
   async function openRequest(requestId: string) {
     if (client) setDetail(await client.usageRequestDetail(tenantId, requestId));
@@ -188,7 +203,7 @@ export function AnalyticsScreen({
   return (
     <ManagementPage width="wide"
       title="Usage"
-      description="Inspect organization spend, tokens, cache behavior, models, people, and individual redacted requests from one filterable view."
+      description={range.from + " to " + range.to + " (UTC)"}
       eyebrow="Usage & billing"
       actions={
         <>
@@ -212,20 +227,17 @@ export function AnalyticsScreen({
           {permissions.includes("usage:export") ? (
           <Button
             variant="secondary"
-            disabled={!client}
-            onClick={() =>
-              client
-                ?.exportUsageCsv(tenantId, query)
-                .then((csv) => download(csv, "organization-usage.csv"))
-            }
+            disabled={!client || exporting}
+            onClick={() => void exportCsv()}
           >
             <Download />
-            Export CSV
+            {exporting ? "Exporting…" : "Export CSV"}
           </Button>
           ) : null}
         </>
       }
     >
+      {exportError ? <InlineNotice tone="warning">{exportError}</InlineNotice> : null}
       <SegmentedControl
         label="Analytics view"
         value={view}
@@ -254,10 +266,9 @@ export function AnalyticsScreen({
                   items={[
                     {
                       label: "Billed spend",
-                      value: formatCompactMoney(data.totals.billedCostMicros),
-                      exactValue: formatMoney(data.totals.billedCostMicros),
+                      value: formatMoneyWithCents(data.totals.billedCostMicros),
                       trend: data.series.map((point: any) => Number(point.billedCostMicros) / 1e6),
-                      ...(data.totals.projectedMonthEndMicros
+                      ...(rangePreset === "month-to-date" && data.totals.projectedMonthEndMicros
                         ? { hint: `Projected ${formatCompactMoney(data.totals.projectedMonthEndMicros)} by month end` }
                         : {}),
                     },
@@ -319,12 +330,10 @@ export function AnalyticsScreen({
                     <ShareDonut
                       caption="Token volume by type"
                       centerLabel="Tokens"
-                      rows={[
-                        { label: "Fresh input", value: Math.max(0, Number(data.totals.inputTokens) - Number(data.performance.cacheReadTokens)) },
-                        { label: "Cache read", value: Number(data.performance.cacheReadTokens) },
-                        { label: "Output", value: Number(data.totals.outputTokens) },
-                        { label: "Cache write", value: Number(data.performance.cacheWriteTokens) },
-                      ].filter((row) => row.value > 0)}
+                      rows={usageTokenBreakdown(
+                        data.totals.inputTokens, data.totals.outputTokens,
+                        data.performance.cacheReadTokens, data.performance.cacheWriteTokens,
+                      )}
                       format={formatCompact}
                     />
                   </Section>
@@ -495,10 +504,10 @@ export function AnalyticsScreen({
             ) : null}
             {view === "requests" ? (
               <AsyncState
-                loading={requests.loading}
-                error={requests.error}
-                onRetry={requests.retry}
-                empty={!requests.data?.items.length}
+                loading={requests.isLoading}
+                error={requests.error && !requests.isFetchNextPageError ? "Requests could not be loaded." : null}
+                onRetry={() => void requests.refetch()}
+                empty={!requestItems.length}
                 emptyTitle="No requests match"
                 emptyText="Request records hold metadata only. Prompts and responses are never stored here."
               >
@@ -518,11 +527,11 @@ export function AnalyticsScreen({
                     "Latency",
                   ]}
                   onRowSelect={(index) => {
-                    const row = requests.data?.items[index];
+                    const row = requestItems[index];
                     if (row) void openRequest(row.id);
                   }}
-                  rowLabel={(index) => `Request ${requests.data?.items[index]?.requestId ?? ""}`}
-                  rows={(requests.data?.items ?? []).map((row: any) => [
+                  rowLabel={(index) => `Request ${requestItems[index]?.requestId ?? ""}`}
+                  rows={requestItems.map((row) => [
                     <span data-sort={new Date(row.ts).getTime()} className="whitespace-nowrap text-muted-foreground">{formatDateTime(row.ts)}</span>,
                     <CellStack
                       primary={row.userName || row.userEmail || "Unattributed"}
@@ -539,6 +548,13 @@ export function AnalyticsScreen({
                     <Num value={row.billedCostMicros} kind="money" />,
                     <span data-sort={Number(row.latencyMs ?? 0)}>{formatDuration(row.latencyMs)}</span>,
                   ])}
+                />
+                <InfiniteScrollTrigger
+                  autoLoad={false}
+                  hasMore={requests.hasNextPage}
+                  loading={requests.isFetchingNextPage}
+                  error={requests.isFetchNextPageError ? "Older requests could not be loaded." : null}
+                  onLoadMore={() => void requests.fetchNextPage({ cancelRefetch: false })}
                 />
               </AsyncState>
             ) : null}
@@ -800,13 +816,6 @@ function label(value: string) {
     .replaceAll("_", " ")
     .replaceAll("-", " ")
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
-}
-function download(value: string, name: string) {
-  const anchor = document.createElement("a");
-  anchor.href = URL.createObjectURL(new Blob([value], { type: "text/csv" }));
-  anchor.download = name;
-  anchor.click();
-  URL.revokeObjectURL(anchor.href);
 }
 function demoAnalytics(dashboard: any) {
   if (!dashboard) return null;

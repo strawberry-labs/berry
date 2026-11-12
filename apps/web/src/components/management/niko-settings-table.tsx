@@ -50,6 +50,7 @@ type SettingsTableRow = {
 type TableCellProtocol = {
   tableSortValue?: (props: Record<string, unknown>) => string | number;
   tableAlignEnd?: boolean;
+  tableText?: (props: Record<string, unknown>) => ReactNode;
 };
 
 function cellProtocol(node: ReactNode): TableCellProtocol | null {
@@ -84,8 +85,9 @@ function cellText(node: ReactNode): string {
     return String(node);
   }
   if (Array.isArray(node)) return node.map(cellText).join(" ");
-  if (React.isValidElement<{ children?: ReactNode }>(node)) {
-    return cellText(node.props.children);
+  if (React.isValidElement<Record<string, unknown>>(node)) {
+    const content = cellProtocol(node)?.tableText?.(node.props) ?? (node.props.children as ReactNode);
+    return cellText(content);
   }
   return "";
 }

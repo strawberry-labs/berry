@@ -503,13 +503,22 @@ function queryFilter(query: UsageAnalyticsQuery): UsageEventFilter {
   };
 }
 
+function projectMonthEndSpend(query: Pick<UsageAnalyticsQuery, "from" | "to">, spend: bigint, now = new Date()): string | null {
+  const start = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
+  const end = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
+  const to = Date.parse(query.to);
+  // Forecast only from a month-to-date sample of at least one full day.
+  if (Date.parse(query.from) !== start || to >= end) return null;
+  const elapsedMs = Math.min(to, now.getTime()) - start;
+  if (elapsedMs < 86_400_000) return null;
+  const elapsed = BigInt(elapsedMs);
+  return ((spend * BigInt(end - start) + elapsed / 2n) / elapsed).toString();
+}
+
 function analyticsFromEvents(tenantId: string, query: UsageAnalyticsQuery, events: CloudUsageEventRecord[]): UsageAnalytics {
   const totalCost = events.reduce((sum, event) => sum + BigInt(event.costBilledMicros), 0n);
   const successes = events.filter((event) => isSuccess(event.status)).length;
   const tokens = events.reduce((sum, event) => sum + event.tokensIn + event.tokensOut, 0);
-  const elapsedDays = Math.max(1, (new Date(query.to).getTime() - new Date(query.from).getTime()) / 86_400_000);
-  const monthDays = new Date(new Date(query.to).getUTCFullYear(), new Date(query.to).getUTCMonth() + 1, 0).getUTCDate();
-  const projection = totalCost * BigInt(Math.max(1, Math.round(monthDays / elapsedDays)));
   const latencies = events.flatMap((event) => event.latencyMs === null ? [] : [event.latencyMs]).sort((a, b) => a - b);
   const ttfts = events.flatMap((event) => event.ttftMs === null ? [] : [event.ttftMs]).sort((a, b) => a - b);
   const sandboxMinutes = events.reduce((sum, event) => sum + sandboxMinutesFor(event.sandboxUsage), 0);
@@ -520,7 +529,7 @@ function analyticsFromEvents(tenantId: string, query: UsageAnalyticsQuery, event
       inputTokens: events.reduce((sum, event) => sum + event.tokensIn, 0),
       outputTokens: events.reduce((sum, event) => sum + event.tokensOut, 0),
       successRate: events.length ? successes / events.length : null,
-      projectedMonthEndMicros: events.length ? projection.toString() : null,
+      projectedMonthEndMicros: events.length ? projectMonthEndSpend(query, totalCost) : null,
     },
     series: usageSeries(events, query),
     breakdowns: {
@@ -649,7 +658,7 @@ async function postgresAnalytics(
       FROM aggregated
     )
     SELECT * FROM ranked
-    WHERE dimension_rank <= 100
+    WHERE dimension_rank <= 100 OR dimension = 'member'
     ORDER BY dimension, dimension_rank
   `, filter.params);
 
@@ -657,14 +666,7 @@ async function postgresAnalytics(
   const requestCount = numberFromDb(totals?.requests);
   const inputTokens = numberFromDb(totals?.input_tokens);
   const outputTokens = numberFromDb(totals?.output_tokens);
-  const elapsedDays = Math.max(
-    1,
-    (new Date(query.to).getTime() - new Date(query.from).getTime()) / 86_400_000,
-  );
-  const to = new Date(query.to);
-  const monthDays = new Date(Date.UTC(to.getUTCFullYear(), to.getUTCMonth() + 1, 0)).getUTCDate();
   const totalCost = BigInt(totals?.billed_cost_micros ?? "0");
-  const projection = totalCost * BigInt(Math.max(1, Math.round(monthDays / elapsedDays)));
   const series = seriesRows.map((row) => ({
     ts: iso(row.bucket),
     billedCostMicros: String(row.billed_cost_micros),
@@ -733,7 +735,7 @@ async function postgresAnalytics(
       inputTokens,
       outputTokens,
       successRate: requestCount ? numberFromDb(totals?.successes) / requestCount : null,
-      projectedMonthEndMicros: requestCount ? projection.toString() : null,
+      projectedMonthEndMicros: requestCount ? projectMonthEndSpend(query, totalCost) : null,
     },
     series,
     breakdowns,

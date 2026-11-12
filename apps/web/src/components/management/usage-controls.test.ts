@@ -1,6 +1,7 @@
+import { UsageAnalyticsQuerySchema } from "@berry/shared";
 import { describe, expect, it } from "vitest";
 
-import { calculateCacheMetric, usageDateInput, usageRangeForPreset } from "./usage-controls";
+import { calculateCacheMetric, usageCsvFilter, usageDateInput, usageRangeForPreset, usageReportBounds, usageTokenBreakdown } from "./usage-controls";
 
 describe("usage analytics controls", () => {
   it("creates stable preset date ranges", () => {
@@ -21,6 +22,36 @@ describe("usage analytics controls", () => {
       from: "2026-07-11",
       to: "2026-08-10",
     });
+  });
+
+  it("uses the selected UTC day in full and stops month-to-date at the report time", () => {
+    const anchor = new Date("2026-11-12T12:30:00.000Z");
+    expect(usageReportBounds(usageRangeForPreset("month-to-date", anchor, undefined, "UTC"), anchor)).toEqual({
+      from: "2026-11-01T00:00:00.000Z",
+      to: "2026-11-12T12:30:00.000Z",
+    });
+    expect(usageReportBounds({ from: "2026-11-07", to: "2026-11-07" }, anchor)).toEqual({
+      from: "2026-11-07T00:00:00.000Z",
+      to: "2026-11-08T00:00:00.000Z",
+    });
+  });
+
+  it("exports the selected member and all requests in the report period", () => {
+    const filter = usageCsvFilter(UsageAnalyticsQuerySchema.parse({
+      from: "2026-11-01T00:00:00.000Z", to: "2026-11-12T12:30:00.000Z",
+      memberId: "member-1", provider: "anthropic", status: "completed", cursor: "some-cursor", limit: 50,
+    }));
+    expect(filter).toMatchObject({ userId: "member-1", provider: "anthropic", status: "completed" });
+    for (const key of ["cursor", "limit", "memberId"]) expect(filter).not.toHaveProperty(key);
+  });
+
+  it("counts cache reads and writes once in the total token breakdown", () => {
+    expect(usageTokenBreakdown(1_000, 100, 600, 300)).toEqual([
+      { label: "Fresh input", value: 100 },
+      { label: "Cache read", value: 600 },
+      { label: "Cache write", value: 300 },
+      { label: "Output", value: 100 },
+    ]);
   });
 
   it("reports cached input-token share even when most requests had some cache hit", () => {

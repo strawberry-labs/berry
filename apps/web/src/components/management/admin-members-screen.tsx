@@ -5,7 +5,7 @@ import { toast } from "sonner";
 import {
   AsyncState, Button, CellStack, Checkbox, DataTable, DefinitionList, DetailDrawer,
   FormSelect, InlineNotice, Input, ManagementDialog, ManagementPage, Meter, MetricGrid,
-  Num, StatusPill, SuccessMessage, formatDate, formatMoney, formatNumber,
+  Num, StatusPill, SuccessMessage, formatDate, formatMoney, formatMoneyWithCents, formatNumber,
 } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
 import { parseMemberImportCsv, type MemberImportRow } from "../../lib/member-import";
@@ -329,7 +329,7 @@ export function AdminMembersScreen({
 
   const columns = [
     "Member", "Role", "Department", "Status",
-    ...(canReadUsage ? ["Spend this month"] : []),
+    ...(canReadUsage ? ["Month-to-date spend (UTC)"] : []),
     ...(canReadBalances ? ["Allowance"] : []),
     "Joined",
   ];
@@ -375,6 +375,7 @@ export function AdminMembersScreen({
         />
         <DataTable
           label="Members"
+          searchable
           columns={columns}
           initialPageSize={25}
           onRowSelect={(index) => openMember(rows[index])}
@@ -388,9 +389,9 @@ export function AdminMembersScreen({
               departmentLabel(m),
               <StatusPill tone={STATUS_TONE[m.status] ?? "neutral"}>{STATUS_LABEL[m.status] ?? sentence(m.status)}</StatusPill>,
               ...(canReadUsage ? [
-                usage.loading ? "…" : memberSpend.has(m.userId)
-                  ? <Num value={memberSpend.get(m.userId)} kind="money" />
-                  : <span data-sort={0} className="text-muted-foreground" title="Not among the 100 highest spenders this month">—</span>,
+                usage.loading ? "…" : usage.error
+                  ? <span className="text-muted-foreground" title="Usage could not be loaded">—</span>
+                  : <Num value={memberSpend.get(m.userId) ?? "0"} kind="money" />,
               ] : []),
               ...(canReadBalances ? [
                 balances.loading ? "…" : <AllowanceCell balance={balance} />,
@@ -418,7 +419,7 @@ export function AdminMembersScreen({
             items={[
               { term: "Added through", detail: SOURCE_LABEL[editing.source] ?? sentence(String(editing.source ?? "manual")) },
               { term: "Joined", detail: formatDate(editing.joinedAt) },
-              ...(canReadUsage && memberSpend.has(editing.userId) ? [{ term: "Spend this month", detail: formatMoney(memberSpend.get(editing.userId)) }] : []),
+              ...(canReadUsage && !usage.loading && !usage.error ? [{ term: "Month-to-date spend (UTC)", detail: formatMoneyWithCents(memberSpend.get(editing.userId) ?? "0") }] : []),
               ...(canReadBalances && editingBalance ? [{
                 term: "Allowance",
                 detail: editingBalance.effectiveLimitMicros === null

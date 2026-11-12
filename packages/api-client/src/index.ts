@@ -1730,28 +1730,28 @@ export class BerryApiClient {
     return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/dashboard${usageQuery(filter)}`, CloudUsageDashboardSchema);
   }
 
-  async usageAnalytics(tenantId: string, query: UsageAnalyticsQuery): Promise<UsageAnalytics> {
+  async usageAnalytics(tenantId: string, query: UsageAnalyticsQuery, options: { signal?: AbortSignal } = {}): Promise<UsageAnalytics> {
     const parsed = UsageAnalyticsQuerySchema.parse(query);
-    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/analytics${usageQuery(parsed)}`, UsageAnalyticsSchema);
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/analytics${usageQuery(parsed)}`, UsageAnalyticsSchema, options);
   }
 
-  async usageRequests(tenantId: string, query: UsageAnalyticsQuery): Promise<UsageRequestPage> {
+  async usageRequests(tenantId: string, query: UsageAnalyticsQuery, options: { signal?: AbortSignal } = {}): Promise<UsageRequestPage> {
     const parsed = UsageAnalyticsQuerySchema.parse(query);
-    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/requests${usageQuery(parsed)}`, UsageRequestPageSchema);
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/requests${usageQuery(parsed)}`, UsageRequestPageSchema, options);
   }
 
   async usageRequestDetail(tenantId: string, requestId: string): Promise<UsageRequestDetail> {
     return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/requests/${encodeURIComponent(requestId)}`, UsageRequestDetailSchema);
   }
 
-  async myUsage(tenantId: string, query: UsageAnalyticsQuery): Promise<UsageAnalytics> {
+  async myUsage(tenantId: string, query: UsageAnalyticsQuery, options: { signal?: AbortSignal } = {}): Promise<UsageAnalytics> {
     const parsed = UsageAnalyticsQuerySchema.parse(query);
-    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/me${usageQuery(parsed)}`, UsageAnalyticsSchema);
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/me${usageQuery(parsed)}`, UsageAnalyticsSchema, options);
   }
 
-  async myUsageRequests(tenantId: string, query: UsageAnalyticsQuery): Promise<UsageRequestPage> {
+  async myUsageRequests(tenantId: string, query: UsageAnalyticsQuery, options: { signal?: AbortSignal } = {}): Promise<UsageRequestPage> {
     const parsed = UsageAnalyticsQuerySchema.parse(query);
-    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/me/requests${usageQuery(parsed)}`, UsageRequestPageSchema);
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/me/requests${usageQuery(parsed)}`, UsageRequestPageSchema, options);
   }
 
   async exportMyUsageCsv(tenantId: string, filter: UsageEventFilter = {}): Promise<string> {

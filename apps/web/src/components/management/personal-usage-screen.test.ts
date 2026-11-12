@@ -1,6 +1,6 @@
 import type { UsageRequestSummary } from "@berry/shared";
 import { describe, expect, it } from "vitest";
-import { summarizePromptCache } from "./personal-usage-screen";
+import { selectedRange, summarizePromptCache } from "./personal-usage-screen";
 
 function request(patch: Partial<UsageRequestSummary>): UsageRequestSummary {
   return {
@@ -38,5 +38,18 @@ describe("summarizePromptCache", () => {
       request({ cacheReadTokens: 0 }),
       request({ cacheEligible: false, cacheReadTokens: 0 }),
     ])).toEqual({ eligibleRequests: 2, hits: 1, misses: 1, hitRate: 0.5 });
+  });
+});
+
+describe("personal report periods", () => {
+  it("uses the configured allowance bounds only for the allowance cycle option", () => {
+    const anchor = Date.parse("2026-11-12T12:30:00.000Z");
+    const cycle = { cycleStart: "2026-11-04T20:00:00.000Z", cycleEnd: "2026-12-04T20:00:00.000Z" };
+    expect(selectedRange("month-to-date", anchor, "", "", cycle)).toEqual({
+      from: "2026-11-01T00:00:00.000Z", to: "2026-11-12T12:30:00.000Z",
+    });
+    expect(selectedRange("allowance-cycle", anchor, "", "", cycle)).toEqual({
+      from: "2026-11-04T20:00:00.000Z", to: "2026-11-12T12:30:00.000Z",
+    });
   });
 });

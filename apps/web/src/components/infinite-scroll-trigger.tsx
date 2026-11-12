@@ -115,6 +115,7 @@ export function InfiniteScrollTrigger({
   error,
   className,
   rootMargin = "480px 0px",
+  autoLoad = true,
 }: {
   hasMore: boolean;
   loading: boolean;
@@ -122,6 +123,7 @@ export function InfiniteScrollTrigger({
   error?: string | null | undefined;
   className?: string;
   rootMargin?: string;
+  autoLoad?: boolean;
 }) {
   const ref = React.useRef<HTMLDivElement>(null);
   const loadRef = React.useRef(onLoadMore);
@@ -129,7 +131,7 @@ export function InfiniteScrollTrigger({
 
   React.useEffect(() => {
     const node = ref.current;
-    if (!node || !hasMore || loading || error || typeof IntersectionObserver === "undefined") return;
+    if (!node || !autoLoad || !hasMore || loading || error || typeof IntersectionObserver === "undefined") return;
     // Recreated whenever a page settles; observe() reports the current state
     // straight away, so a short page that leaves the trigger visible loads the next one.
     const observer = new IntersectionObserver((entries) => {
@@ -137,7 +139,7 @@ export function InfiniteScrollTrigger({
     }, { root: scrollParent(node.parentElement), rootMargin });
     observer.observe(node);
     return () => observer.disconnect();
-  }, [error, hasMore, loading, rootMargin]);
+  }, [autoLoad, error, hasMore, loading, rootMargin]);
 
   if (!hasMore) return null;
   return (
@@ -152,7 +154,7 @@ export function InfiniteScrollTrigger({
           <Loader2 className="size-3.5 animate-spin motion-reduce:animate-none" aria-hidden />
           <span>Loading more…</span>
         </>
-      ) : null}
+      ) : !autoLoad ? <Button variant="ghost" size="sm" onClick={onLoadMore}>Load more requests</Button> : null}
     </div>
   );
 }

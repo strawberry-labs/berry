@@ -592,7 +592,7 @@ export class AgentApiController {
     @Inject(MemoryService) private readonly memory: MemoryService,
     @Inject(ContextAssemblyService) private readonly contextAssembly: ContextAssemblyService,
     @Inject(DurableTurnService) private readonly durableTurns: DurableTurnService,
-    @Inject(QueuedFollowUpService) private readonly queuedFollowUps: QueuedFollowUpService,
+    @Inject(QueuedFollowUpService) private readonly queuedFollowUps: QueuedFollowUpService | null,
     @Inject(ENTERPRISE_IDENTITY_REPOSITORY) private readonly identity: EnterpriseIdentityRepository,
     @Inject(CONNECTORS) private readonly connectors: ConnectorsService,
     @Inject(MANAGEMENT_SERVICE) private readonly management: ManagementService,
@@ -1510,7 +1510,7 @@ export class AgentApiController {
 
   @Get("/sessions/:sessionId/follow-ups")
   async listQueuedFollowUps(@Req() request: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Query() query: unknown) {
-    if (!this.durableTurns.enabled) throw new NotFoundException("Server-owned follow-ups require the durable runner");
+    if (!this.durableTurns.enabled || !this.queuedFollowUps) throw new NotFoundException("Server-owned follow-ups require the durable runner");
     await this.ownedSession(request, sessionId);
     const parsed = FollowUpListQuerySchema.parse(query ?? {});
     return QueuedFollowUpPageSchema.parse(await this.queuedFollowUps.list(
@@ -1524,7 +1524,7 @@ export class AgentApiController {
 
   @Post("/sessions/:sessionId/follow-ups")
   async enqueueQueuedFollowUp(@Req() request: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Body() body: unknown) {
-    if (!this.durableTurns.enabled) throw new NotFoundException("Server-owned follow-ups require the durable runner");
+    if (!this.durableTurns.enabled || !this.queuedFollowUps) throw new NotFoundException("Server-owned follow-ups require the durable runner");
     const { session, task } = await this.ownedSession(request, sessionId);
     const raw = body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : {};
     const parsed = QueuedFollowUpCreateSchema.parse({
@@ -1556,7 +1556,7 @@ export class AgentApiController {
 
   @Patch("/follow-ups/:followUpId")
   async updateQueuedFollowUp(@Req() request: AuthenticatedRequest, @Param("followUpId") followUpId: string, @Body() body: unknown) {
-    if (!this.durableTurns.enabled) throw new NotFoundException("Server-owned follow-ups require the durable runner");
+    if (!this.durableTurns.enabled || !this.queuedFollowUps) throw new NotFoundException("Server-owned follow-ups require the durable runner");
     const parsed = QueuedFollowUpUpdateSchema.parse(body ?? {});
     const scope = parsed.attachments
       ? await this.queuedFollowUps.scope(tenantIdFromRequest(request), request.auth!.user.id, followUpId)
@@ -1572,7 +1572,7 @@ export class AgentApiController {
 
   @Delete("/follow-ups/:followUpId")
   async cancelQueuedFollowUp(@Req() request: AuthenticatedRequest, @Param("followUpId") followUpId: string) {
-    if (!this.durableTurns.enabled) throw new NotFoundException("Server-owned follow-ups require the durable runner");
+    if (!this.durableTurns.enabled || !this.queuedFollowUps) throw new NotFoundException("Server-owned follow-ups require the durable runner");
     return this.queuedFollowUps.cancel(tenantIdFromRequest(request), request.auth!.user.id, followUpId);
   }
 

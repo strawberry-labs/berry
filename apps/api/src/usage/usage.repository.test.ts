@@ -1,5 +1,5 @@
 import { CloudUsageIngestRequestSchema, UsageAnalyticsQuerySchema } from "@berry/shared";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { InMemoryUsageRepository, PostgresUsageRepository } from "./usage.repository.ts";
 
 const TENANT_ID = "00000000-0000-7000-8000-000000000001";
@@ -37,7 +37,7 @@ describe("PostgresUsageRepository pagination", () => {
     expect(statements.every((statement) => !/SELECT\s+\*\s+FROM\s+usage_events/i.test(statement.sql))).toBe(true);
     expect(statements[0]?.sql).toContain("SUM(cost_billed_micros)");
     expect(statements[1]?.sql).toContain("GROUP BY 1");
-    expect(statements[2]?.sql).toContain("dimension_rank <= 100");
+    expect(statements[2]?.sql).toContain("dimension_rank <= 100 OR dimension = 'member'");
   });
 
   it("paginates request logs in newest-first order at the database", async () => {
@@ -58,6 +58,26 @@ describe("PostgresUsageRepository pagination", () => {
     expect(statements[0]?.sql).toContain("ts <");
     expect(statements[0]?.sql).toContain("id <");
     expect(statements[0]?.params).toContain("2026-07-31T12:00:00.000Z");
+  });
+});
+
+describe("usage projections", () => {
+  it("projects from elapsed UTC month-to-date and excludes trailing ranges", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-11-12T12:00:00.000Z"));
+      const usage = new InMemoryUsageRepository();
+      await usage.ingestInternal(TENANT_ID, CloudUsageIngestRequestSchema.shape.normalized.parse({
+        requestId: "month-to-date", ts: "2026-11-10T12:00:00.000Z",
+        feature: "model.turn", status: "completed", costBilledMicros: "11500000",
+      }));
+      const currentMonth = await usage.analytics(TENANT_ID, { ...query(), from: "2026-11-01T00:00:00.000Z", to: "2026-11-12T12:00:00.000Z" });
+      const trailingMonth = await usage.analytics(TENANT_ID, { ...query(), from: "2026-10-13T12:00:00.000Z", to: "2026-11-12T12:00:00.000Z" });
+      expect(currentMonth.totals.projectedMonthEndMicros).toBe("30000000");
+      expect(trailingMonth.totals.projectedMonthEndMicros).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
