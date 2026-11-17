@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { McpToolError } from "@berry/local-agent/mcp";
+import { McpConnectionError, McpToolError } from "@berry/local-agent/mcp";
 import { classifyToolFailure, storedToolFailure, type ToolFailureCategory } from "./tool-failures.js";
 import { IMAGE_PROVIDER_CREDIT_EXHAUSTED_MESSAGE } from "./provider-credits.js";
 
@@ -57,7 +57,8 @@ describe("tool failure classes (H-003, H-006)", () => {
     const proxy = new McpToolError("Scrape failed", { error: { code: "SCRAPE_PROXY_UNAVAILABLE", message: "proxy tunnel failed" } });
     const token = new McpToolError("Upstream rejected the call", { error: "invalid_token", error_description: "<redacted>" });
     expect(classifyToolFailure(proxy, { changesState: false })).toMatchObject({ category: "transient", code: "SCRAPE_PROXY_UNAVAILABLE" });
-    expect(classifyToolFailure(token, { changesState: false })).toMatchObject({ category: "credentials", code: "invalid_token" });
+    expect(classifyToolFailure(token, { changesState: false })).toMatchObject({ category: "transient", code: "invalid_token" });
+    expect(classifyToolFailure(token, { changesState: true })).toMatchObject({ category: "unknown_outcome", outcome: "unknown" });
   });
 
   it("treats an interrupted change-making call as an unknown outcome unless the request never left", () => {
@@ -80,5 +81,17 @@ describe("tool failure classes (H-003, H-006)", () => {
     expect(storedToolFailure({ failure: JSON.parse(JSON.stringify(failure)) })).toEqual(failure);
     expect(storedToolFailure({ failure: { category: "made_up" } })).toBeNull();
     expect(storedToolFailure(null)).toBeNull();
+  });
+
+  it("journals a reconnect action only for the server-confirmed unusable OAuth grant", () => {
+    const reconnect = { connectorId: "connector_mcp_test", grantId: "known-grant" };
+    const required = classifyToolFailure(new McpConnectionError("reauth_required", true, reconnect), { changesState: true });
+    expect(storedToolFailure({ failure: required })).toMatchObject({ outcome: "not_applied", reconnect, blockedConnectorId: reconnect.connectorId });
+    const lost = classifyToolFailure(new McpConnectionError("temporary", false, { connectorId: reconnect.connectorId }), { changesState: true });
+    expect(lost).toMatchObject({ category: "unknown_outcome", outcome: "unknown" });
+    expect(lost).not.toHaveProperty("reconnect");
+    const forbidden = classifyToolFailure(new McpConnectionError("permission", true, { status: 403 }), { changesState: true });
+    expect(forbidden).toMatchObject({ category: "configuration", status: 403, outcome: "not_applied" });
+    expect(forbidden).not.toHaveProperty("reconnect");
   });
 });

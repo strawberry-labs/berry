@@ -42,6 +42,19 @@ describe("BerryApiClient", () => {
     );
   });
 
+  it("reads the task's reconnect action and starts sign-in with the verified task ID", async () => {
+    const taskId = "00000000-0000-7000-8000-000000000301";
+    const connectorId = "connector_mcp_connect";
+    const action = { taskId, connectorId, name: "Connect", runId: "00000000-0000-7000-8000-000000000401", canReconnect: true };
+    const flow = { connectorId, state: "test-state", authorizationUrl: "https://authorization.example/authorize", expiresAt: "2026-11-17T10:00:00.000Z" };
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValueOnce(json([action])).mockResolvedValueOnce(json(flow));
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl });
+    await expect(client.taskConnectorReconnects(taskId)).resolves.toEqual([action]);
+    await expect(client.startConnectorOAuth(connectorId, "full", "/settings/mcp", taskId)).resolves.toEqual(flow);
+    expect(fetchImpl.mock.calls[0]?.[0]).toBe(`https://api.berry.test/v1/connectors/tasks/${taskId}/reconnect`);
+    expect(fetchImpl.mock.calls[1]?.[1]?.body).toBe(JSON.stringify({ accessLevel: "full", redirectAfter: "/settings/mcp", taskId }));
+  });
+
   it("improves a task prompt without creating a task turn", async () => {
     const fetchImpl = vi.fn(async () => json({
       prompt: "Write a concise executive summary with three recommendations.",

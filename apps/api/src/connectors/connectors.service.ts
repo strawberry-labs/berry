@@ -1,9 +1,11 @@
 import { mcpOAuthStartError } from "./mcp-oauth-error.ts";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { BadRequestException, ConflictException, Injectable, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
+import { setTimeout as delay } from "node:timers/promises";
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
 import {
   completeRemoteMcpOAuth,
   discoverRemoteMcpTools,
+  McpOAuthRefreshError,
   refreshRemoteMcpOAuth,
   resolvePublicRemoteUrl,
   startRemoteMcpOAuth,
@@ -11,15 +13,25 @@ import {
   type McpOAuthState,
   type McpServerSpec,
 } from "@berry/local-agent";
+import { McpConnectionError, type McpResolvedCredential } from "@berry/local-agent/mcp";
 import {
   ConnectorSecretEnvelopeSchema,
   ConnectorSchema,
+  DurableMcpServerSchema,
+  McpCredentialRequestSchema,
+  isStoredMcpCredentialRef,
   openConnectorSecret,
+  openDurableSecret,
   sealConnectorSecret,
   type Connector,
   type ConnectorAccessLevel,
   type ConnectorSecretEnvelope,
   type ConnectorWorkspaceAccessMode,
+  type DurableMcpServer,
+  type DurableSecretEnvelope,
+  type McpCredentialRequest,
+  type McpCredentialResult,
+  type TaskConnectorReconnect,
 } from "@berry/shared";
 import type { CloudDatabaseService, SqlExecutor } from "../db/cloud-database.service.ts";
 import {
@@ -138,7 +150,23 @@ type ConnectorSession = {
   exp: number;
 };
 
-type StoredMcpOAuth = { state: McpOAuthState; obtainedAt: string };
+type StoredMcpOAuth = {
+  state: McpOAuthState;
+  obtainedAt: string;
+  authorizedAt?: string;
+  grantId?: string;
+  version?: string;
+  reauthRequired?: true;
+  // Commit the claim before sending a rotating refresh request. An interrupted
+  // claimant leaves proof that the outcome may be unknown, even after restart.
+  refresh?: { claimId: string | null; until: number; uncertain: boolean; invalidGrant?: true; configuration?: true };
+};
+type McpGrant = { stored: StoredMcpOAuth; grantId: string; version: string; context: string; connection: ConnectionRow | null };
+type McpAdmission = { server: DurableMcpServer; createdAt: string | Date; userId: string };
+type McpRefreshClaim = { row: ConnectorRow; grant: McpGrant; claimId: string; uncertain: boolean };
+type McpResolution = McpCredentialResult | { status: "waiting" } | { status: "refresh"; claim: McpRefreshClaim };
+const MCP_REFRESH_CLAIM_MS = 45_000;
+const MCP_REFRESH_COOLDOWN_MS = 30_000;
 type CustomConnectorConfig = {
   discoveredTools?: Array<{ name: string; description: string | null; inputSchema: Record<string, unknown>; annotations?: Record<string, boolean> }>;
   allowedTools?: string[];
@@ -169,7 +197,13 @@ export class ConnectorsService {
       const row = byKey.get(key);
       return this.#connectorView(row ?? virtualBuiltIn(key), byConnector, userId, googleConfigured);
     });
-    const custom = rows.filter((row) => row.kind === "custom_mcp").map((row) => this.#connectorView(row, byConnector, userId, true));
+    const custom = await Promise.all(rows.filter((row) => row.kind === "custom_mcp").map(async (row) => {
+      const view = this.#connectorView(row, byConnector, userId, true);
+      if (row.auth_strategy !== "shared" || row.auth_type !== "oauth") return view;
+      const envelope = connectorEnvelope(row.shared_credential_envelope);
+      const grant = envelope ? await this.#openMcpGrant(envelope, sharedCredentialContext(tenantId, row.id)) : null;
+      return grant?.reauthRequired ? { ...view, connectionStatus: "reauth_required" as const, connectedAccessLevel: null } : view;
+    }));
     return ConnectorSchema.array().parse([...builtIns, ...custom]);
   }
 
@@ -461,43 +495,44 @@ export class ConnectorsService {
     },
   ): Promise<Connector> {
     const url = await safeRemoteUrl(input.url, this.env.NODE_ENV !== "production");
-    const existing = input.id ? await this.#row(tenantId, input.id) : null;
-    if (existing && existing.kind !== "custom_mcp") throw new BadRequestException("Built-in connectors cannot be replaced by a custom MCP");
-    const priorConfig = customConfig(existing?.config);
-    const authorityChanged = Boolean(existing && (
-      existing.endpoint_url !== url
-      || existing.transport !== input.transport
-      || existing.auth_type !== input.authType
-      || existing.auth_strategy !== input.authStrategy
-      || (priorConfig.oauthScope ?? "") !== (input.oauthScope?.trim() ?? "")
-    ));
-    const reusableSharedCredential = !authorityChanged ? connectorEnvelope(existing?.shared_credential_envelope) : null;
-    if (input.authStrategy === "shared" && input.authType === "bearer" && !input.sharedCredential?.trim() && !reusableSharedCredential) {
-      throw new BadRequestException("A shared bearer token is required");
-    }
-    if (input.authStrategy === "personal" && input.authType === "bearer" && !input.personalCredential?.trim() && (!existing || authorityChanged)) {
-      throw new BadRequestException("An administrator bearer token is required to discover this connector's tools");
-    }
-    const id = existing?.id ?? `connector_mcp_${randomUUID()}`;
-    const key = existing?.connector_key ?? `custom-mcp-${randomUUID()}`;
-    const sharedEnvelope = input.authStrategy !== "shared"
-      ? null
-      : input.authType === "bearer" && input.sharedCredential?.trim()
-        ? await this.#seal(input.sharedCredential.trim(), sharedCredentialContext(tenantId, id))
-        : reusableSharedCredential;
-    const personalEnvelope = input.authStrategy === "personal" && input.authType === "bearer" && input.personalCredential?.trim()
-      ? await this.#seal(input.personalCredential.trim(), connectionContext(tenantId, id, userId))
-      : null;
-    const config: CustomConnectorConfig = {
-      ...(!authorityChanged && priorConfig.serverApproved !== undefined ? { serverApproved: priorConfig.serverApproved } : {}),
-      ...(!authorityChanged && priorConfig.discoveredTools ? { discoveredTools: priorConfig.discoveredTools } : {}),
-      ...(!authorityChanged && priorConfig.allowedTools ? { allowedTools: priorConfig.allowedTools } : {}),
-      ...(!authorityChanged && priorConfig.lastDiscoveredAt ? { lastDiscoveredAt: priorConfig.lastDiscoveredAt } : {}),
-      ...(input.oauthScope?.trim() ? { oauthScope: input.oauthScope.trim() } : {}),
-      ...(input.websiteUrl?.trim() ? { websiteUrl: new URL(input.websiteUrl).toString() } : {}),
-      ...(input.privacyPolicyUrl?.trim() ? { privacyPolicyUrl: new URL(input.privacyPolicyUrl).toString() } : {}),
-    };
-    await this.database.withTenant(tenantId, async (db) => {
+    const savedId = await this.database.withTenant(tenantId, async (db) => {
+      const existing = input.id ? (await db.query<ConnectorRow>("SELECT * FROM organization_connectors WHERE id=$1 FOR UPDATE", [input.id]))[0] : null;
+      if (input.id && !existing) throw new NotFoundException("Connector not found");
+      if (existing && existing.kind !== "custom_mcp") throw new BadRequestException("Built-in connectors cannot be replaced by a custom MCP");
+      const priorConfig = customConfig(existing?.config);
+      const authorityChanged = Boolean(existing && (
+        existing.endpoint_url !== url
+        || existing.transport !== input.transport
+        || existing.auth_type !== input.authType
+        || existing.auth_strategy !== input.authStrategy
+        || (priorConfig.oauthScope ?? "") !== (input.oauthScope?.trim() ?? "")
+      ));
+      const reusableSharedCredential = !authorityChanged ? connectorEnvelope(existing?.shared_credential_envelope) : null;
+      if (input.authStrategy === "shared" && input.authType === "bearer" && !input.sharedCredential?.trim() && !reusableSharedCredential) {
+        throw new BadRequestException("A shared bearer token is required");
+      }
+      if (input.authStrategy === "personal" && input.authType === "bearer" && !input.personalCredential?.trim() && (!existing || authorityChanged)) {
+        throw new BadRequestException("An administrator bearer token is required to discover this connector's tools");
+      }
+      const id = existing?.id ?? `connector_mcp_${randomUUID()}`;
+      const key = existing?.connector_key ?? `custom-mcp-${randomUUID()}`;
+      const sharedEnvelope = input.authStrategy !== "shared"
+        ? null
+        : input.authType === "bearer" && input.sharedCredential?.trim()
+          ? await this.#seal(input.sharedCredential.trim(), sharedCredentialContext(tenantId, id))
+          : reusableSharedCredential;
+      const personalEnvelope = input.authStrategy === "personal" && input.authType === "bearer" && input.personalCredential?.trim()
+        ? await this.#seal(input.personalCredential.trim(), connectionContext(tenantId, id, userId))
+        : null;
+      const config: CustomConnectorConfig = {
+        ...(!authorityChanged && priorConfig.serverApproved !== undefined ? { serverApproved: priorConfig.serverApproved } : {}),
+        ...(!authorityChanged && priorConfig.discoveredTools ? { discoveredTools: priorConfig.discoveredTools } : {}),
+        ...(!authorityChanged && priorConfig.allowedTools ? { allowedTools: priorConfig.allowedTools } : {}),
+        ...(!authorityChanged && priorConfig.lastDiscoveredAt ? { lastDiscoveredAt: priorConfig.lastDiscoveredAt } : {}),
+        ...(input.oauthScope?.trim() ? { oauthScope: input.oauthScope.trim() } : {}),
+        ...(input.websiteUrl?.trim() ? { websiteUrl: new URL(input.websiteUrl).toString() } : {}),
+        ...(input.privacyPolicyUrl?.trim() ? { privacyPolicyUrl: new URL(input.privacyPolicyUrl).toString() } : {}),
+      };
       await db.execute(`
         INSERT INTO organization_connectors (
           id, tenant_id, connector_key, kind, provider, name, description, enabled,
@@ -519,8 +554,9 @@ export class ConnectorsService {
       if (personalEnvelope) {
         await this.#upsertConnectionWith(db, tenantId, id, userId, input.maxAccessLevel, personalEnvelope, null, null, [], null);
       }
+      return id;
     });
-    return this.#find(await this.list(tenantId, userId), id);
+    return this.#find(await this.list(tenantId, userId), savedId);
   }
 
   async discoverCustom(tenantId: string, userId: string, id: string): Promise<Connector> {
@@ -528,11 +564,13 @@ export class ConnectorsService {
     if (row.kind !== "custom_mcp" || !row.endpoint_url || !row.transport) throw new BadRequestException("Custom MCP is incomplete");
     if (customConfig(row.config).serverApproved) throw new BadRequestException("Organization catalog servers discover their tools through each user's connection");
     const endpoint = await safeRemoteUrl(row.endpoint_url, this.env.NODE_ENV !== "production");
-    const credential = await this.#customCredential(tenantId, userId, row, false);
-    const tools = await discoverRemoteMcpTools({ id: row.id, name: row.name, url: endpoint, transport: row.transport, ...(credential ? { credential } : {}) });
+    const tools = await this.#discoverCustomTools(tenantId, userId, row, endpoint);
     const config = customConfig(row.config);
     const next: CustomConnectorConfig = { ...config, discoveredTools: tools, allowedTools: tools.map((tool) => tool.name), lastDiscoveredAt: new Date().toISOString() };
-    await this.database.withTenant(tenantId, (db) => db.execute("UPDATE organization_connectors SET config=$1::jsonb, publication_status='draft', enabled=false, updated_at=now() WHERE id=$2", [JSON.stringify(next), id]));
+    await this.database.withTenant(tenantId, (db) => db.execute(`
+      UPDATE organization_connectors SET config=$1::jsonb, publication_status='draft', enabled=false, updated_at=now()
+      WHERE id=$2 AND config=$3::jsonb AND endpoint_url=$4 AND transport=$5 AND auth_type=$6 AND auth_strategy=$7
+    `, [JSON.stringify(next), id, JSON.stringify(config), row.endpoint_url, row.transport, row.auth_type, row.auth_strategy]));
     return this.#find(await this.list(tenantId, userId), id);
   }
 
@@ -585,7 +623,11 @@ export class ConnectorsService {
         if (revocable) await revokeGoogleToken(revocable).catch(() => undefined);
       }
     }
-    await this.database.withTenant(tenantId, (db) => db.execute("DELETE FROM connector_connections WHERE connector_id=$1 AND user_id=$2", [id, userId]));
+    await this.database.withTenant(tenantId, async (db) => {
+      await db.query("SELECT id FROM organization_connectors WHERE id=$1 FOR UPDATE", [id]);
+      await db.execute("DELETE FROM connector_connections WHERE connector_id=$1 AND user_id=$2", [id, userId]);
+      await db.execute("DELETE FROM connector_oauth_states WHERE connector_id=$1 AND user_id=$2", [id, userId]);
+    });
     return { ok: true };
   }
 
@@ -604,7 +646,7 @@ export class ConnectorsService {
     const scopes = googleConnectorScopes(row.connector_key, accessLevel, row.workspace_access_mode ?? "selected_files");
     const expiresAt = new Date(Date.now() + 10 * 60_000);
     await this.database.withTenant(tenantId, async (db) => {
-      await db.execute("DELETE FROM connector_oauth_states WHERE expires_at <= now() OR consumed_at IS NOT NULL");
+      await db.execute("DELETE FROM connector_oauth_states WHERE expires_at <= now()");
       await db.execute(`
         INSERT INTO connector_oauth_states (state_digest, tenant_id, connector_id, user_id, access_level, requested_scopes, code_verifier_envelope, redirect_after, expires_at)
         VALUES ($1,$2::uuid,$3,$4,$5,$6::text[],$7::jsonb,'/settings/connectors',$8::timestamptz)
@@ -678,68 +720,101 @@ export class ConnectorsService {
     }
   }
 
-  async startCustomOAuth(tenantId: string, userId: string, id: string, allowShared = false, redirectAfter = "/settings/connectors") {
+  async startCustomOAuth(tenantId: string, userId: string, id: string, allowShared = false, redirectAfter = "/settings/connectors", taskId?: string) {
     const row = await this.#row(tenantId, id);
     if (row.kind !== "custom_mcp" || row.auth_type !== "oauth" || !row.endpoint_url) throw new BadRequestException("This connector does not use MCP OAuth");
     if ((row.approval_status ?? "approved") !== "approved") throw new BadRequestException("This MCP server is awaiting organization approval");
     if (row.auth_strategy === "shared" && !allowShared) throw new BadRequestException("Only an administrator can authorize this organization-wide connector");
-    if (!allowShared && (row.publication_status !== "published" || !row.enabled)) throw new BadRequestException("This connector is not available to members");
+    if ((!allowShared || taskId) && (row.publication_status !== "published" || !row.enabled)) throw new BadRequestException("This connector is not available to members");
+    const reconnect = taskId ? (await this.#taskMcpReconnects(tenantId, userId, taskId, allowShared)).find((action) => action.connectorId === id) : undefined;
+    if (taskId && !reconnect?.canReconnect) throw new ForbiddenException("This task has no eligible reconnect action for this connector");
+    const grantId = reconnect?.grantId ?? (await this.database.withTenant(tenantId, (db) => this.#readMcpGrant(db, tenantId, userId, row)))?.grantId ?? null;
     const endpoint = await safeRemoteUrl(row.endpoint_url, this.env.NODE_ENV !== "production");
     const state = randomBytes(32).toString("base64url"); const stateDigest = sha256(state); const config = customConfig(row.config); const callbackUrl = this.mcpCallbackUrl();
     const clientMetadataUrl = this.mcpClientMetadataUrl();
     const started = await startRemoteMcpOAuth({ serverUrl: endpoint, callbackUrl, requestState: state, ...(config.oauthScope ? { scope: config.oauthScope } : {}), ...(clientMetadataUrl ? { clientMetadataUrl } : {}) }).catch((cause: unknown) => { throw mcpOAuthStartError(cause, endpoint); });
-    const envelope = await this.#seal(JSON.stringify({ type: "mcp", state: started.state }), oauthStateContext(tenantId, stateDigest));
+    const envelope = await this.#seal(JSON.stringify({ type: "mcp", state: started.state, authority: mcpAuthority(row), grantId,
+      ...(reconnect ? { taskId } : {}),
+    }), oauthStateContext(tenantId, stateDigest));
     const expiresAt = new Date(Date.now() + 10 * 60_000);
     await this.database.withTenant(tenantId, async (db) => {
-      await db.execute("DELETE FROM connector_oauth_states WHERE expires_at <= now() OR consumed_at IS NOT NULL");
+      await db.execute("DELETE FROM connector_oauth_states WHERE expires_at <= now()");
       await db.execute(`
         INSERT INTO connector_oauth_states (state_digest, tenant_id, connector_id, user_id, access_level, requested_scopes, code_verifier_envelope, redirect_after, expires_at)
         VALUES ($1,$2::uuid,$3,$4,$5,$6::text[],$7::jsonb,$8,$9::timestamptz)
-      `, [stateDigest, tenantId, row.id, userId, row.max_access_level, config.oauthScope ? config.oauthScope.split(/\s+/).filter(Boolean) : [], JSON.stringify(envelope), redirectAfter, expiresAt.toISOString()]);
+      `, [stateDigest, tenantId, row.id, userId, row.max_access_level, config.oauthScope ? config.oauthScope.split(/\s+/).filter(Boolean) : [], JSON.stringify(envelope), taskId ? `/tasks/${taskId}` : redirectAfter, expiresAt.toISOString()]);
     });
     return { connectorId: row.id, state, authorizationUrl: started.authorizationUrl, expiresAt: expiresAt.toISOString() };
   }
 
-  async completeCustomOAuth(tenantId: string, userId: string, input: { state: string; code?: string; error?: string; issuer?: string }) {
+  async completeCustomOAuth(tenantId: string, userId: string, input: { state: string; code?: string; error?: string; issuer?: string }, canManageShared = false): Promise<{ redirectAfter: string; connectorId: string; error?: string }> {
     const stateDigest = sha256(input.state);
     const states = await this.database.withTenant(tenantId, (db) => db.query<OAuthStateRow>("UPDATE connector_oauth_states SET consumed_at=now() WHERE state_digest=$1 AND user_id=$2 AND consumed_at IS NULL AND expires_at>now() RETURNING *", [stateDigest, userId]));
     const flow = states[0]; if (!flow) throw new BadRequestException("MCP OAuth state is invalid or expired");
+    let taskReturn: string | undefined;
     try {
-      const row = await this.#row(tenantId, flow.connector_id); if (row.kind !== "custom_mcp" || row.auth_type !== "oauth" || !row.endpoint_url) throw new BadRequestException("OAuth state references an invalid MCP connector");
-      const endpoint = await safeRemoteUrl(row.endpoint_url, this.env.NODE_ENV !== "production");
       const envelope = connectorEnvelope(flow.code_verifier_envelope); if (!envelope) throw new BadRequestException("MCP OAuth state is invalid");
-      const stored = JSON.parse(await this.#open(envelope, oauthStateContext(tenantId, stateDigest))) as { type?: string; state?: McpOAuthState };
+      const stored = JSON.parse(await this.#open(envelope, oauthStateContext(tenantId, stateDigest))) as { type?: string; state?: McpOAuthState; authority?: string; taskId?: string; grantId?: string | null };
       if (stored.type !== "mcp" || !stored.state) throw new BadRequestException("MCP OAuth state is invalid");
+      if (stored.taskId) {
+        await this.#assertTaskMcpAccess(tenantId, userId, stored.taskId);
+        taskReturn = `/tasks/${stored.taskId}`;
+      }
+      const row = await this.#row(tenantId, flow.connector_id);
+      if (!isMcpOAuth(row) || (stored.authority && stored.authority !== mcpAuthority(row))) throw new BadRequestException("The MCP connector configuration changed");
+      if (row.auth_strategy === "shared" && !canManageShared) throw new ForbiddenException("Only an administrator can authorize this organization-wide connector");
       validateRemoteMcpOAuthIssuer(stored.state, input.issuer);
-      if (input.error) throw new BadRequestException(`MCP authorization failed: ${input.error}`);
+      if (input.error) {
+        if (taskReturn) return { redirectAfter: taskReturn, connectorId: row.id, error: "Sign-in was cancelled or denied. You can try again." };
+        throw new BadRequestException("MCP authorization was cancelled or denied");
+      }
       if (!input.code) throw new BadRequestException("MCP authorization code is missing");
+      const endpoint = await safeRemoteUrl(row.endpoint_url!, this.env.NODE_ENV !== "production");
       const config = customConfig(row.config);
       const clientMetadataUrl = this.mcpClientMetadataUrl();
       const completed = await completeRemoteMcpOAuth({ serverUrl: endpoint, callbackUrl: this.mcpCallbackUrl(), requestState: input.state, authorizationCode: input.code, state: stored.state, ...(config.oauthScope ? { scope: config.oauthScope } : {}), ...(clientMetadataUrl ? { clientMetadataUrl } : {}) });
-      const credential: StoredMcpOAuth = { state: completed, obtainedAt: new Date().toISOString() };
-      if (row.auth_strategy === "shared") {
-        const shared = await this.#seal(JSON.stringify(credential), sharedCredentialContext(tenantId, row.id));
-        await this.database.withTenant(tenantId, (db) => db.execute("UPDATE organization_connectors SET shared_credential_envelope=$1::jsonb, updated_at=now() WHERE id=$2", [JSON.stringify(shared), row.id]));
-      } else {
-        const personal = await this.#seal(JSON.stringify(credential), connectionContext(tenantId, row.id, userId));
-        await this.#upsertConnection(tenantId, row.id, userId, row.max_access_level, personal, null, null, flow.requested_scopes, null);
-      }
-      if (config.serverApproved && row.transport && completed.tokens?.access_token) {
+      const obtainedAt = new Date().toISOString();
+      const credential: StoredMcpOAuth = { state: completed, obtainedAt, authorizedAt: obtainedAt, grantId: sha256(randomUUID()), version: sha256(randomUUID()) };
+      const saved = await this.database.withTenant(tenantId, async (db) => {
+        const [current] = await db.query<ConnectorRow>("SELECT * FROM organization_connectors WHERE id=$1 FOR UPDATE", [row.id]);
+        const [activeState] = await db.query("SELECT state_digest FROM connector_oauth_states WHERE state_digest=$1", [stateDigest]);
+        if (!current || !activeState || !isMcpOAuth(current) || mcpAuthority(current) !== mcpAuthority(row)) throw new BadRequestException("The MCP connector configuration changed");
+        if (taskReturn && (!current.enabled || current.publication_status !== "published")) throw new ForbiddenException("This connector is unavailable to the task");
+        if (stored.grantId !== undefined) {
+          const latest = await this.#readMcpGrant(db, tenantId, userId, current, true);
+          if ((latest?.grantId ?? null) !== stored.grantId || (taskReturn && latest && !mcpReauthRequired(latest))) {
+            if (taskReturn && latest && !mcpReauthRequired(latest)) return false;
+            throw new ConflictException("The connector grant changed during sign-in. Start sign-in again if needed.");
+          }
+        }
+        const sealed = await this.#seal(JSON.stringify(credential), customCredentialContext(tenantId, userId, current));
+        if (current.auth_strategy === "shared") {
+          await db.execute("UPDATE organization_connectors SET shared_credential_envelope=$1::jsonb, updated_at=now() WHERE id=$2", [JSON.stringify(sealed), row.id]);
+        } else {
+          await this.#upsertConnectionWith(db, tenantId, row.id, userId, current.max_access_level, sealed, null, null, mcpScopes(credential, flow.requested_scopes), mcpExpiry(credential)?.toISOString() ?? null);
+        }
+        return true;
+      });
+      if (saved && config.serverApproved && row.transport && (!taskReturn || !config.discoveredTools?.length)) {
         try {
-          const tools = await discoverRemoteMcpTools({ id: row.id, name: row.name, url: endpoint, transport: row.transport, credential: completed.tokens.access_token });
+          const tools = await this.#discoverCustomTools(tenantId, userId, row, endpoint);
           const next: CustomConnectorConfig = { ...config, discoveredTools: tools, lastDiscoveredAt: new Date().toISOString() };
-          await this.database.withTenant(tenantId, (db) => db.execute("UPDATE organization_connectors SET config=$1::jsonb, updated_at=now() WHERE id=$2", [JSON.stringify(next), row.id]));
+          await this.database.withTenant(tenantId, (db) => db.execute("UPDATE organization_connectors SET config=$1::jsonb, updated_at=now() WHERE id=$2 AND config=$3::jsonb", [JSON.stringify(next), row.id, JSON.stringify(config)]));
         } catch {
           // Authorization succeeded. Live tool discovery will retry when the connector is used.
         }
       }
-      return { redirectAfter: flow.redirect_after, connectorId: row.id };
+      return { redirectAfter: taskReturn ?? flow.redirect_after, connectorId: row.id };
+    } catch (cause) {
+      if (taskReturn) return { redirectAfter: taskReturn, connectorId: flow.connector_id, error: "Could not finish reconnecting. You can try again." };
+      if (cause instanceof BadRequestException || cause instanceof ForbiddenException || cause instanceof ConflictException) throw cause;
+      throw new BadRequestException("MCP authorization failed. Try connecting again.");
     } finally {
       await this.database.withTenant(tenantId, (db) => db.execute("DELETE FROM connector_oauth_states WHERE state_digest=$1", [stateDigest]));
     }
   }
 
-  async runtime(tenantId: string, userId: string, context: { taskId?: string; sessionId?: string } = {}): Promise<McpServerSpec[]> {
+  async runtime(tenantId: string, userId: string, context: { taskId?: string; sessionId?: string; resolveDuringExecution?: boolean } = {}): Promise<McpServerSpec[]> {
     const rows = await this.database.withTenant(tenantId, (db) => db.query<ConnectorRow>("SELECT * FROM organization_connectors WHERE enabled=true AND publication_status='published' AND approval_status='approved' ORDER BY kind, name"));
     const servers: McpServerSpec[] = [];
     for (const row of rows) {
@@ -750,7 +825,7 @@ export class ConnectorsService {
         const grantedScopes = connection.granted_scopes ?? [];
         const tools = googleToolCatalog(row.connector_key, accessLevel, grantedScopes);
         if (!tools.length) continue;
-        const credential = this.#signSession({ tenantId, userId, connectorKey: row.connector_key, accessLevel, ...context, exp: Math.floor(Date.now() / 1000) + 20 * 60 });
+        const credential = this.#signSession({ tenantId, userId, connectorKey: row.connector_key, accessLevel, ...(context.taskId ? { taskId: context.taskId } : {}), ...(context.sessionId ? { sessionId: context.sessionId } : {}), exp: Math.floor(Date.now() / 1000) + 20 * 60 });
         servers.push({
           id: row.id,
           name: row.name,
@@ -770,16 +845,25 @@ export class ConnectorsService {
         continue;
       }
       if (row.kind !== "custom_mcp" || !row.endpoint_url || !row.transport) continue;
-      const endpoint = await safeRemoteUrl(row.endpoint_url, this.env.NODE_ENV !== "production").catch(() => null);
+      // The registration was validated on save. Connection-time fetch still
+      // validates every socket's address, including after an outage or DNS change.
+      const lazyOAuth = row.auth_type === "oauth" && context.resolveDuringExecution === true;
+      const endpoint = lazyOAuth ? row.endpoint_url : await safeRemoteUrl(row.endpoint_url, this.env.NODE_ENV !== "production").catch(() => null);
       if (!endpoint) continue;
       let credential: string | undefined;
+      let credentialKey = customCredentialReference(row, userId);
       try {
-        credential = await this.#customCredential(tenantId, userId, row, true);
+        if (lazyOAuth) {
+          const grant = await this.database.withTenant(tenantId, (db) => this.#readMcpGrant(db, tenantId, userId, row));
+          if (!grant) continue;
+          credentialKey = mcpOAuthReference(row, userId, grant.grantId);
+        } else {
+          credential = await this.#customCredential(tenantId, userId, row);
+          if (row.auth_type !== "none" && !credential) continue;
+        }
       } catch {
-        await this.#invalidateCustomCredential(tenantId, userId, row).catch(() => undefined);
         continue;
       }
-      if (row.auth_type !== "none" && !credential) continue;
       const config = customConfig(row.config);
       const serverApproved = config.serverApproved === true;
       const approved = new Set(config.allowedTools ?? []);
@@ -797,7 +881,7 @@ export class ConnectorsService {
         env: {},
         enabled: true,
         trusted: true,
-        credentialKey: `connector:${row.id}:${row.auth_strategy === "shared" ? "shared" : userId}`,
+        credentialKey,
         cachedTools,
         ...(serverApproved && cachedTools.length ? { defaultTools: cachedTools.map((tool) => tool.name) } : {}),
         ...(!serverApproved ? { allowedTools: cachedTools.map((tool) => tool.name) } : {}),
@@ -1066,44 +1150,248 @@ export class ConnectorsService {
     await this.database.withTenant(tenantId, (db) => db.execute("UPDATE connector_connections SET status=$1, last_error_code=$2, updated_at=now() WHERE id=$3", [status, errorCode.slice(0, 120), id]));
   }
 
-  async #customCredential(tenantId: string, userId: string, row: ConnectorRow, persistRefresh: boolean): Promise<string | undefined> {
+  async resolveRunMcpCredential(proof: DurableSecretEnvelope, signal?: AbortSignal): Promise<McpCredentialResult> {
+    const key = this.env.BERRY_DURABLE_CAPABILITY_KEY?.trim();
+    const request = key ? await openDurableSecret(proof, key)
+      .then((plaintext) => McpCredentialRequestSchema.parse(JSON.parse(plaintext)))
+      .catch(() => null) : null;
+    if (!request || request.expiresAt <= Date.now() || request.expiresAt > Date.now() + 60_000) {
+      throw new ForbiddenException("Invalid connector credential request");
+    }
+    const admission = await this.#mcpRunAdmission(request);
+    const row = await this.#row(request.tenantId, request.connectorId);
+    if (!mcpAdmissionMatches(row, admission)) return { status: "configuration" };
+    if (row.auth_type !== "oauth") {
+      if (admission.server.credentialRef !== customCredentialReference(row, request.userId)) return { status: "configuration" };
+      const credential = await this.#customCredential(request.tenantId, request.userId, row);
+      if (row.auth_type === "bearer" && (!credential || !admission.server.credential || await openDurableSecret(admission.server.credential, key!).catch(() => undefined) !== credential)) {
+        return { status: "configuration" };
+      }
+      return { status: "static" };
+    }
+    const result = await this.#resolveMcpOAuth(request.tenantId, request.userId, row, { admission, rejectedVersion: request.rejectedVersion, signal });
+    signal?.throwIfAborted();
+    if (result.status === "available") await this.#mcpRunAdmission(request);
+    return result;
+  }
+
+  async taskMcpReconnects(tenantId: string, userId: string, taskId: string, canManageShared: boolean): Promise<TaskConnectorReconnect[]> {
+    return (await this.#taskMcpReconnects(tenantId, userId, taskId, canManageShared)).map(({ grantId: _grantId, ...action }) => action);
+  }
+
+  async #assertTaskMcpAccess(tenantId: string, userId: string, taskId: string): Promise<void> {
+    const [task] = await this.database.withTenant(tenantId, (db) => db.query(`
+      SELECT t.id FROM tasks t
+      JOIN tenant_memberships m ON m.tenant_id=t.tenant_id AND m.user_id=t.user_id
+      WHERE t.tenant_id=$1::uuid AND t.user_id=$2::uuid AND t.id=$3::uuid AND t.deleted_at IS NULL
+        AND m.status='active' AND m.deprovisioned_at IS NULL
+    `, [tenantId, userId, taskId]));
+    if (!task) throw new NotFoundException("Task not found");
+  }
+
+  async #taskMcpReconnects(tenantId: string, userId: string, taskId: string, canManageShared: boolean): Promise<Array<TaskConnectorReconnect & { grantId: string }>> {
+    await this.#assertTaskMcpAccess(tenantId, userId, taskId);
+    return this.database.withTenant(tenantId, async (db) => {
+      const failures = await db.query<{ connector_id: string; grant_id: string; run_id: string }>(`
+        SELECT DISTINCT ON (connector_id, grant_id)
+          s.output#>>'{failure,reconnect,connectorId}' AS connector_id,
+          s.output#>>'{failure,reconnect,grantId}' AS grant_id, r.id AS run_id
+        FROM turn_runs r
+        JOIN turn_steps s ON s.tenant_id=r.tenant_id AND s.run_id=r.id
+        WHERE r.tenant_id=$1::uuid AND r.user_id=$2::uuid AND r.task_id=$3::uuid
+          AND s.state='failed' AND s.output#>>'{failure,reconnect,grantId}' IS NOT NULL
+        ORDER BY connector_id, grant_id, r.created_at DESC
+      `, [tenantId, userId, taskId]);
+      if (!failures.length) return [];
+      const connectors = await db.query<ConnectorRow>("SELECT * FROM organization_connectors WHERE id=ANY($1::text[]) AND enabled=true AND publication_status='published' AND approval_status='approved'", [[...new Set(failures.map((failure) => failure.connector_id))]]);
+      const actions = await Promise.all(connectors.map(async (row) => {
+        if (!isMcpOAuth(row)) return null;
+        const grant = await this.#readMcpGrant(db, tenantId, userId, row);
+        if (!grant || !mcpReauthRequired(grant)) return null;
+        const failure = failures.find((candidate) => candidate.connector_id === row.id && candidate.grant_id === grant.grantId);
+        return failure ? { connectorId: row.id, name: row.name, taskId, runId: failure.run_id, grantId: grant.grantId, canReconnect: row.auth_strategy === "personal" || canManageShared } : null;
+      }));
+      return actions.filter((action) => action !== null);
+    });
+  }
+
+  async #mcpRunAdmission(request: McpCredentialRequest): Promise<McpAdmission> {
+    const [admission] = await this.database.withTenant(request.tenantId, (db) => db.query<{ server: unknown; created_at: Date | string }>(`
+      SELECT server.spec AS server, r.created_at
+      FROM turn_runs r
+      JOIN tasks t ON t.tenant_id=r.tenant_id AND t.id=r.task_id
+      JOIN tenant_memberships m ON m.tenant_id=r.tenant_id AND m.user_id=r.user_id
+      CROSS JOIN LATERAL jsonb_array_elements(r.runtime_request->'mcpServers') AS server(spec)
+      WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid AND r.user_id=$3::uuid
+        AND r.lease_owner=$4 AND r.ownership_generation=$5 AND r.lease_expires_at>now()
+        AND r.state='executing_tool' AND r.cancelled_at IS NULL
+        AND t.user_id=r.user_id AND t.deleted_at IS NULL
+        AND m.status='active' AND m.deprovisioned_at IS NULL AND server.spec->>'id'=$6
+      LIMIT 1
+    `, [request.tenantId, request.runId, request.userId, request.leaseOwner, request.ownershipGeneration, request.connectorId]));
+    const server = DurableMcpServerSchema.safeParse(admission?.server);
+    if (!admission || !server.success || !server.data.enabled || !server.data.trusted
+      || !isStoredMcpCredentialRef(server.data.id, server.data.credentialRef)) {
+      throw new ForbiddenException("Connector is outside the active run's admission");
+    }
+    return { server: server.data, createdAt: admission.created_at, userId: request.userId };
+  }
+
+  async #discoverCustomTools(tenantId: string, userId: string, row: ConnectorRow, endpoint: string) {
+    if (!row.transport) throw new BadRequestException("Custom MCP is incomplete");
+    const resolveCredential = async (_server: McpServerSpec, signal?: AbortSignal, rejectedVersion?: string): Promise<McpResolvedCredential> => {
+      const result = await this.#resolveMcpOAuth(tenantId, userId, row, { rejectedVersion, signal });
+      if (result.status === "available") return result;
+      if (result.status === "reauth_required") throw new McpConnectionError("reauth_required", true);
+      if (result.status === "temporary") throw new McpConnectionError("temporary", true);
+      throw new McpConnectionError("configuration", true);
+    };
+    const credential = row.auth_type !== "oauth" ? await this.#customCredential(tenantId, userId, row) : undefined;
+    try {
+      return await discoverRemoteMcpTools({
+        id: row.id, name: row.name, url: endpoint, transport: row.transport,
+        ...(credential ? { credential } : {}),
+        ...(row.auth_type === "oauth" ? { resolveCredential } : {}),
+      });
+    } catch (cause) {
+      if (cause instanceof McpConnectionError && cause.kind === "temporary") throw new ServiceUnavailableException(cause.message);
+      if (cause instanceof McpConnectionError) throw new BadRequestException(cause.message);
+      throw new BadRequestException("Unable to discover MCP tools with the saved connection");
+    }
+  }
+
+  async #customCredential(tenantId: string, userId: string, row: ConnectorRow): Promise<string | undefined> {
     if (row.auth_type === "none") return undefined;
+    if (row.auth_type === "oauth") {
+      const result = await this.#resolveMcpOAuth(tenantId, userId, row);
+      return result.status === "available" ? result.accessToken : undefined;
+    }
     const connection = row.auth_strategy === "personal" ? await this.#connection(tenantId, row.id, userId) : null;
     const envelope = row.auth_strategy === "shared" ? connectorEnvelope(row.shared_credential_envelope) : connectorEnvelope(connection?.credential_envelope);
     if (!envelope) return undefined;
-    const context = row.auth_strategy === "shared" ? sharedCredentialContext(tenantId, row.id) : connectionContext(tenantId, row.id, userId);
-    const opened = await this.#open(envelope, context);
-    if (row.auth_type === "bearer") return opened;
-    let stored = JSON.parse(opened) as StoredMcpOAuth;
-    const tokens = stored.state.tokens;
-    if (!tokens?.access_token) return undefined;
-    const expiresIn = typeof tokens.expires_in === "number" ? tokens.expires_in : null;
-    const expired = expiresIn !== null && Date.parse(stored.obtainedAt) + expiresIn * 1000 <= Date.now() + 90_000;
-    if (expired && tokens.refresh_token && row.endpoint_url) {
-      const config = customConfig(row.config);
-      const endpoint = await safeRemoteUrl(row.endpoint_url, this.env.NODE_ENV !== "production");
-      stored = { state: await refreshRemoteMcpOAuth({ serverUrl: endpoint, callbackUrl: this.mcpCallbackUrl(), state: stored.state, ...(config.oauthScope ? { scope: config.oauthScope } : {}) }), obtainedAt: new Date().toISOString() };
-      if (persistRefresh) {
-        const refreshedEnvelope = await this.#seal(JSON.stringify(stored), context);
-        if (row.auth_strategy === "shared") await this.database.withTenant(tenantId, (db) => db.execute("UPDATE organization_connectors SET shared_credential_envelope=$1::jsonb, updated_at=now() WHERE id=$2", [JSON.stringify(refreshedEnvelope), row.id]));
-        else if (connection) await this.database.withTenant(tenantId, (db) => db.execute("UPDATE connector_connections SET credential_envelope=$1::jsonb, updated_at=now() WHERE id=$2", [JSON.stringify(refreshedEnvelope), connection.id]));
-      }
-    }
-    return stored.state.tokens?.access_token;
+    return this.#open(envelope, customCredentialContext(tenantId, userId, row));
   }
 
-  async #invalidateCustomCredential(tenantId: string, userId: string, row: ConnectorRow): Promise<void> {
-    const errorCode = row.auth_type === "oauth" ? "mcp_oauth_refresh_failed" : "mcp_credential_unavailable";
-    await this.database.withTenant(tenantId, async (db) => {
-      if (row.auth_strategy === "shared") {
-        await db.execute("UPDATE organization_connectors SET shared_credential_envelope=NULL, updated_at=now() WHERE tenant_id=$1::uuid AND id=$2", [tenantId, row.id]);
-        return;
-      }
+  async #readMcpGrant(db: SqlExecutor, tenantId: string, userId: string, row: ConnectorRow, lock = false): Promise<McpGrant | null> {
+    const connection = row.auth_strategy === "shared" ? null : (await db.query<ConnectionRow>(
+      `SELECT * FROM connector_connections WHERE connector_id=$1 AND user_id=$2${lock ? " FOR UPDATE" : ""}`, [row.id, userId],
+    ))[0] ?? null;
+    if (connection && connection.status !== "connected" && connection.status !== "reauth_required") return null;
+    const envelope = connectorEnvelope(row.auth_strategy === "shared" ? row.shared_credential_envelope : connection?.credential_envelope);
+    if (!envelope) return null;
+    const context = customCredentialContext(tenantId, userId, row);
+    const stored = await this.#openMcpGrant(envelope, context);
+    if (!stored?.state?.tokens?.access_token) return null;
+    // Existing envelopes become their own stable grant ID on first write.
+    const version = stored.version ?? sha256(envelope.ciphertext);
+    return { stored, grantId: stored.grantId ?? version, version, context, connection };
+  }
+
+  async #openMcpGrant(envelope: ConnectorSecretEnvelope, context: string): Promise<StoredMcpOAuth | null> {
+    return this.#open(envelope, context).then((plaintext) => JSON.parse(plaintext) as StoredMcpOAuth).catch(() => null);
+  }
+
+  async #writeMcpGrant(db: SqlExecutor, row: ConnectorRow, grant: McpGrant, stored: StoredMcpOAuth): Promise<void> {
+    const envelope = JSON.stringify(await this.#seal(JSON.stringify(stored), grant.context));
+    if (row.auth_strategy === "shared") {
+      await db.execute("UPDATE organization_connectors SET shared_credential_envelope=$1::jsonb, updated_at=now() WHERE id=$2", [envelope, row.id]);
+    } else if (grant.connection) {
       await db.execute(`
-        UPDATE connector_connections
-        SET status='reauth_required',credential_envelope=NULL,last_error_code=$4,updated_at=now()
-        WHERE tenant_id=$1::uuid AND connector_id=$2 AND user_id=$3
-      `, [tenantId, row.id, userId, errorCode]);
+        UPDATE connector_connections SET credential_envelope=$1::jsonb, status=$2, expires_at=$3::timestamptz,
+          last_error_code=$4, granted_scopes=$5::text[], updated_at=now() WHERE id=$6
+      `, [envelope, stored.reauthRequired ? "reauth_required" : "connected", mcpExpiry(stored)?.toISOString() ?? null,
+        stored.reauthRequired ? "mcp_oauth_grant_unusable" : null, mcpScopes(stored, grant.connection.granted_scopes ?? []), grant.connection.id]);
+    }
+  }
+
+  async #resolveMcpOAuth(
+    tenantId: string, userId: string, expected: ConnectorRow,
+    { admission, rejectedVersion, signal }: { admission?: McpAdmission; rejectedVersion?: string | undefined; signal?: AbortSignal | undefined } = {},
+  ): Promise<McpCredentialResult> {
+    const deadline = Date.now() + MCP_REFRESH_CLAIM_MS;
+    while (Date.now() < deadline) {
+      signal?.throwIfAborted();
+      const decision: McpResolution = await this.database.withTenant(tenantId, async (db) => {
+        const [row] = await db.query<ConnectorRow>("SELECT * FROM organization_connectors WHERE id=$1 FOR UPDATE", [expected.id]);
+        if (!row || mcpAuthority(row) !== mcpAuthority(expected) || (row.approval_status ?? "approved") !== "approved"
+          || (admission && !mcpAdmissionMatches(row, admission))) return { status: "configuration" };
+        const grant = await this.#readMcpGrant(db, tenantId, userId, row, true);
+        if (!grant || (admission && !mcpGrantAdmitted(row, grant, admission))) return { status: "configuration" };
+        const { stored, grantId, version } = grant;
+        if (mcpReauthRequired(grant)) return { status: "reauth_required", grantId };
+        const now = Date.now();
+        const expiresAt = mcpExpiry(stored)?.getTime();
+        const rejected = rejectedVersion === version;
+        const expired = expiresAt !== undefined && expiresAt <= now;
+        const refreshToken = stored.state.tokens?.refresh_token;
+        const refreshSoon = expiresAt !== undefined && expiresAt <= now + Math.min(90_000, (stored.state.tokens?.expires_in ?? 0) * 100);
+        if (!rejected && !expired && (!refreshToken || !refreshSoon || rejectedVersion !== undefined)) return mcpAvailable(grant);
+        if (!refreshToken) {
+          await this.#writeMcpGrant(db, row, grant, { ...stored, grantId, version, reauthRequired: true });
+          return { status: "reauth_required", grantId };
+        }
+        if (stored.refresh && stored.refresh.until > now) {
+          if (stored.refresh.claimId) return { status: "waiting" };
+          if (!rejected && !expired) return mcpAvailable(grant);
+          return stored.refresh.configuration ? { status: "configuration" } : { status: "temporary", uncertain: stored.refresh.uncertain };
+        }
+        const claimId = randomUUID();
+        const uncertain = Boolean(stored.refresh?.uncertain || stored.refresh?.claimId);
+        await this.#writeMcpGrant(db, row, grant, { ...stored, grantId, version, refresh: { ...stored.refresh, claimId, until: now + MCP_REFRESH_CLAIM_MS, uncertain } });
+        return { status: "refresh", claim: { row, grant, claimId, uncertain } };
+      });
+      if (decision.status === "waiting") {
+        await delay(150, undefined, { signal });
+        continue;
+      }
+      if (decision.status !== "refresh") return decision;
+      const result = await this.#finishMcpRefresh(tenantId, userId, decision.claim, admission, signal);
+      if (!result) continue; // The grant changed while the provider request was in flight.
+      return result;
+    }
+    return { status: "temporary", uncertain: false };
+  }
+
+  async #finishMcpRefresh(tenantId: string, userId: string, claim: McpRefreshClaim, admission?: McpAdmission, signal?: AbortSignal): Promise<McpCredentialResult | null> {
+    const { row, grant, claimId } = claim;
+    let nextState: McpOAuthState | undefined;
+    let failure: McpOAuthRefreshError | undefined;
+    try {
+      if (signal?.aborted) throw new McpOAuthRefreshError("temporary");
+      nextState = await refreshRemoteMcpOAuth({ serverUrl: row.endpoint_url!, callbackUrl: this.mcpCallbackUrl(), state: grant.stored.state, ...(signal ? { signal } : {}) });
+    } catch (cause) {
+      failure = cause instanceof McpOAuthRefreshError ? cause : new McpOAuthRefreshError("uncertain");
+    }
+    // Finish persistence even when the HTTP caller has stopped waiting. A
+    // rotated token must be saved before another process can use this grant.
+    return this.database.withTenant(tenantId, async (db) => {
+      const [current] = await db.query<ConnectorRow>("SELECT * FROM organization_connectors WHERE id=$1 FOR UPDATE", [row.id]);
+      if (!current || mcpAuthority(current) !== mcpAuthority(row)) return null;
+      const latest = await this.#readMcpGrant(db, tenantId, userId, current, true);
+      if (!latest || latest.grantId !== grant.grantId || latest.stored.refresh?.claimId !== claimId) return null;
+      const { refresh: _claim, ...stored } = latest.stored;
+      if (nextState) {
+        const version = sha256(randomUUID());
+        const renewed: StoredMcpOAuth = { ...stored, state: nextState, obtainedAt: new Date().toISOString(), version };
+        await this.#writeMcpGrant(db, current, latest, renewed);
+        return admission && !mcpAdmissionMatches(current, admission) ? { status: "configuration" } : mcpAvailable({ ...latest, stored: renewed, version });
+      }
+      // After an uncertain rotation, require a second definitive rejection
+      // against the same persisted grant before asking for an interactive login.
+      const invalidGrant = failure?.kind === "invalid_grant";
+      if (invalidGrant && (!claim.uncertain || _claim?.invalidGrant)) {
+        await this.#writeMcpGrant(db, current, latest, { ...stored, reauthRequired: true });
+        return { status: "reauth_required", grantId: latest.grantId };
+      }
+      const uncertain = claim.uncertain || failure?.kind === "uncertain";
+      const configuration = failure?.kind === "configuration";
+      const until = Date.now() + Math.max(MCP_REFRESH_COOLDOWN_MS, failure?.retryAfterMs ?? 0);
+      await this.#writeMcpGrant(db, current, latest, { ...stored, refresh: {
+        claimId: null, until, uncertain,
+        ...(invalidGrant || _claim?.invalidGrant ? { invalidGrant: true } : {}),
+        ...(configuration ? { configuration: true } : {}),
+      } });
+      return configuration ? { status: "configuration" } : { status: "temporary", uncertain };
     });
   }
 
@@ -1211,6 +1499,52 @@ function customConfig(value: unknown): CustomConnectorConfig { return value && t
 function providerContext(tenantId: string, purpose: string) { return `${tenantId}:provider:google:${purpose}`; }
 function sharedCredentialContext(tenantId: string, connectorId: string) { return `${tenantId}:connector:${connectorId}:shared-credential`; }
 function connectionContext(tenantId: string, connectorId: string, userId: string) { return `${tenantId}:connector:${connectorId}:user:${userId}:credential`; }
+function customCredentialContext(tenantId: string, userId: string, row: ConnectorRow): string {
+  return row.auth_strategy === "shared" ? sharedCredentialContext(tenantId, row.id) : connectionContext(tenantId, row.id, userId);
+}
+function customCredentialReference(row: ConnectorRow, userId: string): string {
+  return `connector:${row.id}:${row.auth_strategy === "shared" ? "shared" : userId}`;
+}
+function isMcpOAuth(row: ConnectorRow): boolean {
+  return row.kind === "custom_mcp" && row.provider === "mcp" && row.auth_type === "oauth" && Boolean(row.endpoint_url && row.transport)
+    && (row.approval_status ?? "approved") === "approved";
+}
+function mcpAuthority(row: ConnectorRow): string {
+  return sha256(JSON.stringify([row.provider, row.endpoint_url, row.transport, row.auth_type, row.auth_strategy, row.max_access_level, customConfig(row.config).oauthScope ?? ""]));
+}
+function mcpOAuthReference(row: ConnectorRow, userId: string, grantId: string): string {
+  return `connector-oauth:${row.id}:${row.auth_strategy === "shared" ? "shared" : userId}:${sha256(`${mcpAuthority(row)}:${grantId}`)}`;
+}
+function mcpAdmissionMatches(row: ConnectorRow, { server }: McpAdmission): boolean {
+  if (row.kind !== "custom_mcp" || row.provider !== "mcp" || !row.enabled || row.publication_status !== "published"
+    || (row.approval_status ?? "approved") !== "approved" || row.endpoint_url !== server.url || row.transport !== server.transport) return false;
+  const config = customConfig(row.config);
+  if (config.serverApproved === true) return true;
+  const allowed = new Set(config.allowedTools ?? []);
+  return Boolean(server.allowedTools?.length && server.allowedTools.every((tool) => allowed.has(tool)));
+}
+function mcpGrantAdmitted(row: ConnectorRow, grant: McpGrant, admission: McpAdmission): boolean {
+  if (admission.server.credentialRef === mcpOAuthReference(row, admission.userId, grant.grantId)) return true;
+  // Existing snapshots have a reference and an encrypted access-token copy.
+  // They can follow rotation, but an interactive sign-in creates a new grant.
+  return admission.server.credentialRef === customCredentialReference(row, admission.userId)
+    && (!grant.stored.authorizedAt || Date.parse(grant.stored.authorizedAt) <= new Date(admission.createdAt).getTime());
+}
+function mcpExpiry(stored: StoredMcpOAuth): Date | null {
+  const lifetime = stored.state.tokens?.expires_in;
+  if (typeof lifetime !== "number") return null;
+  const expiry = new Date(Date.parse(stored.obtainedAt) + lifetime * 1000);
+  return Number.isFinite(expiry.getTime()) ? expiry : null;
+}
+function mcpScopes(stored: StoredMcpOAuth, fallback: string[]): string[] {
+  return stored.state.tokens?.scope?.split(/\s+/).filter(Boolean) ?? fallback;
+}
+function mcpReauthRequired(grant: McpGrant): boolean {
+  return grant.stored.reauthRequired === true || grant.connection?.status === "reauth_required";
+}
+function mcpAvailable(grant: McpGrant): McpCredentialResult {
+  return { status: "available", accessToken: grant.stored.state.tokens!.access_token, version: grant.version };
+}
 function oauthStateContext(tenantId: string, digest: string) { return `${tenantId}:oauth-state:${digest}`; }
 function sha256(value: string) { return createHash("sha256").update(value).digest("hex"); }
 function googleOAuthErrorCode(cause: unknown) { const message = cause instanceof Error ? cause.message : "token_refresh_failed"; if (/invalid_grant/i.test(message)) return "invalid_grant"; if (/admin_policy_enforced/i.test(message)) return "admin_policy_enforced"; return "token_refresh_failed"; }

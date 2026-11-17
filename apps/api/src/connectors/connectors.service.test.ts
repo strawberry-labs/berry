@@ -383,7 +383,7 @@ describe("ConnectorsService custom MCP credential lifecycle", () => {
     expect(result.connectionStatus).toBe("connected");
   });
 
-  it("skips a connector with an unreadable shared credential instead of failing the whole runtime", async () => {
+  it("skips a connector with an unreadable shared credential while preserving the stored envelope", async () => {
     const invalidEnvelope = await sealConnectorSecret("shared-token", ENCRYPTION_KEY, "wrong-context");
     const row = customRow({ shared_credential_envelope: invalidEnvelope });
     const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
@@ -400,7 +400,7 @@ describe("ConnectorsService custom MCP credential lifecycle", () => {
     await expect(service.runtime(TENANT_ID, USER_ID)).resolves.toEqual([]);
     expect(executions.some(({ sql, params }) =>
       sql.includes("shared_credential_envelope=NULL") && params[1] === row.id
-    )).toBe(true);
+    )).toBe(false);
   });
 });
 

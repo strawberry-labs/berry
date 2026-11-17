@@ -5611,6 +5611,7 @@ const SANDBOX_INTERRUPTED_ACTION = "It stopped before it finished, so it may hav
 const SANDBOX_EARLIER_EFFECTS = " Whatever it did before the error has already happened. Fix the problem and continue; do not repeat a step that sent or changed something outside the sandbox (for example an API request) unless you know it did not happen.";
 
 function toolFailureNote(failure: ToolFailure, step: DurableTurnStep): string {
+  if (failure.code?.startsWith("mcp_")) return `Failure class: ${failure.category}. ${failure.action}`;
   if (isMcpToolStep(step) && (!holdsForReview(step) || failure.outcome === "not_applied")) {
     const outcome = failure.outcome === "unknown"
       ? " This call may already have changed something. Check the target state before repeating a change-making call."
@@ -5637,7 +5638,6 @@ function toolFailureNote(failure: ToolFailure, step: DurableTurnStep): string {
  * Transient and unclassified failures keep the bounded repeat limit.
  */
 function unchangedFailedRetry(snapshot: DurableTurnSnapshot, step: DurableTurnStep): UnchangedFailedRetry | null {
-  if (isMcpToolStep(step)) return null;
   const fingerprint = failureArgumentFingerprint(snapshot, step);
   const previous = snapshot.steps
     .filter((candidate) => candidate.sequence < step.sequence
@@ -5647,6 +5647,7 @@ function unchangedFailedRetry(snapshot: DurableTurnSnapshot, step: DurableTurnSt
   if (!previous || previous.state !== "failed") return null;
   const failure = storedToolFailure(previous.output);
   if (!failure) return null;
+  if (isMcpToolStep(step) && !(failure.code?.startsWith("mcp_") && failure.deterministic)) return null;
   const stored = record(record(previous.output)?.failure);
   const previousError = stringValue(stored?.previousError)
     ?? toolFailureIdentity(previous.error).split("\n")[0]?.slice(0, 500)
@@ -5658,6 +5659,7 @@ function unchangedFailedRetry(snapshot: DurableTurnSnapshot, step: DurableTurnSt
       && candidate.error !== DUPLICATE_TOOL_CALL_SUPPRESSED
       && record(record(candidate.output)?.failure)?.refusedUnchangedRetry !== true)));
   const refusal = { previous, failure, previousError };
+  if (isMcpToolStep(step)) return refusal;
   switch (failure.category) {
     case "credentials":
     case "configuration":

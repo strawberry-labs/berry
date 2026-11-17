@@ -1,4 +1,5 @@
 import type { AgentTool, AgentToolResult } from "@berry/harness";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -8,6 +9,7 @@ import { ExecPolicyEngine, type ExecPolicyRule } from "@berry/execpolicy";
 import { networkDomainAllowed, type NetworkPolicy } from "@berry/shared";
 import { z } from "zod";
 import { createPublicRemoteFetch, validatedPublicRemoteUrl } from "./remote-fetch.ts";
+import { McpConnectionError, observeMcpTransport, waitForMcpRetry, type McpResolvedCredential } from "./mcp-connection.ts";
 import {
   BERRYCRAWL_DEFAULT_TOOL_NAMES,
   BERRYCRAWL_NON_REPLAYABLE_TOOL_NAMES,
@@ -15,6 +17,7 @@ import {
 } from "./berrycrawl-tools.ts";
 
 export { BERRYCRAWL_TOOL_CATALOG, BERRYCRAWL_DEFAULT_TOOL_NAMES, BERRYCRAWL_NON_REPLAYABLE_TOOL_NAMES } from "./berrycrawl-tools.ts";
+export { McpConnectionError, type McpResolvedCredential } from "./mcp-connection.ts";
 
 export interface McpCachedTool {
   name: string;
@@ -64,6 +67,7 @@ export interface McpToolSourceOptions {
   onHealth?: (health: McpServerHealth) => void | Promise<void>;
   networkPolicy?: NetworkPolicy;
   execPolicyRules?: ExecPolicyRule[];
+  resolveCredential?: (server: McpServerSpec, signal?: AbortSignal, rejectedVersion?: string) => Promise<McpResolvedCredential | undefined>;
 }
 
 const McpServerConfigSchema = z.object({
@@ -178,7 +182,12 @@ interface ConnectedServer {
   client: Client;
   tools: AgentTool[];
   cachedTools: McpCachedTool[];
+  version: string | undefined;
+  inUse: number;
+  retired: boolean;
 }
+
+const mcpRequestSignal = new AsyncLocalStorage<AbortSignal | undefined>();
 
 function sanitizeName(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -333,7 +342,7 @@ export class McpToolError extends Error {
 export class McpToolSource {
   readonly #options: McpToolSourceOptions;
   readonly #servers = new Map<string, ConnectedServer>();
-  readonly #connecting = new Map<string, Promise<ConnectedServer>>();
+  readonly #connecting = new Map<string, { version: string | undefined; promise: Promise<ConnectedServer> }>();
 
   constructor(options: McpToolSourceOptions) {
     this.#options = options;
@@ -347,7 +356,7 @@ export class McpToolSource {
         return;
       }
       try {
-        await this.#ensureConnected(spec);
+        await this.discoverServer(spec.id);
       } catch {
         // Each server publishes its own health and does not make the source fail.
       }
@@ -363,12 +372,12 @@ export class McpToolSource {
    * catalog. This keeps startup non-blocking while ensuring tool_search can
    * bootstrap a newly connected service instead of disappearing forever.
    */
-  async discoverTools(serverIds?: readonly string[]): Promise<AgentTool[]> {
+  async discoverTools(serverIds?: readonly string[], signal?: AbortSignal): Promise<AgentTool[]> {
     const selected = serverIds ? new Set(serverIds) : null;
     await Promise.all(this.#options.servers.map(async (spec) => {
       if (!spec.enabled || !spec.trusted || (selected && !selected.has(spec.id))) return;
       try {
-        await this.#ensureConnected(spec);
+        await this.discoverServer(spec.id, signal);
       } catch {
         // One unavailable connector must not hide healthy authorized servers.
       }
@@ -376,15 +385,29 @@ export class McpToolSource {
     return this.listTools();
   }
 
-  async #ensureConnected(spec: McpServerSpec): Promise<ConnectedServer> {
+  async discoverServer(id: string, signal?: AbortSignal): Promise<McpCachedTool[]> {
+    const spec = this.#options.servers.find((server) => server.id === id && server.enabled && server.trusted);
+    if (!spec) throw new McpConnectionError("configuration", true);
+    return this.#withConnection(spec, signal, true, async (server) => server.cachedTools);
+  }
+
+  async #ensureConnected(spec: McpServerSpec, version?: string, signal?: AbortSignal): Promise<ConnectedServer> {
+    signal?.throwIfAborted();
     const existing = this.#servers.get(spec.id);
-    if (existing) return existing;
+    if (existing && existing.version === version) return existing;
+    if (existing) this.#retire(existing);
     const pending = this.#connecting.get(spec.id);
-    if (pending) return pending;
+    if (pending) {
+      if (pending.version === version) return pending.promise;
+      await pending.promise.catch(() => undefined);
+      return this.#ensureConnected(spec, version, signal);
+    }
     const started = Date.now();
-    await this.#options.onHealth?.({ id: spec.id, status: "connecting", toolCount: spec.cachedTools?.length ?? 0, latencyMs: null, lastError: null, tools: spec.cachedTools ?? [] });
     const client = new Client({ name: "berry-desktop", version: "0.1.0" });
-    const promise = withTimeout(this.#connectServer(spec, client), this.#options.connectTimeoutMs ?? 10_000, `MCP server ${spec.name}`)
+    const promise = Promise.resolve().then(async () => {
+      await this.#options.onHealth?.({ id: spec.id, status: "connecting", toolCount: spec.cachedTools?.length ?? 0, latencyMs: null, lastError: null, tools: spec.cachedTools ?? [] });
+      return withTimeout(this.#connectServer(spec, client, version, signal), this.#options.connectTimeoutMs ?? 10_000, `MCP server ${spec.name}`);
+    })
       .then(async (server) => {
         this.#servers.set(spec.id, server);
         this.#options.log?.("info", `MCP server ${spec.name} exposed ${server.tools.length} tool(s)`);
@@ -400,30 +423,39 @@ export class McpToolSource {
         throw error;
       })
       .finally(() => this.#connecting.delete(spec.id));
-    this.#connecting.set(spec.id, promise);
+    this.#connecting.set(spec.id, { version, promise });
     return promise;
   }
 
-  async #connectServer(spec: McpServerSpec, client: Client): Promise<ConnectedServer> {
+  async #connectServer(spec: McpServerSpec, client: Client, version?: string, signal?: AbortSignal): Promise<ConnectedServer> {
     if (spec.transport === "stdio") {
       if (!spec.command) throw new Error("stdio MCP server has no command");
       await client.connect(new StdioClientTransport({ command: spec.command, args: spec.args, env: mcpProcessEnv(spec.env), stderr: "ignore" }));
     } else {
-      if (!spec.url) throw new Error(`${spec.transport} MCP server has no url`);
-      const url = validatedRemoteMcpUrl(spec.url);
-      const networkPolicy = this.#options.networkPolicy;
-      if (networkPolicy?.egress === "off") throw new Error("network egress is off for remote MCP servers");
-      if (networkPolicy && !networkDomainAllowed(url.hostname, networkPolicy.allowedDomains)) throw new Error(`${url.hostname} is not in the network domain allowlist`);
-      const networkDecision = new ExecPolicyEngine(this.#options.execPolicyRules ?? []).evaluateNetwork(url.toString());
-      if (networkDecision.decision === "forbid") throw new Error(`execpolicy forbids remote MCP server ${url.hostname}`);
-      const remoteFetch = createPublicRemoteFetch({ bearerToken: bearerToken(spec.credential) });
+      const url = this.#remoteUrl(spec);
+      // Managed tool POSTs must never be resubmitted by HTTP redirect handling.
+      const fetchRemote = createPublicRemoteFetch({ bearerToken: version ? spec.credential ?? null : bearerToken(spec.credential), ...(version ? { redirect: "manual" as const } : {}) });
       if (spec.transport === "streamable-http") {
-        await client.connect(new StreamableHTTPClientTransport(url, { fetch: remoteFetch }) as never);
+        const remoteFetch = version ? observeMcpTransport(fetchRemote, true, () => mcpRequestSignal.getStore()) : fetchRemote;
+        await client.connect(new StreamableHTTPClientTransport(url, {
+          fetch: remoteFetch,
+          // Berry owns replay. Disable the SDK's separate SSE reconnection loop.
+          ...(version ? { reconnectionOptions: { maxRetries: 0, initialReconnectionDelay: 0, maxReconnectionDelay: 0, reconnectionDelayGrowFactor: 1 } } : {}),
+        }) as never, signal ? { signal } : undefined);
       } else {
-        await client.connect(new SSEClientTransport(url, { fetch: remoteFetch }));
+        // EventSource replaces errors raised by its fetch callback. Preserve
+        // the inspected failure for the initialization that installed it.
+        let opening = true;
+        let failure: McpConnectionError | undefined;
+        const remoteFetch = version ? observeMcpTransport(fetchRemote, false, () => mcpRequestSignal.getStore(), (error) => {
+          if (opening) failure = error;
+        }) : fetchRemote;
+        try { await client.connect(new SSEClientTransport(url, { fetch: remoteFetch }), signal ? { signal } : undefined); }
+        catch (cause) { throw failure ?? cause; }
+        finally { opening = false; }
       }
     }
-    const listed = await client.listTools();
+    const listed = await client.listTools(undefined, signal ? { signal } : undefined);
     const allow = spec.allowedTools ? new Set(spec.allowedTools) : null;
     const reviewed = allow
       ? new Map((spec.cachedTools ?? []).filter((tool) => allow.has(tool.name)).map((tool) => [tool.name, tool]))
@@ -446,7 +478,83 @@ export class McpToolSource {
       return [approved];
     });
     const tools = cachedTools.map((tool) => cachedTool(spec, tool, async (name, args, signal) => this.#call(client, name, args, signal, spec)));
-    return { spec, client, tools, cachedTools };
+    return { spec, client, tools, cachedTools, version, inUse: 0, retired: false };
+  }
+
+  #remoteUrl(spec: McpServerSpec): URL {
+    if (!spec.url) throw new McpConnectionError("configuration", true, {}, `${spec.transport} MCP server has no URL.`);
+    const url = validatedRemoteMcpUrl(spec.url);
+    const policy = this.#options.networkPolicy;
+    if (policy?.egress === "off") throw new McpConnectionError("configuration", true, {}, "network egress is off for remote MCP servers");
+    if (policy && !networkDomainAllowed(url.hostname, policy.allowedDomains)) throw new McpConnectionError("configuration", true, {}, `${url.hostname} is not in the network domain allowlist`);
+    const decision = new ExecPolicyEngine(this.#options.execPolicyRules ?? []).evaluateNetwork(url.toString());
+    if (decision.decision === "forbid") throw new McpConnectionError("configuration", true, {}, `Execution policy forbids remote MCP server ${url.hostname}.`);
+    return url;
+  }
+
+  async #withConnection<T>(
+    spec: McpServerSpec, signal: AbortSignal | undefined, safeToReplay: boolean,
+    execute: (server: ConnectedServer) => Promise<T>,
+  ): Promise<T> {
+    signal?.throwIfAborted();
+    // Check policy before an OAuth resolution can contact the issuer.
+    if (this.#options.resolveCredential && spec.transport !== "stdio") this.#remoteUrl(spec);
+    let credential = await this.#options.resolveCredential?.(spec, signal);
+    let connection: ConnectedServer | undefined;
+    const attempt = async () => {
+      signal?.throwIfAborted();
+      const effective = credential ? { ...spec, credential: credential.accessToken } : spec;
+      let server: ConnectedServer;
+      try {
+        server = await this.#ensureConnected(effective, credential?.version, signal);
+      } catch (cause) {
+        if (!credential) throw failedCall(cause, "not_sent");
+        if (signal?.aborted) throw cause;
+        if (cause instanceof McpConnectionError) throw new McpConnectionError(cause.kind, true, cause.details, cause.message);
+        throw new McpConnectionError("temporary", true);
+      }
+      if (server.retired) throw new McpConnectionError("temporary", true);
+      connection = server;
+      server.inUse += 1;
+      try { return await execute(server); }
+      finally {
+        server.inUse -= 1;
+        if (server.retired && server.inUse === 0) void server.client.close().catch(() => undefined);
+      }
+    };
+    if (!credential) return attempt();
+    return mcpRequestSignal.run(signal, async () => {
+      try { return await attempt(); }
+      catch (cause) {
+        if (!(cause instanceof McpConnectionError) || signal?.aborted) throw cause;
+        if (!cause.beforeDispatch && !safeToReplay) throw cause;
+        if (cause.kind === "token_rejected") {
+          credential = await this.#options.resolveCredential!(spec, signal, credential!.version);
+          if (!credential) throw new McpConnectionError("configuration", true);
+          if (connection) this.#retire(connection);
+        } else if (cause.kind === "session_expired") {
+          if (connection) this.#retire(connection);
+        } else if (cause.kind === "temporary") {
+          if (!await waitForMcpRetry(cause.details.retryAfterMs, signal)) {
+            throw new McpConnectionError("temporary", cause.beforeDispatch, { ...cause.details, exhausted: true });
+          }
+        } else throw cause;
+
+        try { return await attempt(); }
+        catch (retry) {
+          if (!(retry instanceof McpConnectionError)) throw retry;
+          const kind = retry.kind === "token_rejected" || retry.kind === "session_expired" ? "temporary" : retry.kind;
+          throw new McpConnectionError(kind, cause.beforeDispatch && retry.beforeDispatch, { ...retry.details, exhausted: true });
+        }
+      }
+    });
+  }
+
+  #retire(server: ConnectedServer): void {
+    if (this.#servers.get(server.spec.id) === server) this.#servers.delete(server.spec.id);
+    if (server.retired) return;
+    server.retired = true;
+    if (server.inUse === 0) void server.client.close().catch(() => undefined);
   }
 
   async #call(
@@ -465,6 +573,7 @@ export class McpToolSource {
     try {
       result = await client.callTool({ name, arguments: args }, undefined, requestOptions);
     } catch (error) {
+      if (error instanceof McpConnectionError) throw error;
       // Only a refusal from the HTTP transport proves the tool did not run.
       const rejected = error instanceof StreamableHTTPError && typeof error.code === "number"
         && error.code >= 400 && error.code < 500 && error.code !== 408;
@@ -485,18 +594,28 @@ export class McpToolSource {
       const live = this.#servers.get(spec.id);
       const allowed = spec.allowedTools ? new Set(spec.allowedTools) : null;
       const cached = (live?.cachedTools ?? spec.cachedTools ?? []).filter((tool) => !allowed || allowed.has(tool.name));
-      return cached.map((tool) => cachedTool(spec, tool, async (name, args, signal) => {
-        let server: ConnectedServer;
-        try {
-          server = await this.#ensureConnected(spec);
-        } catch (error) {
-          throw failedCall(error, "not_sent");
-        }
-        if (spec.allowedTools && !server.cachedTools.some((candidate) => candidate.name === name)) {
-          throw new Error(`MCP tool ${spec.name}:${name} is unavailable because its definition changed after administrator review`);
-        }
-        return this.#call(server.client, name, args, signal, spec);
-      }));
+      return cached.map((tool) => cachedTool(spec, tool, (name, args, signal) => this.#executeTool(spec, name, args, signal, false)));
+    });
+  }
+
+  async executeTool(serverId: string, toolName: string, args: Record<string, unknown>, signal?: AbortSignal, safeToReplay = false): Promise<AgentToolResult<Record<string, unknown>>> {
+    const spec = this.#options.servers.find((server) => server.id === serverId && server.enabled && server.trusted);
+    if (!spec) throw new McpConnectionError("configuration", true);
+    const prefix = `mcp__${sanitizeName(spec.name)}__`;
+    const tool = (this.#servers.get(spec.id)?.cachedTools ?? spec.cachedTools)?.find((candidate) => `${prefix}${sanitizeName(candidate.name)}` === toolName);
+    if (!tool) throw new McpConnectionError("configuration", true);
+    return this.#executeTool(spec, tool.name, args, signal, safeToReplay);
+  }
+
+  #executeTool(spec: McpServerSpec, name: string, args: Record<string, unknown>, signal: AbortSignal | undefined, safeToReplay: boolean) {
+    let previousDefinition: McpCachedTool | undefined;
+    return this.#withConnection(spec, signal, safeToReplay, async (server) => {
+      const definition = server.cachedTools.find((candidate) => candidate.name === name);
+      if ((!definition && (spec.allowedTools || server.version)) || (previousDefinition && definition && !sameReviewedToolDefinition(previousDefinition, definition))) {
+        throw new McpConnectionError("configuration", true, {}, `MCP tool ${spec.name}:${name} is unavailable because its definition changed after administrator review`);
+      }
+      previousDefinition = definition;
+      return this.#call(server.client, name, args, signal, spec);
     });
   }
 
@@ -585,8 +704,8 @@ export async function discoverRemoteMcpTools(input: {
   transport: "http-sse" | "streamable-http";
   credential?: string | null;
   timeoutMs?: number;
+  resolveCredential?: McpToolSourceOptions["resolveCredential"];
 }): Promise<McpCachedTool[]> {
-  let discovered: McpCachedTool[] = [];
   const source = new McpToolSource({
     connectTimeoutMs: input.timeoutMs ?? 10_000,
     servers: [{
@@ -601,10 +720,10 @@ export async function discoverRemoteMcpTools(input: {
       trusted: true,
       ...(input.credential ? { credential: input.credential } : {}),
     }],
-    onHealth: (health) => { if (health.status === "connected") discovered = health.tools; },
+    ...(input.resolveCredential ? { resolveCredential: input.resolveCredential } : {}),
   });
   try {
-    await source.connect();
+    const discovered = await source.discoverServer(input.id);
     if (!discovered.length) throw new Error("MCP server did not expose any tools");
     return discovered;
   } finally {

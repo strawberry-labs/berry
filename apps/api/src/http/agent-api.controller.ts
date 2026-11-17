@@ -708,7 +708,7 @@ export class AgentApiController {
     const [initialCatalog, effective, connectorRuntime, departmentId] = await Promise.all([
       this.runtimeConfig.catalog(tenantId),
       this.organizationCapabilities.effective(tenantId, userId ?? ""),
-      userId ? this.connectors.runtime(tenantId, userId) : Promise.resolve([]),
+      userId ? this.connectors.runtime(tenantId, userId, { resolveDuringExecution: this.durableTurns.enabled }) : Promise.resolve([]),
       this.#primaryDepartmentId(tenantId, userId),
     ]);
     if (!initialCatalog) return null;
@@ -1649,7 +1649,7 @@ export class AgentApiController {
       this.organizationCapabilities.effective(tenantId, userId),
     );
     const connectorRuntimeWork = observeAdmissionPreparation(
-      this.connectors.runtime(tenantId, userId, { taskId: task.id, sessionId }),
+      this.connectors.runtime(tenantId, userId, { taskId: task.id, sessionId, resolveDuringExecution: this.durableTurns.enabled }),
     );
     const departmentIdWork = observeAdmissionPreparation(
       this.#primaryDepartmentId(tenantId, userId),

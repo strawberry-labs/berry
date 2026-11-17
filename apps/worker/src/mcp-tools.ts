@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { McpImageResults } from "./mcp-images.js";
 import {
   McpToolSource,
+  McpConnectionError,
   isOfficialBerryCrawlServer,
   mcpServerSpecsFromJson,
   type McpServerSpec,
@@ -10,6 +11,7 @@ import {
   BROWSER_HANDOFF_TOOL,
   BrowserSessionReceiptSchema,
   parseAdmittedRuntimeRequest,
+  isStoredMcpCredentialRef,
   NetworkPolicySchema,
   normalizeWorkerRole,
   openDurableSecret,
@@ -27,6 +29,8 @@ import {
   type TurnToolResult,
 } from "./turn-runner.js";
 import { emitWorkerOperationalEvent } from "./operational-telemetry.js";
+import { resolveMcpCredential } from "./mcp-credentials.js";
+import { storedToolFailure } from "./tool-failures.js";
 import {
   READ_TOOL_RESULT, S3ToolResultStore, TOOL_RESULT_INLINE_CHARACTERS,
   readStoredToolResult, readToolResultDefinition,
@@ -141,7 +145,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     try {
       await this.base.release?.(snapshot);
     } finally {
-      await this.#releaseTurnContext(snapshot.id);
+      await this.#releaseTurnContext(snapshot);
     }
   }
 
@@ -149,7 +153,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     try {
       return await (this.base.finalize?.(snapshot) ?? []);
     } finally {
-      await this.#releaseTurnContext(snapshot.id);
+      await this.#releaseTurnContext(snapshot);
     }
   }
 
@@ -175,7 +179,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     if (!toolName.startsWith("mcp__")) {
       return this.base.policy?.(snapshot, toolName, permissionMode);
     }
-    const context = this.#turnContexts.get(snapshot.id);
+    const context = this.#turnContexts.get(mcpContextKey(snapshot));
     const source = context?.source ?? this.#source;
     const servers = context?.servers ?? this.#allowedServers(snapshot);
     const server = this.#serverForTool(toolName, servers);
@@ -195,7 +199,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   argumentSchema(snapshot: DurableTurnSnapshot, toolName: string): unknown {
     if (toolName === READ_TOOL_RESULT && this.resultStore) return readToolResultDefinition.function.parameters;
     if (!toolName.startsWith("mcp__")) return this.base.argumentSchema?.(snapshot, toolName);
-    const source = this.#turnContexts.get(snapshot.id)?.source;
+    const source = this.#turnContexts.get(mcpContextKey(snapshot))?.source;
     return source?.listTools().find((tool) => tool.name === toolName)?.parameters;
   }
 
@@ -228,7 +232,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     }
     if (!toolName.startsWith("mcp__")) return this.base.repeatContextSince?.(snapshot, step);
     const runtime = parseAdmittedRuntimeRequest(snapshot.runtimeRequest);
-    const servers = this.#turnContexts.get(snapshot.id)?.servers ?? (runtime ? runtime.mcpServers : this.#allowedServers(snapshot));
+    const servers = this.#turnContexts.get(mcpContextKey(snapshot))?.servers ?? (runtime ? runtime.mcpServers : this.#allowedServers(snapshot));
     const server = servers.find((server) => server.enabled && server.trusted && isOfficialBerryCrawlServer(server)
       && toolName.startsWith(`mcp__${sanitizeName(server.name)}__berrycrawl_browser_`));
     if (!server) return undefined;
@@ -273,7 +277,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName === BROWSER_HANDOFF_TOOL) throw new Error("Human takeover requires a browser session opened successfully in this run and a non-empty reason.");
     if (toolName === READ_TOOL_RESULT && this.resultStore) return readStoredToolResult(this.resultStore, snapshot, step, signal);
-    if (toolName === "tool_search") return this.#searchTools(snapshot, step);
+    if (toolName === "tool_search") return this.#searchTools(snapshot, step, signal);
     if (toolName === USE_TOOL_NAME) {
       throw new Error('use_tool needs {"tool": "<exact connector tool name>", "arguments": {...}}. Call tool_search to find tool names and their input schemas.');
     }
@@ -287,7 +291,8 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
         : this.base.execute(snapshot, step);
     }
     const context = await this.#context(snapshot);
-    if (!this.#serverForTool(toolName, context.servers)) {
+    const server = this.#serverForTool(toolName, context.servers);
+    if (!server) {
       const lost = context.unavailable.find((server) => toolName.startsWith(`mcp__${sanitizeName(server.name)}__`));
       if (lost) throw new Error(`The ${lost.name} connector is unavailable for this message: ${lost.reason}`);
       throw new Error(`MCP tool ${toolName} is not enabled for this turn`);
@@ -303,7 +308,14 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     const resumed = this.base.stageAssociatedInputFiles ? resumableConnectorImport(snapshot, step, toolName) : null;
     const result = resumed
       ? { content: [], details: resumed.details }
-      : signal || reportProgress
+      : isStoredMcpCredentialRef(server.id, server.credentialKey)
+        ? await this.#runManagedMcp(snapshot, server, () => context.source.executeTool(
+          server.id, toolName, record(step.input.arguments) ?? {}, mcpStepSignal(step, signal),
+          // A durable step ID alone gives the remote service no idempotency
+          // guarantee. Custom OAuth MCP tool annotations are untrusted.
+          step.retryClass === "read_only" || step.retryClass === "idempotent",
+        ))
+        : signal || reportProgress
         ? await tool.execute(callId, (record(step.input.arguments) ?? {}) as never, signal, reportProgress)
         : await tool.execute(callId, (record(step.input.arguments) ?? {}) as never);
     const fullText = result.content.flatMap((part) =>
@@ -388,23 +400,28 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     ]);
   }
 
-  async #releaseTurnContext(runId: string): Promise<void> {
-    this.#images.release(runId);
-    const context = this.#turnContexts.get(runId);
+  async #releaseTurnContext(snapshot: DurableTurnSnapshot): Promise<void> {
+    this.#images.release(snapshot.id);
+    const key = mcpContextKey(snapshot);
+    const context = this.#turnContexts.get(key);
     if (!context) return;
-    this.#turnContexts.delete(runId);
+    this.#turnContexts.delete(key);
     await context.source.close();
   }
 
   async #context(snapshot: DurableTurnSnapshot): Promise<DurableMcpTurnContext> {
-    const existing = this.#turnContexts.get(snapshot.id);
+    const key = mcpContextKey(snapshot);
+    const existing = this.#turnContexts.get(key);
     if (existing) return existing;
-    const pending = this.#pendingContexts.get(snapshot.id);
+    const pending = this.#pendingContexts.get(key);
     if (pending) return pending;
-    const preparing = this.#prepareContext(snapshot);
-    this.#pendingContexts.set(snapshot.id, preparing);
+    const preparing = this.#prepareContext(snapshot).then((context) => {
+      if (context.source !== this.#source) this.#turnContexts.set(key, context);
+      return context;
+    });
+    this.#pendingContexts.set(key, preparing);
     try { return await preparing; }
-    finally { if (this.#pendingContexts.get(snapshot.id) === preparing) this.#pendingContexts.delete(snapshot.id); }
+    finally { if (this.#pendingContexts.get(key) === preparing) this.#pendingContexts.delete(key); }
   }
 
   async #prepareContext(snapshot: DurableTurnSnapshot): Promise<DurableMcpTurnContext> {
@@ -418,7 +435,10 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     const enabled = runtime.mcpServers.filter((server) => server.enabled && server.trusted);
     const prepared = await Promise.allSettled(enabled
       .map(async (server): Promise<McpServerSpec> => {
-        const credential = await durableMcpCredential(server.credential, server.credentialRef, this.env);
+        const stored = isStoredMcpCredentialRef(server.id, server.credentialRef);
+        const credential = stored
+          ? server.credential && await durableMcpCredential(server.credential, null, this.env).catch(() => undefined)
+          : await durableMcpCredential(server.credential, server.credentialRef, this.env);
         const environment = await durableMcpEnvironment(server.environment, server.env, this.env);
         return {
           id: server.id,
@@ -458,18 +478,31 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       servers: [...servers],
       ...(policy.success ? { networkPolicy: policy.data } : {}),
       connectTimeoutMs: this.connectTimeoutMs,
+      resolveCredential: (server, signal, rejectedVersion) => isStoredMcpCredentialRef(server.id, server.credentialKey)
+        ? resolveMcpCredential(snapshot, server.id, this.env, signal, rejectedVersion)
+        : Promise.resolve(undefined),
       log: (level, _message) => {
         emitMcpLog(level, snapshot.id);
       },
     });
     // Cached, administrator-reviewed schemas are enough for model preparation.
     // McpToolSource connects only when one exposed tool is actually executed.
-    const context = { source, servers, unavailable };
-    this.#turnContexts.set(snapshot.id, context);
-    return context;
+    return { source, servers, unavailable };
   }
 
-  async #searchTools(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
+  async #runManagedMcp<T>(snapshot: DurableTurnSnapshot, server: McpServerSpec, run: () => Promise<T>): Promise<T> {
+    const blocked = snapshot.steps.map((step) => storedToolFailure(step.output)).find((failure) => failure?.blockedConnectorId === server.id);
+    if (blocked) throw new McpConnectionError(blocked.reconnect ? "reauth_required" : "temporary", true, {
+      connectorId: server.id, exhausted: true, ...(blocked.reconnect ? { grantId: blocked.reconnect.grantId } : {}),
+    });
+    try { return await run(); }
+    catch (cause) {
+      if (!(cause instanceof McpConnectionError)) throw cause;
+      throw new McpConnectionError(cause.kind, cause.beforeDispatch, { ...cause.details, connectorId: server.id }, cause.message);
+    }
+  }
+
+  async #searchTools(snapshot: DurableTurnSnapshot, step: DurableTurnStep, signal?: AbortSignal): Promise<TurnToolResult> {
     const context = await this.#context(snapshot);
     const unavailable = connectorsUnavailableReason(snapshot);
     if (unavailable && context.servers.length === 0) {
@@ -512,9 +545,12 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     const uncachedServerIds = (connector ? [connector] : context.servers)
       .filter((server) => (server.cachedTools?.length ?? 0) === 0)
       .map((server) => server.id);
-    if (uncachedServerIds.length > 0) {
-      await context.source.discoverTools(uncachedServerIds);
-    }
+    const discovery = await Promise.allSettled(context.servers.filter((server) => uncachedServerIds.includes(server.id)).map((server) =>
+      isStoredMcpCredentialRef(server.id, server.credentialKey)
+        ? this.#runManagedMcp(snapshot, server, () => context.source.discoverServer(server.id, mcpStepSignal(step, signal)))
+        : context.source.discoverServer(server.id, signal),
+    ));
+    signal?.throwIfAborted();
     let matches: ReturnType<McpToolSource["listTools"]> = [];
     if (connector) {
       const connectorTools = context.source.listTools().filter((tool) =>
@@ -526,6 +562,13 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
         matches = revealed;
       });
       await search.execute(stringValue(step.input.toolCallId) ?? step.id, { query, limit } as never);
+    }
+    if (!matches.length) {
+      // A failed discovery should be actionable if the search could not find
+      // tools. Healthy connectors can still answer a broad search.
+      const unavailable = discovery.find((result): result is PromiseRejectedResult =>
+        result.status === "rejected" && result.reason instanceof McpConnectionError && Boolean(result.reason.details.connectorId));
+      if (unavailable) throw unavailable.reason;
     }
     const activatedTools = matches.map((tool) => tool.name);
     const activatedServerIds = [...new Set(matches.flatMap((tool) => {
@@ -643,6 +686,25 @@ type DurableMcpTurnContext = {
   /** Enabled connectors whose credentials or environment could not be opened this turn (H-077). */
   unavailable: readonly { id: string; name: string; reason: string }[];
 };
+
+function mcpContextKey(snapshot: DurableTurnSnapshot): string {
+  // A resumed phase needs its current lease in the credential request.
+  return JSON.stringify([snapshot.id, snapshot.leaseOwner, snapshot.ownershipGeneration]);
+}
+
+function mcpStepSignal(step: DurableTurnStep, signal?: AbortSignal): AbortSignal | undefined {
+  signal?.throwIfAborted();
+  const deadline = Math.min(Date.parse(step.deadlineAt ?? "") || Infinity, Date.parse(step.idleDeadlineAt ?? "") || Infinity);
+  if (deadline === Infinity) return signal;
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) {
+    throw new McpConnectionError("temporary", true, { exhausted: true }, "The MCP tool deadline passed before dispatch.");
+  }
+  // Keep the runner's lease and settlement policy for mutating steps. Only
+  // the managed connection and its retry observe the deadline here.
+  const timeout = AbortSignal.timeout(remaining);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
 
 /** Stable across turns and tenants: the connector catalog lives in the turn context (H-032). */
 function durableToolSearchDefinition(): ChatToolDefinition {

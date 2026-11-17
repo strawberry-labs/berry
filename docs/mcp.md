@@ -114,6 +114,24 @@ Remote servers can use OAuth authorization-code with PKCE or OAuth device author
 
 Authorization-code callbacks use `berry://mcp/oauth/callback`. Device authorization shows the provider's user code and polls at the provider-specified interval. The **Authorize** action remains available for re-authentication; **Reconnect** retries health discovery with the stored credential.
 
+### Hosted task recovery
+
+For an approved custom OAuth MCP connector such as AESG Connect, the durable run stores a grant reference. At tool execution or live discovery, the worker presents an encrypted credential request to the API. The API verifies the tenant, task owner, active worker lease, and admitted connector. It pulls the endpoint and grant from the organization connector records. The worker receives the current access token and its version for the connection. Refresh credentials stay in the API's encrypted connector store.
+
+Discovery and task execution share the refresh path. One caller claims the latest grant, then saves the access token, expiry, and any rotated refresh token together. A missing replacement refresh token keeps the saved one. A lost or unconfirmed token response leaves an encrypted uncertainty marker with a cooldown. After that, Berry requires two definitive rejections of the same saved grant before requesting another sign-in. An intentional disconnect or new sign-in supersedes the old grant and any outstanding refresh claim.
+
+Berry gets one recovery attempt inside the original tool step. An HTTP authentication rejection before dispatch can trigger a refresh and retry. A Streamable HTTP `404` on a session-bound request can trigger a new handshake and retry. Connection failures after dispatch require a trusted replay policy for automatic retry. A write with an uncertain outcome goes through the existing read-only outcome check. Retry delays respect `Retry-After` when it fits the step's remaining time. Cancellation prevents further tool dispatch. An already-sent rotating token exchange can finish saving its result.
+
+The task shows **Reconnect** when the current grant needs interactive sign-in. A member using a shared grant sees who can reconnect it. The OAuth callback returns to the task, where the action clears once the saved grant is restored. Interactive sign-in creates a new grant and can change the remote identity. Completed tool steps stay in the task journal. Use the existing **Continue** action for an interrupted turn and verify any uncertain outcomes before retrying writes.
+
+#### Rollout
+
+Roll out `api`, `worker`, `worker-foreground`, and `web` from the same revision using the hosted service deployment path in [Production](../deploy/PRODUCTION.md). Drain active workers at a durable step boundary and coordinate task admission during the rollout. Upgrade all API replicas before starting the new workers so every credential request is routed to an API that understands it. Web can follow the API. The AWS deployment uses the application deployment path through [SSM](../deploy/aws/deploy-application.sh).
+
+The API continues to own `BERRY_CONNECTOR_ENCRYPTION_KEY`. The worker and API use their existing matching `BERRY_DURABLE_CAPABILITY_KEY` to protect credential requests. Compose and Helm provide the private API service URL through `BERRY_WEB_API_INTERNAL_URL`. Production secrets stay in `deploy/.env.production`.
+
+Existing encrypted grants and durable access-token snapshots are readable by the new runtime. The strict snapshot schema is unchanged and the new reference uses the existing `credentialRef` field. Older workers require the old snapshot token, so keep the updated worker available for queued and resumable runs admitted by the updated API. If rolling back that worker, drain those runs first or continue them through a newly admitted turn. The database schema is unchanged.
+
 ## Health and startup
 
 The settings row reports connection state, tool count, last error, and latency. Health probes cache tool names, descriptions, and input schemas. Agent turns use that cache immediately and connect in the background, so a slow or broken MCP server does not delay turn startup. Calling a cached tool waits for its own server connection and reports that server's failure without disabling other servers.

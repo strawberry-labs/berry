@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mcpServerSpecsFromJson } from "@berry/local-agent/mcp";
+import { McpConnectionError, mcpServerSpecsFromJson } from "@berry/local-agent/mcp";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DURABLE_BASE_BUILT_IN_TOOLS,
@@ -2029,6 +2029,26 @@ describe("durable turn runner", () => {
 
 
   describe("model-directed MCP failure recovery", () => {
+    it("records one reconnect requirement and refuses the unchanged write after recovery", async () => {
+      const name = "mcp__Connect__remove_record";
+      const first = toolStep("pending", "non_idempotent_manual", false);
+      first.type = `tool.${name}`;
+      first.input = { ...first.input, toolName: name, toolCallId: "mcp-first", approvalKind: "mcp", arguments: { id: "record-1" } };
+      const second = { ...first, id: randomUUID(), sequence: first.sequence + 1, input: { ...first.input, toolCallId: "mcp-second" } };
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), first, second]));
+      const reconnect = { connectorId: "connector_mcp_test", grantId: "a".repeat(64) };
+      const execute = vi.fn().mockRejectedValue(new McpConnectionError("reauth_required", true, reconnect));
+      const runner = new DurableTurnRunner(repository, unusedModel(), { execute });
+      await runner.execute({ tenantId, runId, reason: "continue" });
+      await runner.execute({ tenantId, runId, reason: "continue" });
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(repository.current.steps.find((step) => step.id === first.id)).toMatchObject({
+        state: "failed",
+        output: { failure: { outcome: "not_applied", reconnect } },
+      });
+      expect(repository.current.steps.find((step) => step.id === second.id)?.error).toContain("this exact call already failed");
+    });
+
     const mcpCases = [
       { name: "mcp__CustomServer__lookup", retryClass: "non_idempotent_manual", error: "403: proxy access denied", phase: "rejected" },
       { name: "mcp__Google_Workspace__update_record", retryClass: "non_idempotent_manual", error: "socket hang up", phase: "not_sent" },

@@ -103,6 +103,7 @@ import {
   EffectiveCapabilitySchema,
   ConnectorSchema,
   ConnectorOAuthStartSchema,
+  TaskConnectorReconnectSchema,
   GoogleConnectorConfigurationSchema,
   GooglePickerSessionSchema,
   DepartmentSchema,
@@ -729,7 +730,12 @@ export class BerryApiClient {
   async listConnectors(): Promise<Connector[]> { return this.#request("/v1/connectors", z.array(ConnectorSchema)); }
   async listConnectorRequests(): Promise<Connector[]> { return this.#request("/v1/connectors/requests", z.array(ConnectorSchema)); }
   async requestMcpConnector(url: string): Promise<Connector> { return this.#request("/v1/connectors/requests", ConnectorSchema, { method: "POST", body: { url } }); }
-  async startConnectorOAuth(id: string, accessLevel: "read" | "full" = "read", redirectAfter: "/settings/connectors" | "/settings/mcp" = "/settings/connectors"): Promise<ConnectorOAuthStart> { return this.#request(`/v1/connectors/${encodeURIComponent(id)}/oauth/start`, ConnectorOAuthStartSchema, { method: "POST", body: { accessLevel, redirectAfter } }); }
+  async startConnectorOAuth(id: string, accessLevel: "read" | "full" = "read", redirectAfter: "/settings/connectors" | "/settings/mcp" = "/settings/connectors", taskId?: string): Promise<ConnectorOAuthStart> {
+    return this.#request(`/v1/connectors/${encodeURIComponent(id)}/oauth/start`, ConnectorOAuthStartSchema, { method: "POST", body: { accessLevel, redirectAfter, ...(taskId ? { taskId } : {}) } });
+  }
+  async taskConnectorReconnects(taskId: string, signal?: AbortSignal) {
+    return this.#request(`/v1/connectors/tasks/${encodeURIComponent(taskId)}/reconnect`, TaskConnectorReconnectSchema.array(), signal ? { signal } : {});
+  }
   async connectConnectorBearer(id: string, credential: string): Promise<Connector> { return this.#request(`/v1/connectors/${encodeURIComponent(id)}/credentials`, ConnectorSchema, { method: "POST", body: { credential } }); }
   async disconnectConnector(id: string): Promise<{ ok: true }> { return this.#request(`/v1/connectors/${encodeURIComponent(id)}/connection`, z.object({ ok: z.literal(true) }), { method: "DELETE" }); }
   async googlePickerSession(id: string): Promise<GooglePickerSession> { return this.#request(`/v1/connectors/${encodeURIComponent(id)}/google-picker`, GooglePickerSessionSchema); }

@@ -1,10 +1,12 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpToolSource, type McpServerSpec } from "@berry/local-agent/mcp";
+import { openDurableSecret, type DurableSecretEnvelope } from "@berry/shared";
 import type { ChatToolDefinition } from "@berry/router-client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DurableTurnSnapshot, DurableTurnStep, DurableTurnToolExecutor } from "./turn-runner.js";
 import type { ToolResultStore } from "./tool-result-store.js";
+import { classifyToolFailure } from "./tool-failures.js";
 import {
   boundedMcpText,
   connectorArtifactText,
@@ -14,6 +16,50 @@ import {
 } from "./mcp-tools.js";
 
 describe("durable MCP tool exposure", () => {
+  it("uses the current lease before the deadline and suppresses calls after a confirmed reconnect requirement", async () => {
+    const key = Buffer.alloc(32, 8).toString("base64");
+    const server = connectorServer("connector_mcp_test", "Connect", true, "remove_record", "Remove a record");
+    const name = "mcp__Connect__remove_record";
+    server.defaultTools = ["remove_record"];
+    const snapshot = mcpSnapshot("Remove record 42");
+    snapshot.userId = "00000000-0000-7000-8000-000000000201";
+    snapshot.leaseOwner = "worker-lease";
+    snapshot.ownershipGeneration = 2;
+    snapshot.runtimeRequest = admittedRuntimeRequest(snapshot, { ...server, credentialRef: `connector-oauth:${server.id}:${snapshot.userId}:${"a".repeat(64)}` } as McpServerSpec);
+    const grantId = "b".repeat(64);
+    const requests = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(Response.json({ status: "reauth_required", grantId }));
+    const tools = new DurableMcpToolExecutor({ execute: vi.fn() }, [], undefined, 1_000, { BERRY_DURABLE_CAPABILITY_KEY: key, BERRY_WEB_API_INTERNAL_URL: "http://api:3000" });
+    const step: DurableTurnStep = {
+      id: "remove-record", sequence: 1, type: `tool.${name}`, state: "running",
+      input: { toolName: name, arguments: { id: "42" } }, retryClass: "non_idempotent_manual",
+      output: null, idempotencyKey: null, attempt: 1, error: null,
+    };
+    try {
+      const earlierLease = { ...snapshot, leaseOwner: "previous-lease", ownershipGeneration: 1 };
+      expect(await tools.turnContext(earlierLease)).toContain(name);
+      await expect(tools.execute(snapshot, { ...step, deadlineAt: new Date(Date.now() - 1_000).toISOString() }))
+        .rejects.toMatchObject({ kind: "temporary", beforeDispatch: true, details: { exhausted: true } });
+      expect(requests).not.toHaveBeenCalled();
+      const failure = await tools.execute(snapshot, step).then(
+        () => { throw new Error("Expected a reconnect requirement"); },
+        (error: unknown) => classifyToolFailure(error, { changesState: true }),
+      );
+      expect(failure).toMatchObject({ outcome: "not_applied", reconnect: { connectorId: server.id, grantId } });
+      const [endpoint, request] = requests.mock.calls[0]!;
+      expect(String(endpoint)).toBe("http://api:3000/v1/connectors/mcp/runtime-credential");
+      const proof = JSON.parse(String(request?.body)) as DurableSecretEnvelope;
+      expect(JSON.parse(await openDurableSecret(proof, key))).toMatchObject({ tenantId: snapshot.tenantId, runId: snapshot.id,
+        userId: snapshot.userId, leaseOwner: "worker-lease", ownershipGeneration: 2, connectorId: server.id });
+      await tools.release(earlierLease);
+      snapshot.steps = [{ ...step, state: "failed", output: { failure: { ...failure } } }];
+      await expect(tools.execute(snapshot, { ...step, input: { toolName: name, arguments: { id: "43" } } })).rejects.toMatchObject({ kind: "reauth_required" });
+      expect(requests).toHaveBeenCalledTimes(1);
+    } finally {
+      requests.mockRestore();
+      await tools.close();
+    }
+  });
+
   it("declares connector abort support, keeps discovery non-abortable, and delegates core tools", () => {
     const baseSupportsAbort = vi.fn(() => true);
     const tools = new DurableMcpToolExecutor({

@@ -30,6 +30,7 @@ export {
 export {
   completeRemoteMcpOAuth,
   refreshRemoteMcpOAuth,
+  McpOAuthRefreshError,
   startRemoteMcpOAuth,
   validateRemoteMcpOAuthIssuer,
   type McpOAuthStartResult,

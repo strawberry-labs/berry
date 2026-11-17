@@ -12,6 +12,7 @@ import type {
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { validatedRemoteMcpUrl } from "./mcp.ts";
 import { createPublicRemoteFetch, resolvePublicRemoteUrl } from "./remote-fetch.ts";
+import { retryAfterMs, waitForMcpRetry } from "./mcp-connection.ts";
 
 export type McpOAuthState = {
   clientInformation?: OAuthClientInformationMixed;
@@ -24,6 +25,13 @@ export type McpOAuthStartResult = {
   authorizationUrl: string;
   state: McpOAuthState;
 };
+
+export class McpOAuthRefreshError extends Error {
+  constructor(readonly kind: "invalid_grant" | "configuration" | "temporary" | "uncertain", readonly retryAfterMs?: number) {
+    super(`MCP OAuth refresh ${kind}`);
+    this.name = "McpOAuthRefreshError";
+  }
+}
 
 class PersistedOAuthProvider implements OAuthClientProvider {
   authorizationUrl: URL | null = null;
@@ -138,24 +146,52 @@ export async function refreshRemoteMcpOAuth(input: {
   callbackUrl: string;
   state: McpOAuthState;
   scope?: string;
+  signal?: AbortSignal;
 }): Promise<McpOAuthState> {
   validatedRemoteMcpUrl(input.serverUrl);
   const discovery = input.state.discoveryState;
   const client = input.state.clientInformation;
   const refreshToken = input.state.tokens?.refresh_token;
-  if (!discovery || !client || !refreshToken) throw new Error("MCP OAuth refresh metadata is incomplete");
-  const refreshed = await refreshAuthorization(discovery.authorizationServerUrl, {
-    ...(discovery.authorizationServerMetadata ? { metadata: discovery.authorizationServerMetadata } : {}),
-    clientInformation: client,
-    refreshToken,
-    ...(discovery.resourceMetadata?.resource ? { resource: new URL(discovery.resourceMetadata.resource) } : {}),
-    fetchFn: guardedOAuthFetch,
-  });
-  input.state.tokens = {
-    ...refreshed,
-    refresh_token: refreshed.refresh_token ?? refreshToken,
-  };
-  return input.state;
+  if (!discovery || !client || !refreshToken) throw new McpOAuthRefreshError("configuration");
+  try {
+    const refreshed = await refreshAuthorization(discovery.authorizationServerUrl, {
+      ...(discovery.authorizationServerMetadata ? { metadata: discovery.authorizationServerMetadata } : {}),
+      clientInformation: client,
+      refreshToken,
+      ...(discovery.resourceMetadata?.resource ? { resource: new URL(discovery.resourceMetadata.resource) } : {}),
+      fetchFn: async (target, init) => {
+        input.signal?.throwIfAborted();
+        const send = () => guardedOAuthFetch(target, init);
+        let response = await send();
+        // An explicit rate-limit response is safe to retry. A lost response
+        // or 5xx may have consumed a rotating refresh token already.
+        if (response.status === 429) {
+          const wait = retryAfterMs(response.headers);
+          await response.body?.cancel().catch(() => undefined);
+          if (!await waitForMcpRetry(wait, input.signal)) throw new McpOAuthRefreshError("temporary", wait);
+          response = await send();
+        }
+        if (response.ok) return response;
+        const status = response.status;
+        const wait = retryAfterMs(response.headers);
+        const error = await response.json().catch(() => null) as { error?: unknown } | null;
+        if (status === 400 && error?.error === "invalid_grant") throw new McpOAuthRefreshError("invalid_grant");
+        if (status === 408 || status >= 500) throw new McpOAuthRefreshError("uncertain", wait);
+        if (status === 429 || error?.error === "temporarily_unavailable") throw new McpOAuthRefreshError("temporary", wait);
+        throw new McpOAuthRefreshError("configuration");
+      },
+    });
+    return { ...input.state, tokens: {
+      ...refreshed,
+      ...(refreshed.scope === undefined && input.state.tokens?.scope ? { scope: input.state.tokens.scope } : {}),
+      refresh_token: refreshed.refresh_token ?? refreshToken,
+    } };
+  } catch (cause) {
+    if (cause instanceof McpOAuthRefreshError) throw cause;
+    // Includes malformed successful responses. A successful exchange may have
+    // rotated the grant even if the response could not be received or parsed.
+    throw new McpOAuthRefreshError("uncertain");
+  }
 }
 
 function clientMetadata(callbackUrl: string, scope?: string): OAuthClientMetadata {

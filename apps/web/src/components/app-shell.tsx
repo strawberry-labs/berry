@@ -1,4 +1,5 @@
 import { BrowserControl } from "./tasks/browser-control";
+import { TaskConnectorReconnects } from "./tasks/task-connector-reconnect";
 import { CanvasFileDropZone } from "./tasks/canvas-file-drop";
 import * as React from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -3332,6 +3333,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         />
         <div className="workspace">
           <section className="thread-pane berry-task-thread" aria-label="Task">
+            {client ? <TaskConnectorReconnects key={activeTask.id} client={client} taskId={activeTask.id} active={Boolean(durableState?.active || stream.turnActive || turnBusy)} /> : null}
             {client && activeSessionId ? <BrowserControl key={activeSessionId} client={client} sessionId={activeSessionId} active={Boolean(durableState?.active || stream.turnActive || turnBusy)} onChanged={() => {
               void client.turnState(activeSessionId).then((state) => applyDurableState(activeSessionId, state, true)).catch(() => undefined);
               void refreshSessionMessages(activeSessionId).catch(() => undefined);

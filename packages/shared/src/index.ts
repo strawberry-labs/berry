@@ -4,6 +4,7 @@ import { ProviderAttemptEventSchema } from "./provider-errors.ts";
 
 export { BUILT_IN_COMMANDS, builtInCommandManifests, parseSlashCommand, type BuiltInCommandDefinition } from "./commands.ts";
 export * from "./durable-context.ts";
+export * from "./mcp-recovery.ts";
 export * from "./context-budget.ts";
 export * from "./checkpoint.ts";
 export * from "./retrieval.ts";

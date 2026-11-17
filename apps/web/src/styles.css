@@ -3808,7 +3808,7 @@ html body .berry-onboarding-connector-toggle input:focus-visible + span {
 }
 
 /* Live browser control stays in the task surface and never offsets the app shell. */
-.berry-browser-card { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-shrink:0; margin:8px 16px; padding:10px 12px; border:1px solid var(--berry-border); border-radius:8px; background:var(--berry-card-bg); }
+.berry-browser-card,.berry-task-connector-card { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-shrink:0; margin:8px 16px; padding:10px 12px; border:1px solid var(--berry-border); border-radius:8px; background:var(--berry-card-bg); }
 .berry-browser-dialog { width:calc(100vw - 32px); max-width:1180px; max-height:94dvh; overflow:auto; gap:12px; }
 .berry-browser-toolbar { display:flex; align-items:center; gap:12px; min-width:0; padding:8px 10px; border:1px solid var(--berry-border); border-radius:6px; background:var(--berry-card-bg); }
 .berry-browser-tabs { max-width:40%; min-width:80px; padding:4px; border:1px solid var(--berry-border); border-radius:4px; background:var(--berry-card-bg); color:var(--berry-text); font-size: var(--berry-fs-sm); }
