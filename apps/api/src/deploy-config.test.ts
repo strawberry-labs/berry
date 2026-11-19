@@ -110,7 +110,7 @@ describe("self-host compose deployment", () => {
     expect(serviceRoleBootstrap).not.toContain('"BYPASSRLS"');
     expect(productionRunbook).toContain("aws s3api put-bucket-cors");
     expect(productionRunbook).toContain('"AllowedOrigins":["https://ai.example.com"]');
-    expect(productionRunbook).toContain('"ExposeHeaders":["ETag"]');
+    expect(productionRunbook).toContain('"ExposeHeaders":["ETag","Content-Range"]');
   });
 
   it("uses direct E2B in production while keeping Docker and Router seams available", () => {

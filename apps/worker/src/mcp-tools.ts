@@ -483,6 +483,8 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   }
 
   async #prepareContext(snapshot: DurableTurnSnapshot): Promise<DurableMcpTurnContext> {
+    // Only a run admitted before capability snapshots uses the deployment's
+    // connector list; an invalid snapshot throws rather than swap connectors.
     const runtime = parseAdmittedRuntimeRequest(snapshot.runtimeRequest);
     if (!runtime) {
       return { source: this.#source, servers: this.#allowedServers(snapshot), unavailable: [], relistAttempts: new Map() };

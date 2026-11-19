@@ -1030,7 +1030,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   // Discover chats created by server schedules while the workspace is open.
   // Refresh one bounded page and retain older chats already loaded by the user.
   React.useEffect(() => {
-    if (!client || !tasksLoaded) return;
+    if (!client || !tasksLoaded || supportView) return;
     const abort = new AbortController();
     let refreshing = false;
     const refresh = async () => {

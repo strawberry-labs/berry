@@ -5826,8 +5826,6 @@ export const cloudMigrations = [
   },
   { id: 73, name: "mobile_pairing_v1", sql: MOBILE_PAIRING_MIGRATION },
   {
-    // 71-73 are taken by migrations in progress elsewhere; ids are tracked
-    // alone, so a reused id would be skipped silently on deploy.
     id: 74,
     name: "task_creation_idempotency_v1",
     sql: TASK_CREATION_IDEMPOTENCY_MIGRATION,

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { formatSkillInvocation } from "@berry/harness";
 import {
   DEFERRED_SKILL_RESOURCE_INSTRUCTIONS,
-  DurableTurnRuntimeRequestSchema,
+  parseAdmittedRuntimeRequest,
   parseAgentSkillMarkdown,
 } from "@berry/shared";
 import type { ChatContentPart, ChatToolDefinition } from "@berry/router-client";
@@ -242,7 +242,8 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
     step: DurableTurnStep,
     options: { signal?: AbortSignal | undefined; reportProgress?: (() => void) | undefined } = {},
   ): Promise<TurnToolResult> {
-    const runtime = DurableTurnRuntimeRequestSchema.parse(snapshot.runtimeRequest);
+    const runtime = parseAdmittedRuntimeRequest(snapshot.runtimeRequest);
+    if (!runtime) throw new Error("Stored skills are available only to turns admitted with a capability snapshot");
     const parsedInput = ActivateStoredSkillInputSchema.safeParse(step.input.arguments ?? {});
     if (!parsedInput.success) {
       throw new Error("activate_skill requires a valid skill name and, when loading files, an optional resources array of exact relative paths");

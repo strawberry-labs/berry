@@ -29,7 +29,7 @@ const usage = (costRawMicros) => ({
   kind: "usage", inputTokens: 100, outputTokens: 20, totalTokens: 120,
   costRawMicros: String(costRawMicros), pricingSource: "measured", servedProvider: "router", servedModel: "test-model",
 });
-/** First call asks for a mutating shell command; later calls answer. */
+/** First call asks for a connector change (shell commands never wait for review); later calls answer. */
 function model(costs) {
   let calls = 0;
   return {
@@ -39,9 +39,9 @@ function model(costs) {
         return {
           text: "", inputTokens: 100, outputTokens: 20, usage: usage(costs.first),
           toolCalls: [{
-            id: randomUUID(), name: "bash", input: { command: "soffice --convert-to xlsx input.xlsx" },
+            id: randomUUID(), name: "mcp__Connect_Aesg_MCP__recalculate_workbook", input: { workbook: "input.xlsx" },
             retryClass: "non_idempotent_manual", repeatPolicy: "compare_result", idempotencyKey: null,
-            requiresApproval: false, approvalKind: "file-edit",
+            requiresApproval: false, approvalKind: "mcp",
           }],
         };
       }

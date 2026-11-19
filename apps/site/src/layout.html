@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id={{analytics.googleTagId}}"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+
+    gtag('config', '{{analytics.googleTagId}}');
+  </script>
+<!--head-->
+  <link rel="icon" href="/favicon.ico" sizes="32x32">
+  <link rel="icon" href="/assets/berry-logo.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+  <link rel="manifest" href="/site.webmanifest">
+  <link rel="preload" href="/assets/fonts/plus-jakarta-sans.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/assets/fonts/geist-mono.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/styles.css">
+  <script>document.documentElement.classList.add("js")</script>
+  <script src="/site.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="header-row">
+      <a class="brand" href="/" aria-label="Berry home">
+        <img src="/assets/berry-logo.svg" alt="" width="16" height="24">
+        <span>Berry</span>
+      </a>
+      <nav class="site-nav" aria-label="Primary"><!--nav--></nav>
+      <div class="header-actions">
+        <a class="button button-ink button-small" href="mailto:{{contact.sales}}?subject=Berry%20demo">Book a demo <span class="arrow" aria-hidden="true">›</span></a>
+      </div>
+      <details class="menu">
+        <summary aria-label="Menu"><span></span><span></span></summary>
+        <nav class="menu-panel" aria-label="Primary"><!--nav--><a href="mailto:{{contact.sales}}?subject=Berry%20demo">Book a demo</a></nav>
+      </details>
+    </div>
+  </header>
+
+  <main id="main"><!--content--></main>
+
+  <footer class="site-footer band">
+    <div class="frame">
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <a class="brand" href="/" aria-label="Berry home">
+            <img src="/assets/berry-logo.svg" alt="" width="16" height="24">
+            <span>Berry</span>
+          </a>
+          <p>Berry is the enterprise AI workspace for organizations that need their data, models and spend under their own control. Self-hosted or dedicated.</p>
+        </div>
+        <div>
+          <h2>Product</h2>
+          <a href="/#agents">Agents</a>
+          <a href="/#models">Models and routing</a>
+          <a href="/#governance">Governance</a>
+          <a href="/#deploy">Deployment</a>
+          <a href="/#enterprise">Enterprise</a>
+          <a href="/mobile/">Mobile app</a>
+        </div>
+        <div>
+          <h2>Trust</h2>
+          <a href="/security/">Security</a>
+          <a href="/privacy/">Privacy policy</a>
+          <a href="/terms/">Terms of service</a>
+        </div>
+        <div>
+          <h2>Contact</h2>
+          <a href="mailto:{{contact.sales}}">Sales</a>
+          <a href="/support/">Support</a>
+          <a href="mailto:{{contact.security}}">Report a vulnerability</a>
+        </div>
+      </div>
+      <div class="wordmark" aria-hidden="true" data-inview>
+        <svg viewBox="0 0 1000 232"><text x="500" y="222" text-anchor="middle" textLength="984" lengthAdjust="spacing">BERRY</text></svg>
+      </div>
+      <div class="footer-base">
+        <span>© {{year}} <a class="legal-link" href="{{company.website}}">{{company.legalName}}</a>. All rights reserved.</span>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

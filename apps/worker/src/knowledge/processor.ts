@@ -12,8 +12,8 @@ const DEFAULT_MAX_EMBEDDED_CHUNKS = 5_000;
 // exports, coordinate lists and binary noise sit near or below a tenth.
 const MIN_EMBEDDABLE_LETTER_SHARE = 0.15;
 // A file where fewer than half the chunks have words is data, not a document,
-// and stays keyword-only. Real uploads on ai.aesg.com were at least 60% wordy
-// on 2026-10-28; the mesh export was 30% (its labels and exponents count as
+// and stays keyword-only. Real documents are well above half; a mesh export
+// with load labels sits near a third (its labels and exponents count as
 // letters).
 const MIN_WORDY_CHUNK_SHARE = 0.5;
 
@@ -149,8 +149,7 @@ export class KnowledgeProcessor {
     // Every chunk stays keyword-searchable. Vectors are only worth computing
     // for documents, for the chunks with words in them, and a file's first
     // chunks are enough to make it findable, so one huge file cannot hold the
-    // embedding service for hours (a 69,898-chunk mesh export did on
-    // 2026-10-28).
+    // embedding service for hours.
     const wordy = chunks.filter((chunk) => letterShare(chunk.text) >= MIN_EMBEDDABLE_LETTER_SHARE);
     const embeddable = wordy.length < chunks.length * MIN_WORDY_CHUNK_SHARE
       ? []

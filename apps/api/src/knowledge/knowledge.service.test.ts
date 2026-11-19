@@ -110,6 +110,28 @@ describe("KnowledgeService", () => {
     expect(vectorQuery?.sql).toContain("ORDER BY kc.embedding <=> $5::vector\n      LIMIT 60");
   });
 
+  it("returns keyword results when the embedding service is too busy to answer in time", async () => {
+    const executor = new RetrievalExecutor();
+    let embeddingSignal: AbortSignal | undefined;
+    const service = new KnowledgeService(new CloudDatabaseService(executor), {
+      profile: { id: "profile", provider: "fixture", model: "fixture", dimensions: 3, version: 1 },
+      embed: (_texts, options) => new Promise((_resolve, reject) => {
+        embeddingSignal = options?.signal;
+        options?.signal?.addEventListener("abort", () => reject(options.signal!.reason), { once: true });
+      }),
+    });
+
+    const startedAt = Date.now();
+    const grounding = await service.retrieve({ tenantId, userId, workspaceId, taskId, request: "lease recovery" });
+
+    // Default retrievalEmbeddingTimeoutMs is 400 ms.
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(embeddingSignal?.aborted).toBe(true);
+    expect(grounding.retrieval.degradedReason).toBe("embeddings_unavailable");
+    expect(grounding.projectFacts).toEqual([expect.objectContaining({ chunkId })]);
+    expect(executor.calls.some((call) => call.sql.includes("<=>"))).toBe(false);
+  });
+
   it("gates earlier task answers by relevance, labels them and keeps them below files (H-040)", async () => {
     const row = (id: string, sourceType: "file" | "task_outcome", rank: string, title: string) => ({
       chunk_id: `00000000-0000-7000-8000-0000000001${id}`,

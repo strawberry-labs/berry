@@ -3,10 +3,12 @@ import {
   DEFAULT_SANDBOX_INPUT_MAX_BYTES,
   DURABLE_BASE_BUILT_IN_TOOLS,
   DurableTurnRuntimeRequestSchema,
+  InvalidRuntimeRequestError,
   durableContextConfigFromEnv,
   isConnectorEncryptionKeyValid,
   openConnectorSecret,
   openDurableSecret,
+  parseAdmittedRuntimeRequest,
   sealConnectorSecret,
   sealDurableSecret,
 } from "./durable-context.js";
@@ -131,5 +133,81 @@ describe("durable capability contract", () => {
       .toThrow("Admitted vision configuration requires the inspect_images tool");
     expect(() => DurableTurnRuntimeRequestSchema.parse({ ...base, modelAcceptsImages: true }))
       .toThrow("Native vision models must receive images directly");
+  });
+
+  describe("stored runtime requests", () => {
+    const admitted = {
+      capabilityVersion: 1,
+      requestId: "request_1",
+      input: "Summarise the report",
+      providerId: "provider",
+      provider: {
+        id: "provider",
+        name: "Provider",
+        kind: "openai",
+        baseUrl: "https://provider.example/v1",
+        defaultModel: "model",
+        headers: { "x-provider-secret": "header-secret-value" },
+      },
+      model: "model",
+      workspacePath: "/workspace",
+      workspaceId: "workspace",
+      permissionMode: "full-access",
+      reasoning: "off",
+      maxTokens: 8_000,
+      contextWindowTokens: 128_000,
+      builtInTools: DURABLE_BASE_BUILT_IN_TOOLS,
+    };
+
+    it("accepts the queue, Continue and recovery metadata the API stores on a run", () => {
+      const parsed = parseAdmittedRuntimeRequest({
+        ...admitted,
+        queuedBudgetRequestId: "queued:browser-key",
+        continuationSourceRunId: "00000000-0000-7000-8000-000000000002",
+        continuationHeadEntryId: "entry-head",
+        budgetBaseRequestId: "request_1",
+        budgetGeneration: 2,
+        budgetUsageAfterSequence: 0,
+        budgetBaselineCostMicros: "5000",
+      });
+      expect(parsed).toMatchObject({
+        provider: { id: "provider" },
+        model: "model",
+        queuedBudgetRequestId: "queued:browser-key",
+        continuationHeadEntryId: "entry-head",
+        budgetGeneration: 2,
+        budgetUsageAfterSequence: 0,
+        budgetBaselineCostMicros: "5000",
+      });
+    });
+
+    it("treats only unversioned requests as legacy", () => {
+      expect(parseAdmittedRuntimeRequest({ input: "hello", mcpServerIds: [] })).toBeNull();
+      expect(parseAdmittedRuntimeRequest(null)).toBeNull();
+      for (const invalid of [
+        { ...admitted, budgetGeneration: "2" },
+        { ...admitted, budgetGeneration: 0 },
+        { ...admitted, budgetUsageAfterSequence: -1 },
+        { ...admitted, budgetBaselineCostMicros: "-5" },
+        { ...admitted, continuationHeadEntryId: "" },
+        { ...admitted, capabilityVersion: 2 },
+        { ...admitted, capabilityVersion: null },
+      ]) {
+        expect(() => parseAdmittedRuntimeRequest(invalid)).toThrow(InvalidRuntimeRequestError);
+      }
+    });
+
+    it("names the invalid fields without echoing their values", () => {
+      let failure: unknown;
+      try {
+        parseAdmittedRuntimeRequest({ ...admitted, provider: { ...admitted.provider, baseUrl: "not a url" }, sessionToken: "token-value" });
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(InvalidRuntimeRequestError);
+      expect((failure as InvalidRuntimeRequestError).fields).toEqual(["provider.baseUrl", "sessionToken"]);
+      expect((failure as Error).message).toContain("admitted model configuration is invalid (provider.baseUrl, sessionToken)");
+      expect((failure as Error).message).not.toMatch(/not a url|token-value|header-secret-value/);
+    });
   });
 });

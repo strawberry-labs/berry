@@ -379,7 +379,6 @@ function failedCall(error: unknown, phase: "not_sent" | "dispatched" | "rejected
   return Object.assign(new Error(error instanceof Error ? error.message : String(error), { cause: error }), { toolCallPhase: phase });
 }
 
-/** Connects MCP servers independently. Cached schemas are usable immediately; live startup never needs to block turn creation. */
 /**
  * An MCP tool returned an error result. The structured content (error codes,
  * statuses, diagnostics) stays attached so callers can classify the failure
@@ -387,6 +386,7 @@ function failedCall(error: unknown, phase: "not_sent" | "dispatched" | "rejected
  */
 export class McpToolError extends Error {
   readonly structuredContent: unknown;
+  /** The server answered a dispatched call. */
   readonly toolCallPhase = "dispatched";
 
   constructor(message: string, structuredContent: unknown) {
@@ -396,6 +396,7 @@ export class McpToolError extends Error {
   }
 }
 
+/** Connects MCP servers independently. Cached schemas are usable before connecting. */
 export class McpToolSource {
   readonly #options: McpToolSourceOptions;
   readonly #servers = new Map<string, ConnectedServer>();

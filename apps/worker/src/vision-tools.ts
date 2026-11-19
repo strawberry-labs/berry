@@ -28,6 +28,8 @@ import {
 
 // v4: observations cut off at the output limit are no longer cached, so v3
 // entries of unknown completeness are not reused (they age out) (H-039).
+// v5: v4 could cache a cut-off answer whose continuation was empty as complete.
+// v6: v5 could cache a first answer a content filter stopped as complete.
 const VISION_PROMPT_VERSION = "vision-observation-v6";
 const DEFAULT_OVERVIEW_QUESTION = "Produce a comprehensive reusable observation of these images.";
 // About half of focused observations reached the old 1,024-token cap, mostly

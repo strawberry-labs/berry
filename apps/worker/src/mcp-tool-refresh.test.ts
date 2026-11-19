@@ -365,6 +365,7 @@ describe("durable MCP executor tool refresh", () => {
 
   afterEach(async () => {
     await Promise.all(sockets.splice(0).map((cleanup) => cleanup()));
+    vi.unstubAllGlobals();
   });
 
   type Setup = {
@@ -384,6 +385,10 @@ describe("durable MCP executor tool refresh", () => {
     write(options.live);
     const key = randomBytes(32).toString("base64");
     const env = { BERRY_DURABLE_CAPABILITY_KEY: key } as NodeJS.ProcessEnv;
+    vi.stubGlobal("fetch", vi.fn(async (input: URL) => {
+      expect(input.pathname).toBe("/v1/connectors/mcp/runtime-credential");
+      return Response.json({ status: "static" });
+    }));
     const store = new MemorySnapshotStore();
     store.seed(connectorId, options.stored?.tools ?? options.cached, options.stored ? options.stored.checkedAt : Date.now());
     const refresher = new McpToolSnapshotRefresher(store);

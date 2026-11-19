@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { BerryAuthRuntime } from "../auth/auth-runtime.ts";
 import { FilePlatformService } from "../files/file-platform.service.ts";
 import { AgentApiModule } from "../http/agent-api.module.ts";
+import { QueuedFollowUpService } from "../runtime/queued-follow-up.service.ts";
 import { InMemoryEnterpriseIdentityRepository } from "./identity.repository.ts";
 
 describe("Enterprise identity API", () => {
@@ -471,6 +472,9 @@ async function createApp(options: {
       },
     })],
   })
+    // This controller fixture has no database and does not exercise queued turns.
+    .overrideProvider(QueuedFollowUpService)
+    .useValue({})
     .overrideProvider(FilePlatformService)
     .useValue({})
     .compile();

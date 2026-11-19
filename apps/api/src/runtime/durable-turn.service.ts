@@ -2128,6 +2128,8 @@ async function cancelActiveDurableRun(
        AND status IN ('queued','delivering') AND expires_at>now()`,
     [tenantId, active.session_id],
   );
+  // Stopping a task during a shell command or edit just cancels it: those act
+  // inside the sandbox. A change outside it whose reply never came waits for review.
   const ambiguousRows = await transaction.query<{ step_id: string; tool_call_id: string }>(
     `
 SELECT s.id AS step_id,tc.id AS tool_call_id
@@ -2153,7 +2155,7 @@ FOR UPDATE OF s
     active.task_id,
     active.id,
     ambiguous ? "failed" : "cancelled",
-    ambiguous ? "The external mutation outcome is uncertain. Operator review is required before retry." : undefined,
+    ambiguous ? "Berry didn't get a reply from the last action, so it can't tell whether it went through. Check it, then press Continue to run it again." : undefined,
   );
   await transaction.execute(
     `

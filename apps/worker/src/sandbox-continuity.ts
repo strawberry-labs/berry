@@ -39,7 +39,7 @@ import {
   networkDomainAllowed,
   type NetworkPolicy,
 } from "@berry/shared";
-import { MODEL_IMAGE_LIMITS, describeImageBytes, modelImageLabel, modelImageOmission, prepareModelImage } from "./model-image.js";
+import { MODEL_IMAGE_LIMITS, describeImageBytes, modelImageLabel, modelImageOmission, modelImageWithheld, prepareModelImage } from "./model-image.js";
 import { durableAttachmentPath } from "./durable-attachments.js";
 import { ToolArgumentError, invalidJsonProblem, jsonSyntaxError, notRunMessage } from "./tool-arguments.js";
 import type { SandboxSnapshotJobPayload } from "./jobs.js";
@@ -874,6 +874,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       };
       /** Emails administrators when the image provider is out of credit (H-005). */
       providerCreditAlerts?: ProviderCreditAlertSink;
+      /** Sends upload_file requests; defaults to the public-network-only client. */
       uploadFetch?: typeof fetch;
     },
   ) {}
@@ -982,15 +983,26 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const attachedImages = turnInputFiles.filter((file) => file.mediaType.startsWith("image/"));
     const attachedImageIds = new Set(attachedImages.map((file) => file.fileId));
     const explicitPaths = requestedInspectionImagePaths(snapshot, workspaceRoot);
-    // Valid attachments take their slots first and keep them for the run.
-    const attachmentSlots = Math.min(MAX_MODEL_IMAGES, attachedImages.filter((file) =>
-      file.sizeBytes > 0 && file.sizeBytes <= MAX_MODEL_IMAGE_BYTES
-    ).length);
-    const exposed = explicitPaths ? null : exposedSandboxImages(snapshot, MAX_MODEL_IMAGES - attachmentSlots);
+    // Valid attachments are shown first and keep their slots while images
+    // read later fit beside them; then they yield (exposedSandboxImages).
+    const unusableIds = new Set(attachedImages
+      .filter((file) => file.sizeBytes <= 0 || file.sizeBytes > MAX_MODEL_IMAGE_BYTES)
+      .map((file) => file.fileId));
+    const shownAttachments = attachedImages.filter((file) => !unusableIds.has(file.fileId)).slice(0, MAX_MODEL_IMAGES);
+    const exposed = explicitPaths ? null : exposedSandboxImages(
+      snapshot,
+      MAX_MODEL_IMAGES,
+      shownAttachments.map((file) => durableAttachmentPath(file, workspaceRoot)),
+      // An empty or oversized attachment is never shown, so reading it takes no slot.
+      (path) => unusableIds.has(sandboxAttachmentId(path, workspaceRoot) ?? ""),
+    );
+    const attachmentsYielded = exposed !== null && shownAttachments.length > 0 && exposed.attachments.length === 0;
     const requestedSandboxImages = (explicitPaths ?? exposed!.selected)
       .filter((path) => {
         const attachmentId = sandboxAttachmentId(path, workspaceRoot);
-        return !attachmentId || !attachedImageIds.has(attachmentId);
+        if (!attachmentId || !attachedImageIds.has(attachmentId)) return true;
+        // Once the attachments yielded their slots, one read again is shown like any image.
+        return attachmentsYielded && !unusableIds.has(attachmentId);
       });
     const selectedAttachments = explicitPaths
       ? explicitPaths.flatMap((path) => {
@@ -1110,26 +1122,38 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       return parts;
     }
 
-    // Attachments come first: they sit at a fixed place after the turn context
-    // for the whole run, so their slots must not depend on later reads (H-032).
-    // Oversized candidates are skipped so later valid files take their slots.
+    // Attachments come first: they sit at a fixed place after the turn context,
+    // so later reads do not move them (H-032). Oversized candidates are
+    // skipped so later valid files take their slots.
     const attachmentFiles: SandboxInputFile[] = [];
+    const notShown = (path: string) => !requestedSandboxImages.includes(path) && !withheld.includes(path);
     for (const file of selectedAttachments) {
-      if (attachmentFiles.length >= MAX_MODEL_IMAGES) break;
-      if (file.sizeBytes <= 0 || file.sizeBytes > MAX_MODEL_IMAGE_BYTES) {
-        omit(durableAttachmentPath(file, workspaceRoot), "the source is empty or exceeds the 20 MiB image inspection limit");
-        continue;
+      const path = durableAttachmentPath(file, workspaceRoot);
+      if (unusableIds.has(file.fileId)) {
+        omit(path, "the source is empty or exceeds the 20 MiB image inspection limit");
+      } else if (attachmentFiles.length < MAX_MODEL_IMAGES) {
+        attachmentFiles.push(file);
+      } else if (notShown(path)) {
+        parts.push({ type: "text", text: modelImageWithheld(path, `only ${MAX_MODEL_IMAGES} images are sent per request`) });
       }
-      attachmentFiles.push(file);
     }
-    const attachmentSources = await loadAttachmentSources(attachmentFiles);
-    for (const source of attachmentSources) {
-      if (source.bytes) await append(source.path, source.bytes);
-      else omit(source.path, `the attached image could not be loaded (${source.unavailable}), so it has not been seen; ask the user to send it again`);
+    if (attachmentsYielded) {
+      // Images read later in the turn did not fit beside them; the request
+      // changes at this point once, and the model can read them again.
+      for (const file of attachmentFiles) {
+        const path = durableAttachmentPath(file, workspaceRoot);
+        if (notShown(path)) parts.push({ type: "text", text: modelImageWithheld(path, `this attachment was shown earlier in this turn, but only ${MAX_MODEL_IMAGES} images are sent per request and newer images took its place`) });
+      }
+    } else {
+      const attachmentSources = await loadAttachmentSources(attachmentFiles);
+      for (const source of attachmentSources) {
+        if (source.bytes) await append(source.path, source.bytes);
+        else omit(source.path, `the attached image could not be loaded (${source.unavailable}), so it has not been seen; ask the user to send it again`);
+      }
     }
 
     for (const path of withheld) {
-      omit(path, `only ${MAX_MODEL_IMAGES} images are sent per request; read this image again on its own or in a batch of at most ${MAX_MODEL_IMAGES} to inspect it`);
+      parts.push({ type: "text", text: modelImageWithheld(path, `only ${MAX_MODEL_IMAGES} images are sent per request and this batch read more`) });
     }
     const sandboxSources = await loadSandboxSources(requestedSandboxImages);
     for (const source of sandboxSources) {
@@ -1844,7 +1868,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         throw new Error(reason ? `Image generation is unavailable for this message: ${reason}` : "Image generation is not configured for this durable turn");
       }
       const prompt = stringValue(args.prompt);
-      if (!prompt) throw new Error("create_image requires a prompt");
+      if (!prompt) throw new ToolArgumentError(notRunMessage("create_image", "prompt must be a non-empty string"));
       // The stored failure class also covers steps recorded with earlier wording.
       if ((snapshot.steps ?? []).some((candidate) => candidate.state === "failed"
         && (stringValue(candidate.input.toolName) ?? candidate.type.slice(5)) === "create_image"
@@ -2088,6 +2112,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       const truncated = output.result();
       const rawOutput = truncated.content;
       const networkFailure = sandboxNetworkFailureHint(command, networkPolicy(snapshot.runtimeRequest.networkPolicy), exitCode, rawOutput);
+      // The command ran: a failure of a later part cannot show that an earlier
+      // part changed nothing, so the hint keeps its exit status (H-003).
       if (networkFailure) throw new Error(`${networkFailure}\n\nCommand exited with code ${exitCode ?? "unknown"}`);
       const hasMeaningfulOutput = rawOutput.trim().length > 0;
       let text = hasMeaningfulOutput
@@ -3100,11 +3126,19 @@ async function sandboxFileEntry(
  * every request and defeated the provider's cache (H-032). `withheld` lists
  * images read since the last model call that do not fit; the model was
  * promised their pixels, so they are disclosed, not dropped.
+ *
+ * This turn's `attachments` are shown first, after the turn context, and
+ * reading one again changes nothing while they are. They keep their slots
+ * while every later batch fits beside them. The first batch that does not fit
+ * makes them yield for the rest of the run, so the request changes there once
+ * and then only grows again; a yielded attachment is read like any image.
  */
 export function exposedSandboxImages(
   snapshot: Pick<DurableTurnSnapshot, "steps">,
   capacity: number = MAX_MODEL_IMAGES,
-): { selected: string[]; withheld: string[] } {
+  attachments: readonly string[] = [],
+  takesNoSlot: (path: string) => boolean = () => false,
+): { selected: string[]; withheld: string[]; attachments: string[] } {
   const modelCalls = snapshot.steps
     .filter((step) => step.type === "model.call" && step.state === "completed")
     .map((step) => step.sequence);
@@ -3114,27 +3148,40 @@ export function exposedSandboxImages(
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName !== "read" && toolName !== "create_image") return [];
     const path = stringValue(objectValue(step.output).visionPath);
-    if (!path || !binaryMediaType(path)?.startsWith("image/")) return [];
+    if (!path || !binaryMediaType(path)?.startsWith("image/") || takesNoSlot(path)) return [];
     return [{ path, batch: batchOf(step.sequence) }];
   });
-  // A re-read moves an image to the batch that read it last.
-  const latest = new Map<string, number>();
-  for (const read of reads) {
-    latest.delete(read.path);
-    latest.set(read.path, read.batch);
-  }
-  const batches = new Map<number, string[]>();
-  for (const [path, batch] of latest) batches.set(batch, [...(batches.get(batch) ?? []), path]);
   const limit = Math.max(0, capacity);
-  let block: string[] = [];
-  for (const paths of [...batches.entries()].sort(([left], [right]) => left - right).map(([, paths]) => paths)) {
-    if (block.length + paths.length > limit) block = [];
-    block.push(...paths);
+  const blockAfter = (candidates: typeof reads, first: readonly string[]) => {
+    // A re-read moves an image to the batch that read it last.
+    const latest = new Map<string, number>();
+    for (const read of candidates) {
+      latest.delete(read.path);
+      latest.set(read.path, read.batch);
+    }
+    const batches = new Map<number, string[]>();
+    for (const [path, batch] of latest) batches.set(batch, [...(batches.get(batch) ?? []), path]);
+    let block = [...first];
+    let restarted = false;
+    for (const paths of [...batches.entries()].sort(([left], [right]) => left - right).map(([, paths]) => paths)) {
+      if (block.length + paths.length > limit) {
+        block = [];
+        restarted = true;
+      }
+      block.push(...paths);
+    }
+    return { block, restarted, current: batches.get(modelCalls.length) ?? [] };
+  };
+  const shown = attachments.slice(0, limit);
+  const attached = new Set(shown);
+  const beside = shown.length > 0 ? blockAfter(reads.filter((read) => !attached.has(read.path)), shown) : null;
+  if (beside && !beside.restarted) {
+    return { selected: beside.block.slice(shown.length), withheld: [], attachments: shown };
   }
+  const { block, current } = blockAfter(reads, []);
   const selected = limit === 0 ? [] : block.slice(-limit);
-  const current = batches.get(modelCalls.length) ?? [];
   const withheld = current.filter((path) => !selected.includes(path));
-  return { selected, withheld };
+  return { selected, withheld, attachments: [] };
 }
 
 function sandboxAttachmentId(path: string, workspaceRoot = "/workspace"): string | null {

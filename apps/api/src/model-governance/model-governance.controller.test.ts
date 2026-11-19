@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BerryAuthRuntime } from "../auth/auth-runtime.ts";
 import { FilePlatformService } from "../files/file-platform.service.ts";
 import { AgentApiModule } from "../http/agent-api.module.ts";
+import { QueuedFollowUpService } from "../runtime/queued-follow-up.service.ts";
 import { InMemoryEnterpriseIdentityRepository } from "../identity/identity.repository.ts";
 import { InMemoryModelGovernanceRepository, ModelGovernanceService } from "./model-governance.service.ts";
 import { synchronizeRuntimeModels, synchronizeRuntimeProviders } from "./model-governance.controller.ts";
@@ -200,6 +201,9 @@ async function createApp(): Promise<INestApplication> {
       modelGovernance: { service: { useValue: new ModelGovernanceService(new InMemoryModelGovernanceRepository()) } },
     })],
   })
+    // This controller fixture has no database and does not exercise queued turns.
+    .overrideProvider(QueuedFollowUpService)
+    .useValue({})
     .overrideProvider(FilePlatformService)
     .useValue({})
     .compile();

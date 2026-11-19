@@ -86,7 +86,8 @@ const PERSONAL_MEMORY_TOOL_DEFINITIONS: readonly ChatToolDefinition[] = [
   },
 ];
 
-const SETTINGS_REQUEST_REUSE_MS = 5_000;
+const SETTINGS_UNREADABLE_NOTICE = "[Personal memory is unavailable for this message: its settings could not be read. Do not save or forget memories, and do not say that anything was remembered.]";
+const MEMORY_OFF_NOTICE = "[Personal memory is turned off for this user. Do not save or forget memories, and do not say that anything was remembered.]";
 
 export class DurablePersonalMemoryToolExecutor implements DurableTurnToolExecutor {
   constructor(
@@ -98,9 +99,11 @@ export class DurablePersonalMemoryToolExecutor implements DurableTurnToolExecuto
 
   async definitions(snapshot: DurableTurnSnapshot): Promise<readonly ChatToolDefinition[]> {
     const inherited = await this.base.definitions?.(snapshot) ?? [];
-    return (await this.settingsState(snapshot)).enabled
-      ? [...inherited, ...PERSONAL_MEMORY_TOOL_DEFINITIONS]
-      : inherited;
+    // Declared from the deployment alone, so neither a user's setting nor a
+    // failed settings lookup changes the tool list and the provider's cached
+    // prefix (H-032, H-077). Declaring authorizes nothing: execute reads the
+    // settings again and refuses unless memory is on.
+    return this.#deploymentHasMemory() ? [...inherited, ...PERSONAL_MEMORY_TOOL_DEFINITIONS] : inherited;
   }
 
   async modelContent(
@@ -108,37 +111,30 @@ export class DurablePersonalMemoryToolExecutor implements DurableTurnToolExecuto
     signal?: AbortSignal,
     reportProgress?: () => void,
   ): Promise<readonly ChatContentPart[]> {
-    const [inherited, settings] = await Promise.all([
+    const [inherited, notice] = await Promise.all([
       this.base.modelContent?.(snapshot, signal, reportProgress) ?? [],
-      this.settingsState(snapshot),
+      this.#settingsNotice(snapshot),
     ]);
-    return settings.unreadable
-      ? [...inherited, {
-          type: "text",
-          text: "[Personal memory is unavailable for this message: its settings could not be read. Do not save or forget memories, and do not say that anything was remembered.]",
-        }]
-      : inherited;
+    return notice ? [...inherited, { type: "text", text: notice }] : inherited;
   }
 
   /**
-   * The memory settings for one model request. When they cannot be read,
-   * memory is off for that request: consent is never assumed, and the rest of
-   * the request continues with a notice instead of failing (H-077).
+   * What this request tells the model about memory for its user. Settings
+   * that cannot be read leave memory off for the request with a notice
+   * instead of failing it; consent is never assumed (H-077).
    */
-  private settingsState(snapshot: DurableTurnSnapshot): Promise<{ enabled: boolean; unreadable: boolean }> {
-    // Tool definitions and model content are prepared together for one
-    // request; they share one lookup so they cannot disagree.
-    const cached = this.#settingsByRequest.get(snapshot);
-    if (cached && Date.now() - cached.at < SETTINGS_REQUEST_REUSE_MS) return cached.state;
-    const state = this.enabled(snapshot).then(
-      (enabled) => ({ enabled, unreadable: false }),
-      () => ({ enabled: false, unreadable: true }),
-    );
-    this.#settingsByRequest.set(snapshot, { state, at: Date.now() });
-    return state;
+  async #settingsNotice(snapshot: DurableTurnSnapshot): Promise<string | null> {
+    if (!this.#deploymentHasMemory()) return null;
+    try {
+      return await this.enabled(snapshot) ? null : MEMORY_OFF_NOTICE;
+    } catch {
+      return SETTINGS_UNREADABLE_NOTICE;
+    }
   }
 
-  readonly #settingsByRequest = new WeakMap<DurableTurnSnapshot, { state: Promise<{ enabled: boolean; unreadable: boolean }>; at: number }>();
+  #deploymentHasMemory(): boolean {
+    return this.globallyEnabled && this.personalMemory !== null;
+  }
 
   async stageAssociatedInputFiles(
     snapshot: DurableTurnSnapshot,
@@ -201,7 +197,13 @@ export class DurablePersonalMemoryToolExecutor implements DurableTurnToolExecuto
         ? this.base.execute(snapshot, step, signal, reportProgress)
         : this.base.execute(snapshot, step);
     }
-    if (!await this.enabled(snapshot)) {
+    let enabled: boolean;
+    try {
+      enabled = await this.enabled(snapshot);
+    } catch {
+      throw new Error("Personal memory is unavailable right now: its settings could not be read. Nothing was saved or forgotten; do not say that anything was remembered.");
+    }
+    if (!enabled) {
       throw new Error("Personal memory is disabled for this user");
     }
     if (!this.personalMemory) {

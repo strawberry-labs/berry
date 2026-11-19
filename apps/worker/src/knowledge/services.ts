@@ -216,7 +216,11 @@ export function createEmbeddingProviderFromEnv(env: NodeJS.ProcessEnv, input: {
   version: number;
 }): EmbeddingProvider | null {
   if (input.provider !== "openai-compatible") throw new Error(`Unsupported embedding provider: ${input.provider}`);
-  const baseUrl = env.BERRY_EMBEDDING_BASE_URL ?? env.BERRY_ROUTER_INFERENCE_BASE_URL;
+  // Indexing can use its own embedding server (same model) so bulk batches
+  // never queue ahead of the API's live query embeddings.
+  const baseUrl = env.BERRY_INDEX_EMBEDDING_BASE_URL?.trim()
+    || env.BERRY_EMBEDDING_BASE_URL
+    || env.BERRY_ROUTER_INFERENCE_BASE_URL;
   const apiKey = env.BERRY_EMBEDDING_API_KEY ?? env.BERRY_ROUTER_API_KEY;
   if (!baseUrl || !apiKey) return null;
   return new OpenAICompatibleEmbeddingProvider(baseUrl, apiKey, {
