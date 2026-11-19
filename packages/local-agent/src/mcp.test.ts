@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -385,6 +385,161 @@ describe("McpToolSource failure phase", () => {
       await expect(echo.execute("call_1", { message: "berry" } as never, undefined, undefined)).rejects.toMatchObject({ toolCallPhase: "not_sent" });
     } finally {
       await source.close();
+    }
+  });
+});
+
+const catalogFixturePath = join(dirname(fileURLToPath(import.meta.url)), "..", "test", "fixtures", "mcp-catalog-server.mjs");
+
+type CatalogTool = { name: string; description?: string; inputSchema: Record<string, unknown> };
+
+function catalogTool(name: string, properties: Record<string, unknown> = {}): CatalogTool {
+  return { name, description: `The ${name} tool`, inputSchema: { type: "object", properties } };
+}
+
+/** A catalog server whose tools a test can rewrite while connected. */
+function catalogServer(tools: CatalogTool[], env: Record<string, string> = {}, overrides: Partial<McpServerSpec> = {}) {
+  const directory = mkdtempSync(join(tmpdir(), "berry-mcp-catalog-"));
+  const file = join(directory, "tools.json");
+  const log = join(directory, "requests.log");
+  const write = (next: CatalogTool[]) => writeFileSync(file, JSON.stringify(next));
+  write(tools);
+  const spec = stdioServer({
+    id: "mcp_catalog",
+    name: "catalog",
+    args: [catalogFixturePath],
+    env: { MCP_CATALOG_FILE: file, MCP_CATALOG_LOG: log, ...env },
+    ...overrides,
+  });
+  const listRequests = () => {
+    try {
+      return readFileSync(log, "utf8").split("\n").filter(Boolean).length;
+    } catch {
+      return 0;
+    }
+  };
+  return { spec, write, listRequests, cleanup: () => rmSync(directory, { recursive: true, force: true }) };
+}
+
+describe("McpToolSource live tool listing", () => {
+  it("follows tools/list cursors and reports the complete live listing", async () => {
+    const catalog = catalogServer(["a", "b", "c", "d", "e"].map((name) => catalogTool(name)), { MCP_CATALOG_PAGE_SIZE: "2" });
+    const listed: Array<{ reason: string; names: string[] }> = [];
+    const source = new McpToolSource({
+      servers: [catalog.spec],
+      onToolsListed: (_spec, tools, reason) => { listed.push({ reason, names: tools.map((tool) => tool.name) }); },
+    });
+    try {
+      await source.connect();
+      expect(source.listTools().map((tool) => tool.name)).toEqual(["a", "b", "c", "d", "e"].map((name) => `mcp__catalog__${name}`));
+      expect(catalog.listRequests()).toBe(3);
+      expect(listed).toEqual([{ reason: "connect", names: ["a", "b", "c", "d", "e"] }]);
+      expect(source.listedAt("mcp_catalog")).toEqual(expect.any(Number));
+    } finally {
+      await source.close();
+      catalog.cleanup();
+    }
+  });
+
+  it("picks up added, changed and removed tools on refresh and after list_changed", async () => {
+    const catalog = catalogServer([catalogTool("notify_tools_changed"), catalogTool("leave", { kind: { enum: ["sick"] } })]);
+    const listed: Array<{ reason: string; names: string[] }> = [];
+    const source = new McpToolSource({
+      servers: [catalog.spec],
+      onToolsListed: (_spec, tools, reason) => { listed.push({ reason, names: tools.map((tool) => tool.name) }); },
+    });
+    try {
+      await source.connect();
+      catalog.write([
+        catalogTool("notify_tools_changed"),
+        catalogTool("leave", { kind: { enum: ["sick", "annual"] } }),
+        catalogTool("team_list"),
+      ]);
+      await source.refreshTools(["mcp_catalog"]);
+      expect(source.listTools().map((tool) => tool.name)).toContain("mcp__catalog__team_list");
+      expect(source.listTools().find((tool) => tool.name === "mcp__catalog__leave")?.parameters)
+        .toMatchObject({ properties: { kind: { enum: ["sick", "annual"] } } });
+      expect(listed.at(-1)).toEqual({ reason: "refresh", names: ["notify_tools_changed", "leave", "team_list"] });
+
+      catalog.write([catalogTool("notify_tools_changed"), catalogTool("team_list"), catalogTool("team_leave_create")]);
+      const notify = source.listTools().find((tool) => tool.name === "mcp__catalog__notify_tools_changed")!;
+      await notify.execute("call_notify", {} as never, undefined, undefined);
+      await vi.waitFor(() => expect(listed.at(-1)?.reason).toBe("list_changed"), { timeout: 3_000 });
+      expect(source.listTools().map((tool) => tool.name)).toEqual([
+        "mcp__catalog__notify_tools_changed",
+        "mcp__catalog__team_list",
+        "mcp__catalog__team_leave_create",
+      ]);
+    } finally {
+      await source.close();
+      catalog.cleanup();
+    }
+  });
+
+  it("shares one tools/list between concurrent refreshes of a connected server", async () => {
+    const catalog = catalogServer([catalogTool("a")], { MCP_CATALOG_DELAY_MS: "150" });
+    const source = new McpToolSource({ servers: [catalog.spec] });
+    try {
+      await source.connect();
+      expect(catalog.listRequests()).toBe(1);
+      await Promise.all([source.refreshTools(), source.refreshTools(["mcp_catalog"]), source.refreshTools()]);
+      expect(catalog.listRequests()).toBe(2);
+    } finally {
+      await source.close();
+      catalog.cleanup();
+    }
+  });
+
+  it("keeps the previous tools when a refresh fails", async () => {
+    const catalog = catalogServer([catalogTool("a")]);
+    const source = new McpToolSource({ servers: [catalog.spec] });
+    try {
+      await source.connect();
+      writeFileSync(catalog.spec.env.MCP_CATALOG_FILE!, "not json");
+      await expect(source.refreshTools()).resolves.toEqual([expect.objectContaining({ name: "mcp__catalog__a" })]);
+    } finally {
+      await source.close();
+      catalog.cleanup();
+    }
+  });
+
+  it("does not keep a connection that finishes after the source closed", async () => {
+    const catalog = catalogServer([catalogTool("a")], { MCP_CATALOG_DELAY_MS: "200" }, { cachedTools: [catalogTool("cached_only") as never] });
+    const source = new McpToolSource({ servers: [catalog.spec] });
+    try {
+      const refreshing = source.refreshTools();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await source.close();
+      await refreshing;
+      expect(source.listServers()).toEqual([]);
+      expect(source.listedAt("mcp_catalog")).toBeNull();
+      expect(source.listTools().map((tool) => tool.name)).toEqual(["mcp__catalog__cached_only"]);
+    } finally {
+      await source.close();
+      catalog.cleanup();
+    }
+  });
+
+  it("follows a changed approved definition when asked, and never exposes an unapproved tool", async () => {
+    const live = [catalogTool("leave", { kind: { enum: ["sick", "annual"] } }), catalogTool("team_list")];
+    const reviewed = { name: "leave", description: "The leave tool", inputSchema: { type: "object", properties: { kind: { enum: ["sick"] } } } };
+    const strict = catalogServer(live, {}, { allowedTools: ["leave"], cachedTools: [reviewed] });
+    const following = catalogServer(live, {}, { id: "mcp_following", name: "following", allowedTools: ["leave"], cachedTools: [reviewed], followApprovedToolChanges: true });
+    const listed: string[][] = [];
+    const source = new McpToolSource({
+      servers: [strict.spec, following.spec],
+      onToolsListed: (spec, tools) => { if (spec.id === "mcp_following") listed.push(tools.map((tool) => tool.name)); },
+    });
+    try {
+      await source.connect();
+      expect(source.listTools().map((tool) => tool.name)).toEqual(["mcp__following__leave"]);
+      expect(source.listTools()[0]?.parameters).toMatchObject({ properties: { kind: { enum: ["sick", "annual"] } } });
+      // The observer still sees the whole server, including the pending tool.
+      expect(listed).toEqual([["leave", "team_list"]]);
+    } finally {
+      await source.close();
+      strict.cleanup();
+      following.cleanup();
     }
   });
 });

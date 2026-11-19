@@ -1289,6 +1289,54 @@ describe("durable turn runner", () => {
       expect(step).toMatchObject({ type: "tool.mcp__Drive__search", state: "failed" });
       expect(resultText).toContain('mcp__Drive__search was not run: its arguments do not match the tool schema: "query" is required but missing (sent fields: limit)');
     });
+
+    it("refreshes a refused connector schema once and accepts a value the server added", async () => {
+      let kinds = ["sick"];
+      const refreshArgumentSchemas = vi.fn(async () => {
+        kinds = ["sick", "leave"];
+      });
+      const { repository, execute, step } = await run(
+        callWith("use_tool", { tool: "mcp__Connect__log_absence", arguments: { kind: "leave" } }, { retryClass: "read_only", approvalKind: "mcp" }),
+        {
+          policy: (_snapshot, name) => name === "mcp__Connect__log_absence"
+            ? { retryClass: "read_only", repeatPolicy: "compare_result", requiresApproval: false, approvalKind: "mcp" }
+            : undefined,
+          argumentSchema: (_snapshot, name) => name === "mcp__Connect__log_absence"
+            ? { type: "object", required: ["kind"], properties: { kind: { enum: kinds } } }
+            : undefined,
+          refreshArgumentSchemas,
+        },
+      );
+      expect(refreshArgumentSchemas).toHaveBeenCalledOnce();
+      expect(refreshArgumentSchemas).toHaveBeenCalledWith(expect.anything(), ["mcp__Connect__log_absence"]);
+      expect(step?.input).not.toHaveProperty("argumentError");
+      expect(execute).toHaveBeenCalledOnce();
+      expect(repository.current.steps.find((candidate) => candidate.type === "tool.mcp__Connect__log_absence")?.state).toBe("completed");
+    });
+
+    it("still refuses a connector call that breaks the refreshed schema", async () => {
+      const refreshArgumentSchemas = vi.fn(async () => undefined);
+      const { execute, step, resultText } = await run(
+        callWith("use_tool", { tool: "mcp__Connect__log_absence", arguments: { kind: "holiday" } }, { retryClass: "read_only", approvalKind: "mcp" }),
+        {
+          argumentSchema: (_snapshot, name) => name === "mcp__Connect__log_absence"
+            ? { type: "object", required: ["kind"], properties: { kind: { enum: ["sick", "leave"] } } }
+            : undefined,
+          refreshArgumentSchemas,
+        },
+      );
+      expect(refreshArgumentSchemas).toHaveBeenCalledOnce();
+      expect(execute).not.toHaveBeenCalled();
+      expect(step?.state).toBe("failed");
+      expect(resultText).toContain("mcp__Connect__log_absence was not run: its arguments do not match the tool schema");
+    });
+
+    it("does not refresh schemas for invalid JSON or declared tools", async () => {
+      const refreshArgumentSchemas = vi.fn(async () => undefined);
+      await run(callWith("edit", { raw: '{"path": "a' }), { refreshArgumentSchemas });
+      await run(callWith("compose_message", { id: "draft", kind: "sms", variants: "[]" }), { refreshArgumentSchemas });
+      expect(refreshArgumentSchemas).not.toHaveBeenCalled();
+    });
   });
 
   it("does not spend the turn wall-clock budget on persisted human wait", async () => {

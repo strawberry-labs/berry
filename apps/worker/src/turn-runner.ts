@@ -551,6 +551,12 @@ export interface DurableTurnToolExecutor {
   policy?(snapshot: DurableTurnSnapshot, toolName: string, permissionMode: string): DurableToolPolicy | undefined;
   /** Input schema of a tool the model reaches without a declared definition (a connector tool behind use_tool). */
   argumentSchema?(snapshot: DurableTurnSnapshot, toolName: string): unknown;
+  /**
+   * Called before refusing calls whose arguments break a schema from
+   * argumentSchema. An executor whose schemas may be out of date refreshes
+   * them (bounded; never throws), and the arguments are checked again.
+   */
+  refreshArgumentSchemas?(snapshot: DurableTurnSnapshot, toolNames: readonly string[]): Promise<void>;
   /** Return true only when every awaited part of this tool observes the signal. */
   supportsAbort?(snapshot: DurableTurnSnapshot, step: DurableTurnStep): boolean;
   /** Return true only when every awaited model-preparation seam observes the signal. */
@@ -1456,11 +1462,23 @@ export class DurableTurnRunner {
     }];
     const nextSequence = nextStepSequence(snapshot.steps);
     const declaredSchemas = new Map(definitions.map((definition) => [definition.function.name, definition.function.parameters]));
-    const argumentErrors = result.toolCalls.map((call) => toolArgumentError(
+    const checkArguments = () => result.toolCalls.map((call) => toolArgumentError(
       call,
       declaredSchemas,
       (name) => this.tools.argumentSchema?.(snapshot, name),
     ));
+    let argumentErrors = checkArguments();
+    // A connector may have changed a tool since its schema was stored, so
+    // refresh refused connector schemas once before refusing the call.
+    const schemaRefusals = [...new Set(result.toolCalls.filter((call, index) =>
+      argumentErrors[index] !== null
+      && !declaredSchemas.has(call.name)
+      && unparsedToolArguments(call.invocation?.arguments ?? call.input, declaredSchemas.get(call.invocation?.name ?? call.name)) === null
+    ).map((call) => call.name))];
+    if (schemaRefusals.length > 0 && this.tools.refreshArgumentSchemas) {
+      await this.tools.refreshArgumentSchemas(snapshot, schemaRefusals).catch(() => undefined);
+      argumentErrors = checkArguments();
+    }
     const toolSteps = result.toolCalls.map((call, index): DurableStepMutation => ({
       id: randomUUID(),
       sequence: nextSequence + index,
