@@ -81,12 +81,29 @@ export function toolFailureAction(category: ToolFailureCategory): string {
   return ACTIONS[category];
 }
 
+/** A verified connector response rejected a write before applying it. */
+export class McpWriteValidationError extends Error {
+  constructor(message: string, readonly status: number, options?: ErrorOptions) {
+    super(message, options);
+  }
+}
+
 /**
  * Classifies one tool failure. `changesState` is false for read-only tools:
  * a failed read never needs an outcome check, while a failed change-making call
  * that may have reached its target has an unknown outcome.
  */
 export function classifyToolFailure(error: unknown, options: { changesState: boolean; timedOut?: boolean }): ToolFailure {
+  if (error instanceof McpWriteValidationError) {
+    return {
+      category: "invalid_input",
+      deterministic: true,
+      outcome: "not_applied",
+      outcomeVersion: TOOL_FAILURE_OUTCOME_VERSION,
+      status: error.status,
+      action: ACTIONS.invalid_input,
+    };
+  }
   if (error instanceof McpConnectionError) return mcpConnectionFailure(error, options.changesState);
   const transport = classifyProviderFailure(error);
   const details = structuredFailureDetails(error);

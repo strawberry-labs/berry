@@ -2287,6 +2287,14 @@ export type TurnEndStatus = z.infer<typeof TurnEndStatusSchema>;
 export const SessionNoteKindSchema = z.enum(["compacting", "compacted", "resumed", "forked", "rewound", "steered", "followed-up", "limit-reached"]);
 export type SessionNoteKind = z.infer<typeof SessionNoteKindSchema>;
 
+const ApprovalWritePreviewSchema = z.object({
+  service: z.string(),
+  action: z.string(),
+  approveLabel: z.string(),
+  fields: z.array(z.object({ label: z.string(), value: z.string() })),
+});
+export type ApprovalWritePreview = z.infer<typeof ApprovalWritePreviewSchema>;
+
 /**
  * Streaming vocabulary for a single agent turn. The host pushes these to the
  * renderer as JSON-RPC notifications; the renderer folds them into thread state.
@@ -2345,6 +2353,7 @@ export const AgentStreamEventSchema = z.discriminatedUnion("kind", [
     diff: z.string().optional(),
     destructive: z.boolean().optional(),
     openWorld: z.boolean().optional(),
+    writePreview: ApprovalWritePreviewSchema.optional(),
   }),
   z.object({
     kind: z.literal("approval.resolved"),

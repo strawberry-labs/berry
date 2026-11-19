@@ -565,6 +565,11 @@ export function BerryThreadView({
   const liveTimelineWindow = windowLiveTimeline(stream.timeline);
   const omittedLiveActivity = stream.timelineOmitted + liveTimelineWindow.omitted;
   const liveSegments = groupLiveTimeline(liveTimelineWindow.entries);
+  const reviewingWrite = stream.approval?.writePreview !== undefined;
+  const foldedApprovalIntroduction = reviewingWrite && !stream.text
+    ? [...liveSegments].reverse().find((segment) => segment.kind === "text")
+    : undefined;
+  const approvalIntroduction = reviewingWrite ? stream.text || foldedApprovalIntroduction?.text : undefined;
   const liveTimelineOnlyNotes = stream.timeline.length > 0 && stream.timeline.every((entry) => entry.kind === "note");
   let liveThoughtOrdinal = 0;
   const liveActivityNodes = [
@@ -578,6 +583,7 @@ export function BerryThreadView({
       </div>
     )] : []),
     ...liveSegments.map((segment, index) => {
+      if (segment === foldedApprovalIntroduction) return null;
       if (segment.kind === "tools") {
         return (
           <ToolFlow
@@ -873,8 +879,9 @@ export function BerryThreadView({
                       ) : (
                         <TurnActivity
                           turnKey={liveTurnKey}
-                          active={stream.turnActive}
+                          active={stream.turnActive && !reviewingWrite}
                           activeLabel={activeStatus}
+                          inactiveLabel={reviewingWrite ? "Activity" : undefined}
                           elapsedMs={stream.turnStartedAt ? now - stream.turnStartedAt : undefined}
                           liveAction={
                             stream.turnActive
@@ -886,7 +893,7 @@ export function BerryThreadView({
                         </TurnActivity>
                       )}
                     </BerryActivityStackBlock>
-                  ) : stream.turnActive && stream.text.length === 0 ? (
+                  ) : stream.turnActive && stream.text.length === 0 && !reviewingWrite ? (
                     <BerryActivityStackBlock>
                       {showPendingTurnActivity ? (
                         <TurnActivity
@@ -901,9 +908,10 @@ export function BerryThreadView({
                       )}
                     </BerryActivityStackBlock>
                   ) : null}
+                  {approvalIntroduction ? <BerryAssistantMarkdownBlock>{approvalIntroduction}</BerryAssistantMarkdownBlock> : null}
                   {stream.approval ? (
                     <BerryActivityStackBlock>
-                      <BerryApprovalAccordion approval={stream.approval} adapter={adapter} />
+                      <BerryApprovalAccordion key={stream.approval.approvalId} approval={stream.approval} adapter={adapter} />
                     </BerryActivityStackBlock>
                   ) : null}
                   {showQuestions && stream.question ? (
@@ -911,7 +919,7 @@ export function BerryThreadView({
                       <BerryQuestionAccordion question={stream.question} adapter={adapter} />
                     </BerryActivityStackBlock>
                   ) : null}
-                  {stream.text ? <BerryAssistantMarkdownBlock live={shouldUseLiveMarkdown(stream)}>{stream.text}</BerryAssistantMarkdownBlock> : null}
+                  {!reviewingWrite && stream.text ? <BerryAssistantMarkdownBlock live={shouldUseLiveMarkdown(stream)}>{stream.text}</BerryAssistantMarkdownBlock> : null}
                   {stream.error ? <BerryAssistantErrorBlock>{stream.error}</BerryAssistantErrorBlock> : null}
                   {liveContent}
                 </div>
@@ -1483,15 +1491,62 @@ export function BerryActivityStackBlock({ children }: { children: React.ReactNod
 
 export function BerryApprovalAccordion({ approval, adapter }: { approval: ApprovalPrompt; adapter: BerryThreadAdapter }) {
   const [pending, setPending] = React.useState(false);
+  const [decisionError, setDecisionError] = React.useState<string>();
   const decide = async (decision: ApprovalDecision) => {
-    if (!adapter.onApprovalDecide) return;
+    if (pending || !adapter.onApprovalDecide) return;
     setPending(true);
+    setDecisionError(undefined);
     try {
       await adapter.onApprovalDecide(approval, decision);
+    } catch {
+      setDecisionError("Berry couldn’t record your decision. Try again.");
     } finally {
       setPending(false);
     }
   };
+
+  const preview = approval.writePreview;
+  if (preview) {
+    return (
+      <section aria-label={`Review ${preview.service} action`} aria-busy={pending} className="berry-activity-surface w-full max-w-[560px] overflow-hidden">
+        <div className="flex items-center gap-3 px-4 pt-4">
+          <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-accent text-foreground">
+            <ShieldQuestion className="size-4" aria-hidden="true" />
+          </span>
+          <div className="min-w-0">
+            <p className="text-xs text-muted-foreground">{preview.service} · {preview.action}</p>
+            <h3 className="break-words text-sm font-semibold text-foreground">{approval.title}</h3>
+          </div>
+        </div>
+        {preview.fields.length > 0 ? (
+          <dl className="mx-4 mt-4 grid max-h-64 grid-cols-[5.5rem_minmax(0,1fr)] gap-x-3 gap-y-2 overflow-auto border-t border-border/60 pt-3 text-xs">
+            {preview.fields.map(({ label, value }, index) => (
+              <React.Fragment key={`${label}-${index}`}>
+                <dt className="break-words text-muted-foreground">{label}</dt>
+                <dd className="whitespace-pre-wrap break-words text-foreground" dir="auto">{value}</dd>
+              </React.Fragment>
+            ))}
+          </dl>
+        ) : null}
+        {approval.detail ? (
+          <p className="mx-4 mt-3 max-h-44 overflow-auto whitespace-pre-wrap break-words text-xs text-muted-foreground" dir="auto">
+            {approval.detail}
+          </p>
+        ) : null}
+        {adapter.onApprovalDecide ? (
+          <div className="flex flex-wrap items-center gap-2 px-4 py-4">
+            <Button size="sm" className="min-h-10" disabled={pending} onClick={() => void decide("approved_once")}>
+              {preview.approveLabel}
+            </Button>
+            <Button size="sm" className="min-h-10" variant="outline" disabled={pending} onClick={() => void decide("denied")}>
+              Decline
+            </Button>
+          </div>
+        ) : null}
+        {decisionError ? <p className="px-4 pb-4 text-xs text-destructive" role="alert">{decisionError}</p> : null}
+      </section>
+    );
+  }
 
   return (
     <div className="berry-activity-surface overflow-hidden">
@@ -1535,6 +1590,7 @@ export function BerryApprovalAccordion({ approval, adapter }: { approval: Approv
           </Button>
         </div>
       ) : null}
+      {decisionError ? <p className="px-3 pb-3 text-xs text-destructive" role="alert">{decisionError}</p> : null}
     </div>
   );
 }

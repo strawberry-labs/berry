@@ -1,12 +1,12 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { McpToolSource, type McpServerSpec } from "@berry/local-agent/mcp";
+import { McpToolError, McpToolSource, type McpServerSpec } from "@berry/local-agent/mcp";
 import { openDurableSecret, type DurableSecretEnvelope } from "@berry/shared";
 import type { ChatToolDefinition } from "@berry/router-client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DurableTurnSnapshot, DurableTurnStep, DurableTurnToolExecutor } from "./turn-runner.js";
 import type { ToolResultStore } from "./tool-result-store.js";
-import { classifyToolFailure } from "./tool-failures.js";
+import { classifyToolFailure, McpWriteValidationError, TOOL_FAILURE_OUTCOME_VERSION } from "./tool-failures.js";
 import {
   boundedMcpText,
   connectorArtifactText,
@@ -16,6 +16,54 @@ import {
 } from "./mcp-tools.js";
 
 describe("durable MCP tool exposure", () => {
+  it.each([true, false])("recognizes a Calendar insert rejection only from the admitted Google connector (%s)", async (native) => {
+    const connectorId = "connector_google_calendar";
+    const remoteName = "google_calendar_create_event";
+    const name = `mcp__Google_Calendar__${remoteName}`;
+    const snapshot = mcpSnapshot("Schedule an interview");
+    snapshot.runtimeRequest.permissionMode = "full-access";
+    const server = connectorServer(native ? connectorId : "custom-calendar", "Google Calendar", true, remoteName, "Create an event");
+    server.defaultTools = [remoteName];
+    server.cachedTools![0]!.annotations = { idempotentHint: true, readOnlyHint: false };
+    if (native) server.credentialKey = `connector:${connectorId}:${snapshot.userId}`;
+    const error = new McpToolError("Google API 400: Invalid resource id value.", { code: "berry_google_calendar_insert_rejected", status: 400 });
+    const list = McpToolSource.prototype.listTools;
+    const spy = vi.spyOn(McpToolSource.prototype, "listTools").mockImplementation(function (this: McpToolSource) {
+      return list.call(this).map((tool) => tool.name === name ? { ...tool, execute: async () => { throw error; } } : tool);
+    });
+    const executor = new DurableMcpToolExecutor({ execute: vi.fn() }, [server], undefined);
+    const step: DurableTurnStep = {
+      id: "create-meeting", sequence: 1, type: `tool.${name}`, state: "pending", output: null,
+      input: {
+        toolName: name,
+        arguments: { summary: "Interview", attendees: ["guest@example.com"], sendUpdates: "all" },
+        requiresApproval: false,
+      },
+      retryClass: "idempotent_with_key", idempotencyKey: "stable-meeting-key", attempt: 0, error: null,
+    };
+
+    try {
+      expect(executor.policy(snapshot, name, "full-access")?.requiresApproval).toBe(native);
+      if (native) {
+        await expect(executor.requiredWriteApproval(snapshot, step)).resolves.toMatchObject({
+          title: "Interview",
+          writePreview: { service: "Google Calendar", action: "Create event", approveLabel: "Approve and send invites" },
+        });
+        const rejected = await executor.execute(snapshot, step).catch((cause: unknown) => cause);
+        expect(rejected).toBeInstanceOf(McpWriteValidationError);
+        expect(classifyToolFailure(rejected, { changesState: true })).toMatchObject({
+          category: "invalid_input", outcome: "not_applied", outcomeVersion: TOOL_FAILURE_OUTCOME_VERSION, status: 400,
+        });
+      } else {
+        await expect(executor.requiredWriteApproval(snapshot, step)).resolves.toBeUndefined();
+        await expect(executor.execute(snapshot, step)).rejects.toBe(error);
+      }
+    } finally {
+      spy.mockRestore();
+      await executor.close();
+    }
+  });
+
   it("uses the current lease before the deadline and suppresses calls after a confirmed reconnect requirement", async () => {
     const key = Buffer.alloc(32, 8).toString("base64");
     const server = connectorServer("connector_mcp_test", "Connect", true, "remove_record", "Remove a record");
@@ -694,14 +742,14 @@ describe("durable MCP approval policy", () => {
     expect(policy).toMatchObject({ retryClass: "non_idempotent_manual", requiresApproval: false });
   });
 
-  it("keeps reviewable native drafts approval-free in full-access tasks", () => {
+  it("requires approval even in full access for listed connector writes", () => {
     const policy = durableMcpToolPolicy(
-      { trustReadOnlyAnnotations: true },
-      { readOnly: false, destructive: false, idempotent: false, openWorld: true },
+      {},
+      { readOnly: false, requiresApproval: true, mandatoryApproval: true, destructive: false, idempotent: false, openWorld: true },
       "full-access",
     );
 
-    expect(policy).toMatchObject({ requiresApproval: false });
+    expect(policy).toMatchObject({ requiresApproval: true });
   });
 });
 

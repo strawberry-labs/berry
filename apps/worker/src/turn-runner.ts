@@ -44,6 +44,7 @@ import {
   measureContextEntries,
   resolveContextBudget,
   type AgentStreamEvent,
+  type ApprovalWritePreview,
   type DurableBuiltInToolName,
   type DurableProviderTransport,
   type DurableSkill,
@@ -565,6 +566,11 @@ export interface DurableTurnToolExecutor {
     reportProgress?: () => void,
   ): Promise<readonly ChatContentPart[]>;
   policy?(snapshot: DurableTurnSnapshot, toolName: string, permissionMode: string): DurableToolPolicy | undefined;
+  requiredWriteApproval?(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<{
+    title: string;
+    detail?: string;
+    writePreview: ApprovalWritePreview;
+  } | undefined>;
   /** Input schema of a tool the model reaches without a declared definition (a connector tool behind use_tool). */
   argumentSchema?(snapshot: DurableTurnSnapshot, toolName: string): unknown;
   /** Return true only when every awaited part of this tool observes the signal. */
@@ -1948,7 +1954,10 @@ export class DurableTurnRunner {
     }
 
     const approval = snapshot.approvals.find((candidate) => candidate.stepId === step.id);
-    const requiresApproval = step.input.requiresApproval === true && !argumentError && !interrupted;
+    // Recheck at execution so a pending step journaled under an older policy
+    // still gets the current connector's mandatory approval.
+    const writeApproval = argumentError || interrupted ? undefined : await this.tools.requiredWriteApproval?.(snapshot, step);
+    const requiresApproval = !argumentError && !interrupted && (writeApproval !== undefined || step.input.requiresApproval === true);
     if (requiresApproval && approval?.status !== "approved") {
       if (approval?.status === "denied" || approval?.status === "expired") {
         const entryId = randomUUID();
@@ -2005,7 +2014,10 @@ export class DurableTurnRunner {
       }
       if (!approval) {
         const approvalId = randomUUID();
-        const kind = approvalKind(step.input.approvalKind);
+        const kind = writeApproval ? "mcp" : approvalKind(step.input.approvalKind);
+        const title = writeApproval?.title ?? `Approve ${toolName}`;
+        const detail = writeApproval ? writeApproval.detail : JSON.stringify(step.input.arguments ?? {});
+        const preview = writeApproval ? { writePreview: writeApproval.writePreview } : {};
         await this.repository.commit(snapshot, {
           expectedState: "executing_tool",
           nextState: "waiting",
@@ -2016,8 +2028,9 @@ export class DurableTurnRunner {
             toolCallId,
             kind,
             request: {
-              title: `Approve ${stringValue(step.input.toolName) ?? step.type.slice(5)}`,
-              detail: JSON.stringify(step.input.arguments ?? {}),
+              title,
+              ...(detail !== undefined ? { detail } : {}),
+              ...preview,
               retryClass: step.retryClass,
             },
           },
@@ -2025,9 +2038,10 @@ export class DurableTurnRunner {
             kind: "approval.request",
             approvalId,
             approvalKind: kind,
-            title: `Approve ${stringValue(step.input.toolName) ?? step.type.slice(5)}`,
-            detail: JSON.stringify(step.input.arguments ?? {}).slice(0, 4_000),
-            destructive: step.retryClass === "non_idempotent_manual",
+            title,
+            ...(detail !== undefined ? { detail: detail.slice(0, 4_000) } : {}),
+            ...preview,
+            destructive: !writeApproval && step.retryClass === "non_idempotent_manual",
           }],
           waitingReason: "approval",
           nextAction: "Wait for an approval decision",

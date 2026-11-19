@@ -73,11 +73,11 @@ function tool(
   access: GoogleAccessLevel,
   scopes: ScopeRequirement,
   run: ToolDefinition["run"],
-  options: { destructive?: boolean; idempotent?: boolean; openWorld?: boolean; approvalRequired?: boolean } = {},
+  options: { destructive?: boolean; idempotent?: boolean; openWorld?: boolean } = {},
 ): ToolDefinition {
   return {
     name, description, inputSchema, access, scopes, run,
-    approvalRequired: options.approvalRequired ?? access === "full",
+    approvalRequired: access === "full",
     annotations: {
       readOnlyHint: access === "read",
       destructiveHint: options.destructive ?? false,
@@ -175,8 +175,8 @@ const gmailTools: ToolDefinition[] = [
   tool("gmail_list_labels", "List Gmail labels.", object({}), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token) => googleJson(token, gmailUrl("users/me/labels"))),
   tool("gmail_list_drafts", "List Gmail drafts.", gmailSearchSchema("drafts"), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl("users/me/drafts", gmailSearchQuery(input)))),
   tool("gmail_get_draft", "Get one Gmail draft.", object({ draftId: string("Draft ID."), format: string("Message format.", { enum: ["full", "metadata", "minimal", "raw"] }) }, ["draftId"]), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl(`users/me/drafts/${encodeURIComponent(requiredString(input.draftId, "draftId"))}`, { format: optionalString(input.format) ?? "full" }))),
-  tool("gmail_create_draft", "Create a reviewable Gmail draft. This does not send it.", mailSchema(), "full", { all: [SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl("users/me/drafts"), { method: "POST", body: jsonBody({ message: compact({ raw: encodeMail(input), threadId: optionalString(input.threadId) }) }) }), { openWorld: true, approvalRequired: false }),
-  tool("gmail_update_draft", "Replace the content of a Gmail draft.", mailSchema({ draftId: string("Draft ID.") }, ["draftId"]), "full", { all: [SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl(`users/me/drafts/${encodeURIComponent(requiredString(input.draftId, "draftId"))}`), { method: "PUT", body: jsonBody({ id: requiredString(input.draftId, "draftId"), message: compact({ raw: encodeMail(input), threadId: optionalString(input.threadId) }) }) }), { idempotent: true, openWorld: true, approvalRequired: false }),
+  tool("gmail_create_draft", "Create a reviewable Gmail draft. This does not send it.", mailSchema(), "full", { all: [SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl("users/me/drafts"), { method: "POST", body: jsonBody({ message: compact({ raw: encodeMail(input), threadId: optionalString(input.threadId) }) }) }), { openWorld: true }),
+  tool("gmail_update_draft", "Replace the content of a Gmail draft.", mailSchema({ draftId: string("Draft ID.") }, ["draftId"]), "full", { all: [SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl(`users/me/drafts/${encodeURIComponent(requiredString(input.draftId, "draftId"))}`), { method: "PUT", body: jsonBody({ id: requiredString(input.draftId, "draftId"), message: compact({ raw: encodeMail(input), threadId: optionalString(input.threadId) }) }) }), { idempotent: true, openWorld: true }),
   tool("gmail_send_draft", "Send an existing Gmail draft.", object({ draftId: string("Draft ID.") }, ["draftId"]), "full", { all: [SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl("users/me/drafts/send"), { method: "POST", body: jsonBody({ id: requiredString(input.draftId, "draftId") }) }), { destructive: true, openWorld: true }),
   tool("gmail_send_message", "Send an email from the connected Gmail account.", mailSchema(), "full", { all: [SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl("users/me/messages/send"), { method: "POST", body: jsonBody(compact({ raw: encodeMail(input), threadId: optionalString(input.threadId) })) }), { destructive: true, openWorld: true }),
   tool("gmail_reply_to_thread", "Send a correctly threaded reply. Supply the parent Message-ID and References headers from the thread.", mailSchema({ threadId: string("Thread ID."), inReplyTo: string("Parent Message-ID header."), references: string("References header."), subject: string("Matching subject.") }, ["threadId", "inReplyTo", "references"]), "full", { all: [SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl("users/me/messages/send"), { method: "POST", body: jsonBody({ raw: encodeMail(input), threadId: requiredString(input.threadId, "threadId") }) }), { destructive: true, openWorld: true }),
@@ -280,7 +280,23 @@ async function googleFetch(token: string, url: string, init: RequestInit = {}): 
   }
   return last!;
 }
-function googleError(status: number, text: string): Error { let message = `HTTP ${status}`; try { const parsed = JSON.parse(text) as { error?: { message?: string; status?: string } }; message = parsed.error?.message ?? parsed.error?.status ?? message; } catch { /* redacted fallback */ } return new Error(`Google API ${status}: ${message.slice(0, 500)}`); }
+class GoogleApiError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(`Google API ${status}: ${message.slice(0, 500)}`);
+  }
+}
+
+export class GoogleCalendarInsertRejected extends Error {}
+
+function googleError(status: number, text: string): GoogleApiError {
+  let message = `HTTP ${status}`;
+  try {
+    const parsed = JSON.parse(text) as { error?: { message?: string; status?: string } };
+    const detail = parsed?.error?.message ?? parsed?.error?.status;
+    if (typeof detail === "string") message = detail;
+  } catch { /* redacted fallback */ }
+  return new GoogleApiError(status, message);
+}
 
 async function searchDriveFiles(token: string, input: Record<string, unknown>): Promise<unknown> {
   const driveId = optionalString(input.driveId);
@@ -612,10 +628,62 @@ function calendarListEventsSchema(): Record<string, unknown> { return object({ c
 function listCalendarEvents(token: string, input: Record<string, unknown>) { const singleEvents = optionalBoolean(input.singleEvents) ?? true; const orderBy = optionalString(input.orderBy) ?? (singleEvents ? "startTime" : "updated"); if (orderBy === "startTime" && !singleEvents) throw new Error("startTime ordering requires singleEvents=true"); return googleJson(token, calendarUrl(`calendars/${encodeURIComponent(optionalString(input.calendarId) ?? "primary")}/events`, { q: optionalString(input.query), timeMin: optionalString(input.timeMin), timeMax: optionalString(input.timeMax), maxResults: boundedInteger(input.maxResults, 100, 1, 2500), pageToken: optionalString(input.pageToken), singleEvents, orderBy })); }
 function freeBusySchema(): Record<string, unknown> { return object({ timeMin: string("RFC3339 start."), timeMax: string("RFC3339 end."), timeZone: string("IANA time zone."), calendarIds: stringArray("Calendar IDs or attendee emails, maximum 50.", 50) }, ["timeMin", "timeMax", "calendarIds"]); }
 function queryFreeBusy(token: string, input: Record<string, unknown>) { const ids = requiredStringArray(input.calendarIds, "calendarIds"); if (ids.length > 50) throw new Error("Free/busy supports at most 50 calendars per query"); return googleJson(token, calendarUrl("freeBusy"), { method: "POST", body: jsonBody(compact({ timeMin: requiredDate(input.timeMin, "timeMin").toISOString(), timeMax: requiredDate(input.timeMax, "timeMax").toISOString(), timeZone: optionalString(input.timeZone), groupExpansionMax: 100, calendarExpansionMax: 50, items: ids.map((id) => ({ id })) })) }); }
-async function suggestCalendarTimes(token: string, input: Record<string, unknown>): Promise<unknown> { const response = await queryFreeBusy(token, input) as Record<string, unknown>; const calendars = record(response.calendars) ?? {}; const busy = Object.values(calendars).flatMap((calendar) => Array.isArray(record(calendar)?.busy) ? record(calendar)!.busy as unknown[] : []).flatMap((slot) => { const item = record(slot); if (!item) return []; const start = Date.parse(String(item.start)); const end = Date.parse(String(item.end)); return Number.isFinite(start) && Number.isFinite(end) ? [{ start, end }] : []; }).sort((a, b) => a.start - b.start); const min = requiredDate(input.timeMin, "timeMin").getTime(); const max = requiredDate(input.timeMax, "timeMax").getTime(); const duration = boundedInteger(input.durationMinutes, 30, 5, 480) * 60_000; const step = boundedInteger(input.intervalMinutes, 15, 5, 120) * 60_000; const suggestions: Array<{ start: string; end: string }> = []; for (let start = min; start + duration <= max && suggestions.length < 20; start += step) { if (!busy.some((slot) => start < slot.end && start + duration > slot.start)) suggestions.push({ start: new Date(start).toISOString(), end: new Date(start + duration).toISOString() }); } return { suggestions, busySource: response }; }
+async function suggestCalendarTimes(token: string, input: Record<string, unknown>): Promise<unknown> {
+  const response = await queryFreeBusy(token, input) as Record<string, unknown>;
+  const calendars = record(response.calendars) ?? {};
+  const groups = record(response.groups) ?? {};
+  const requested = requiredStringArray(input.calendarIds, "calendarIds");
+  const hasAvailability = (id: string) => {
+    const calendar = record(calendars[id]);
+    return Array.isArray(calendar?.busy) && !(Array.isArray(calendar.errors) && calendar.errors.length > 0);
+  };
+  // An incomplete calendar or group result leaves its availability unknown.
+  const unavailableCalendarIds = requested.filter((id) => {
+    const group = record(groups[id]);
+    if (!group) return !hasAvailability(id);
+    const members = optionalStringArray(group.calendars);
+    return !members?.length || (Array.isArray(group.errors) && group.errors.length > 0) || !members.every(hasAvailability);
+  });
+  if (unavailableCalendarIds.length > 0) return { suggestions: [], unavailableCalendarIds, busySource: response };
+  const busy = Object.values(calendars).flatMap((calendar) => {
+    const slots = record(calendar)?.busy;
+    return Array.isArray(slots) ? slots.flatMap((slot: unknown) => {
+      const start = Date.parse(String(record(slot)?.start));
+      const end = Date.parse(String(record(slot)?.end));
+      return Number.isFinite(start) && Number.isFinite(end) ? [{ start, end }] : [];
+    }) : [];
+  }).sort((a, b) => a.start - b.start);
+  const min = requiredDate(input.timeMin, "timeMin").getTime();
+  const max = requiredDate(input.timeMax, "timeMax").getTime();
+  const duration = boundedInteger(input.durationMinutes, 30, 5, 480) * 60_000;
+  const step = boundedInteger(input.intervalMinutes, 15, 5, 120) * 60_000;
+  const suggestions: Array<{ start: string; end: string }> = [];
+  for (let start = min; start + duration <= max && suggestions.length < 20; start += step) {
+    if (!busy.some((slot) => start < slot.end && start + duration > slot.start)) {
+      suggestions.push({ start: new Date(start).toISOString(), end: new Date(start + duration).toISOString() });
+    }
+  }
+  return { suggestions, busySource: response };
+}
 function calendarEventSchema(update: boolean): Record<string, unknown> { return object({ calendarId: string("Calendar ID, normally primary."), ...(update ? { eventId: string("Event ID.") } : { idempotencyKey: string("Stable idempotency key for retries.") }), summary: string("Event title."), description: string("Description."), location: string("Location."), start: string("RFC3339 date-time."), end: string("RFC3339 date-time."), timeZone: string("IANA time zone."), attendees: stringArray("Attendee emails.", 200), sendUpdates: string("Invitation email behavior.", { enum: ["all", "externalOnly", "none"] }), createMeet: boolean("Create Google Meet conference."), recurrence: stringArray("RFC5545 recurrence rules.", 20) }, [update ? "eventId" : "idempotencyKey", "summary", "start", "end"]); }
 function eventResource(input: Record<string, unknown>): Record<string, unknown> { const start = requiredDate(input.start, "start"); const end = requiredDate(input.end, "end"); if (end <= start) throw new Error("Event end must be after start"); const meet = input.createMeet === true ? { createRequest: { requestId: randomUUID(), conferenceSolutionKey: { type: "hangoutsMeet" } } } : undefined; return compact({ summary: requiredString(input.summary, "summary"), description: optionalString(input.description), location: optionalString(input.location), start: compact({ dateTime: start.toISOString(), timeZone: optionalString(input.timeZone) }), end: compact({ dateTime: end.toISOString(), timeZone: optionalString(input.timeZone) }), attendees: optionalStringArray(input.attendees)?.map((email) => ({ email })), recurrence: optionalStringArray(input.recurrence), conferenceData: meet }); }
-function createCalendarEvent(token: string, input: Record<string, unknown>) { const event = eventResource(input); const id = calendarEventId(requiredString(input.idempotencyKey, "idempotencyKey")); return googleJson(token, calendarUrl(`calendars/${encodeURIComponent(optionalString(input.calendarId) ?? "primary")}/events`, { sendUpdates: optionalString(input.sendUpdates) ?? "none", conferenceDataVersion: input.createMeet === true ? 1 : undefined }), { method: "POST", body: jsonBody({ id, ...event }) }); }
+async function createCalendarEvent(token: string, input: Record<string, unknown>) {
+  const event = eventResource(input);
+  const id = createHash("sha256").update(requiredString(input.idempotencyKey, "idempotencyKey")).digest("hex");
+  const url = calendarUrl(`calendars/${encodeURIComponent(optionalString(input.calendarId) ?? "primary")}/events`, {
+    sendUpdates: optionalString(input.sendUpdates) ?? "none",
+    conferenceDataVersion: input.createMeet === true ? 1 : undefined,
+  });
+  try {
+    return await googleJson(token, url, { method: "POST", body: jsonBody({ id, ...event }) });
+  } catch (error) {
+    // A 400 from this single insert request confirms that Calendar rejected the event.
+    if (error instanceof GoogleApiError && error.status === 400) {
+      throw new GoogleCalendarInsertRejected(error.message, { cause: error });
+    }
+    throw error;
+  }
+}
 async function updateCalendarEvent(token: string, input: Record<string, unknown>): Promise<unknown> { const calendarId = optionalString(input.calendarId) ?? "primary"; const eventId = requiredString(input.eventId, "eventId"); const current = await googleJson(token, calendarUrl(`calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`)) as Record<string, unknown>; if (current.recurringEventId && optionalStringArray(input.recurrence)?.length) throw new Error("Changing recurrence on one occurrence is not supported"); const updated = { ...current, ...eventResource(input), id: current.id, etag: current.etag }; return googleJson(token, calendarUrl(`calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`, { sendUpdates: optionalString(input.sendUpdates) ?? "none", conferenceDataVersion: input.createMeet === true || current.conferenceData ? 1 : undefined }), { method: "PUT", ...(typeof current.etag === "string" ? { headers: { "if-match": current.etag } } : {}), body: jsonBody(updated) }); }
 async function respondToEvent(token: string, input: Record<string, unknown>, context: ToolContext): Promise<unknown> { const calendarId = optionalString(input.calendarId) ?? "primary"; const eventId = requiredString(input.eventId, "eventId"); const event = await googleJson(token, calendarUrl(`calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`)) as Record<string, unknown>; const attendees = Array.isArray(event.attendees) ? event.attendees.map((value) => ({ ...requiredObject(value, "attendee") })) : []; const attendee = attendees.find((value) => value.self === true || (context.accountEmail && value.email === context.accountEmail)); if (!attendee) throw new Error("The connected account is not an attendee on this event"); attendee.responseStatus = requiredEnum(input.responseStatus, ["accepted", "declined", "tentative"], "responseStatus"); return googleJson(token, calendarUrl(`calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`, { sendUpdates: optionalString(input.sendUpdates) ?? "none" }), { method: "PUT", ...(typeof event.etag === "string" ? { headers: { "if-match": event.etag } } : {}), body: jsonBody({ ...event, attendees }) }); }
 
@@ -670,5 +738,4 @@ function requiredDate(value: unknown, name: string): Date { const date = new Dat
 function safeHeader(value: string): string { return value.replace(/[\r\n]+/g, " ").trim(); }
 function safeHeaderList(values: string[]): string { return values.map(safeHeader).join(", "); }
 function googleObjectId(prefix: string): string { return `${prefix}_${randomUUID().replace(/-/g, "")}`.slice(0, 50); }
-function calendarEventId(value: string): string { const normalized = Buffer.from(value).toString("hex").toLowerCase(); return `berry${normalized}`.slice(0, 128).padEnd(10, "0"); }
 function hexColor(value: string): Record<string, number> { const match = /^#?([0-9a-f]{6})$/i.exec(value); if (!match) throw new Error("backgroundColorHex must be six hexadecimal digits"); const hex = match[1]!; return { red: parseInt(hex.slice(0, 2), 16) / 255, green: parseInt(hex.slice(2, 4), 16) / 255, blue: parseInt(hex.slice(4, 6), 16) / 255 }; }

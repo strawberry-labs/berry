@@ -633,6 +633,7 @@ export class McpToolSource {
     readOnly: boolean;
     trustedReadOnly?: true;
     nonReplayable?: true;
+    mandatoryApproval?: true;
     requiresApproval?: true;
     destructive: boolean;
     idempotent: boolean;
@@ -649,6 +650,7 @@ export class McpToolSource {
         readOnly: tool.annotations?.readOnlyHint === true,
         ...(spec.trustReadOnlyAnnotations === true && tool.annotations?.readOnlyHint === true ? { trustedReadOnly: true as const } : {}),
         ...(spec.nonReplayableTools?.includes(tool.name) ? { nonReplayable: true as const } : {}),
+        ...(spec.approvalRequiredTools?.includes(tool.name) ? { mandatoryApproval: true as const } : {}),
         ...(spec.trustReadOnlyAnnotations !== true || spec.approvalRequiredTools?.includes(tool.name)
           ? { requiresApproval: true as const }
           : {}),

@@ -32,6 +32,11 @@ export const GoogleMcpReconnectSchema = z.object({
   grantId: Revision,
 }).strict();
 
+export const GoogleCalendarInsertRejectionSchema = z.object({
+  code: z.literal("berry_google_calendar_insert_rejected"),
+  status: z.literal(400),
+}).strict();
+
 export const TaskConnectorReconnectSchema = z.object({
   connectorId: z.string(),
   name: z.string(),

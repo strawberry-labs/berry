@@ -1347,6 +1347,7 @@ export function TurnActivity({
   active,
   elapsedMs,
   activeLabel,
+  inactiveLabel,
   liveAction = null,
   summary,
   children,
@@ -1356,6 +1357,7 @@ export function TurnActivity({
   elapsedMs?: number | undefined;
   /** Current durable phase. Elapsed time remains explicitly turn-wide. */
   activeLabel?: string | undefined;
+  inactiveLabel?: string | undefined;
   /** Latest tool action, rolled in under the header while active + collapsed. */
   liveAction?: { key: string; node: React.ReactNode } | null;
   /** Compact mode's lossless roll-up; expanding still renders every tool row. */
@@ -1370,7 +1372,7 @@ export function TurnActivity({
     ? activeLabel
       ? `${activeLabel}${totalElapsed}`
       : `Working${time || "..."}`
-    : `Worked${time}${summary ? ` — ${summary}` : ""}`;
+    : inactiveLabel ?? `Worked${time}${summary ? ` — ${summary}` : ""}`;
   const hasChildren = React.Children.toArray(children).some(Boolean);
   const [, rerender] = React.useReducer((count: number) => count + 1, 0);
   // Derived: open for the whole live run, collapsed once settled — unless the

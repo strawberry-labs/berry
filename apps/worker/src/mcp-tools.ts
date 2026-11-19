@@ -12,6 +12,7 @@ import {
   BROWSER_HANDOFF_TOOL,
   BrowserSessionReceiptSchema,
   parseAdmittedRuntimeRequest,
+  GoogleCalendarInsertRejectionSchema,
   GoogleMcpReconnectSchema,
   isStoredMcpCredentialRef,
   NetworkPolicySchema,
@@ -32,7 +33,7 @@ import {
 } from "./turn-runner.js";
 import { emitWorkerOperationalEvent } from "./operational-telemetry.js";
 import { resolveMcpCredential } from "./mcp-credentials.js";
-import { storedToolFailure } from "./tool-failures.js";
+import { McpWriteValidationError, storedToolFailure } from "./tool-failures.js";
 import {
   READ_TOOL_RESULT, S3ToolResultStore, TOOL_RESULT_INLINE_CHARACTERS,
   readStoredToolResult, readToolResultDefinition,
@@ -194,7 +195,20 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       };
     }
     const hints = source.approvalHints(toolName);
-    return durableMcpToolPolicy(server, hints, permissionMode);
+    return durableMcpToolPolicy(server, hints, usesNativeGoogleOAuth(server, snapshot.userId) ? "default" : permissionMode);
+  }
+
+  async requiredWriteApproval(snapshot: DurableTurnSnapshot, step: DurableTurnStep) {
+    const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
+    if (!toolName.startsWith("mcp__")) return;
+    const context = await this.#context(snapshot);
+    const server = this.#serverForTool(toolName, context.servers);
+    const hints = context.source.approvalHints(toolName);
+    if (!server || !hints) return;
+    const mode = usesNativeGoogleOAuth(server, snapshot.userId) ? "default" : stringValue(snapshot.runtimeRequest.permissionMode) ?? "default";
+    const policy = durableMcpToolPolicy(server, hints, mode);
+    if (policy.retryClass === "read_only" || !policy.requiresApproval) return;
+    return mcpWritePreview(server, toolName, record(step.input.arguments) ?? {});
   }
 
   /** A connector tool's reviewed input schema, so malformed calls are refused before approval (H-011). */
@@ -321,7 +335,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
           step.retryClass === "read_only" || step.retryClass === "idempotent",
         ))
         : usesNativeGoogleOAuth(server, snapshot.userId)
-          ? await this.#runManagedMcp(snapshot, server, executeTool)
+          ? await this.#runManagedMcp(snapshot, server, executeTool, toolName)
           : await executeTool();
     const fullText = result.content.flatMap((part) =>
       part.type === "text" && typeof part.text === "string" ? [part.text] : []
@@ -495,7 +509,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     return { source, servers, unavailable };
   }
 
-  async #runManagedMcp<T>(snapshot: DurableTurnSnapshot, server: McpServerSpec, run: () => Promise<T>): Promise<T> {
+  async #runManagedMcp<T>(snapshot: DurableTurnSnapshot, server: McpServerSpec, run: () => Promise<T>, toolName?: string): Promise<T> {
     const blocked = snapshot.steps.map((step) => storedToolFailure(step.output)).find((failure) => failure?.blockedConnectorId === server.id);
     if (blocked) throw new McpConnectionError(blocked.reconnect ? "reauth_required" : "temporary", true, {
       connectorId: server.id, exhausted: true, ...(blocked.reconnect ? { grantId: blocked.reconnect.grantId } : {}),
@@ -506,6 +520,10 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
         const reconnect = GoogleMcpReconnectSchema.safeParse(cause.structuredContent);
         if (reconnect.success && reconnect.data.connectorId === server.id) {
           throw new McpConnectionError("reauth_required", true, { connectorId: server.id, grantId: reconnect.data.grantId });
+        }
+        if (server.id === "connector_google_calendar" && toolName === `mcp__${sanitizeName(server.name)}__google_calendar_create_event`) {
+          const rejected = GoogleCalendarInsertRejectionSchema.safeParse(cause.structuredContent);
+          if (rejected.success) throw new McpWriteValidationError(cause.message, rejected.data.status, { cause });
         }
       }
       if (!(cause instanceof McpConnectionError)) throw cause;
@@ -871,6 +889,86 @@ function usesNativeGoogleOAuth(server: McpServerSpec, userId: string): boolean {
     && server.credentialKey === `connector:${server.id}:${userId}`;
 }
 
+function mcpWritePreview(server: McpServerSpec, toolName: string, args: Record<string, unknown>) {
+  const remoteName = toolName.slice(`mcp__${sanitizeName(server.name)}__`.length);
+  if (server.id === "connector_google_calendar" && (remoteName === "google_calendar_create_event" || remoteName === "google_calendar_update_event")) {
+    const creating = remoteName === "google_calendar_create_event";
+    const action = creating ? "Create event" : "Update event";
+    const start = stringValue(args.start);
+    const end = stringValue(args.end);
+    const timeZone = stringValue(args.timeZone);
+    const attendees = stringArray(args.attendees);
+    const recurrence = stringArray(args.recurrence);
+    const location = stringValue(args.location);
+    const calendar = stringValue(args.calendarId);
+    const notifications = stringValue(args.sendUpdates) ?? "none";
+    const detail = stringValue(args.description);
+    return {
+      title: stringValue(args.summary) ?? action,
+      ...(detail !== undefined ? { detail } : {}),
+      writePreview: {
+        service: server.name,
+        action,
+        approveLabel: creating && notifications === "all" && attendees.length > 0 ? "Approve and send invites" : "Approve",
+        fields: [
+          ...(start && end ? [{ label: "When", value: calendarApprovalTime(start, end, timeZone) }] : []),
+          { label: "Calendar", value: calendar && calendar !== "primary" ? calendar : "Your primary calendar" },
+          ...(attendees.length > 0 ? [{ label: "Guests", value: attendees.join(", ") }] : []),
+          ...(recurrence.length > 0 ? [{ label: "Repeats", value: recurrence.join("\n") }] : []),
+          ...(location ? [{ label: "Location", value: location }] : []),
+          ...(args.createMeet === true ? [{ label: "Video call", value: "Create a Google Meet link" }] : []),
+          { label: "Notifications", value: notifications === "all" ? "Email all guests" : notifications === "externalOnly" ? "Email external guests" : "No invitation emails" },
+        ],
+      },
+    };
+  }
+  const servicePrefix = sanitizeName(server.name).toLowerCase();
+  const actionName = remoteName.startsWith(`${servicePrefix}_`) ? remoteName.slice(servicePrefix.length + 1) : remoteName;
+  const action = approvalFieldLabel(actionName);
+  const title = stringValue(args.title) ?? stringValue(args.subject) ?? stringValue(args.name) ?? action;
+  const entries = Object.entries(args);
+  const fields = entries.slice(0, 24).map(([key, value]) => ({
+    label: approvalFieldLabel(key),
+    value: key === "content" && args.contentEncoding === "base64"
+      ? "Encoded file content"
+      : approvalFieldValue(key, value),
+  }));
+  if (entries.length > fields.length) fields.push({ label: "Additional fields", value: `${entries.length - fields.length} more inputs` });
+  return {
+    title: title.slice(0, 240),
+    writePreview: {
+      service: server.name,
+      action,
+      approveLabel: "Approve",
+      fields,
+    },
+  };
+}
+
+function approvalFieldLabel(name: string): string {
+  const words = name.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replaceAll("_", " ");
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+function approvalFieldValue(key: string, value: unknown): string {
+  const hideEncodedFile = (name: string) => /^(?:base64|dataBase64|b64_json)$/i.test(name);
+  if (hideEncodedFile(key)) return "Encoded file content";
+  const text = typeof value === "string" ? value : JSON.stringify(value, (name, item) => (
+    hideEncodedFile(name) ? "Encoded file content" : item
+  ), 2);
+  return text.length <= 4_000 ? text : `${text.slice(0, 4_000)}\n[Preview shortened]`;
+}
+
+function calendarApprovalTime(start: string, end: string, timeZone?: string): string {
+  if (timeZone) {
+    try {
+      const format = new Intl.DateTimeFormat("en-US", { dateStyle: "medium", timeStyle: "short", timeZone });
+      return `${format.formatRange(new Date(start), new Date(end))} (${timeZone.split("/").at(-1)?.replaceAll("_", " ")})`;
+    } catch { /* Show the supplied time and offset when formatting is unavailable. */ }
+  }
+  return `${start} – ${end}`;
+}
+
 function isDeferredMcpToolFailure(step: DurableTurnStep, toolName: string): boolean {
   if (step.state !== "failed" || typeof step.error !== "string") return false;
   return step.error === deferredMcpToolError(toolName)
@@ -927,6 +1025,7 @@ export function durableMcpToolPolicy(
   hints: ReturnType<McpToolSource["approvalHints"]>,
   permissionMode: string,
 ): DurableToolPolicy {
+  const requiresApproval = hints?.mandatoryApproval === true || permissionMode !== "full-access";
   if (hints?.nonReplayable) {
     // Billed reads still do not change the user's external state. A scrape
     // rejection or lost response must reach the model instead of holding all
@@ -938,7 +1037,7 @@ export function durableMcpToolPolicy(
     return {
       retryClass: readOnly ? "read_only" : "non_idempotent_manual",
       repeatPolicy: "block_after_success",
-      requiresApproval: (!readOnly || hints.requiresApproval === true) && permissionMode !== "full-access",
+      requiresApproval: (!readOnly || hints.requiresApproval === true) && requiresApproval,
       approvalKind: "mcp",
     };
   }
@@ -946,7 +1045,7 @@ export function durableMcpToolPolicy(
     return {
       retryClass: hints.idempotent ? "idempotent_with_key" : "non_idempotent_manual",
       repeatPolicy: "block_after_success",
-      requiresApproval: permissionMode !== "full-access",
+      requiresApproval,
       approvalKind: "mcp",
     };
   }
@@ -964,11 +1063,10 @@ export function durableMcpToolPolicy(
     return {
       retryClass: "non_idempotent_manual",
       repeatPolicy: "block_after_success",
-      requiresApproval: permissionMode !== "full-access",
+      requiresApproval,
       approvalKind: "mcp",
     };
   }
-  const requiresApproval = permissionMode !== "full-access";
   if (hints?.destructive) {
     return {
       retryClass: "non_idempotent_manual",

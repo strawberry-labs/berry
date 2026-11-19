@@ -1,4 +1,4 @@
-import type { AgentStreamEvent, ApprovalKind, ImageAspectRatio, MessageDraft, QuestionOption, SessionNoteKind } from "@berry/shared";
+import type { AgentStreamEvent, ApprovalKind, ApprovalWritePreview, ImageAspectRatio, MessageDraft, QuestionOption, SessionNoteKind } from "@berry/shared";
 import type { ActivityTool, ToolStatus } from "./activity.ts";
 
 /* ------------------------------------------------------------------------ */
@@ -122,6 +122,7 @@ export interface ApprovalPrompt {
   diff?: string | undefined;
   destructive?: boolean | undefined;
   openWorld?: boolean | undefined;
+  writePreview?: ApprovalWritePreview | undefined;
 }
 
 export interface QuestionPrompt {
@@ -388,6 +389,7 @@ export function reduceStream(state: StreamState, event: AgentStreamEvent): Strea
           diff: event.diff,
           destructive: event.destructive,
           openWorld: event.openWorld,
+          writePreview: event.writePreview,
         },
       };
     case "approval.resolved":

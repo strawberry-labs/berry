@@ -18,6 +18,7 @@ import {
   ConnectorSecretEnvelopeSchema,
   ConnectorSchema,
   DurableMcpServerSchema,
+  GoogleCalendarInsertRejectionSchema,
   McpCredentialRequestSchema,
   isStoredMcpCredentialRef,
   openConnectorSecret,
@@ -37,6 +38,7 @@ import type { CloudDatabaseService, SqlExecutor } from "../db/cloud-database.ser
 import {
   DEFAULT_GOOGLE_CONNECTOR_ACCESS_LEVEL,
   executeGoogleTool,
+  GoogleCalendarInsertRejected,
   GOOGLE_CONNECTOR_SERVICES,
   googleConnectorScopes,
   googleToolCatalog,
@@ -976,7 +978,10 @@ export class ConnectorsService {
           isError: true,
         } } };
       }
-      return { status: 200, body: { jsonrpc: "2.0", id: rpc.id, result: { content: [{ type: "text", text: cause instanceof Error ? cause.message : "Google connector tool failed" }], isError: true } } };
+      const structuredContent = cause instanceof GoogleCalendarInsertRejected
+        ? { code: GoogleCalendarInsertRejectionSchema.shape.code.value, status: 400 }
+        : undefined;
+      return { status: 200, body: { jsonrpc: "2.0", id: rpc.id, result: { content: [{ type: "text", text: cause instanceof Error ? cause.message : "Google connector tool failed" }], ...(structuredContent ? { structuredContent } : {}), isError: true } } };
     }
   }
 

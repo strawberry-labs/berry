@@ -2437,6 +2437,35 @@ describe("durable turn runner", () => {
   });
 
 
+  it.each(["approved", "denied"] as const)("waits for a one-step %s decision before running an older connector write", async (status) => {
+    const toolName = "mcp__Calendar__create_event";
+    const pending = toolStep("pending", "idempotent_with_key", false);
+    const tool = {
+      ...pending,
+      type: `tool.${toolName}`,
+      input: { ...pending.input, toolName, arguments: { summary: "Interview" } },
+    };
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    const writePreview = { service: "Calendar", action: "Create event", approveLabel: "Approve", fields: [] };
+    const execute = vi.fn(async () => ({ output: { id: "new-event" }, summary: "Event created" }));
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute,
+      requiredWriteApproval: async () => ({ title: "Interview", writePreview }),
+    });
+
+    expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("waiting");
+    expect(execute).not.toHaveBeenCalled();
+    expect(repository.events).toContainEqual(expect.objectContaining({
+      kind: "approval.request", approvalKind: "mcp", title: "Interview", writePreview,
+    }));
+
+    repository.current.approvals = repository.current.approvals.map((approval) => ({ ...approval, status }));
+    repository.current.steps = repository.current.steps.map((step) => step.id === tool.id ? { ...step, state: "pending" } : step);
+    repository.current.state = "executing_tool";
+    expect((await runner.execute({ tenantId, runId, reason: "approval-resolved" })).state).toBe("calling_model");
+    expect(execute).toHaveBeenCalledTimes(status === "approved" ? 1 : 0);
+  });
+
   it("meters journaled connector context before deciding to compact", async () => {
     const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
     current.runtimeRequest.contextWindowTokens = 80_000;

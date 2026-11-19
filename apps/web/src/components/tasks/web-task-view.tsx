@@ -109,7 +109,8 @@ export function Thread({ sessionId, taskId, messages, stream: initialStream, cli
             await cancelTurn();
             return;
           }
-          await client.decideApproval(approval.approvalId, { decision });
+          const result = await client.decideApproval(approval.approvalId, { decision });
+          if (!result.ok) throw new Error("The approval decision was not recorded.");
         },
         onQuestionAnswer: async (question, answer, selectedOptions) => {
           const answerMessageId = await stableQuestionAnswerMessageId(question.questionId);
