@@ -173,7 +173,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
   );
   const personalSkillTools = new DurablePersonalSkillToolExecutor(memoryTools, executor);
   const scheduledTaskTools = new DurableScheduledTaskToolExecutor(personalSkillTools, executor);
-  const durableTools = createDurableTurnToolsFromEnv(env, scheduledTaskTools);
+  const durableTools = createDurableTurnToolsFromEnv(env, scheduledTaskTools, executor);
   const fileDeleter = S3FileObjectDeleter.fromEnv(env, new SqlFileDeletionReceiptStore(executor));
   const fileBlobs = SqlFileBlobProcessor.fromEnv(env, executor);
   const dependencies: Parameters<typeof createBerryWorker>[0] = {

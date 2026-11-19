@@ -39,6 +39,21 @@ import {
   readStoredToolResult, readToolResultDefinition,
   type StoredToolResultReference, type ToolResultStore,
 } from "./tool-result-store.js";
+import {
+  MCP_TOOL_SNAPSHOT_STALE_MS,
+  McpToolSnapshotRefresher,
+  SqlMcpToolSnapshotStore,
+  isRefreshableConnector,
+  type McpToolRefreshEvent,
+} from "./mcp-tool-refresh.js";
+import type { SqlExecutor } from "./sql-repositories.js";
+
+/** How long a turn-start refresh may wait for a connector before the cached list is kept. */
+const MCP_BACKGROUND_REFRESH_TIMEOUT_MS = 5_000;
+/** How long a re-list after a tool_search miss or schema refusal may wait. */
+const MCP_RELIST_TIMEOUT_MS = 8_000;
+/** A connector listed or re-list-attempted this recently in the turn is not re-listed again. */
+const MCP_RELIST_FRESH_MS = 30_000;
 
 export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   readonly #source: McpToolSource;
@@ -54,6 +69,8 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     private readonly connectTimeoutMs = 10_000,
     private readonly env: NodeJS.ProcessEnv = process.env,
     private readonly resultStore: ToolResultStore | null = S3ToolResultStore.fromEnv(env),
+    /** Stores custom connectors' live tool lists; null keeps them turn-local. */
+    private readonly toolRefresh: McpToolSnapshotRefresher | null = null,
   ) {
     this.#servers = servers;
     this.#source = new McpToolSource({
@@ -219,6 +236,23 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     return source?.listTools().find((tool) => tool.name === toolName)?.parameters;
   }
 
+  /**
+   * Re-lists the custom connectors whose tools' arguments were refused, so a
+   * server that added an enum value or changed a schema since the stored list
+   * was taken is checked against what it accepts now. Bounded and never throws.
+   */
+  async refreshArgumentSchemas(snapshot: DurableTurnSnapshot, toolNames: readonly string[]): Promise<void> {
+    const inherited = toolNames.filter((name) => !name.startsWith("mcp__"));
+    if (inherited.length > 0) await this.base.refreshArgumentSchemas?.(snapshot, inherited).catch(() => undefined);
+    const context = this.#turnContexts.get(mcpContextKey(snapshot));
+    if (!context) return;
+    const serverIds = new Set(toolNames.flatMap((name) => {
+      const server = name.startsWith("mcp__") ? this.#serverForTool(name, context.servers) : undefined;
+      return server ? [server.id] : [];
+    }));
+    await this.#relist(context, [...serverIds]);
+  }
+
   supportsAbort(snapshot: DurableTurnSnapshot, step: DurableTurnStep): boolean {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName === READ_TOOL_RESULT && this.resultStore) return true;
@@ -312,6 +346,11 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       const lost = context.unavailable.find((server) => toolName.startsWith(`mcp__${sanitizeName(server.name)}__`));
       if (lost) throw new Error(`The ${lost.name} connector is unavailable for this message: ${lost.reason}`);
       throw new Error(`MCP tool ${toolName} is not enabled for this turn`);
+    }
+    // A tool the stored list does not have may be new on the server.
+    if (!context.source.listTools().some((candidate) => candidate.name === toolName)) {
+      await this.#relist(context, [server.id], mcpStepSignal(step, signal));
+      signal?.throwIfAborted();
     }
     if (!this.#visibleToolNames(snapshot, context).has(toolName)) {
       throw new Error(deferredMcpToolError(toolName));
@@ -446,7 +485,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   async #prepareContext(snapshot: DurableTurnSnapshot): Promise<DurableMcpTurnContext> {
     const runtime = parseAdmittedRuntimeRequest(snapshot.runtimeRequest);
     if (!runtime) {
-      return { source: this.#source, servers: this.#allowedServers(snapshot), unavailable: [] };
+      return { source: this.#source, servers: this.#allowedServers(snapshot), unavailable: [], relistAttempts: new Map() };
     }
     // Each connector opens its own credentials: one that cannot be opened is
     // unavailable for this turn without blocking healthy connectors or a
@@ -484,7 +523,13 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
           ...(credential ? { credential } : {}),
         };
       }));
-    const servers = prepared.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+    // An administrator-reviewed connector exposes only its approved tool names,
+    // but an approved tool's definition follows the server (new enum values,
+    // fields). A new tool name stays pending until an administrator approves it.
+    const servers = prepared.flatMap((result) => result.status === "fulfilled" ? [result.value] : [])
+      .map((server) => mcpToolRefreshEnabled(this.env) && isRefreshableConnector(server) && server.allowedTools
+        ? { ...server, followApprovedToolChanges: true }
+        : server);
     const unavailable = prepared.flatMap((result, index) => result.status === "rejected"
       ? [{
           id: enabled[index]!.id,
@@ -493,20 +538,41 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
         }]
       : []);
     const policy = NetworkPolicySchema.safeParse(runtime.networkPolicy);
+    const toolRefresh = this.toolRefresh;
+    const refreshable = toolRefresh ? servers.filter((server) => isRefreshableConnector(server)).map((server) => server.id) : [];
+    const refreshableIds = new Set(refreshable);
     const source = new McpToolSource({
       servers: [...servers],
       ...(policy.success ? { networkPolicy: policy.data } : {}),
       connectTimeoutMs: this.connectTimeoutMs,
+      enableToolListNotifications: mcpToolRefreshEnabled(this.env),
       resolveCredential: (server, signal, rejectedVersion) => isStoredMcpCredentialRef(server.id, server.credentialKey)
         ? resolveMcpCredential(snapshot, server.id, this.env, signal, rejectedVersion)
         : Promise.resolve(undefined),
       log: (level, _message) => {
         emitMcpLog(level, snapshot.id);
       },
+      // Every live listing of a custom connector (connect, re-list,
+      // list_changed) updates its stored tool list for later turns.
+      ...(toolRefresh && refreshable.length > 0 ? {
+        onToolsListed: (spec: McpServerSpec, tools: NonNullable<McpServerSpec["cachedTools"]>) => {
+          if (refreshableIds.has(spec.id)) void toolRefresh.record(snapshot.tenantId, spec.id, tools);
+        },
+      } : {}),
     });
-    // Cached, administrator-reviewed schemas are enough for model preparation.
-    // McpToolSource connects only when one exposed tool is actually executed.
-    return { source, servers, unavailable };
+    // Cached schemas are enough for model preparation. McpToolSource connects
+    // when a tool runs, a lookup needs the live list, or the stored list is stale.
+    const context: DurableMcpTurnContext = { source, servers, unavailable, relistAttempts: new Map() };
+    if (toolRefresh && refreshable.length > 0) {
+      // Never awaited: the turn runs on the stored list until the server answers.
+      void toolRefresh.refreshStale(
+        snapshot.tenantId,
+        refreshable,
+        (connectorIds) => source.refreshTools(connectorIds, AbortSignal.timeout(MCP_BACKGROUND_REFRESH_TIMEOUT_MS)),
+        MCP_BACKGROUND_REFRESH_TIMEOUT_MS,
+      ).catch(() => undefined);
+    }
+    return context;
   }
 
   async #runManagedMcp<T>(snapshot: DurableTurnSnapshot, server: McpServerSpec, run: () => Promise<T>, toolName?: string): Promise<T> {
@@ -530,6 +596,39 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       throw new McpConnectionError(cause.kind, cause.beforeDispatch, { ...cause.details, connectorId: server.id }, cause.message);
     }
   }
+
+  /**
+   * Lists custom connectors' tools again on this turn's connection, at most
+   * once per connector in any MCP_RELIST_FRESH_MS window, and waits at most
+   * MCP_RELIST_TIMEOUT_MS. Failures keep the tools already known.
+   */
+  async #relist(context: DurableMcpTurnContext, serverIds: readonly string[], signal?: AbortSignal): Promise<void> {
+    if (!mcpToolRefreshEnabled(this.env)) return;
+    const now = Date.now();
+    const due = serverIds.filter((serverId) => {
+      const server = context.servers.find((candidate) => candidate.id === serverId);
+      if (!server || !isRefreshableConnector(server)) return false;
+      const listedAt = context.source.listedAt(serverId);
+      const attemptedAt = context.relistAttempts.get(serverId);
+      return (listedAt === null || now - listedAt >= MCP_RELIST_FRESH_MS)
+        && (attemptedAt === undefined || now - attemptedAt >= MCP_RELIST_FRESH_MS);
+    });
+    if (due.length === 0) return;
+    for (const serverId of due) context.relistAttempts.set(serverId, now);
+    const timeoutSignal = AbortSignal.timeout(MCP_RELIST_TIMEOUT_MS);
+    const refreshSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      context.source.refreshTools(due, refreshSignal).catch(() => undefined),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, MCP_RELIST_TIMEOUT_MS);
+        timer.unref?.();
+      }),
+    ]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+  }
+
 
   async #searchTools(snapshot: DurableTurnSnapshot, step: DurableTurnStep, signal?: AbortSignal): Promise<TurnToolResult> {
     const context = await this.#context(snapshot);
@@ -571,27 +670,37 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       ? input.limit
       : 8;
     const limit = Math.max(1, Math.min(20, limitValue));
-    const uncachedServerIds = (connector ? [connector] : context.servers)
-      .filter((server) => (server.cachedTools?.length ?? 0) === 0)
-      .map((server) => server.id);
-    const discovery = await Promise.allSettled(context.servers.filter((server) => uncachedServerIds.includes(server.id)).map((server) =>
+    const candidates = connector ? [connector] : context.servers;
+    const discovery = await Promise.allSettled(candidates.filter((server) => !server.cachedTools?.length).map((server) =>
       isStoredMcpCredentialRef(server.id, server.credentialKey)
         ? this.#runManagedMcp(snapshot, server, () => context.source.discoverServer(server.id, mcpStepSignal(step, signal)))
         : context.source.discoverServer(server.id, signal),
     ));
     signal?.throwIfAborted();
-    let matches: ReturnType<McpToolSource["listTools"]> = [];
-    if (connector) {
-      const connectorTools = context.source.listTools().filter((tool) =>
-        this.#serverForTool(tool.name, [connector]) !== undefined
+    const find = async (): Promise<{ matches: ReturnType<McpToolSource["listTools"]>; missed: boolean }> => {
+      const candidateTools = context.source.listTools().filter((tool) =>
+        this.#serverForTool(tool.name, candidates) !== undefined
       );
-      matches = connectorToolMatches(connectorTools, query, limit);
-    } else {
-      const search = context.source.createToolSearch(async (revealed) => {
-        matches = revealed;
-      });
-      await search.execute(stringValue(step.input.toolCallId) ?? step.id, { query, limit } as never);
+      let found: ReturnType<McpToolSource["listTools"]> = [];
+      if (connector) {
+        found = connectorToolMatches(candidateTools, query, limit);
+      } else {
+        const search = context.source.createToolSearch(async (revealed) => {
+          found = revealed;
+        });
+        await search.execute(stringValue(step.input.toolCallId) ?? step.id, { query, limit } as never);
+      }
+      const nothingMatched = connector ? !hasConnectorToolMatch(candidateTools, query) : found.length === 0;
+      return { matches: found, missed: nothingMatched || namesUnknownTool(query, candidateTools) };
+    };
+    let found = await find();
+    if (found.missed) {
+      // The server may have added the tool since its list was stored.
+      await this.#relist(context, candidates.map((server) => server.id), mcpStepSignal(step, signal));
+      signal?.throwIfAborted();
+      found = await find();
     }
+    const matches = found.matches;
     if (!matches.length) {
       // A failed discovery should be actionable if the search could not find
       // tools. Healthy connectors can still answer a broad search.
@@ -714,6 +823,8 @@ type DurableMcpTurnContext = {
   servers: readonly McpServerSpec[];
   /** Enabled connectors whose credentials or environment could not be opened this turn (H-077). */
   unavailable: readonly { id: string; name: string; reason: string }[];
+  /** When this turn last tried to re-list each connector (epoch ms). */
+  relistAttempts: Map<string, number>;
 };
 
 function mcpContextKey(snapshot: DurableTurnSnapshot): string {
@@ -991,6 +1102,33 @@ function connectorToolMatches<T extends { name: string; description?: string }>(
   return (matches.length > 0 ? matches : ranked).slice(0, limit).map((item) => item.tool);
 }
 
+/** True when at least one tool shares a query term, the test connectorToolMatches ranks by. */
+function hasConnectorToolMatch(tools: readonly { name: string; description?: string }[], query: string): boolean {
+  const terms = [...catalogIdentityTokens(query)];
+  return tools.some((tool) => {
+    const text = `${tool.name} ${tool.description ?? ""}`.toLowerCase();
+    return terms.some((term) => text.includes(term));
+  });
+}
+
+/**
+ * True when the query names a tool identifier (snake_case or a full
+ * mcp__connector__tool name) that none of the listed tools has.
+ */
+function namesUnknownTool(query: string, tools: readonly { name: string }[]): boolean {
+  const named = query.match(/[A-Za-z][A-Za-z0-9]*(?:_+[A-Za-z0-9]+)+/g) ?? [];
+  if (named.length === 0) return false;
+  const known = new Set(tools.flatMap((tool) => {
+    const remote = /^mcp__[A-Za-z0-9_-]+?__(.+)$/.exec(tool.name)?.[1];
+    return [tool.name.toLowerCase(), ...(remote ? [remote.toLowerCase()] : [])];
+  }));
+  return named.some((identifier) => {
+    const lower = identifier.toLowerCase();
+    const remote = /^mcp__[a-z0-9_-]+?__(.+)$/.exec(lower)?.[1];
+    return !known.has(lower) && !(remote && known.has(remote));
+  });
+}
+
 function normalizeCatalogIdentity(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
@@ -1094,6 +1232,7 @@ export function durableMcpToolPolicy(
 export function createDurableTurnToolsFromEnv(
   env: NodeJS.ProcessEnv,
   base: DurableTurnToolExecutor,
+  executor?: SqlExecutor,
 ): DurableMcpToolExecutor {
   const servers = mcpServerSpecsFromJson(env.BERRY_CLOUD_MCP_SERVERS_JSON, env);
   const networkPolicy = servers.length > 0
@@ -1102,12 +1241,41 @@ export function createDurableTurnToolsFromEnv(
         allowedDomains: csv(env.BERRY_CLOUD_NETWORK_ALLOWED_DOMAINS),
       })
     : undefined;
+  // BERRY_MCP_TOOL_REFRESH=off keeps every connector on its stored tool list.
+  const toolRefresh = executor && mcpToolRefreshEnabled(env)
+    ? new McpToolSnapshotRefresher(new SqlMcpToolSnapshotStore(executor), {
+        staleAfterMs: positiveInteger(env.BERRY_MCP_TOOL_REFRESH_STALE_MS) ?? MCP_TOOL_SNAPSHOT_STALE_MS,
+        onEvent: emitToolRefreshEvent,
+      })
+    : null;
   return new DurableMcpToolExecutor(
     base,
     servers,
     networkPolicy,
     positiveInteger(env.BERRY_MCP_CONNECT_TIMEOUT_MS) ?? 10_000,
     env,
+    undefined,
+    toolRefresh,
+  );
+}
+
+function mcpToolRefreshEnabled(env: NodeJS.ProcessEnv): boolean {
+  return env.BERRY_MCP_TOOL_REFRESH?.trim().toLowerCase() !== "off";
+}
+
+function emitToolRefreshEvent(event: McpToolRefreshEvent): void {
+  emitWorkerOperationalEvent(
+    "phase.transition",
+    normalizeWorkerRole(process.env.BERRY_WORKER_ROLE),
+    sourceRevisionFromEnv(process.env),
+    {
+      phase: "mcp",
+      operation: event.operation,
+      outcome: event.outcome,
+      toolFamily: "mcp",
+      ...(event.itemCount !== undefined ? { itemCount: event.itemCount } : {}),
+      ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
+    },
   );
 }
 
