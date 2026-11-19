@@ -118,6 +118,10 @@ describe("MCP tool snapshot diffing", () => {
   it("refreshes only organization custom connectors, not Berry-owned adapters", () => {
     expect(isRefreshableConnector({ id: "connector_mcp_1", credentialKey: "connector:connector_mcp_1:user-1" })).toBe(true);
     expect(isRefreshableConnector({ id: "connector_mcp_1", credentialKey: "connector:connector_mcp_1:shared" })).toBe(true);
+    expect(isRefreshableConnector({ id: "connector_mcp_1", credentialKey: "connector-oauth:connector_mcp_1:user-1:authority" })).toBe(true);
+    expect(isRefreshableConnector({ id: "connector_mcp_1", credentialKey: "connector-oauth:connector_mcp_1:shared:authority" })).toBe(true);
+    expect(isRefreshableConnector({ id: "connector_mcp_1", credentialKey: "connector-oauth:connector_mcp_2:user-1:authority" })).toBe(false);
+    expect(isRefreshableConnector({ id: "connector_gmail", credentialKey: "connector-oauth:connector_gmail:user-1:authority" })).toBe(false);
     expect(isRefreshableConnector({ id: "gmail", credentialKey: "connector:gmail:user-1", trustReadOnlyAnnotations: true })).toBe(false);
     expect(isRefreshableConnector({ id: "berrycrawl", credentialKey: "env:BERRYCRAWL_API_KEY" })).toBe(false);
     expect(isRefreshableConnector({ id: "other", credentialKey: "connector:connector_mcp_1:user-1" })).toBe(false);
@@ -375,6 +379,7 @@ describe("durable MCP executor tool refresh", () => {
     allowedTools?: string[];
     stored?: { tools: McpCachedTool[]; checkedAt: number | null };
     delayMs?: number;
+    oauth?: boolean;
   };
 
   async function setup(options: Setup) {
@@ -387,7 +392,9 @@ describe("durable MCP executor tool refresh", () => {
     const env = { BERRY_DURABLE_CAPABILITY_KEY: key } as NodeJS.ProcessEnv;
     vi.stubGlobal("fetch", vi.fn(async (input: URL) => {
       expect(input.pathname).toBe("/v1/connectors/mcp/runtime-credential");
-      return Response.json({ status: "static" });
+      return Response.json(options.oauth
+        ? { status: "available", accessToken: "member-token", version: "a".repeat(64) }
+        : { status: "static" });
     }));
     const store = new MemorySnapshotStore();
     store.seed(connectorId, options.stored?.tools ?? options.cached, options.stored ? options.stored.checkedAt : Date.now());
@@ -409,8 +416,9 @@ describe("durable MCP executor tool refresh", () => {
         env: { MCP_CATALOG_FILE: catalog, MCP_CATALOG_LOG: log, ...(options.delayMs ? { MCP_CATALOG_DELAY_MS: String(options.delayMs) } : {}) },
         enabled: true,
         trusted: true,
-        credentialRef: `connector:${connectorId}:user-1`,
-        credential: await sealDurableSecret("member-token", key),
+        ...(options.oauth
+          ? { credentialRef: `connector-oauth:${connectorId}:user-1:${"a".repeat(64)}` }
+          : { credentialRef: `connector:${connectorId}:user-1`, credential: await sealDurableSecret("member-token", key) }),
         cachedTools: options.cached,
         ...(options.allowedTools ? { allowedTools: options.allowedTools } : { defaultTools: options.cached.map((item) => item.name) }),
       }),
@@ -439,10 +447,11 @@ describe("durable MCP executor tool refresh", () => {
     input: { toolName: "tool_search", arguments: { query, connector: connectorId, ...extra } },
   }) as unknown as DurableTurnStep;
 
-  it("re-lists after a tool_search miss, finds the new tool, and stores the server's list", async () => {
+  it.each([{ oauth: false }, { oauth: true }])("re-lists after a tool_search miss and saves the catalog (OAuth: $oauth)", async ({ oauth }) => {
     const { tools, snapshot, store, refresher, listRequests } = await setup({
-      cached: [tool("people_list")],
-      live: [tool("people_list"), tool("fls_team_list")],
+      cached: [tool("people_list"), tool("team_import")],
+      live: [tool("people_list"), tool("team_import"), tool("fls_team_list")],
+      oauth,
     });
     await tools.turnContext(snapshot);
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -453,7 +462,7 @@ describe("durable MCP executor tool refresh", () => {
     expect((found.output as { activatedTools: string[] }).activatedTools[0]).toBe("mcp__Connect__fls_team_list");
     expect(listRequests()).toBe(1);
     await refresher.settled(tenantId, connectorId);
-    expect(store.tools(connectorId)).toEqual(["people_list", "fls_team_list"]);
+    expect(store.tools(connectorId)).toEqual(["people_list", "team_import", "fls_team_list"]);
 
     // A second miss moments later is a real miss: no new request to the server.
     await tools.execute(snapshot, search("payroll_export"));
