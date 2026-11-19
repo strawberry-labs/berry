@@ -2,7 +2,7 @@ import * as React from "react";
 import { ArrowUp, X } from "lucide-react";
 import { type BerryApiClient } from "@berry/api-client";
 import { MessageAttachmentContentSchema, type Message, type StoredFile } from "@berry/shared";
-import { BerryThreadView, BerryUserEditorFrame, findMessageSearchTarget, fullUserText, type BerryThreadAdapter } from "@berry/desktop-ui/components/berry-thread-view";
+import { BerryThreadView, BerryUserEditorFrame, fullUserText, type BerryThreadAdapter } from "@berry/desktop-ui/components/berry-thread-view";
 import { ImageGeneration, ImageGenerationError, type ImageGenerationState } from "@berry/desktop-ui/components/image-generation";
 import type { GeneratedImageView, ImageEditAnnotation } from "@berry/desktop-ui/components/generated-image-gallery";
 import type { StreamState, ToolEntry } from "@berry/desktop-ui/components/thread-stream";
@@ -17,6 +17,8 @@ import { fileTypeLabel, formatBytes } from "../library/file-metadata";
 import { stableQuestionAnswerMessageId } from "./composer-question-overlay";
 import { TaskConnectorReconnects } from "./task-connector-reconnect";
 import { sessionStreamStore, useSessionStream } from "@/lib/session-stream-store";
+
+export { TaskBrowserWorkspace } from "./browser-control";
 
 const DocumentPreviewModal = React.lazy(async () => ({
   default: (await import("../library/document-preview-modal")).DocumentPreviewModal,
@@ -53,22 +55,6 @@ export function Thread({ sessionId, taskId, messages, stream: initialStream, cli
   const [showReasoning, setShowReasoning] = React.useState(false);
   const [selectedAttachment, setSelectedAttachment] = React.useState<StoredFile | null>(null);
   const threadRef = React.useRef<HTMLDivElement>(null);
-  const messagesRef = React.useRef(messages);
-  const hasOlderMessagesRef = React.useRef(hasOlderMessages);
-  const searchGenerationRef = React.useRef(0);
-  const searchSessionRef = React.useRef(sessionId);
-  if (searchSessionRef.current !== sessionId) {
-    // Invalidate a pending search during render so a session switch cannot
-    // race the passive effect below and let the old search inspect new rows.
-    searchSessionRef.current = sessionId;
-    searchGenerationRef.current += 1;
-  }
-  messagesRef.current = messages;
-  hasOlderMessagesRef.current = hasOlderMessages;
-  React.useEffect(() => {
-    searchGenerationRef.current += 1;
-    return () => { searchGenerationRef.current += 1; };
-  }, [sessionId]);
   React.useLayoutEffect(() => {
     if (scrollRequest === 0) return;
     let nextFrame = window.requestAnimationFrame(() => {
@@ -191,55 +177,6 @@ export function Thread({ sessionId, taskId, messages, stream: initialStream, cli
     />
   ) : null;
 
-  const searchMessages = React.useCallback(async (query: string): Promise<string | null> => {
-    const needle = query.trim().toLocaleLowerCase();
-    if (!needle) return null;
-    const generation = ++searchGenerationRef.current;
-    const searchSessionId = searchSessionRef.current;
-    const isCurrent = () => generation === searchGenerationRef.current && searchSessionRef.current === searchSessionId;
-    for (;;) {
-      if (!isCurrent()) return null;
-      const currentMessages = messagesRef.current;
-      const matchTarget = findMessageSearchTarget(currentMessages, needle);
-      if (matchTarget) {
-        const match = currentMessages.find((candidate) => candidate.id === matchTarget);
-        const matchIndex = match ? currentMessages.indexOf(match) : -1;
-        // Assistant rows are grouped under the preceding user turn. Return
-        // that owning user id so the virtualizer can address the rendered
-        // `${userId}:user`/`${userId}:assistant` row key.
-        if (match?.role === "assistant") {
-          for (let index = matchIndex - 1; index >= 0; index -= 1) {
-            if (currentMessages[index]?.role === "user") return currentMessages[index]!.id;
-          }
-          // A bounded page can begin in the middle of an assistant group. Load
-          // one older page so the owning user row is present before returning
-          // a target that the virtualizer can scroll to.
-          if (onLoadOlderMessages && hasOlderMessagesRef.current) {
-            const beforeLength = currentMessages.length;
-            const loaded = await onLoadOlderMessages();
-            if (!isCurrent()) return null;
-            await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
-            if (loaded && messagesRef.current.length > beforeLength) continue;
-          }
-          // Never return a raw assistant id when its owning user row could not
-          // be materialized. BerryThreadView has no row key for that orphan,
-          // so leaving it as the target would strand the search UI in a stale
-          // pending state with no visible result or error.
-          return null;
-        }
-        return matchTarget;
-      }
-      if (!onLoadOlderMessages || !hasOlderMessagesRef.current) return null;
-      const beforeLength = currentMessages.length;
-      const loaded = await onLoadOlderMessages();
-      if (!isCurrent()) return null;
-      if (!loaded) return null;
-      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
-      if (messagesRef.current.length <= beforeLength) return null;
-    }
-    return null;
-  }, [onLoadOlderMessages]);
-
   return (
     <div ref={threadRef} className="berry-web-thread contents" data-testid="web-task-thread">
       <BerryThreadView
@@ -261,7 +198,6 @@ export function Thread({ sessionId, taskId, messages, stream: initialStream, cli
         {...(onLoadOlderMessages ? { onLoadOlderMessages } : {})}
         hasOlderMessages={hasOlderMessages}
         loadingOlderMessages={loadingOlderMessages}
-        {...(onLoadOlderMessages ? { onSearchMessages: searchMessages } : {})}
       />
       {selectedAttachment ? (
         <React.Suspense fallback={null}>

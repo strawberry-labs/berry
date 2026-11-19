@@ -3823,14 +3823,132 @@ html body .berry-onboarding-connector-toggle input:focus-visible + span {
   outline: none !important;
 }
 
-/* Live browser control stays in the task surface and never offsets the app shell. */
-.berry-browser-card { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-shrink:0; margin:8px 16px; padding:10px 12px; border:1px solid var(--berry-border); border-radius:8px; background:var(--berry-card-bg); }
-.berry-browser-dialog { width:calc(100vw - 32px); max-width:1180px; max-height:94dvh; overflow:auto; gap:12px; }
-.berry-browser-toolbar { display:flex; align-items:center; gap:12px; min-width:0; padding:8px 10px; border:1px solid var(--berry-border); border-radius:6px; background:var(--berry-card-bg); }
-.berry-browser-tabs { max-width:40%; min-width:80px; padding:4px; border:1px solid var(--berry-border); border-radius:4px; background:var(--berry-card-bg); color:var(--berry-text); font-size: var(--berry-fs-sm); }
-.berry-browser-stage { min-height:200px; max-height:65dvh; overflow:auto; display:grid; place-items:center; border:1px solid var(--berry-border); border-radius:6px; background:var(--berry-card-bg); }
-.berry-browser-stage canvas { display:block; max-width:100%; height:auto; touch-action:none; outline-offset:-2px; }
-.berry-browser-stage canvas:focus-visible,.berry-browser-tabs:focus-visible { outline:2px solid var(--berry-accent); }
-.berry-browser-stage canvas[hidden] { display:none; }
-.berry-browser-error { margin:0 16px 8px; font-size: var(--berry-fs-sm); color:var(--berry-text-secondary); }
-@media (max-width:640px) { .berry-browser-card { flex-direction:column; align-items:stretch; margin:6px 8px; } .berry-browser-tabs { max-width:50%; } }
+.berry-browser-trigger[aria-expanded="true"] {
+  background: var(--berry-hover);
+  color: var(--berry-text);
+}
+
+.berry-browser-divider {
+  background: var(--berry-border);
+}
+
+.berry-browser-divider:hover,
+.berry-browser-divider:focus-visible {
+  background: var(--berry-accent);
+}
+
+.berry-browser-pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  gap: 10px;
+  overflow: auto;
+  padding: 0 12px 12px;
+  background: var(--berry-main-bg);
+  color: var(--berry-text);
+  font-size: var(--berry-fs-xs);
+}
+
+.berry-browser-heading {
+  display: flex;
+  flex: none;
+  align-items: center;
+  min-height: 42px;
+  gap: 8px;
+  border-bottom: 1px solid var(--berry-border);
+}
+
+.berry-browser-heading > svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: var(--berry-text-secondary);
+}
+
+.berry-browser-heading h2 {
+  font-size: var(--berry-fs-sm);
+  font-weight: 600;
+}
+
+.berry-browser-heading [role="status"] {
+  margin-inline-start: auto;
+  color: var(--berry-text-secondary);
+  font-size: 11px;
+  text-align: end;
+}
+
+.berry-browser-handoff,
+.berry-browser-footer > p {
+  margin: 0;
+  color: var(--berry-text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.berry-browser-toolbar {
+  display: flex;
+  flex: none;
+  align-items: center;
+  min-height: 30px;
+  min-width: 0;
+  gap: 8px;
+  padding: 0 8px;
+  border: 1px solid var(--berry-border);
+  border-radius: 6px;
+  background: var(--berry-surface-inset);
+  color: var(--berry-text-secondary);
+}
+
+.berry-browser-tabs {
+  max-width: 45%;
+  padding: 3px;
+  border: 1px solid var(--berry-border);
+  border-radius: 4px;
+  background: var(--berry-main-bg);
+  color: var(--berry-text);
+  font: inherit;
+}
+
+.berry-browser-stage {
+  display: flex;
+  flex: 1 0 8rem;
+  overflow: auto;
+  border: 1px solid var(--berry-border);
+  border-radius: 6px;
+  background: var(--berry-surface-inset);
+}
+
+.berry-browser-stage p {
+  margin: auto;
+  padding: 12px;
+  color: var(--berry-text-secondary);
+}
+
+.berry-browser-stage canvas {
+  flex: none;
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: auto;
+  outline-offset: -2px;
+}
+
+.berry-browser-stage canvas[tabindex="0"] {
+  touch-action: none;
+}
+
+.berry-browser-stage canvas:focus-visible,
+.berry-browser-tabs:focus-visible {
+  outline: 2px solid var(--berry-accent);
+}
+
+.berry-browser-stage canvas[hidden] {
+  display: none;
+}
+
+.berry-browser-footer {
+  flex: none;
+}
+
+.berry-browser-footer > p {
+  margin-bottom: 8px;
+}

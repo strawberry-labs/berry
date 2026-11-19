@@ -1,4 +1,3 @@
-import { BrowserControl } from "./tasks/browser-control";
 import { CanvasFileDropZone } from "./tasks/canvas-file-drop";
 import * as React from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -113,6 +112,9 @@ const Composer = React.lazy(async () => ({
 }));
 const Thread = React.lazy(async () => ({
   default: (await import("./tasks/web-task-view")).Thread,
+}));
+const TaskBrowserWorkspace = React.lazy(async () => ({
+  default: (await import("./tasks/web-task-view")).TaskBrowserWorkspace,
 }));
 const TaskRouteState = React.lazy(async () => ({
   default: (await import("./tasks/task-route-state")).TaskRouteState,
@@ -3232,203 +3234,209 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         <div className={shouldMountTaskSurface(surface) ? "contents" : "hidden"}>
         {shouldMountTaskSurface(surface) && activeTask && !activeTask.deletedAt ? (
         <>
-        <BerryTaskHeaderFrame
-          leading={
-            <>
-              <h1 className="berry-task-title min-w-0 truncate">
-                {editingTitle ? (
-                  <input
-                    ref={titleInputRef}
-                    autoFocus
-                    defaultValue={activeTask?.title ?? "Berry task"}
-                    aria-label="Rename task"
-                    className="berry-task-title-input min-w-0 max-w-[min(42vw,460px)] px-2"
-                    onBlur={(event) => void saveTaskTitle(event.currentTarget.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        event.preventDefault();
-                        void saveTaskTitle(event.currentTarget.value);
-                      } else if (event.key === "Escape") {
-                        setEditingTitle(false);
-                      }
-                    }}
-                  />
-                ) : (
-                  <button
-                    type="button"
-                    title="Rename task"
-                    className="berry-task-title-input min-w-0 max-w-[min(42vw,460px)] shrink truncate px-2 text-left"
-                    onClick={() => setEditingTitle(true)}
+        <TaskBrowserWorkspace
+          client={client}
+          sessionId={activeSessionId}
+          active={Boolean(durableState?.active || stream.turnActive || turnBusy)}
+          onChanged={() => {
+            if (!client || !activeSessionId) return;
+            void client.turnState(activeSessionId).then((state) => applyDurableState(activeSessionId, state, true)).catch(() => undefined);
+            void refreshSessionMessages(activeSessionId).catch(() => undefined);
+          }}
+          renderHeader={(browserButton) => (
+            <BerryTaskHeaderFrame
+              leading={
+                <>
+                  <h1 className="berry-task-title min-w-0 truncate">
+                    {editingTitle ? (
+                      <input
+                        ref={titleInputRef}
+                        autoFocus
+                        defaultValue={activeTask?.title ?? "Berry task"}
+                        aria-label="Rename task"
+                        className="berry-task-title-input min-w-0 max-w-[min(42vw,460px)] px-2"
+                        onBlur={(event) => void saveTaskTitle(event.currentTarget.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") {
+                            event.preventDefault();
+                            void saveTaskTitle(event.currentTarget.value);
+                          } else if (event.key === "Escape") {
+                            setEditingTitle(false);
+                          }
+                        }}
+                      />
+                    ) : (
+                      <button
+                        type="button"
+                        title="Rename task"
+                        className="berry-task-title-input min-w-0 max-w-[min(42vw,460px)] shrink truncate px-2 text-left"
+                        onClick={() => setEditingTitle(true)}
+                      >
+                        {activeTask?.title ?? "Berry task"}
+                      </button>
+                    )}
+                  </h1>
+                  {activeWorkspace ? (
+                    <ProjectSwitcher
+                      workspaces={workspaces}
+                      activeWorkspaceId={activeWorkspaceId}
+                      onSelectWorkspace={(workspaceId) => {
+                        setActiveWorkspaceId(workspaceId);
+                        const taskId = tasks.find((task) => task.workspaceId === workspaceId && !task.deletedAt && !task.archived)?.id;
+                        if (taskId && taskId !== activeTask.id) navigateToTask(taskId);
+                        else if (!taskId) navigateHome();
+                      }}
+                      onCreateProject={() => setCreatingProject(true)}
+                    />
+                  ) : null}
+                  {activeTask?.worktreeBranch ? (
+                    <span className="berry-task-pill hidden sm:inline-flex" title={activeTask.worktreeBranch}>
+                      <GitBranch />
+                      <span className="truncate font-mono">{activeTask.worktreeBranch}</span>
+                    </span>
+                  ) : null}
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button variant="ghost" size="icon-sm" aria-label="More actions" className="berry-titlebar-control shrink-0"><Ellipsis /></Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="start">
+                      <DropdownMenuItem onClick={() => setEditingTitle(true)}>Rename task</DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => { if (activeTask) void toggleTaskPinned(activeTask); }}>{activeTask?.pinned ? <PinOff /> : <Pin />} {activeTask?.pinned ? "Unpin task" : "Pin task"}</DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => void archiveTask(activeTask, true)}>Archive task</DropdownMenuItem>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem onClick={() => navigator.clipboard?.writeText(activeTask?.id ?? "")}>Copy task ID</DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => void deleteTask(activeTask)}>Delete task</DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </>
+              }
+              trailing={
+                <>
+                  {browserButton}
+                  <TooltipProvider delayDuration={300}>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label="View all files"
+                          onClick={() => setTaskFilesOpen(true)}
+                          className="berry-titlebar-control"
+                        >
+                          <FileSearchIcon />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent side="bottom">View all files</TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={activeTask?.pinned ? "Unpin task" : "Pin task"}
+                    aria-pressed={activeTask?.pinned ?? false}
+                    onClick={() => { if (activeTask) void toggleTaskPinned(activeTask); }}
+                    className="berry-titlebar-control"
                   >
-                    {activeTask?.title ?? "Berry task"}
-                  </button>
-                )}
-              </h1>
-              {activeWorkspace ? (
-                <ProjectSwitcher
-                  workspaces={workspaces}
-                  activeWorkspaceId={activeWorkspaceId}
-                  onSelectWorkspace={(workspaceId) => {
-                    setActiveWorkspaceId(workspaceId);
-                    const taskId = tasks.find((task) => task.workspaceId === workspaceId && !task.deletedAt && !task.archived)?.id;
-                    if (taskId && taskId !== activeTask.id) navigateToTask(taskId);
-                    else if (!taskId) navigateHome();
-                  }}
-                  onCreateProject={() => setCreatingProject(true)}
-                />
-              ) : null}
-              {activeTask?.worktreeBranch ? (
-                <span className="berry-task-pill hidden sm:inline-flex" title={activeTask.worktreeBranch}>
-                  <GitBranch />
-                  <span className="truncate font-mono">{activeTask.worktreeBranch}</span>
-                </span>
-              ) : null}
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button variant="ghost" size="icon-sm" aria-label="More actions" className="berry-titlebar-control shrink-0"><Ellipsis /></Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="start">
-                  <DropdownMenuItem onClick={() => setEditingTitle(true)}>Rename task</DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => { if (activeTask) void toggleTaskPinned(activeTask); }}>{activeTask?.pinned ? <PinOff /> : <Pin />} {activeTask?.pinned ? "Unpin task" : "Pin task"}</DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => void archiveTask(activeTask, true)}>Archive task</DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem onClick={() => navigator.clipboard?.writeText(activeTask?.id ?? "")}>Copy task ID</DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => void deleteTask(activeTask)}>Delete task</DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </>
-          }
-          trailing={
-            <>
-              <TooltipProvider delayDuration={300}>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="View all files"
-                      onClick={() => setTaskFilesOpen(true)}
-                      className="berry-titlebar-control"
-                    >
-                      <FileSearchIcon />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom">View all files</TooltipContent>
-                </Tooltip>
-              </TooltipProvider>
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                aria-label={activeTask?.pinned ? "Unpin task" : "Pin task"}
-                aria-pressed={activeTask?.pinned ?? false}
-                onClick={() => { if (activeTask) void toggleTaskPinned(activeTask); }}
-                className="berry-titlebar-control"
-              >
-                {activeTask?.pinned ? <PinOff /> : <Pin />}
-              </Button>
-              <WebHelpMenu />
-            </>
-          }
-        />
-        <div className="workspace">
-          <section className="thread-pane berry-task-thread" aria-label="Task">
-            {client && activeSessionId ? <BrowserControl key={activeSessionId} client={client} sessionId={activeSessionId} active={Boolean(durableState?.active || stream.turnActive || turnBusy)} onChanged={() => {
-              void client.turnState(activeSessionId).then((state) => applyDurableState(activeSessionId, state, true)).catch(() => undefined);
-              void refreshSessionMessages(activeSessionId).catch(() => undefined);
-            }} /> : null}
-            <Thread
-              sessionId={activeTask.activeSessionId ?? activeTask.id}
-              taskId={activeTask.id}
-              messages={messages}
-              stream={stream}
-              client={client}
-              config={config}
-              taskTitles={taskTitles}
-              imageGeneration={imageGenerationBySession[activeTask.activeSessionId ?? activeTask.id] ?? null}
-              onRetryImage={(prompt) => void generateImage(activeTask, prompt, false)}
-              onEditGeneratedImage={editGeneratedImage}
-              onRegenerateGeneratedImage={regenerateGeneratedImage}
-              editTurn={activeTask.activeSessionId ? editTurn : undefined}
-              recoveryRequired={durableState?.runState === "recovery_required"}
-              activeStatus={durableTurnPhase(durableState)}
-              cancelTurn={cancelTurn}
-              onViewTaskFiles={() => setTaskFilesOpen(true)}
-              onLoadOlderMessages={client ? loadOlderActiveMessages : undefined}
-              hasOlderMessages={activeMessageHistory?.hasOlder ?? false}
-              loadingOlderMessages={activeMessageHistory?.loadingOlder ?? false}
-              scrollRequest={threadScrollRequest?.sessionId === (activeTask.activeSessionId ?? activeTask.id) ? threadScrollRequest.id : 0}
+                    {activeTask?.pinned ? <PinOff /> : <Pin />}
+                  </Button>
+                  <WebHelpMenu />
+                </>
+              }
             />
-            <Composer
-              config={config}
-              activeTask={activeTask}
-              taskTitles={taskTitles}
-              client={client}
-              workspaces={workspaces}
-              activeWorkspaceId={activeWorkspaceId}
-              onSelectWorkspace={(workspaceId) => {
-                setActiveWorkspaceId(workspaceId);
-                const taskId = tasks.find((task) => task.workspaceId === workspaceId && !task.deletedAt && !task.archived)?.id;
-                if (taskId && taskId !== activeTask.id) navigateToTask(taskId);
-                else if (!taskId) navigateHome();
-              }}
-              onCreateProject={() => setCreatingProject(true)}
-              model={model}
-              onModelChange={updateModel}
-              variant="thread"
-              streaming={turnBusy || stream.turnActive || Boolean(durableState?.active)}
-              reasoning={reasoning}
-              onReasoningChange={updateReasoning}
-              onCommand={runSlashCommand}
-              queuedFollowUps={activeTask.activeSessionId ? followUpsBySession[activeTask.activeSessionId] ?? [] : []}
-              onQueuedFollowUp={enqueueFollowUp}
-              onRemoveFollowUp={removeFollowUp}
-              onRetryFollowUp={retryFollowUp}
-              onReorderFollowUps={reorderFollowUps}
-              onSteerFollowUp={sendFollowUpNow}
-              onUpdateFollowUp={updateFollowUp}
-              onResumeFollowUps={resumeFollowUps}
-              onEditingFollowUpChange={setEditingFollowUp}
-              onSteerMessage={steerActiveTurn}
-              question={stream.question}
-              streamSessionId={activeTask.activeSessionId}
-              streamMessages={messages}
-              showProjectSwitcher={shouldShowComposerProjectSwitcher(messages)}
-              personalization={personalization}
-              imageGenerationCapability={imageGenerationCapability}
-              onCreateTask={createTask}
-              onCancel={() => void cancelTurn()}
-              onContinueTurn={activeTask.activeSessionId && interruptedTurnAvailable
-                ? durableState?.runState === "recovery_required"
-                  ? recoverDurableTurn
-                  : continueTurn
-                : undefined}
-              runTurn={runTurn}
-              onUserMessage={(text, sessionId, taskId, attachments, messageId) => {
-                if (messageId) markRequestMessagePending(sessionId, messageId);
-                const user = optimisticUserMessage(sessionId, text, attachments, messageId);
-                const nextTitle = text.trim().slice(0, 42);
-                requestThreadBottom(sessionId);
-                replaceSessionMessages(sessionId, (current) => current.some((item) => item.id === user.id)
-                  ? current
-                  : [...current, user]);
-                setTasks((current) => current.map((task) => task.id === taskId ? { ...task, title: task.title === "New cloud task" ? nextTitle || task.title : task.title } : task));
-                if (client && activeTask.title === "New cloud task" && nextTitle) {
-                  void client.updateTask(taskId, { title: nextTitle })
-                    .catch((cause) => toast.error(cause instanceof Error ? cause.message : "Unable to save the task title"));
-                }
-                return user.id;
-              }}
-              onUserMessagePersisted={(sessionId, optimisticMessageId, persistedMessage) => {
-                replaceSessionMessages(sessionId, (current) => confirmOptimisticMessage(current, optimisticMessageId, persistedMessage));
-              }}
-              onAssistantMessage={(text, sessionId) => {
-                replaceSessionMessages(sessionId, (current) => [...current, message(`msg_assistant_${Date.now()}`, sessionId, "assistant", text)]);
-                resetSessionStream(sessionId);
-              }}
-              onEvent={updateSessionStream}
-            />
-          </section>
-        </div>
+          )}
+        >
+          <Thread
+            sessionId={activeTask.activeSessionId ?? activeTask.id}
+            taskId={activeTask.id}
+            messages={messages}
+            stream={stream}
+            client={client}
+            config={config}
+            taskTitles={taskTitles}
+            imageGeneration={imageGenerationBySession[activeTask.activeSessionId ?? activeTask.id] ?? null}
+            onRetryImage={(prompt) => void generateImage(activeTask, prompt, false)}
+            onEditGeneratedImage={editGeneratedImage}
+            onRegenerateGeneratedImage={regenerateGeneratedImage}
+            editTurn={activeTask.activeSessionId ? editTurn : undefined}
+            recoveryRequired={durableState?.runState === "recovery_required"}
+            activeStatus={durableTurnPhase(durableState)}
+            cancelTurn={cancelTurn}
+            onViewTaskFiles={() => setTaskFilesOpen(true)}
+            onLoadOlderMessages={client ? loadOlderActiveMessages : undefined}
+            hasOlderMessages={activeMessageHistory?.hasOlder ?? false}
+            loadingOlderMessages={activeMessageHistory?.loadingOlder ?? false}
+            scrollRequest={threadScrollRequest?.sessionId === (activeTask.activeSessionId ?? activeTask.id) ? threadScrollRequest.id : 0}
+          />
+          <Composer
+            config={config}
+            activeTask={activeTask}
+            taskTitles={taskTitles}
+            client={client}
+            workspaces={workspaces}
+            activeWorkspaceId={activeWorkspaceId}
+            onSelectWorkspace={(workspaceId) => {
+              setActiveWorkspaceId(workspaceId);
+              const taskId = tasks.find((task) => task.workspaceId === workspaceId && !task.deletedAt && !task.archived)?.id;
+              if (taskId && taskId !== activeTask.id) navigateToTask(taskId);
+              else if (!taskId) navigateHome();
+            }}
+            onCreateProject={() => setCreatingProject(true)}
+            model={model}
+            onModelChange={updateModel}
+            variant="thread"
+            streaming={turnBusy || stream.turnActive || Boolean(durableState?.active)}
+            reasoning={reasoning}
+            onReasoningChange={updateReasoning}
+            onCommand={runSlashCommand}
+            queuedFollowUps={activeTask.activeSessionId ? followUpsBySession[activeTask.activeSessionId] ?? [] : []}
+            onQueuedFollowUp={enqueueFollowUp}
+            onRemoveFollowUp={removeFollowUp}
+            onRetryFollowUp={retryFollowUp}
+            onReorderFollowUps={reorderFollowUps}
+            onSteerFollowUp={sendFollowUpNow}
+            onUpdateFollowUp={updateFollowUp}
+            onResumeFollowUps={resumeFollowUps}
+            onEditingFollowUpChange={setEditingFollowUp}
+            onSteerMessage={steerActiveTurn}
+            question={stream.question}
+            streamSessionId={activeTask.activeSessionId}
+            streamMessages={messages}
+            showProjectSwitcher={shouldShowComposerProjectSwitcher(messages)}
+            personalization={personalization}
+            imageGenerationCapability={imageGenerationCapability}
+            onCreateTask={createTask}
+            onCancel={() => void cancelTurn()}
+            onContinueTurn={activeTask.activeSessionId && interruptedTurnAvailable
+              ? durableState?.runState === "recovery_required"
+                ? recoverDurableTurn
+                : continueTurn
+              : undefined}
+            runTurn={runTurn}
+            onUserMessage={(text, sessionId, taskId, attachments, messageId) => {
+              if (messageId) markRequestMessagePending(sessionId, messageId);
+              const user = optimisticUserMessage(sessionId, text, attachments, messageId);
+              const nextTitle = text.trim().slice(0, 42);
+              requestThreadBottom(sessionId);
+              replaceSessionMessages(sessionId, (current) => current.some((item) => item.id === user.id)
+                ? current
+                : [...current, user]);
+              setTasks((current) => current.map((task) => task.id === taskId ? { ...task, title: task.title === "New cloud task" ? nextTitle || task.title : task.title } : task));
+              if (client && activeTask.title === "New cloud task" && nextTitle) {
+                void client.updateTask(taskId, { title: nextTitle })
+                  .catch((cause) => toast.error(cause instanceof Error ? cause.message : "Unable to save the task title"));
+              }
+              return user.id;
+            }}
+            onUserMessagePersisted={(sessionId, optimisticMessageId, persistedMessage) => {
+              replaceSessionMessages(sessionId, (current) => confirmOptimisticMessage(current, optimisticMessageId, persistedMessage));
+            }}
+            onAssistantMessage={(text, sessionId) => {
+              replaceSessionMessages(sessionId, (current) => [...current, message(`msg_assistant_${Date.now()}`, sessionId, "assistant", text)]);
+              resetSessionStream(sessionId);
+            }}
+            onEvent={updateSessionStream}
+          />
+        </TaskBrowserWorkspace>
         </>
         ) : (
           (shouldMountTaskSurface(surface) && shellLocation.kind === "task") ? (
