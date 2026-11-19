@@ -26,12 +26,20 @@ export const McpCredentialResultSchema = z.discriminatedUnion("status", [
 ]);
 export type McpCredentialResult = z.infer<typeof McpCredentialResultSchema>;
 
+export const GoogleMcpReconnectSchema = z.object({
+  code: z.literal("berry_google_reauth_required"),
+  connectorId: z.enum(["connector_google_workspace", "connector_gmail", "connector_google_calendar"]),
+  grantId: Revision,
+}).strict();
+
 export const TaskConnectorReconnectSchema = z.object({
   connectorId: z.string(),
   name: z.string(),
   taskId: z.string().uuid(),
   runId: z.string().uuid(),
   canReconnect: z.boolean(),
+  connectorKey: z.string().optional(),
+  accessLevel: z.enum(["read", "full"]).optional(),
 }).strict();
 export type TaskConnectorReconnect = z.infer<typeof TaskConnectorReconnectSchema>;
 

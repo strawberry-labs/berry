@@ -328,14 +328,14 @@ time from their Google Account's linked-apps page.
 | --- | --- | --- |
 | Workspace, Selected files | Search/read files selected through Berry, read Docs/Sheets/Slides, read Form responses | Create/update only files created by or explicitly opened with Berry; Full still uses only `drive.file` |
 | Workspace, Workspace search | Search/read all files the user can already access, read Docs/Sheets/Slides and Form responses | Broad Docs/Sheets/Slides/Forms editor scopes plus `drive.file` for Drive file operations |
-| Gmail | Search/read messages, threads, attachments, labels, and drafts | Create/update/send drafts and messages; reply; label; mark read/unread; trash/untrash |
-| Calendar | List calendars/events, read events, query free/busy, suggest slots | Create/update/respond/delete events with explicit invitation-update behavior |
+| Gmail | Search/read messages, threads, attachments, labels, and drafts | Create/update/send drafts and messages, reply, apply or remove labels, mark read or unread, restore from trash |
+| Calendar | List calendars/events, read events, query free/busy, suggest slots | Create, update, or respond to events with explicit invitation-update behavior |
 
 Berry also supports My Drive and shared-drive reads, capability preflights,
 bounded Sheets reads/writes, Docs revision guards, Slides thumbnails, Forms
 responses/publishing, Gmail MIME attachments and threading, and Calendar
 recurrence/free-busy. It intentionally excludes Drive ownership/sharing
-changes, irreversible Drive/Gmail deletion, Gmail administration, Calendar
+changes, deletion and trash tools, Gmail administration, Calendar
 ACL/calendar administration, raw Google endpoint calls, background mailbox or
 Drive indexing, and Google Admin SDK operations.
 

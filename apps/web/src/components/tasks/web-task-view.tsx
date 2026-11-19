@@ -15,6 +15,7 @@ import { MentionMenu, useStaticMentions } from "../mention-menu";
 import { PromptEditor, type PromptEditorHandle } from "../prompt-editor";
 import { fileTypeLabel, formatBytes } from "../library/file-metadata";
 import { stableQuestionAnswerMessageId } from "./composer-question-overlay";
+import { TaskConnectorReconnects } from "./task-connector-reconnect";
 import { sessionStreamStore, useSessionStream } from "@/lib/session-stream-store";
 
 const DocumentPreviewModal = React.lazy(async () => ({
@@ -253,6 +254,9 @@ export function Thread({ sessionId, taskId, messages, stream: initialStream, cli
         {...(recoveryRequired ? { latestTurnError: "Something interrupted this response." } : {})}
         adapter={adapter}
         liveContent={imageGenerationContent}
+        afterMessages={client && !readOnly ? (
+          <TaskConnectorReconnects key={taskId} client={client} taskId={taskId} active={Boolean(stream.turnActive || activeStatus)} />
+        ) : null}
         {...(onLoadOlderMessages ? { onLoadOlderMessages } : {})}
         hasOlderMessages={hasOlderMessages}
         loadingOlderMessages={loadingOlderMessages}

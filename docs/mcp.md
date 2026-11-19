@@ -122,7 +122,7 @@ Discovery and task execution share the refresh path. One caller claims the lates
 
 Berry gets one recovery attempt inside the original tool step. An HTTP authentication rejection before dispatch can trigger a refresh and retry. A Streamable HTTP `404` on a session-bound request can trigger a new handshake and retry. Connection failures after dispatch require a trusted replay policy for automatic retry. A write with an uncertain outcome goes through the existing read-only outcome check. Retry delays respect `Retry-After` when it fits the step's remaining time. Cancellation prevents further tool dispatch. An already-sent rotating token exchange can finish saving its result.
 
-The task shows **Reconnect** when the current grant needs interactive sign-in. A member using a shared grant sees who can reconnect it. The OAuth callback returns to the task, where the action clears once the saved grant is restored. Interactive sign-in creates a new grant and can change the remote identity. Completed tool steps stay in the task journal. Use the existing **Continue** action for an interrupted turn and verify any uncertain outcomes before retrying writes.
+The chat shows a **Reconnect** card when a tool call needs a new OAuth sign-in. Choose **Reconnect** to sign in and return to the chat, or **Cancel** to dismiss the card for that run. A member using a shared grant sees who can reconnect it. Completed tool steps stay in the task journal. Use **Continue** for an interrupted turn and verify any uncertain outcomes before retrying writes.
 
 #### Rollout
 

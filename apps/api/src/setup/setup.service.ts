@@ -28,6 +28,7 @@ import {
 import { Redis } from "ioredis";
 import { z } from "zod";
 import type { ConnectorsService } from "../connectors/connectors.service.ts";
+import { DEFAULT_GOOGLE_CONNECTOR_ACCESS_LEVEL } from "../connectors/google-tools.ts";
 import type { CloudDatabaseService } from "../db/cloud-database.service.ts";
 import type { EnterpriseIdentityRepository } from "../identity/identity.repository.ts";
 import { s3ClientOptions } from "../storage/s3-client-options.ts";
@@ -80,16 +81,16 @@ export const SetupGoogleConnectorsInputSchema = z.object({
   drive: z.object({
     enabled: z.boolean().default(true),
     access: z.enum(["selected_files", "search_workspace"]).default("selected_files"),
-    maxAccessLevel: z.enum(["read", "full"]).default("read"),
-  }).default({ enabled: true, access: "selected_files", maxAccessLevel: "read" }),
+    maxAccessLevel: z.enum(["read", "full"]).default(DEFAULT_GOOGLE_CONNECTOR_ACCESS_LEVEL),
+  }).default({ enabled: true, access: "selected_files", maxAccessLevel: DEFAULT_GOOGLE_CONNECTOR_ACCESS_LEVEL }),
   gmail: z.object({
     enabled: z.boolean().default(false),
-    maxAccessLevel: z.enum(["read", "full"]).default("read"),
-  }).default({ enabled: false, maxAccessLevel: "read" }),
+    maxAccessLevel: z.enum(["read", "full"]).default(DEFAULT_GOOGLE_CONNECTOR_ACCESS_LEVEL),
+  }).default({ enabled: false, maxAccessLevel: DEFAULT_GOOGLE_CONNECTOR_ACCESS_LEVEL }),
   calendar: z.object({
     enabled: z.boolean().default(false),
-    maxAccessLevel: z.enum(["read", "full"]).default("read"),
-  }).default({ enabled: false, maxAccessLevel: "read" }),
+    maxAccessLevel: z.enum(["read", "full"]).default(DEFAULT_GOOGLE_CONNECTOR_ACCESS_LEVEL),
+  }).default({ enabled: false, maxAccessLevel: DEFAULT_GOOGLE_CONNECTOR_ACCESS_LEVEL }),
 }).strict();
 
 type SetupDraft = {
@@ -610,7 +611,7 @@ async function settleProbe(probe: () => Promise<boolean>): Promise<boolean> {
 }
 
 function connectorView(row: { enabled: boolean; max_access_level: "read" | "full"; workspace_access_mode: "selected_files" | "search_workspace" | null } | undefined, defaultAccess?: "selected_files" | "search_workspace") {
-  return { enabled: row?.enabled ?? false, maxAccessLevel: row?.max_access_level ?? "read", ...(defaultAccess ? { access: row?.workspace_access_mode ?? defaultAccess } : {}) };
+  return { enabled: row?.enabled ?? false, maxAccessLevel: row?.max_access_level ?? DEFAULT_GOOGLE_CONNECTOR_ACCESS_LEVEL, ...(defaultAccess ? { access: row?.workspace_access_mode ?? defaultAccess } : {}) };
 }
 
 function check(id: string, label: string, ok: boolean, success: string, failure: string, blocking: boolean): SetupCheck {

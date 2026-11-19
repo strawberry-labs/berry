@@ -1,6 +1,6 @@
 import * as React from "react";
 import type { Connector } from "@berry/shared";
-import { CalendarDays, ExternalLink, FileText, HardDrive, Mail, Plus, PlugZap } from "lucide-react";
+import { ExternalLink, FileText, Plus, PlugZap } from "lucide-react";
 import { toast } from "sonner";
 import {
   AsyncState,
@@ -19,6 +19,7 @@ import {
 } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
 import { PersonalConnectorsSkeleton } from "./management-screen-skeletons";
+import { ConnectorMark } from "../connector-mark";
 
 export function PersonalConnectorsScreen({ client, permissions }: ManagementScreenProps) {
   const resource = useResource("connectors:me", () => client?.listConnectors() ?? Promise.resolve([]), [] as Connector[]);
@@ -55,10 +56,11 @@ export function PersonalConnectorsScreen({ client, permissions }: ManagementScre
 
   const open = (connector: Connector) => {
     setSelected(connector);
-    setAccess(connector.maxAccessLevel === "read" ? "read" : connector.connectedAccessLevel ?? "read");
+    const defaultAccess = connector.provider === "google" ? connector.maxAccessLevel : "read";
+    setAccess(connector.connectedAccessLevel ?? defaultAccess);
     setCredential("");
   };
-  const connect = async () => {
+  const connect = async (accessLevel = access) => {
     if (!client || !selected) return;
     setBusy(true);
     try {
@@ -69,7 +71,7 @@ export function PersonalConnectorsScreen({ client, permissions }: ManagementScre
         setSelected(updated); resource.retry(); toast.success(`${updated.name} connected`);
         return;
       }
-      const flow = await client.startConnectorOAuth(selected.id, access);
+      const flow = await client.startConnectorOAuth(selected.id, accessLevel);
       window.location.assign(flow.authorizationUrl);
     } catch (cause) {
       toast.error(message(cause));
@@ -135,6 +137,8 @@ export function PersonalConnectorsScreen({ client, permissions }: ManagementScre
   const pendingCount = rows.filter((connector) => connector.approvalStatus === "pending").length;
   const selectedApproved = selected?.approvalStatus === "approved";
   const selectedConnected = selected?.connectionStatus === "connected";
+  const canGrantWriteAccess = selectedApproved && selectedConnected && selected.provider === "google"
+    && selected.connectedAccessLevel === "read" && selected.maxAccessLevel === "full";
 
   return <ManagementPage title="Connectors" description="Connect your accounts in other apps so Berry can use them when a task needs to." actions={<Button disabled={!client} onClick={() => setAddOpen(true)}><Plus />Add MCP server</Button>}>
     {pendingCount ? <InlineNotice tone="info">
@@ -198,6 +202,7 @@ export function PersonalConnectorsScreen({ client, permissions }: ManagementScre
       footer={selected ? <>
         {selectedConnected && selected.authStrategy === "personal" ? <Button variant="secondary" disabled={busy} onClick={() => void disconnect()}>Disconnect</Button> : null}
         {selectedConnected && selected.key === "google-workspace" && selected.workspaceAccessMode === "selected_files" ? <Button variant="secondary" disabled={busy} onClick={() => void chooseFiles()}><FileText />Choose Drive files</Button> : null}
+        {canGrantWriteAccess ? <Button disabled={busy || !client || !selected.configured} onClick={() => void connect("full")}>{busy ? "Opening sign-in…" : "Grant write access"}</Button> : null}
         {selectedApproved && !selectedConnected && selected.authType !== "none" ? <Button disabled={busy || !client || !selected.configured} onClick={() => void connect()}>{busy ? "Connecting…" : needsReconnect(selected) ? `Reconnect ${selected.name}` : `Connect ${selected.name}`}</Button> : null}
       </> : undefined}
     >
@@ -270,8 +275,7 @@ function needsReconnect(connector: Connector): boolean {
 }
 
 function ConnectorIcon({ connector }: { connector: Connector }) {
-  const Icon = connector.key === "google-workspace" ? HardDrive : connector.key === "gmail" ? Mail : connector.key === "google-calendar" ? CalendarDays : PlugZap;
-  return <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-[var(--berry-surface-under)] text-muted-foreground"><Icon className="size-4" aria-hidden /></span>;
+  return <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-[var(--berry-surface-under)] text-muted-foreground"><ConnectorMark connectorKey={connector.key} className="size-4 object-contain" /></span>;
 }
 
 function humanTool(value: string): string { return value.replace(/^google_/, "").replaceAll("_", " ").replace(/^\w/, (letter) => letter.toUpperCase()); }

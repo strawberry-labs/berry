@@ -35,6 +35,7 @@ import {
 } from "@berry/shared";
 import type { CloudDatabaseService, SqlExecutor } from "../db/cloud-database.service.ts";
 import {
+  DEFAULT_GOOGLE_CONNECTOR_ACCESS_LEVEL,
   executeGoogleTool,
   GOOGLE_CONNECTOR_SERVICES,
   googleConnectorScopes,
@@ -631,11 +632,17 @@ export class ConnectorsService {
     return { ok: true };
   }
 
-  async startGoogleOAuth(tenantId: string, userId: string, id: string, accessLevel: ConnectorAccessLevel) {
+  async startGoogleOAuth(tenantId: string, userId: string, id: string, accessLevel: ConnectorAccessLevel, taskId?: string) {
     const row = await this.#row(tenantId, id);
     if (!isGoogleKey(row.connector_key)) throw new BadRequestException("This connector does not use Google OAuth");
     if (!row.enabled) throw new BadRequestException("This connector is disabled by the administrator");
     if (accessLevel === "full" && row.max_access_level !== "full") throw new BadRequestException("Full access has not been enabled by the administrator");
+    if (taskId) {
+      const action = (await this.#taskMcpReconnects(tenantId, userId, taskId, false)).find((candidate) => candidate.connectorId === id);
+      if (!action?.canReconnect || action.accessLevel !== accessLevel) {
+        throw new BadRequestException("This task no longer needs to reconnect this Google account");
+      }
+    }
     const provider = await this.#providerCredential(tenantId);
     if (!provider) throw new BadRequestException("The administrator has not configured Google OAuth yet");
     const state = randomBytes(32).toString("base64url");
@@ -649,8 +656,8 @@ export class ConnectorsService {
       await db.execute("DELETE FROM connector_oauth_states WHERE expires_at <= now()");
       await db.execute(`
         INSERT INTO connector_oauth_states (state_digest, tenant_id, connector_id, user_id, access_level, requested_scopes, code_verifier_envelope, redirect_after, expires_at)
-        VALUES ($1,$2::uuid,$3,$4,$5,$6::text[],$7::jsonb,'/settings/connectors',$8::timestamptz)
-      `, [stateDigest, tenantId, row.id, userId, accessLevel, scopes, JSON.stringify(verifierEnvelope), expiresAt.toISOString()]);
+        VALUES ($1,$2::uuid,$3,$4,$5,$6::text[],$7::jsonb,$8,$9::timestamptz)
+      `, [stateDigest, tenantId, row.id, userId, accessLevel, scopes, JSON.stringify(verifierEnvelope), taskId ? `/tasks/${taskId}` : "/settings/connectors", expiresAt.toISOString()]);
     });
     const authorizationUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
     authorizationUrl.searchParams.set("client_id", provider.clientId);
@@ -669,7 +676,7 @@ export class ConnectorsService {
     return { connectorId: row.id, state, authorizationUrl: authorizationUrl.toString(), expiresAt: expiresAt.toISOString() };
   }
 
-  async completeGoogleOAuth(tenantId: string, userId: string, input: { state: string; code?: string; error?: string }): Promise<{ redirectAfter: string; connectorId: string }> {
+  async completeGoogleOAuth(tenantId: string, userId: string, input: { state: string; code?: string; error?: string }): Promise<{ redirectAfter: string; connectorId: string; error?: string }> {
     const stateDigest = sha256(input.state);
     const states = await this.database.withTenant(tenantId, (db) => db.query<OAuthStateRow>("UPDATE connector_oauth_states SET consumed_at=now() WHERE state_digest=$1 AND user_id=$2 AND consumed_at IS NULL AND expires_at>now() RETURNING *", [stateDigest, userId]));
     const flow = states[0];
@@ -697,7 +704,7 @@ export class ConnectorsService {
       const profile = await googleUserInfo(accessToken);
       if (provider.hostedDomain && profile.email.split("@")[1]?.toLowerCase() !== provider.hostedDomain) throw new BadRequestException(`Connect an account from ${provider.hostedDomain}`);
       const existing = await this.#connection(tenantId, row.id, userId);
-      const previous = existing ? await this.#openGoogleToken(tenantId, row.id, userId, existing) : null;
+      const previous = existing?.account_subject === profile.sub ? await this.#openGoogleToken(tenantId, row.id, userId, existing) : null;
       const grantedScopes = typeof tokenResponse.scope === "string" ? tokenResponse.scope.split(/\s+/).filter(Boolean) : flow.requested_scopes;
       const missingScopes = flow.requested_scopes.filter((scope) => !grantedScopes.includes(scope));
       if (missingScopes.length) {
@@ -715,6 +722,13 @@ export class ConnectorsService {
       await this.#upsertConnection(tenantId, row.id, userId, flow.access_level, envelope, profile.email, profile.sub, grantedScopes, token.expiresAt);
       await this.database.withTenant(tenantId, (db) => db.execute("UPDATE connector_provider_credentials SET status='verified', last_tested_at=now(), last_error_code=NULL, updated_at=now() WHERE provider='google'"));
       return { redirectAfter: flow.redirect_after, connectorId: row.id };
+    } catch (cause) {
+      if (!flow.redirect_after.startsWith("/tasks/")) throw cause;
+      return {
+        redirectAfter: flow.redirect_after,
+        connectorId: flow.connector_id,
+        error: (cause instanceof Error ? cause.message : "Google authorization failed").slice(0, 240),
+      };
     } finally {
       await this.database.withTenant(tenantId, (db) => db.execute("DELETE FROM connector_oauth_states WHERE state_digest=$1", [stateDigest]));
     }
@@ -820,9 +834,9 @@ export class ConnectorsService {
     for (const row of rows) {
       if (isGoogleKey(row.connector_key)) {
         const connection = await this.#connection(tenantId, row.id, userId);
-        if (!connection || connection.status !== "connected") continue;
+        if (!connection || (connection.status !== "connected" && connection.status !== "reauth_required")) continue;
         const accessLevel: ConnectorAccessLevel = row.max_access_level === "read" ? "read" : connection.access_level;
-        const grantedScopes = connection.granted_scopes ?? [];
+        const grantedScopes = googleCatalogScopes(connection);
         const tools = googleToolCatalog(row.connector_key, accessLevel, grantedScopes);
         if (!tools.length) continue;
         const credential = this.#signSession({ tenantId, userId, connectorKey: row.connector_key, accessLevel, ...(context.taskId ? { taskId: context.taskId } : {}), ...(context.sessionId ? { sessionId: context.sessionId } : {}), exp: Math.floor(Date.now() / 1000) + 20 * 60 });
@@ -920,15 +934,17 @@ export class ConnectorsService {
     if (rpc.method === "ping") return { status: 200, body: { jsonrpc: "2.0", id: rpc.id, result: {} } };
     const row = await this.#row(session.tenantId, BUILT_INS[connectorKey].id);
     if (!row.enabled) return { status: 403, body: rpcError(rpc.id, -32001, "Connector is disabled") };
-    const accessLevel: ConnectorAccessLevel = row.max_access_level === "read" ? "read" : session.accessLevel;
     const connection = await this.#connection(session.tenantId, row.id, session.userId);
-    if (!connection || connection.status !== "connected") return { status: 403, body: rpcError(rpc.id, -32001, "Google connector is not connected") };
-    const grantedScopes = connection.granted_scopes ?? [];
-    if (rpc.method === "tools/list") return { status: 200, body: { jsonrpc: "2.0", id: rpc.id, result: { tools: googleToolCatalog(connectorKey, accessLevel, grantedScopes) } } };
+    if (!connection || (connection.status !== "connected" && connection.status !== "reauth_required")) return { status: 403, body: rpcError(rpc.id, -32001, "Google connector is not connected") };
+    const accessLevel: ConnectorAccessLevel = row.max_access_level === "read" || session.accessLevel === "read" ? "read" : connection.access_level;
+    const tools = googleToolCatalog(connectorKey, accessLevel, googleCatalogScopes(connection));
+    if (rpc.method === "tools/list") return { status: 200, body: { jsonrpc: "2.0", id: rpc.id, result: { tools } } };
     if (rpc.method !== "tools/call") return { status: 200, body: rpcError(rpc.id, -32601, `Method ${rpc.method} is not supported`) };
     try {
       const params = requiredObject(rpc.params, "params");
       const name = requiredTokenString(params.name, "tool name");
+      if (!tools.some((tool) => tool.name === name)) throw new Error(`Tool ${name} is not authorized for this connection`);
+      if (connection.status === "reauth_required") throw new GoogleReconnectRequired(connection);
       const args = params.arguments && typeof params.arguments === "object" && !Array.isArray(params.arguments) ? params.arguments as Record<string, unknown> : {};
       const accessToken = await this.#googleAccessToken(session.tenantId, row, connection);
       const artifactImporter = session.taskId && session.sessionId && options.importArtifact
@@ -948,11 +964,18 @@ export class ConnectorsService {
         accessToken,
         args,
         connection.account_email,
-        grantedScopes,
+        connection.granted_scopes ?? [],
         artifactImporter ? { artifactImporter } : {},
       );
       return { status: 200, body: { jsonrpc: "2.0", id: rpc.id, result: { content: [{ type: "text", text: googleToolText(result) }], structuredContent: result, isError: false } } };
     } catch (cause) {
+      if (cause instanceof GoogleReconnectRequired) {
+        return { status: 200, body: { jsonrpc: "2.0", id: rpc.id, result: {
+          content: [{ type: "text", text: cause.message }],
+          structuredContent: { code: "berry_google_reauth_required", connectorId: row.id, grantId: cause.grantId },
+          isError: true,
+        } } };
+      }
       return { status: 200, body: { jsonrpc: "2.0", id: rpc.id, result: { content: [{ type: "text", text: cause instanceof Error ? cause.message : "Google connector tool failed" }], isError: true } } };
     }
   }
@@ -1007,7 +1030,7 @@ export class ConnectorsService {
           ? (config.discoveredTools ?? []).map((tool) => tool.name)
           : config.allowedTools ?? [],
       limitations: google
-        ? []
+        ? ["Berry blocks deletion and trash actions."]
         : [config.serverApproved
             ? "The organization approved this MCP server. Its live tool catalog may change, and server-supplied safety annotations are not trusted."
             : "The administrator's exact tool allowlist is enforced, and Berry requires approval for every custom MCP call. Server-supplied safety annotations are not trusted."],
@@ -1020,9 +1043,9 @@ export class ConnectorsService {
     const definition = BUILT_INS[key];
     await db.execute(`
       INSERT INTO organization_connectors (id, tenant_id, connector_key, kind, provider, name, description, enabled, max_access_level, workspace_access_mode, auth_strategy, auth_type, publication_status, created_by)
-      VALUES ($1,$2::uuid,$3,'app','google',$4,$5,false,'read',CASE WHEN $3='google-workspace' THEN 'selected_files' ELSE NULL END,'personal','oauth','published',$6)
+      VALUES ($1,$2::uuid,$3,'app','google',$4,$5,false,$7,CASE WHEN $3='google-workspace' THEN 'selected_files' ELSE NULL END,'personal','oauth','published',$6)
       ON CONFLICT (tenant_id, connector_key) DO NOTHING
-    `, [definition.id, tenantId, key, definition.name, definition.description, userId]);
+    `, [definition.id, tenantId, key, definition.name, definition.description, userId, DEFAULT_GOOGLE_CONNECTOR_ACCESS_LEVEL]);
   }
 
   async #providerCredential(tenantId: string): Promise<{ clientId: string; clientSecret: string; hostedDomain: string | null; pickerApiKey: string | null; pickerProjectNumber: string | null } | null> {
@@ -1123,8 +1146,8 @@ export class ConnectorsService {
     if (!stored) throw new Error("Google credentials cannot be opened");
     if (new Date(stored.expiresAt).getTime() > Date.now() + 90_000) return stored.accessToken;
     if (!stored.refreshToken) {
-      await this.#markConnection(tenantId, connection.id, "reauth_required", "refresh_token_missing");
-      throw new Error("Google connection has expired; reconnect it in Settings → Connectors");
+      await this.#markGoogleReconnectRequired(tenantId, connection, "refresh_token_missing");
+      throw new GoogleReconnectRequired(connection);
     }
     const provider = await this.#providerCredential(tenantId);
     if (!provider) throw new ServiceUnavailableException("Google OAuth configuration is missing");
@@ -1138,16 +1161,29 @@ export class ConnectorsService {
         scope: typeof refreshed.scope === "string" ? refreshed.scope.split(/\s+/).filter(Boolean) : stored.scope,
       };
       const envelope = await this.#seal(JSON.stringify(next), connectionContext(tenantId, connector.id, connection.user_id!));
-      await this.database.withTenant(tenantId, (db) => db.execute("UPDATE connector_connections SET credential_envelope=$1::jsonb, expires_at=$2::timestamptz, granted_scopes=$3::text[], status='connected', last_error_code=NULL, last_successful_use_at=now(), updated_at=now() WHERE id=$4", [JSON.stringify(envelope), next.expiresAt, next.scope, connection.id]));
+      const [saved] = await this.database.withTenant(tenantId, (db) => db.query<{ id: string }>(`
+        UPDATE connector_connections
+        SET credential_envelope=$1::jsonb, expires_at=$2::timestamptz, granted_scopes=$3::text[],
+            status='connected', last_error_code=NULL, last_successful_use_at=now(), updated_at=now()
+        WHERE id=$4 AND status='connected' AND credential_envelope IS NOT DISTINCT FROM $5::jsonb
+        RETURNING id
+      `, [JSON.stringify(envelope), next.expiresAt, next.scope, connection.id, JSON.stringify(connection.credential_envelope)]));
+      if (!saved) throw new Error("The Google connection changed during token refresh");
       return next.accessToken;
     } catch (cause) {
-      await this.#markConnection(tenantId, connection.id, "reauth_required", googleOAuthErrorCode(cause));
-      throw new Error(`Google connection for ${connector.name} has expired; reconnect it in Settings → Connectors`);
+      if (cause instanceof GoogleOAuthExchangeError && cause.oauthCode === "invalid_grant") {
+        await this.#markGoogleReconnectRequired(tenantId, connection, "invalid_grant");
+        throw new GoogleReconnectRequired(connection);
+      }
+      throw new ServiceUnavailableException("Google could not refresh this connection. Try again in a moment.");
     }
   }
 
-  async #markConnection(tenantId: string, id: string, status: "reauth_required" | "error", errorCode: string): Promise<void> {
-    await this.database.withTenant(tenantId, (db) => db.execute("UPDATE connector_connections SET status=$1, last_error_code=$2, updated_at=now() WHERE id=$3", [status, errorCode.slice(0, 120), id]));
+  async #markGoogleReconnectRequired(tenantId: string, connection: ConnectionRow, errorCode: string): Promise<void> {
+    await this.database.withTenant(tenantId, (db) => db.execute(`
+      UPDATE connector_connections SET status='reauth_required', last_error_code=$1, updated_at=now()
+      WHERE id=$2 AND status='connected' AND credential_envelope IS NOT DISTINCT FROM $3::jsonb
+    `, [errorCode, connection.id, JSON.stringify(connection.credential_envelope)]));
   }
 
   async resolveRunMcpCredential(proof: DurableSecretEnvelope, signal?: AbortSignal): Promise<McpCredentialResult> {
@@ -1205,6 +1241,18 @@ export class ConnectorsService {
       if (!failures.length) return [];
       const connectors = await db.query<ConnectorRow>("SELECT * FROM organization_connectors WHERE id=ANY($1::text[]) AND enabled=true AND publication_status='published' AND approval_status='approved'", [[...new Set(failures.map((failure) => failure.connector_id))]]);
       const actions = await Promise.all(connectors.map(async (row) => {
+        if (row.provider === "google" && isGoogleKey(row.connector_key)) {
+          const [connection] = await db.query<ConnectionRow>(
+            "SELECT * FROM connector_connections WHERE connector_id=$1 AND user_id=$2 AND status='reauth_required' LIMIT 1", [row.id, userId],
+          );
+          if (!connection) return null;
+          const grantId = googleGrantId(connection);
+          const failure = failures.find((candidate) => candidate.connector_id === row.id && candidate.grant_id === grantId);
+          return failure ? {
+            connectorId: row.id, name: row.name, taskId, runId: failure.run_id, grantId, canReconnect: true,
+            connectorKey: row.connector_key, accessLevel: row.max_access_level === "read" ? "read" as const : connection.access_level,
+          } : null;
+        }
         if (!isMcpOAuth(row)) return null;
         const grant = await this.#readMcpGrant(db, tenantId, userId, row);
         if (!grant || !mcpReauthRequired(grant)) return null;
@@ -1478,7 +1526,7 @@ export class ConnectorsService {
 
 function virtualBuiltIn(key: GoogleConnectorKey): ConnectorRow {
   const item = BUILT_INS[key];
-  return { id: item.id, connector_key: key, kind: "app", provider: "google", name: item.name, description: item.description, enabled: false, max_access_level: "read", workspace_access_mode: key === "google-workspace" ? "selected_files" : null, auth_strategy: "personal", transport: null, endpoint_url: null, auth_type: "oauth", publication_status: "published", shared_credential_envelope: null, config: {}, created_at: "", updated_at: "" };
+  return { id: item.id, connector_key: key, kind: "app", provider: "google", name: item.name, description: item.description, enabled: false, max_access_level: DEFAULT_GOOGLE_CONNECTOR_ACCESS_LEVEL, workspace_access_mode: key === "google-workspace" ? "selected_files" : null, auth_strategy: "personal", transport: null, endpoint_url: null, auth_type: "oauth", publication_status: "published", shared_credential_envelope: null, config: {}, created_at: "", updated_at: "" };
 }
 function mcpNameFromUrl(raw: string): string {
   const hostname = new URL(raw).hostname.replace(/^www\./, "");
@@ -1547,7 +1595,25 @@ function mcpAvailable(grant: McpGrant): McpCredentialResult {
 }
 function oauthStateContext(tenantId: string, digest: string) { return `${tenantId}:oauth-state:${digest}`; }
 function sha256(value: string) { return createHash("sha256").update(value).digest("hex"); }
-function googleOAuthErrorCode(cause: unknown) { const message = cause instanceof Error ? cause.message : "token_refresh_failed"; if (/invalid_grant/i.test(message)) return "invalid_grant"; if (/admin_policy_enforced/i.test(message)) return "admin_policy_enforced"; return "token_refresh_failed"; }
+function googleCatalogScopes(connection: ConnectionRow): string[] | undefined {
+  return connection.status === "reauth_required" && !connection.granted_scopes?.length ? undefined : connection.granted_scopes ?? [];
+}
+function googleGrantId(connection: ConnectionRow): string {
+  return sha256(JSON.stringify([connection.id, connectorEnvelope(connection.credential_envelope)?.ciphertext ?? connection.updated_at]));
+}
+class GoogleReconnectRequired extends Error {
+  readonly grantId: string;
+
+  constructor(connection: ConnectionRow) {
+    super("Google authorization has expired. Reconnect this account to continue.");
+    this.grantId = googleGrantId(connection);
+  }
+}
+class GoogleOAuthExchangeError extends BadRequestException {
+  constructor(readonly oauthCode: string | undefined, message: string) {
+    super(message);
+  }
+}
 function bearer(header: string | undefined): string | null { const match = header?.match(/^Bearer\s+(.+)$/i); return match?.[1]?.trim() || null; }
 function rpcRequest(value: unknown): { id: string | number | null; method: string; params: unknown } { const body = requiredObject(value, "JSON-RPC request"); if (body.jsonrpc !== "2.0" || typeof body.method !== "string") throw new BadRequestException("Invalid JSON-RPC request"); return { id: typeof body.id === "string" || typeof body.id === "number" ? body.id : null, method: body.method, params: body.params }; }
 function rpcError(id: string | number | null, code: number, message: string) { return { jsonrpc: "2.0", id, error: { code, message } }; }
@@ -1581,7 +1647,11 @@ function googleToolText(result: unknown): string {
 async function googleTokenRequest(body: Record<string, string>): Promise<Record<string, unknown>> {
   const response = await fetch("https://oauth2.googleapis.com/token", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(body), signal: AbortSignal.timeout(20_000) });
   const value = await response.json().catch(() => ({})) as Record<string, unknown>;
-  if (!response.ok) throw new BadRequestException(`Google token exchange failed: ${typeof value.error_description === "string" ? value.error_description : typeof value.error === "string" ? value.error : response.status}`);
+  if (!response.ok) {
+    const code = typeof value.error === "string" ? value.error : undefined;
+    const message = typeof value.error_description === "string" ? value.error_description : code ?? response.status;
+    throw new GoogleOAuthExchangeError(code, `Google token exchange failed: ${message}`);
+  }
   return value;
 }
 async function revokeGoogleToken(token: string): Promise<void> {

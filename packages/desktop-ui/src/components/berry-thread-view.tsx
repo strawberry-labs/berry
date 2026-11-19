@@ -459,6 +459,8 @@ export interface BerryThreadViewProps {
   messages: Message[];
   /** Host-owned content rendered inside the active turn's message column. */
   liveContent?: React.ReactNode;
+  /** Host-owned cards shown below the conversation. */
+  afterMessages?: React.ReactNode;
   density?: "full" | "compact";
   autoScroll?: boolean;
   showReasoning?: boolean;
@@ -500,6 +502,7 @@ export function BerryThreadView({
   stream,
   messages,
   liveContent,
+  afterMessages,
   density = "full",
   autoScroll = true,
   showReasoning = false,
@@ -914,6 +917,7 @@ export function BerryThreadView({
                 </div>
               </MessageScrollerItem>
             ) : null}
+            {afterMessages}
           </MessageScrollerContent>
         </MessageScrollerViewport>
         <MessageScrollerButton />

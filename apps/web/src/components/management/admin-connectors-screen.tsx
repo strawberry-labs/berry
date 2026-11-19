@@ -2,17 +2,13 @@ import * as React from "react";
 import { McpApprovalsLink, canReadMcpApprovals } from "./admin-mcp-approvals-screen";
 import type { Connector, GoogleConnectorConfiguration } from "@berry/shared";
 import {
-  CalendarDays,
-  HardDrive,
   KeyRound,
-  Mail,
   Plus,
   PlugZap,
   RefreshCw,
   Search,
   ShieldCheck,
   Trash2,
-  type LucideIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -31,6 +27,7 @@ import {
   SegmentedControl, SettingList, SettingRow, StatusPill, Textarea, formatDate, formatDateTime,
 } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
+import { ConnectorMark, GoogleWorkspaceWordmark } from "../connector-mark";
 
 const EMPTY_GOOGLE: GoogleConnectorConfiguration = {
   configured: false,
@@ -183,7 +180,7 @@ export function AdminConnectorsScreen({ client, tenantId, permissions }: Managem
       </InlineNotice>
     ) : null}
     <AsyncState loading={resource.loading} error={resource.error} onRetry={resource.retry}>
-      <Section flush title="Google apps" description="Set up one Google OAuth client for the organization. Each member then connects their own Google account, up to the access level you allow here.">
+      <Section flush title={<GoogleWorkspaceWordmark />} description="Set up one Google OAuth client for the organization. Each member then connects their own Google account, up to the access level you allow here.">
         <SettingList>
           {canReadGoogleConfiguration ? (
             <SettingRow
@@ -400,7 +397,6 @@ const AUTH_LABEL: Record<string, string> = { oauth: "OAuth", bearer: "Bearer tok
 const GOOGLE_STATUS_LABEL: Record<string, string> = { not_configured: "Not set up", configured: "Not tested", verified: "Verified", error: "Failing" };
 const GOOGLE_STATUS_TONE: Record<string, "neutral" | "good" | "warning" | "danger"> = { not_configured: "neutral", configured: "warning", verified: "good", error: "danger" };
 const ACCESS_LABEL = { off: "Off", read: "Read only", full: "Read and write" } as const;
-const CONNECTOR_ICONS: Record<string, LucideIcon> = { "google-workspace": HardDrive, gmail: Mail, "google-calendar": CalendarDays };
 
 /** Draft, published and switched-off servers share one pill so every list reads the same. */
 function CustomStatusPill({ connector }: { connector: Connector }) {
@@ -415,7 +411,7 @@ function GooglePolicyRow({ connector, lockedReason, busy, onChange }: { connecto
   const services = connector.services.join(" · ");
   return <>
     <SettingRow
-      icon={CONNECTOR_ICONS[connector.key] ?? PlugZap}
+      iconContent={<ConnectorMark connectorKey={connector.key} className="mt-0.5 size-4 shrink-0 object-contain text-muted-foreground" />}
       title={connector.name}
       description={lockedReason ? <>{services ? `${services}. ` : ""}{lockedReason}</> : services || connector.description}
     >

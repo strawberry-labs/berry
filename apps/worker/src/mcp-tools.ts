@@ -3,6 +3,7 @@ import { McpImageResults } from "./mcp-images.js";
 import {
   McpToolSource,
   McpConnectionError,
+  McpToolError,
   isOfficialBerryCrawlServer,
   mcpServerSpecsFromJson,
   type McpServerSpec,
@@ -11,6 +12,7 @@ import {
   BROWSER_HANDOFF_TOOL,
   BrowserSessionReceiptSchema,
   parseAdmittedRuntimeRequest,
+  GoogleMcpReconnectSchema,
   isStoredMcpCredentialRef,
   NetworkPolicySchema,
   normalizeWorkerRole,
@@ -306,6 +308,9 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     // Repeating an import whose file was not staged retries staging of the
     // Berry file already held instead of downloading it again (H-068).
     const resumed = this.base.stageAssociatedInputFiles ? resumableConnectorImport(snapshot, step, toolName) : null;
+    const executeTool = () => signal || reportProgress
+      ? tool.execute(callId, (record(step.input.arguments) ?? {}) as never, signal, reportProgress)
+      : tool.execute(callId, (record(step.input.arguments) ?? {}) as never);
     const result = resumed
       ? { content: [], details: resumed.details }
       : isStoredMcpCredentialRef(server.id, server.credentialKey)
@@ -315,9 +320,9 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
           // guarantee. Custom OAuth MCP tool annotations are untrusted.
           step.retryClass === "read_only" || step.retryClass === "idempotent",
         ))
-        : signal || reportProgress
-        ? await tool.execute(callId, (record(step.input.arguments) ?? {}) as never, signal, reportProgress)
-        : await tool.execute(callId, (record(step.input.arguments) ?? {}) as never);
+        : usesNativeGoogleOAuth(server, snapshot.userId)
+          ? await this.#runManagedMcp(snapshot, server, executeTool)
+          : await executeTool();
     const fullText = result.content.flatMap((part) =>
       part.type === "text" && typeof part.text === "string" ? [part.text] : []
     ).join("\n");
@@ -497,6 +502,12 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     });
     try { return await run(); }
     catch (cause) {
+      if (cause instanceof McpToolError && usesNativeGoogleOAuth(server, snapshot.userId)) {
+        const reconnect = GoogleMcpReconnectSchema.safeParse(cause.structuredContent);
+        if (reconnect.success && reconnect.data.connectorId === server.id) {
+          throw new McpConnectionError("reauth_required", true, { connectorId: server.id, grantId: reconnect.data.grantId });
+        }
+      }
       if (!(cause instanceof McpConnectionError)) throw cause;
       throw new McpConnectionError(cause.kind, cause.beforeDispatch, { ...cause.details, connectorId: server.id }, cause.message);
     }
@@ -852,6 +863,12 @@ function mcpToolNamesInContent(content: unknown): string[] {
 
 function deferredMcpToolError(toolName: string): string {
   return `MCP tool ${toolName} has not been found in this conversation yet. Call tool_search for it to get its input schema, then run it with use_tool.`;
+}
+
+function usesNativeGoogleOAuth(server: McpServerSpec, userId: string): boolean {
+  return server.trustReadOnlyAnnotations === true
+    && GoogleMcpReconnectSchema.shape.connectorId.safeParse(server.id).success
+    && server.credentialKey === `connector:${server.id}:${userId}`;
 }
 
 function isDeferredMcpToolFailure(step: DurableTurnStep, toolName: string): boolean {

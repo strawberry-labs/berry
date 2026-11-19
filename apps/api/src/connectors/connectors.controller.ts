@@ -110,11 +110,11 @@ export class ConnectorsController {
     const available = await this.connectors.list(tenantId(), request.auth!.user.id);
     const connector = available.find((item) => item.id === id);
     if (!connector) throw new BadRequestException("Connector not found");
+    if (connector.provider === "google") return this.connectors.startGoogleOAuth(tenantId(), request.auth!.user.id, id, input.accessLevel, input.taskId);
     if (input.taskId) {
       const admin = connector.authStrategy === "shared" && await this.identity.authorize(request.auth!.user.id, tenantId(), "mcp:write");
       return this.connectors.startCustomOAuth(tenantId(), request.auth!.user.id, id, admin, input.redirectAfter, input.taskId);
     }
-    if (connector.provider === "google") return this.connectors.startGoogleOAuth(tenantId(), request.auth!.user.id, id, input.accessLevel);
     return this.connectors.startCustomOAuth(tenantId(), request.auth!.user.id, id, false, input.redirectAfter);
   }
 
@@ -152,7 +152,7 @@ export class ConnectorsController {
     await this.completeAndRedirect(response, "/settings/connectors", async () => {
       if (!state) throw new BadRequestException("Google OAuth state is missing");
       const result = await this.connectors.completeGoogleOAuth(tenantId(), request.auth!.user.id, { state, ...(code ? { code } : {}), ...(error ? { error } : {}) });
-      await this.record(request.auth!.user.id, "connector-connected", result.connectorId, { provider: "google", authType: "oauth" });
+      if (!result.error) await this.record(request.auth!.user.id, "connector-connected", result.connectorId, { provider: "google", authType: "oauth" });
       return result;
     });
   }

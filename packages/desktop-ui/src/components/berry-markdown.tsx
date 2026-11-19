@@ -1,5 +1,6 @@
 import * as React from "react";
 import { memo, type ReactNode } from "react";
+import { Maximize2 } from "lucide-react";
 import { useTheme } from "next-themes";
 import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
@@ -12,6 +13,8 @@ import type { HighlightResponse } from "./berry-markdown-highlight.worker";
 
 import { Copy } from "@berry/desktop-ui/lib/icons";
 import { cn } from "@berry/desktop-ui/lib/utils";
+import { Button } from "@berry/desktop-ui/components/ui/button";
+import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@berry/desktop-ui/components/ui/dialog";
 
 /* ------------------------------------------------------------------------ */
 /* Streaming word reveal tuned to match the observed desktop interaction.      */
@@ -131,6 +134,7 @@ const SCROLL_MASKS: Record<ScrollShadow, string> = {
 function MarkdownTable({ children, className, ...props }: React.ComponentProps<"table">) {
   const scrollerRef = React.useRef<HTMLDivElement>(null);
   const [shadow, setShadow] = React.useState<ScrollShadow>("none");
+  const [direction, setDirection] = React.useState<"ltr" | "rtl">("ltr");
   React.useEffect(() => {
     const scroller = scrollerRef.current;
     if (!scroller) return;
@@ -157,14 +161,47 @@ function MarkdownTable({ children, className, ...props }: React.ComponentProps<"
       observer.disconnect();
     };
   }, []);
+  const table = (
+    <table className={cn("w-max min-w-full border-separate border-spacing-0 text-[13px]", className)} {...props}>
+      {children}
+    </table>
+  );
   return (
-    <div className="my-4 w-full min-w-full rounded-xl border border-border" data-markdown-table-container="">
-      <div ref={scrollerRef} className={cn("w-full overflow-x-auto overflow-y-visible", SCROLL_MASKS[shadow])}>
-        <table className={cn("w-max min-w-full border-separate border-spacing-0 text-[13px]", className)} {...props}>
-          {children}
-        </table>
+    <Dialog onOpenChange={(open) => {
+      if (open && scrollerRef.current) {
+        setDirection(getComputedStyle(scrollerRef.current).direction === "rtl" ? "rtl" : "ltr");
+      }
+    }}>
+      <div className="my-4 w-full min-w-0 rounded-xl border border-border" data-markdown-table-container="">
+        <div className="flex justify-end border-b border-border px-2 py-1">
+          <DialogTrigger asChild>
+            <Button type="button" size="sm" variant="ghost" className="h-7 text-xs">
+              <Maximize2 aria-hidden />
+              Expand table
+            </Button>
+          </DialogTrigger>
+        </div>
+        <div ref={scrollerRef} className={cn("w-full overflow-x-auto overflow-y-visible", SCROLL_MASKS[shadow])}>
+          {table}
+        </div>
       </div>
-    </div>
+      <DialogContent
+        aria-describedby={undefined}
+        overlayClassName="backdrop-blur-sm motion-reduce:animate-none"
+        className="flex max-h-[88dvh] max-w-[calc(100%-1.5rem)] flex-col gap-0 overflow-hidden rounded-xl p-0 motion-reduce:animate-none sm:max-w-[92vw]"
+      >
+        <DialogTitle className="shrink-0 border-b border-border px-4 py-4 pr-14 text-sm">Expanded table</DialogTitle>
+        <div
+          dir={direction}
+          role="region"
+          aria-label="Table contents"
+          tabIndex={0}
+          className="min-h-0 overflow-auto overscroll-contain focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring [&_th]:sticky [&_th]:top-0 [&_th]:z-10 [&_th]:bg-background"
+        >
+          {table}
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 

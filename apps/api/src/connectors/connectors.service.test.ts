@@ -710,6 +710,53 @@ describe("ConnectorsService internal Google session lifetime", () => {
     expect(runQueries).toEqual([]);
   });
 
+  it("offers a task reconnect for the failed Google grant at the current access level", async () => {
+    const connectorId = "connector_google_workspace";
+    const runId = "00000000-0000-7000-8000-000000000303";
+    const row = googleRow({ id: connectorId });
+    const scopes = ["https://www.googleapis.com/auth/drive.readonly"];
+    const connection = {
+      id: "connection_1", connector_id: connectorId, user_id: USER_ID,
+      access_level: "full", granted_scopes: scopes, status: "reauth_required",
+      credential_envelope: null, updated_at: new Date(),
+    };
+    let failedGrantId: string | undefined;
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string, params: readonly unknown[] = []) => {
+        if (sql.includes("FROM organization_connectors")) return [row] as T[];
+        if (sql.includes("FROM connector_connections") && params[1] === USER_ID) return [connection] as T[];
+        if (sql.includes("SELECT t.id FROM tasks") && params[1] === USER_ID && params[2] === TASK_ID) return [{ id: TASK_ID }] as T[];
+        if (sql.includes("JOIN turn_steps") && failedGrantId) return [{ connector_id: connectorId, grant_id: failedGrantId, run_id: runId }] as T[];
+        return [];
+      },
+    };
+    const database = { withTenant: async <T>(_tenantId: string, callback: (db: SqlExecutor) => Promise<T>) => callback(executor) };
+    const service = new ConnectorsService(database as never, { NODE_ENV: "development", BERRY_CONNECTOR_ENCRYPTION_KEY: ENCRYPTION_KEY });
+    const authorization = await mint(service, { taskId: TASK_ID, sessionId: SESSION_ID });
+    const result = await service.handleGoogleMcp(authorization, "google-workspace", {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "drive_search_files", arguments: {} },
+    });
+    const error = (result.body as { result: { isError: boolean; structuredContent: { grantId: string } } }).result;
+    expect(error).toMatchObject({
+      isError: true,
+      structuredContent: { code: "berry_google_reauth_required", connectorId, grantId: expect.stringMatching(/^[0-9a-f]{64}$/) },
+    });
+
+    await expect(service.taskMcpReconnects(TENANT_ID, USER_ID, TASK_ID, false)).resolves.toEqual([]);
+    failedGrantId = error.structuredContent.grantId;
+    await expect(service.taskMcpReconnects(TENANT_ID, USER_ID, TASK_ID, false)).resolves.toEqual([{
+      connectorId, name: "Google Workspace", taskId: TASK_ID, runId, canReconnect: true,
+      connectorKey: "google-workspace", accessLevel: "read",
+    }]);
+    await expect(service.taskMcpReconnects(TENANT_ID, SECOND_USER_ID, TASK_ID, true)).rejects.toMatchObject({ status: 404 });
+    connection.updated_at = new Date(connection.updated_at.getTime() + 1_000);
+    await expect(service.taskMcpReconnects(TENANT_ID, USER_ID, TASK_ID, false)).resolves.toEqual([]);
+  });
+
   it.each([
     ["the run has ended or access was removed", { taskId: TASK_ID, sessionId: SESSION_ID }, false, 25 * 60_000],
     ["the hard cap has passed", { taskId: TASK_ID, sessionId: SESSION_ID }, true, 25 * 60 * 60_000],

@@ -69,7 +69,36 @@ describe("Google connector tool policy", () => {
     ]);
     expect(calendar).toContain("google_calendar_create_event");
     expect(calendar).toContain("google_calendar_respond_to_event");
-    expect(calendar).toContain("google_calendar_delete_event");
+  });
+
+  it.each([
+    {
+      connector: "google-workspace",
+      writes: ["drive_create_folder", "docs_insert_text", "sheets_update_values", "slides_add_slide", "forms_update_question"],
+      deletions: ["drive_trash_file", "sheets_clear_values", "slides_delete_object", "forms_delete_item"],
+    },
+    {
+      connector: "gmail",
+      writes: ["gmail_create_draft", "gmail_send_message", "gmail_remove_labels"],
+      deletions: ["gmail_trash_message"],
+    },
+    {
+      connector: "google-calendar",
+      writes: ["google_calendar_create_event", "google_calendar_update_event", "google_calendar_respond_to_event"],
+      deletions: ["google_calendar_delete_event"],
+    },
+  ] as const)("allows $connector writes and denies deletion tools", async ({ connector, writes, deletions }) => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const scopes = googleConnectorScopes(connector, "full");
+    const tools = googleToolCatalog(connector, "full", scopes).map((tool) => tool.name);
+    expect(tools).toEqual(expect.arrayContaining([...writes]));
+    for (const name of deletions) {
+      expect(tools).not.toContain(name);
+      await expect(executeGoogleTool(connector, "full", name, "access-token", {}, null, scopes))
+        .rejects.toThrow("not authorized");
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("sends Gmail label removals in removeLabelIds, never addLabelIds", async () => {

@@ -426,7 +426,7 @@ export function Section({
   flush = false,
   className,
 }: {
-  title?: string;
+  title?: ReactNode;
   description?: string;
   actions?: ReactNode;
   children: ReactNode;
@@ -467,12 +467,14 @@ export function SettingList({ children, className }: { children: ReactNode; clas
 
 export function SettingRow({
   icon: Icon,
+  iconContent,
   title,
   description,
   children,
   stacked = false,
 }: {
   icon?: LucideIcon;
+  iconContent?: ReactNode;
   title: ReactNode;
   description?: ReactNode;
   children?: ReactNode;
@@ -482,6 +484,7 @@ export function SettingRow({
   return (
     <div className={cn("flex gap-x-6 gap-y-2.5 px-4 py-3", stacked ? "flex-col" : "flex-col sm:flex-row sm:items-center sm:justify-between")}>
       <span className="flex min-w-0 items-start gap-3">
+        {iconContent}
         {Icon ? <Icon className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden /> : null}
         <span className="grid min-w-0 gap-0.5">
           <b className="text-md font-medium leading-5 text-foreground">{title}</b>
@@ -651,7 +654,9 @@ export function Num({
 }) {
   const number = Number(value ?? 0);
   const money = kind === "money" || kind === "compact-money";
-  const exact = money ? formatMoneyWithCents(number) : formatNumber(number);
+  const exact = money
+    ? new Intl.NumberFormat(undefined, { style: "currency", currency: "USD" }).format(number / 1_000_000)
+    : formatNumber(number);
   const text =
     kind === "number" ? exact
     : kind === "compact" ? formatCompact(number)
@@ -674,8 +679,6 @@ export function CellStack({ primary, secondary, mono = false }: { primary: React
     </span>
   );
 }
-CellStack.tableText = ({ primary, secondary }: { primary: ReactNode; secondary?: ReactNode }) => [primary, secondary];
-
 export function formatPercent(ratio: number | null | undefined, digits?: number) {
   if (ratio == null || !Number.isFinite(ratio)) return "—";
   const percent = ratio * 100;
@@ -696,9 +699,6 @@ export function formatMoney(
     currency: "USD",
     maximumFractionDigits: value < 10 ? 2 : 0,
   }).format(value);
-}
-export function formatMoneyWithCents(micros: string | number | bigint | null | undefined) {
-  return new Intl.NumberFormat(undefined, { style: "currency", currency: "USD" }).format(Number(micros ?? 0) / 1_000_000);
 }
 export function formatNumber(value: number) {
   return new Intl.NumberFormat().format(value);

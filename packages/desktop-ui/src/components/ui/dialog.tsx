@@ -53,6 +53,7 @@ function DialogOverlay({
 
 function DialogContent({
   className,
+  overlayClassName,
   children,
   showCloseButton = true,
   container,
@@ -60,6 +61,7 @@ function DialogContent({
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean
+  overlayClassName?: string
   /**
    * When provided, the dialog is portaled into this element and positioned
    * absolutely so it centers relative to that container instead of the
@@ -85,7 +87,7 @@ function DialogContent({
   }, [])
   return (
     <DialogPortal data-slot="dialog-portal" container={container}>
-      <DialogOverlay absolute={Boolean(container)} />
+      <DialogOverlay absolute={Boolean(container)} className={overlayClassName} />
       <DialogPrimitive.Content
         data-slot="dialog-content"
         onPointerDownOutside={(event) => {
