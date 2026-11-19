@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { McpCachedTool, McpServerSpec } from "@berry/local-agent/mcp";
+import { isStoredMcpCredentialRef } from "@berry/shared";
 import type { SqlExecutor } from "./sql-repositories.js";
 
 /**
@@ -38,9 +39,9 @@ const MCP_TOOL_SNAPSHOT_MAX_BYTES = 2_000_000;
  * connector) and not a Berry-owned adapter whose catalog Berry defines.
  */
 export function isRefreshableConnector(server: Pick<McpServerSpec, "id" | "credentialKey" | "trustReadOnlyAnnotations">): boolean {
-  return server.trustReadOnlyAnnotations !== true
-    && typeof server.credentialKey === "string"
-    && server.credentialKey.startsWith(`connector:${server.id}:`);
+  return server.id.startsWith("connector_mcp_")
+    && server.trustReadOnlyAnnotations !== true
+    && isStoredMcpCredentialRef(server.id, server.credentialKey);
 }
 
 export interface McpToolSnapshotDiff {
