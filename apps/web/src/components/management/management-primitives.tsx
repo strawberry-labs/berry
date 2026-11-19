@@ -654,9 +654,7 @@ export function Num({
 }) {
   const number = Number(value ?? 0);
   const money = kind === "money" || kind === "compact-money";
-  const exact = money
-    ? new Intl.NumberFormat(undefined, { style: "currency", currency: "USD" }).format(number / 1_000_000)
-    : formatNumber(number);
+  const exact = money ? formatMoneyWithCents(number) : formatNumber(number);
   const text =
     kind === "number" ? exact
     : kind === "compact" ? formatCompact(number)
@@ -679,6 +677,8 @@ export function CellStack({ primary, secondary, mono = false }: { primary: React
     </span>
   );
 }
+CellStack.tableText = ({ primary, secondary }: { primary: ReactNode; secondary?: ReactNode }) => [primary, secondary];
+
 export function formatPercent(ratio: number | null | undefined, digits?: number) {
   if (ratio == null || !Number.isFinite(ratio)) return "—";
   const percent = ratio * 100;
@@ -699,6 +699,9 @@ export function formatMoney(
     currency: "USD",
     maximumFractionDigits: value < 10 ? 2 : 0,
   }).format(value);
+}
+export function formatMoneyWithCents(micros: string | number | bigint | null | undefined) {
+  return new Intl.NumberFormat(undefined, { style: "currency", currency: "USD" }).format(Number(micros ?? 0) / 1_000_000);
 }
 export function formatNumber(value: number) {
   return new Intl.NumberFormat().format(value);
