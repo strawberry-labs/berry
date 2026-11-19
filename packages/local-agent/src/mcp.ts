@@ -36,6 +36,12 @@ export interface McpServerSpec {
   cachedTools?: McpCachedTool[];
   /** Server tool names approved by the organization. Omit for unrestricted discovery. */
   allowedTools?: string[];
+  /**
+   * With allowedTools: an approved tool whose live definition differs from its
+   * cached one is used as the server now describes it, instead of being
+   * disabled until it is reviewed again. Unapproved tool names stay excluded.
+   */
+  followApprovedToolChanges?: boolean;
   /** Remote tool names exposed on the first model call without tool_search. */
   defaultTools?: string[];
   /** Remote tool names whose ambiguous execution outcome must not be replayed. */
@@ -55,11 +61,20 @@ export interface McpServerHealth {
   tools: McpCachedTool[];
 }
 
+/** Why a source listed a server's tools: a new connection, an explicit refresh, or the server's list_changed notification. */
+export type McpToolListReason = "connect" | "refresh" | "list_changed";
+
 export interface McpToolSourceOptions {
   servers: McpServerSpec[];
   log?: (level: "info" | "warn" | "error", message: string) => void;
   connectTimeoutMs?: number;
   onHealth?: (health: McpServerHealth) => void | Promise<void>;
+  /**
+   * Receives a server's complete live tools/list result, before any allowlist
+   * or review filtering, each time this source lists it. It is not awaited and
+   * its failures are ignored, so it never delays or breaks a connection.
+   */
+  onToolsListed?: (spec: McpServerSpec, tools: McpCachedTool[], reason: McpToolListReason) => void | Promise<void>;
   networkPolicy?: NetworkPolicy;
   execPolicyRules?: ExecPolicyRule[];
 }
@@ -176,7 +191,18 @@ interface ConnectedServer {
   client: Client;
   tools: AgentTool[];
   cachedTools: McpCachedTool[];
+  /** When tools/list last completed on this connection (epoch ms). */
+  listedAt: number;
 }
+
+/** A tools/list result across every page, and whether all pages arrived. */
+interface LiveToolListing {
+  tools: McpCachedTool[];
+  complete: boolean;
+}
+
+/** Pages followed in one tools/list before Berry stops and keeps what it has. */
+const MAX_TOOL_LIST_PAGES = 50;
 
 function sanitizeName(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -253,6 +279,36 @@ function cachedTool(
   } as AgentTool;
 }
 
+function liveToolDefinition(tool: { name: string; description?: string | undefined; inputSchema?: unknown; annotations?: unknown }): McpCachedTool {
+  const annotations = tool.annotations && typeof tool.annotations === "object"
+    ? compactAnnotations(tool.annotations as NonNullable<McpCachedTool["annotations"]>)
+    : undefined;
+  return {
+    name: tool.name,
+    description: tool.description ?? null,
+    inputSchema: (tool.inputSchema ?? { type: "object", properties: {} }) as Record<string, unknown>,
+    ...(annotations && Object.keys(annotations).length > 0 ? { annotations } : {}),
+  };
+}
+
+/**
+ * Every page of tools/list. A server that keeps returning cursors past the
+ * page limit yields the tools received so far, marked incomplete.
+ */
+async function listAllTools(client: Client): Promise<LiveToolListing> {
+  const tools = new Map<string, McpCachedTool>();
+  let cursor: string | undefined;
+  for (let page = 0; page < MAX_TOOL_LIST_PAGES; page += 1) {
+    const result = await client.listTools(cursor ? { cursor } : undefined);
+    for (const tool of result.tools) {
+      if (!tools.has(tool.name)) tools.set(tool.name, liveToolDefinition(tool));
+    }
+    cursor = typeof result.nextCursor === "string" && result.nextCursor ? result.nextCursor : undefined;
+    if (!cursor) return { tools: [...tools.values()], complete: true };
+  }
+  return { tools: [...tools.values()], complete: false };
+}
+
 function sameReviewedToolDefinition(reviewed: McpCachedTool, live: McpCachedTool): boolean {
   return canonicalJson(reviewDocument(reviewed)) === canonicalJson(reviewDocument(live));
 }
@@ -320,6 +376,9 @@ export class McpToolSource {
   readonly #options: McpToolSourceOptions;
   readonly #servers = new Map<string, ConnectedServer>();
   readonly #connecting = new Map<string, Promise<ConnectedServer>>();
+  readonly #relisting = new Map<string, Promise<ConnectedServer>>();
+  /** Advanced by close() so connections still starting at that moment are not kept. */
+  #generation = 0;
 
   constructor(options: McpToolSourceOptions) {
     this.#options = options;
@@ -362,6 +421,31 @@ export class McpToolSource {
     return this.listTools();
   }
 
+  /**
+   * Lists tools again for the given trusted servers (all when omitted): a
+   * connected server re-lists on its open connection and any other connects.
+   * One server's failure leaves its previous tools in place and does not
+   * affect the others. Concurrent calls for a server share one request.
+   */
+  async refreshTools(serverIds?: readonly string[]): Promise<AgentTool[]> {
+    const selected = serverIds ? new Set(serverIds) : null;
+    await Promise.all(this.#options.servers.map(async (spec) => {
+      if (!spec.enabled || !spec.trusted || (selected && !selected.has(spec.id))) return;
+      try {
+        if (this.#servers.has(spec.id)) await this.#relist(spec.id, "refresh");
+        else await this.#ensureConnected(spec);
+      } catch {
+        // The cached or previously listed tools stay in use.
+      }
+    }));
+    return this.listTools();
+  }
+
+  /** When this source last listed the server's tools live (epoch ms), or null if it has not. */
+  listedAt(serverId: string): number | null {
+    return this.#servers.get(serverId)?.listedAt ?? null;
+  }
+
   async #ensureConnected(spec: McpServerSpec): Promise<ConnectedServer> {
     const existing = this.#servers.get(spec.id);
     if (existing) return existing;
@@ -369,9 +453,25 @@ export class McpToolSource {
     if (pending) return pending;
     const started = Date.now();
     await this.#options.onHealth?.({ id: spec.id, status: "connecting", toolCount: spec.cachedTools?.length ?? 0, latencyMs: null, lastError: null, tools: spec.cachedTools ?? [] });
-    const client = new Client({ name: "berry-desktop", version: "0.1.0" });
-    const promise = withTimeout(this.#connectServer(spec, client), this.#options.connectTimeoutMs ?? 10_000, `MCP server ${spec.name}`)
+    // The SDK installs this handler only when the server advertises
+    // tools.listChanged; Berry lists every page itself instead of autoRefresh.
+    const client = new Client({ name: "berry-desktop", version: "0.1.0" }, {
+      listChanged: {
+        tools: {
+          autoRefresh: false,
+          debounceMs: 300,
+          onChanged: () => {
+            void this.#relist(spec.id, "list_changed").catch(() => {});
+          },
+        },
+      },
+    });
+    const generation = this.#generation;
+    const promise: Promise<ConnectedServer> = withTimeout(this.#connectServer(spec, client), this.#options.connectTimeoutMs ?? 10_000, `MCP server ${spec.name}`)
       .then(async (server) => {
+        // A connection that finishes after close() (a background refresh
+        // outliving its turn) is shut down instead of kept open unowned.
+        if (generation !== this.#generation) throw new Error(`MCP server ${spec.name} connected after its source closed`);
         this.#servers.set(spec.id, server);
         this.#options.log?.("info", `MCP server ${spec.name} exposed ${server.tools.length} tool(s)`);
         await this.#options.onHealth?.({ id: spec.id, status: "connected", toolCount: server.tools.length, latencyMs: Date.now() - started, lastError: null, tools: server.cachedTools });
@@ -385,7 +485,9 @@ export class McpToolSource {
         await this.#options.onHealth?.({ id: spec.id, status, toolCount: spec.cachedTools?.length ?? 0, latencyMs: Date.now() - started, lastError: message, tools: spec.cachedTools ?? [] });
         throw error;
       })
-      .finally(() => this.#connecting.delete(spec.id));
+      .finally(() => {
+        if (this.#connecting.get(spec.id) === promise) this.#connecting.delete(spec.id);
+      });
     this.#connecting.set(spec.id, promise);
     return promise;
   }
@@ -409,30 +511,67 @@ export class McpToolSource {
         await client.connect(new SSEClientTransport(url, { fetch: remoteFetch }));
       }
     }
-    const listed = await client.listTools();
+    const listing = await listAllTools(client);
+    const server: ConnectedServer = { spec, client, tools: [], cachedTools: [], listedAt: 0 };
+    this.#adopt(server, listing, "connect");
+    return server;
+  }
+
+  /** Installs a live listing on a connection and reports it to onToolsListed. */
+  #adopt(server: ConnectedServer, listing: LiveToolListing, reason: McpToolListReason): void {
+    const { spec, client } = server;
+    if (!listing.complete) {
+      this.#options.log?.("warn", `MCP server ${spec.name} returned more than ${MAX_TOOL_LIST_PAGES} pages of tools; using the tools received`);
+    }
+    server.cachedTools = this.#acceptedTools(spec, listing.tools);
+    server.tools = server.cachedTools.map((tool) => cachedTool(spec, tool, async (name, args, signal) => this.#call(client, name, args, signal)));
+    server.listedAt = Date.now();
+    // A partial listing would read as removed tools, so only report complete ones.
+    if (!listing.complete || !this.#options.onToolsListed) return;
+    try {
+      void Promise.resolve(this.#options.onToolsListed(spec, listing.tools.map((tool) => structuredClone(tool)), reason)).catch(() => {});
+    } catch {
+      // Observers never affect the connection.
+    }
+  }
+
+  /** The live tools this source exposes for a server, after its allowlist and review rules. */
+  #acceptedTools(spec: McpServerSpec, live: readonly McpCachedTool[]): McpCachedTool[] {
     const allow = spec.allowedTools ? new Set(spec.allowedTools) : null;
     const reviewed = allow
       ? new Map((spec.cachedTools ?? []).filter((tool) => allow.has(tool.name)).map((tool) => [tool.name, tool]))
       : null;
-    const cachedTools = listed.tools.flatMap((tool): McpCachedTool[] => {
+    return live.flatMap((tool): McpCachedTool[] => {
       if (allow && !allow.has(tool.name)) return [];
-      const annotations = (tool as { annotations?: NonNullable<McpCachedTool["annotations"]> }).annotations;
-      const live = {
-        name: tool.name,
-        description: tool.description ?? null,
-        inputSchema: (tool.inputSchema ?? { type: "object", properties: {} }) as Record<string, unknown>,
-        ...(annotations ? { annotations } : {}),
-      };
-      if (!reviewed) return [live];
+      if (!reviewed) return [tool];
       const approved = reviewed.get(tool.name);
-      if (!approved || !sameReviewedToolDefinition(approved, live)) {
-        this.#options.log?.("warn", `MCP tool ${spec.name}:${tool.name} changed after administrator review; disabling it until republished`);
-        return [];
-      }
-      return [approved];
+      if (approved && sameReviewedToolDefinition(approved, tool)) return [approved];
+      if (spec.followApprovedToolChanges) return [tool];
+      this.#options.log?.("warn", `MCP tool ${spec.name}:${tool.name} changed after administrator review; disabling it until republished`);
+      return [];
     });
-    const tools = cachedTools.map((tool) => cachedTool(spec, tool, async (name, args, signal) => this.#call(client, name, args, signal)));
-    return { spec, client, tools, cachedTools };
+  }
+
+  /** Runs tools/list again on an open connection. Concurrent calls share one request. */
+  async #relist(serverId: string, reason: McpToolListReason): Promise<ConnectedServer> {
+    const pending = this.#relisting.get(serverId);
+    if (pending) return pending;
+    const server = this.#servers.get(serverId);
+    if (!server) throw new Error(`MCP server ${serverId} is not connected`);
+    const promise = withTimeout(listAllTools(server.client), this.#options.connectTimeoutMs ?? 10_000, `MCP server ${server.spec.name} tools/list`)
+      .then((listing) => {
+        // A connection closed or replaced meanwhile keeps its own state.
+        if (this.#servers.get(serverId) === server) {
+          this.#adopt(server, listing, reason);
+          this.#options.log?.("info", `MCP server ${server.spec.name} exposed ${server.tools.length} tool(s) after ${reason}`);
+        }
+        return server;
+      })
+      .finally(() => {
+        if (this.#relisting.get(serverId) === promise) this.#relisting.delete(serverId);
+      });
+    this.#relisting.set(serverId, promise);
+    return promise;
   }
 
   async #call(
@@ -557,6 +696,9 @@ export class McpToolSource {
   }
 
   async close(): Promise<void> {
+    this.#generation += 1;
+    this.#connecting.clear();
+    this.#relisting.clear();
     await Promise.all([...this.#servers.values()].map(async (server) => {
       try { await server.client.close(); } catch { /* best effort */ }
     }));
