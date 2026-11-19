@@ -7,7 +7,7 @@ export function serverCspNonce(): string {
     if (existing) return existing;
     const nonce = createCspNonce();
     setResponseHeader(CSP_NONCE_RESPONSE_HEADER, nonce);
-    setResponseHeader("Content-Security-Policy", buildSiteContentSecurityPolicy({ nonce }));
+    setResponseHeader("Content-Security-Policy", buildSiteContentSecurityPolicy({ nonce, allowInlineStyleElements: import.meta.env.DEV }));
     return nonce;
   } catch {
     return createCspNonce();

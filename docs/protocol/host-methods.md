@@ -1312,6 +1312,42 @@ Result:
                 "properties": {
                   "kind": {
                     "type": "string",
+                    "const": "browser.handoff"
+                  },
+                  "handoffId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "browserSessionId": {
+                    "type": "string",
+                    "pattern": "^bses_[A-Za-z0-9_-]{1,120}$"
+                  },
+                  "state": {
+                    "type": "string",
+                    "enum": [
+                      "ready",
+                      "resumed"
+                    ]
+                  },
+                  "reason": {
+                    "type": "string",
+                    "maxLength": 2000
+                  }
+                },
+                "required": [
+                  "kind",
+                  "handoffId",
+                  "browserSessionId",
+                  "state",
+                  "reason"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
                     "const": "question.answered"
                   },
                   "questionId": {
@@ -18203,6 +18239,31 @@ Result:
           "generationMs": {
             "type": "number",
             "default": 0
+          },
+          "modelTiming": {
+            "type": "object",
+            "properties": {
+              "requestMs": {
+                "type": "number",
+                "minimum": 0
+              },
+              "firstTokenMs": {
+                "type": "number",
+                "minimum": 0
+              },
+              "decodeMs": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "decodeTokens": {
+                "type": "number",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "requestMs"
+            ],
+            "additionalProperties": false
           },
           "createdAt": {
             "$ref": "#/definitions/session.messages.result/items/properties/parts/items/properties/createdAt"

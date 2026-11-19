@@ -1,17 +1,11 @@
 import { createHash } from "node:crypto";
 import sharp, { type Sharp } from "sharp";
 import type { ChatMessage, ChatToolDefinition } from "@berry/router-client";
+import { MODEL_IMAGE_LIMITS, MODEL_REQUEST_MAX_BYTES } from "@berry/shared";
+export { MODEL_IMAGE_LIMITS } from "@berry/shared";
 
 // These are encoded-payload limits, not source-file sizes. Five images leave
 // room for conversation text, tools, and JSON below common 5 MiB ingress caps.
-export const MODEL_IMAGE_LIMITS = {
-  maxCount: 5,
-  maxSourceBytes: 20 * 1024 * 1024,
-  maxDimension: 2_000,
-  maxBase64Bytes: 600 * 1024,
-  maxTotalBase64Bytes: 3 * 1024 * 1024,
-  maxInputPixels: 40_000_000,
-} as const;
 
 export type PreparedModelImage = {
   ok: true;
@@ -214,7 +208,7 @@ export function modelImageWithheld(path: string, reason: string): string {
 export function limitModelImagePayload(
   messages: ChatMessage[],
   tools: readonly ChatToolDefinition[],
-  maxBytes = 4 * 1024 * 1024,
+  maxBytes = MODEL_REQUEST_MAX_BYTES,
 ): ChatMessage[] {
   const size = (value: ChatMessage[]) => Buffer.byteLength(JSON.stringify({ messages: value, tools }), "utf8") + 16_384;
   if (size(messages) <= maxBytes) return messages;

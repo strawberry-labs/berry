@@ -135,8 +135,22 @@ export class ModelGovernanceService {
     }
 
     const runtimeModelIds = new Set(runtimeModels.map((model) => model.id));
-    const staleAlias = policiesByModel.get("berry/auto");
-    if (!runtimeModelIds.has("berry/auto") && staleAlias) {
+    const runtimeDefault = runtimeModelIds.has(provider.defaultModel)
+      ? provider.defaultModel
+      : runtimeModels[0]!.id;
+    const replacements = new Map<string, string>();
+    if (!runtimeModelIds.has("berry/auto")) replacements.set("berry/auto", runtimeDefault);
+    // Retire this route only after its replacement is deployed. Other models
+    // and administrator-selected defaults keep their existing policy.
+    const previousDeepSeek = "canopywave/deepseek/deepseek-v4-flash";
+    const nextDeepSeek = "canopywave/deepseek/deepseek-v4.1-flash";
+    if (!runtimeModelIds.has(previousDeepSeek) && runtimeModelIds.has(nextDeepSeek)) {
+      replacements.set(previousDeepSeek, nextDeepSeek);
+    }
+
+    for (const [retiredModel, replacementModel] of replacements) {
+      const staleAlias = policiesByModel.get(retiredModel);
+      if (!staleAlias) continue;
       const desired = {
         tenantId,
         providerId: provider.id,
@@ -152,6 +166,7 @@ export class ModelGovernanceService {
           ...jsonObject(staleAlias.metadata),
           source: "runtime-catalog",
           retiredReason: "not-in-runtime-catalog",
+          replacementModel,
         },
       };
       if (!runtimePolicyMatches(staleAlias, desired)) {
@@ -159,17 +174,15 @@ export class ModelGovernanceService {
       }
     }
 
-    if (runtimeModelIds.has("berry/auto")) return;
-    const runtimeDefault = runtimeModelIds.has(provider.defaultModel)
-      ? provider.defaultModel
-      : runtimeModels[0]!.id;
     for (const modelDefault of defaults) {
-      if (modelDefault.providerId !== provider.id || modelDefault.model !== "berry/auto") continue;
+      if (modelDefault.providerId !== provider.id) continue;
+      const replacementModel = replacements.get(modelDefault.model);
+      if (!replacementModel) continue;
       await this.upsertDefault({
         tenantId,
         mode: modelDefault.mode,
         providerId: provider.id,
-        model: runtimeDefault,
+        model: replacementModel,
         enforce: modelDefault.enforce,
       });
     }

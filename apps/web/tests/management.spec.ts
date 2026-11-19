@@ -49,6 +49,33 @@ test("archived tasks are a final personal setting and stay out of the home compo
   await expect(navigation.getByRole("button", { name: "Archived tasks" })).toBeVisible();
 });
 
+test("organization People search matches names and email addresses across the directory", async ({ page }) => {
+  await page.goto("/admin/members");
+  await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
+  const directory = page.getByRole("region", { name: "Members", exact: true });
+  const search = directory.getByRole("textbox", { name: "Search table" });
+  const member = directory.getByRole("row").filter({ hasText: "aisha.rahman@northwind.example" });
+  await expect(member).toBeVisible();
+  await search.fill("AISHA RAHMAN");
+  await expect(directory.getByRole("row").filter({ has: page.getByRole("cell") })).toHaveCount(1);
+  await expect(member).toBeVisible();
+  await search.fill("AISHA.RAHMAN@NORTHWIND.EXAMPLE");
+  await expect(directory.getByRole("row").filter({ has: page.getByRole("cell") })).toHaveCount(1);
+  await expect(member).toBeVisible();
+});
+
+test("personal Usage keeps month-to-date and allowance cycles distinct", async ({ page }) => {
+  await page.goto("/settings/usage");
+  await expect(page.getByRole("heading", { name: "Usage", exact: true })).toBeVisible();
+  const period = page.getByRole("combobox", { name: "Period" });
+  await expect(period).toContainText("Month to date (UTC)");
+  await expect(page.getByText("No limit", { exact: true })).toBeVisible();
+  await period.click();
+  await page.getByRole("option", { name: "Current allowance cycle", exact: true }).click();
+  await expect(period).toContainText("Current allowance cycle");
+  await expect(page.getByText(/used this cycle/)).toBeVisible();
+});
+
 test("organization admin routes support direct navigation and validated analytics search", async ({ page }) => {
   await page.goto("/admin/analytics?view=models&from=2026-07-01T00%3A00%3A00.000Z&to=2026-07-21T23%3A59%3A59.999Z");
   await expect(page.getByRole("heading", { name: "Usage", exact: true })).toBeVisible();
@@ -88,7 +115,7 @@ test("management navigation uses the shared mobile sidebar sheet", async ({ page
   await page.goto("/settings/account");
   await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
   await expect(page.getByRole("heading", { name: "Account" })).toBeVisible();
-  const toggle = page.getByRole("button", { name: "Toggle sidebar" });
+  const toggle = page.getByRole("button", { name: "Open sidebar" });
   const mobileSidebar = page.locator('[data-slot="sidebar"][data-mobile="true"]');
   await toggle.click();
   await expect(mobileSidebar).toBeVisible();

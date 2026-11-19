@@ -2,7 +2,14 @@ import * as React from "react";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import { describe, expect, it, vi } from "vitest";
 import { SkillImportDialog } from "./skill-import-dialog";
-vi.mock("./management-primitives", () => ({ ManagementDialog: ({ children }: any) => <div>{children}</div>, Button: (props: any) => <button {...props} />, Input: (props: any) => <input {...props} />, Textarea: (props: any) => <textarea {...props} /> }));
+vi.mock("./management-primitives", () => ({
+  ManagementDialog: ({ children, footer }: any) => <div>{children}{footer}</div>,
+  Button: (props: any) => <button {...props} />,
+  Input: (props: any) => <input {...props} />,
+  Textarea: (props: any) => <textarea {...props} />,
+  InlineNotice: ({ children }: any) => <p role="alert">{children}</p>,
+  SegmentedControl: ({ options, onChange }: any) => <div>{options.map((option: any) => <button key={option.value} type="button" onClick={() => onChange(option.value)}>{option.label}</button>)}</div>,
+}));
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 describe("skill import", () => {
   it("locks duplicate submissions, reports progress and targets the selected member", async () => {

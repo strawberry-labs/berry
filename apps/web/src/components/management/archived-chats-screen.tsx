@@ -3,10 +3,14 @@ import { useInfiniteQuery } from "@tanstack/react-query";
 import { ArchiveRestore, Folder, Trash2 } from "lucide-react";
 import { ArchivedTasksSearchSchema, type Task, type TaskPage } from "@berry/shared";
 import { managementQueryKeys } from "@/lib/management-query-keys";
-import { AsyncState, Button, FormSelect, ManagementPage, SearchInput, StatusPill } from "./management-primitives";
+import { AsyncState, Button, FormSelect, InlineNotice, ManagementDialog, ManagementPage, SearchInput, Section, StatusPill, formatDateTime } from "./management-primitives";
 import type { ManagementScreenProps } from "./management-context";
+import { FillHeightScroller, InfiniteScrollTrigger } from "../infinite-scroll-trigger";
 
-export function ArchivedTasksScreen({ client, tasks, workspaces, onArchiveTask, onDeleteTask, onRestoreTask }: ManagementScreenProps) {
+/** Demo mode pages the local list too, so the archive scrolls the same way it does against the API. */
+const LOCAL_PAGE_SIZE = 20;
+
+export function ArchivedTasksScreen({ client, tenantId, userId, supportView, tasks, workspaces, onArchiveTask, onDeleteTask, onRestoreTask }: ManagementScreenProps) {
   const initial = React.useMemo(() => ArchivedTasksSearchSchema.parse(typeof window === "undefined" ? {} : Object.fromEntries(new URLSearchParams(window.location.search))), []);
   const [filters, setFilters] = React.useState(initial);
   const [busyId, setBusyId] = React.useState<string | null>(null);
@@ -15,7 +19,7 @@ export function ArchivedTasksScreen({ client, tasks, workspaces, onArchiveTask, 
   const [confirmDeleteAll, setConfirmDeleteAll] = React.useState(false);
 
   const archiveQuery = useInfiniteQuery({
-    queryKey: managementQueryKeys.archive(filters),
+    queryKey: [...managementQueryKeys.archive(filters), tenantId, userId, Boolean(supportView)],
     initialPageParam: undefined as string | undefined,
     queryFn: async ({ pageParam, signal }): Promise<TaskPage> => {
       if (client) {
@@ -36,8 +40,11 @@ export function ArchivedTasksScreen({ client, tasks, workspaces, onArchiveTask, 
         return matchesState
           && (filters.workspace === "all" || task.workspaceId === filters.workspace)
           && (!filters.q || task.title.toLocaleLowerCase().includes(filters.q.toLocaleLowerCase()));
-      });
-      return { items: local, hasMore: false, nextCursor: null };
+      }).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+      const offset = pageParam ? Number(pageParam) : 0;
+      const end = offset + LOCAL_PAGE_SIZE;
+      const hasMore = end < local.length;
+      return { items: local.slice(offset, end), hasMore, nextCursor: hasMore ? String(end) : null };
     },
     getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
     staleTime: 15_000,
@@ -104,39 +111,75 @@ export function ArchivedTasksScreen({ client, tasks, workspaces, onArchiveTask, 
   }
 
   const archivedCount = matching.filter((task) => task.archived && !task.deletedAt).length;
+  const allLoaded = !archiveQuery.hasNextPage;
+  const filtered = Boolean(filters.q) || filters.workspace !== "all";
+  const showState = filters.state === "all";
+  const projectName = (workspace: (typeof workspaces)[number] | undefined) => workspace?.workspaceKind === "general" ? "Tasks" : workspace?.name ?? "Unknown project";
   return (
-    <ManagementPage
+    <ManagementPage width="narrow"
       title="Archived tasks"
-      description="Search, restore, or remove tasks without adding recovery controls beneath the composer."
-      eyebrow="History"
-      actions={archivedCount > 0 ? <Button variant="destructive" disabled={busyId !== null} onClick={() => setConfirmDeleteAll(true)}><Trash2 />Delete all</Button> : null}
+      description="Tasks you archived or deleted. Unarchive or restore one to bring it back to your task list."
+      actions={archivedCount > 0 ? <Button variant="secondary" disabled={busyId !== null} onClick={() => { setError(""); setConfirmDeleteAll(true); }}><Trash2 />Delete all archived</Button> : null}
     >
-      <div className="grid gap-2 rounded-xl border border-border bg-card p-3 sm:grid-cols-2 xl:grid-cols-[minmax(220px,1fr)_repeat(3,minmax(140px,auto))]" aria-label="Archived task filters">
-        <SearchInput label="Search archived tasks" value={filters.q ?? ""} onChange={(value) => update({ q: value || undefined })} placeholder="Search archived tasks" />
-        <label><span className="sr-only">Project</span><FormSelect value={filters.workspace} onChange={(value) => update({ workspace: value })} options={[{ value: "all", label: "All projects" }, ...workspaces.map((workspace) => ({ value: workspace.id, label: workspace.workspaceKind === "general" ? "Tasks" : workspace.name }))]} /></label>
-        <label><span className="sr-only">Archive state</span><FormSelect value={filters.state} onChange={(value) => update({ state: value as typeof filters.state })} options={[{ value: "archived", label: "Archived" }, { value: "deleted", label: "Recently deleted" }, { value: "all", label: "Archived and deleted" }]} /></label>
+      <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center" aria-label="Archived task filters">
+        <SearchInput label="Search archived tasks" value={filters.q ?? ""} onChange={(value) => update({ q: value || undefined })} placeholder="Search by title" />
+        <label className="sm:w-48"><span className="sr-only">Project</span><FormSelect value={filters.workspace} onChange={(value) => update({ workspace: value })} options={[{ value: "all", label: "All projects" }, ...workspaces.map((workspace) => ({ value: workspace.id, label: workspace.workspaceKind === "general" ? "Tasks" : workspace.name }))]} /></label>
+        <label className="sm:w-48"><span className="sr-only">Archive state</span><FormSelect value={filters.state} onChange={(value) => update({ state: value as typeof filters.state })} options={[{ value: "archived", label: "Archived" }, { value: "deleted", label: "Recently deleted" }, { value: "all", label: "Archived and deleted" }]} /></label>
       </div>
 
-      {confirmDeleteAll ? <div className="flex flex-col gap-3 rounded-xl border border-destructive/30 bg-destructive/5 p-4 sm:flex-row sm:items-center" role="alertdialog" aria-labelledby="delete-archived-title" aria-describedby="delete-archived-description"><div className="mr-auto"><b className="text-sm text-foreground" id="delete-archived-title">Delete {archivedCount} archived {archivedCount === 1 ? "task" : "tasks"}?</b><p className="mt-1 text-xs text-muted-foreground" id="delete-archived-description">They will move to Recently deleted and can still be restored.</p></div><Button variant="secondary" onClick={() => setConfirmDeleteAll(false)}>Cancel</Button><Button variant="destructive" disabled={busyId !== null} onClick={() => void deleteAll()}><Trash2 />Delete all</Button></div> : null}
-      {error ? <p className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive" role="alert">{error}</p> : null}
-      {status ? <p className="rounded-lg border border-[var(--berry-success)]/25 bg-[var(--berry-success)]/5 px-3 py-2 text-xs text-[var(--berry-success)]" role="status">{status}</p> : null}
+      {error && !confirmDeleteAll ? <InlineNotice tone="danger">{error}</InlineNotice> : null}
+      {status ? <InlineNotice tone="good">{status}</InlineNotice> : null}
 
-      <AsyncState loading={archiveQuery.isPending} error={archiveQuery.error instanceof Error ? archiveQuery.error.message : archiveQuery.error ? "Unable to load archived tasks" : null} onRetry={() => void archiveQuery.refetch()} empty={!archiveQuery.isPending && groups.length === 0} emptyTitle={filters.state === "deleted" ? "No recently deleted tasks" : "No archived tasks"} emptyText={filters.q ? "Try a different search or filter." : "Tasks you archive will appear here."}>
-      {groups.map(({ workspace, items }) => (
-        <section className="grid gap-2" key={workspace?.id ?? items[0]?.workspaceId} aria-labelledby={`archive-group-${items[0]?.workspaceId}`}>
-          <header className="flex items-center justify-between gap-4 px-1"><h2 className="flex items-center gap-2 text-sm font-medium text-foreground" id={`archive-group-${items[0]?.workspaceId}`}><Folder className="size-4 text-muted-foreground" aria-hidden />{workspace?.workspaceKind === "general" ? "Tasks" : workspace?.name ?? "Unknown project"}</h2><span className="text-xs text-muted-foreground">{items.length} {items.length === 1 ? "task" : "tasks"}</span></header>
-          <div className="divide-y divide-border overflow-hidden rounded-xl border border-border bg-card">
-            {items.map((task) => <article className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-2 px-3 py-2.5 sm:grid-cols-[minmax(0,1fr)_auto_auto_auto]" key={task.id}>
-              <div className="grid min-w-0 gap-0.5"><b className="truncate text-sm font-medium text-foreground" title={task.title}>{task.title}</b><time className="text-xs text-muted-foreground" dateTime={task.updatedAt}>{new Date(task.updatedAt).toLocaleString()}</time></div>
-              <StatusPill tone={task.deletedAt ? "warning" : "info"}>{task.deletedAt ? "Recently deleted" : "Task"}</StatusPill>
-              {!task.deletedAt ? <Button variant="ghost" size="icon" aria-label={`Delete ${task.title}`} disabled={busyId !== null} onClick={() => void mutate(task, "delete")}><Trash2 /></Button> : null}
-              <Button variant="secondary" disabled={busyId !== null} onClick={() => void mutate(task, task.deletedAt ? "restore" : "unarchive")}>{task.deletedAt ? "Restore" : "Unarchive"}</Button>
-            </article>)}
+      <AsyncState loading={archiveQuery.isPending} error={archiveQuery.error instanceof Error ? archiveQuery.error.message : archiveQuery.error ? "Unable to load archived tasks" : null} onRetry={() => void archiveQuery.refetch()} empty={!archiveQuery.isPending && groups.length === 0} emptyTitle={filters.state === "deleted" ? "No recently deleted tasks" : "No archived tasks"} emptyText={filtered ? "Nothing matches this search and project. Try a different filter." : filters.state === "deleted" ? "Tasks you delete stay here for a while so you can restore them." : "Archive a task from its menu to move it out of your task list. It will appear here."}>
+        <Section flush>
+          <FillHeightScroller>
+          <div className="grid divide-y divide-border">
+            {groups.map(({ workspace, items }) => (
+              <section key={workspace?.id ?? items[0]?.workspaceId} aria-labelledby={`archive-group-${items[0]?.workspaceId}`}>
+                <header className="sticky top-0 z-10 flex items-center justify-between gap-4 border-b border-border bg-[var(--berry-surface-under)] px-4 py-1.5">
+                  <h2 className="flex min-w-0 items-center gap-2 text-xs font-medium text-muted-foreground" id={`archive-group-${items[0]?.workspaceId}`}><Folder className="size-3.5 shrink-0" aria-hidden /><span className="truncate">{projectName(workspace)}</span></h2>
+                  <span className="shrink-0 text-xs text-muted-foreground tabular-nums">{items.length} {items.length === 1 ? "task" : "tasks"}</span>
+                </header>
+                <div className="grid divide-y divide-border">
+                  {items.map((task) => <article className="flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2.5 hover:bg-[var(--berry-hover)]" key={task.id}>
+                    <div className="grid min-w-0 flex-1 basis-48 gap-0.5">
+                      <b className="truncate text-md font-medium text-foreground" title={task.title}>{task.title}</b>
+                      <time className="text-xs text-muted-foreground" dateTime={task.deletedAt ?? task.updatedAt}>{task.deletedAt ? `Deleted ${formatDateTime(task.deletedAt)}` : `Last updated ${formatDateTime(task.updatedAt)}`}</time>
+                    </div>
+                    {showState ? <StatusPill tone={task.deletedAt ? "warning" : "neutral"}>{task.deletedAt ? "Deleted" : "Archived"}</StatusPill> : null}
+                    <div className="flex shrink-0 items-center gap-1">
+                      <Button variant="secondary" disabled={busyId !== null} onClick={() => void mutate(task, task.deletedAt ? "restore" : "unarchive")}><ArchiveRestore />{task.deletedAt ? "Restore" : "Unarchive"}</Button>
+                      {!task.deletedAt ? <Button variant="ghost" size="icon" aria-label={`Delete ${task.title}`} title="Move to recently deleted" disabled={busyId !== null} onClick={() => void mutate(task, "delete")}><Trash2 /></Button> : null}
+                    </div>
+                  </article>)}
+                </div>
+              </section>
+            ))}
           </div>
-        </section>
-      ))}
-      {archiveQuery.hasNextPage ? <div className="flex justify-center"><Button variant="secondary" disabled={archiveQuery.isFetchingNextPage} onClick={() => void archiveQuery.fetchNextPage()}>{archiveQuery.isFetchingNextPage ? "Loading…" : "Load older tasks"}</Button></div> : null}
+          <InfiniteScrollTrigger
+            className="border-t border-border"
+            hasMore={Boolean(archiveQuery.hasNextPage)}
+            loading={archiveQuery.isFetchingNextPage}
+            error={archiveQuery.isFetchNextPageError ? "Older tasks could not be loaded." : null}
+            onLoadMore={() => void archiveQuery.fetchNextPage()}
+          />
+          </FillHeightScroller>
+        </Section>
       </AsyncState>
+
+      <ManagementDialog
+        open={confirmDeleteAll}
+        onOpenChange={(open) => { if (!open && busyId !== "all") setConfirmDeleteAll(false); }}
+        title={allLoaded ? `Delete ${archivedCount} archived ${archivedCount === 1 ? "task" : "tasks"}?` : "Delete all archived tasks?"}
+        description={`${filtered ? "Every archived task that matches the current search and project" : "Every archived task"} moves to Recently deleted, where you can still restore it.`}
+        size="sm"
+        footer={<>
+          <Button variant="secondary" disabled={busyId === "all"} onClick={() => setConfirmDeleteAll(false)}>Cancel</Button>
+          <Button variant="destructive" disabled={busyId !== null} onClick={() => void deleteAll()}><Trash2 />{busyId === "all" ? "Deleting…" : "Delete all"}</Button>
+        </>}
+      >
+        {error ? <InlineNotice tone="danger">{error}</InlineNotice> : <p className="text-md leading-5 text-muted-foreground">{allLoaded ? "Tasks already in Recently deleted are not affected." : "This includes archived tasks that are not loaded on this page yet."}</p>}
+      </ManagementDialog>
     </ManagementPage>
   );
 }

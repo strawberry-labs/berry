@@ -357,6 +357,11 @@ export const WebConfigSchema = z.object({
   providers: z.array(ProviderConfigSchema),
   mcpServers: z.array(McpHttpConfigSchema),
   skills: z.array(SkillConfigSchema),
+  /** Store links shown in the "Get the mobile app" dialog; hidden when unset. */
+  mobileApp: z.object({
+    appStoreUrl: z.string().url().nullable(),
+    playStoreUrl: z.string().url().nullable(),
+  }).default({ appStoreUrl: null, playStoreUrl: null }),
 });
 
 export type WebConfig = z.infer<typeof WebConfigSchema>;

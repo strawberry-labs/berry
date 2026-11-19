@@ -19,6 +19,7 @@ export const loadWebBootstrap = createServerFn({ method: "GET" }).handler(async 
     const extraFrames = splitCspSources(process.env.BERRY_CSP_EXTRA_FRAME_SOURCES);
     setResponseHeader("Content-Security-Policy", buildSiteContentSecurityPolicy({
       nonce,
+      allowInlineStyleElements: import.meta.env.DEV,
       connectOrigins: [apiOrigin, ...extraConnect, ...storageConnectOrigins({ endpoint: process.env.BERRY_ARTIFACT_S3_PUBLIC_ENDPOINT || process.env.BERRY_ARTIFACT_S3_ENDPOINT, bucket: process.env.BERRY_ARTIFACT_S3_BUCKET, region: process.env.BERRY_ARTIFACT_S3_REGION, accelerate: process.env.BERRY_ARTIFACT_S3_ACCELERATE === "true" })].filter((value): value is string => Boolean(value)),
       imageOrigins: [apiOrigin, ...extraImages].filter((value): value is string => Boolean(value)),
       ...(extraFrames.length > 0 ? { frameSources: extraFrames } : {}),

@@ -859,7 +859,7 @@ export class SupportViewController {
     return scoped;
   }
 
-  private async subjectRead<T>(
+  async subjectRead<T>(
     request: AuthenticatedRequest,
     tenantId: string,
     userId: string,
@@ -878,7 +878,7 @@ export class SupportViewController {
     return result;
   }
 
-  private async subjectWrite<T>(
+  async subjectWrite<T>(
     request: AuthenticatedRequest,
     tenantId: string,
     userId: string,

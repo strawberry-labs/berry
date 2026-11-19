@@ -1,24 +1,26 @@
 import * as React from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { Copy, Download, FileUp, Plus, Save, Search, UserPlus, Users } from "lucide-react";
+import { ArrowRight } from "lucide-react";
 import {
-  AsyncState, Button, Checkbox, DataTable, FormSelect, Input, ManagementDialog,
-  ManagementPage, MetricGrid, SearchInput, Section, StatusPill, SuccessMessage,
-  Switch, Toolbar, formatDateTime, formatMoney, formatNumber,
+  AsyncState, Button, CellStack, DataTable, InlineNotice, ManagementPage, MetricGrid,
+  Section, StatusPill, formatCompact, formatCompactMoney, formatDateTime, formatDuration,
+  formatMoney, formatNumber, formatPercent,
 } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
-import { BreakdownBars, DualTrend, HealthRings, OutcomeBars } from "./management-charts";
+import { BreakdownBars, DualTrend, OutcomeBars, ShareDonut, aggregateModelSpendRows } from "./management-charts";
 import {
-  calculateCacheMetric, UsageRangeControl, usageRangeForPreset,
+  UsageRangeControl, usageRangeForPreset,
   type UsageDateRange, type UsageRangePreset,
 } from "./usage-controls";
-import { parseMemberImportCsv, type MemberImportRow } from "../../lib/member-import";
-import { memberAccessStatusOptions, memberStatusUpdate } from "../../lib/member-administration";
-export function AdminOverviewScreen({ client, config, tenantId }: ManagementScreenProps) {
+import { AdminOverviewSkeleton } from "./management-screen-skeletons";
+
+export function AdminOverviewScreen({ client, config, tenantId, permissions }: ManagementScreenProps) {
+  const navigate = useNavigate();
   const [preset, setPreset] = React.useState<UsageRangePreset>("month");
   const [range, setRange] = React.useState<UsageDateRange>(() => usageRangeForPreset("month"));
   const from = `${range.from}T00:00:00.000Z`;
   const to = `${range.to}T23:59:59.999Z`;
+  const canReadBudgets = permissions.includes("budgets:read");
   const r = useResource(
     `overview:${tenantId}:${from}:${to}`,
     async () =>
@@ -28,6 +30,7 @@ export function AdminOverviewScreen({ client, config, tenantId }: ManagementScre
             client.usageAnalytics(tenantId, { from, to, limit: 20 }),
             client.billingHealth(tenantId),
             client.listAuditEvents(tenantId, { limit: 8 }),
+            canReadBudgets ? client.listBudgetLimits(tenantId).catch(() => []) : Promise.resolve([]),
           ])
         : ([
             [],
@@ -35,21 +38,48 @@ export function AdminOverviewScreen({ client, config, tenantId }: ManagementScre
               null,
             null,
             config.auditEvents,
+            config.budgetLimits.filter((x) => x.tenantId === tenantId),
           ] as any),
     [] as any,
   );
-  const [members, usage, health, audit] = r.data;
-  const cacheMetric = calculateCacheMetric({
-    inputTokens: Number(usage?.totals?.inputTokens ?? 0),
-    cacheReadTokens: Number(usage?.performance?.cacheReadTokens ?? 0),
-    cacheEligibleRequests: Number(usage?.performance?.cacheEligibleRequests ?? 0),
-    cacheHitRequests: Number(usage?.performance?.cacheHitRequests ?? 0),
+  const [members = [], usage, health, audit = [], budgets = []] = r.data as [any[], any, any, any[], any[]];
+  const open = (tab: string) => void navigate({ to: "/admin/$tab", params: { tab }, search: {} });
+
+  const series: any[] = usage?.series ?? usage?.burnDown ?? [];
+  const point = (x: any) => ({
+    label: String(x.ts ?? x.date),
+    spend: Number(x.billedCostMicros ?? x.costBilledMicros ?? 0) / 1e6,
+    requests: Number(x.requests ?? 0),
+    tokens: Number(x.tokens ?? 0),
+    successes: Number(x.successes ?? x.requests ?? 0),
+    failures: Number(x.failures ?? 0),
   });
+  const points = series.map(point);
+  const spendMicros = Number(usage?.totals?.billedCostMicros ?? usage?.totals?.costBilledMicros ?? 0);
+  const inputTokens = Number(usage?.totals?.inputTokens ?? usage?.totals?.tokensIn ?? 0);
+  const outputTokens = Number(usage?.totals?.outputTokens ?? usage?.totals?.tokensOut ?? 0);
+  const totalTokens = Number(usage?.totals?.tokens ?? 0) || inputTokens + outputTokens;
+  const successRate: number | null = usage?.totals?.successRate ?? derivedSuccessRate(series);
+  const memberRows: any[] = usage?.breakdowns?.members ?? usage?.breakdowns?.users ?? usage?.byUser ?? [];
+  const activeMembers = members.filter((m: any) => m.status === "active").length;
+  const membersWithUsage = memberRows.filter((row: any) => (row.id ?? row.userId) != null).length;
+  const memberName = React.useMemo(() => {
+    const names = new Map<string, string>();
+    for (const member of members) names.set(member.userId, member.name || member.email || member.userId);
+    return (id: string | null | undefined) => (id ? names.get(id) ?? shortId(id) : "System");
+  }, [members]);
+
+  // The monthly organization budget only gives honest context for the month view.
+  const orgBudget = budgets.find((b: any) => b.scopeType === "org" && b.period === "month" && b.status !== "disabled");
+  const budgetMicros = preset === "month" && orgBudget ? Number(orgBudget.hardLimitMicros) : 0;
+  const budgetUse = budgetMicros > 0 ? spendMicros / budgetMicros : null;
+  const projected = usage?.totals?.projectedMonthEndMicros;
+
   return (
-    <ManagementPage
+    <ManagementPage width="wide"
       title="Overview"
-      description="Operational health, adoption, spend, and recent administration activity."
-      eyebrow="Organization administration"
+      description="Spend, adoption and reliability for the organization, and what needs your attention."
+      eyebrow="Organization"
       actions={
         <UsageRangeControl
           preset={preset}
@@ -65,186 +95,198 @@ export function AdminOverviewScreen({ client, config, tenantId }: ManagementScre
         loading={r.loading}
         error={r.error}
         onRetry={r.retry}
+        skeleton={<AdminOverviewSkeleton />}
         empty={!r.loading && !usage}
-        emptyTitle="Overview data unavailable"
-        emptyText="Connect the organization API to load operational health, adoption, and spend."
+        emptyTitle="No organization data yet"
+        emptyText="Usage, adoption and spend appear here once the organization API is connected and members start working."
       >
         {usage ? (
           <>
             <MetricGrid
               items={[
                 {
-                  label: "Active members",
-                  value: formatNumber(
-                    members.length
-                      ? members.filter((m: any) => m.status === "active").length
-                      : (usage.byUser ?? []).filter((u: any) => u.userId)
-                          .length,
-                  ),
-                },
-                {
                   label: "Billed spend",
-                  value: formatMoney(
-                    usage.totals?.billedCostMicros ??
-                      usage.totals?.costBilledMicros,
-                  ),
+                  value: formatCompactMoney(spendMicros),
+                  exactValue: formatMoney(spendMicros),
+                  trend: points.map((x) => x.spend),
+                  ...(budgetUse != null
+                    ? {
+                        hint: `${formatPercent(budgetUse)} of ${formatCompactMoney(budgetMicros)} monthly budget`,
+                        ...(budgetUse >= 1 ? { status: "danger" as const } : budgetUse >= 0.8 ? { status: "warning" as const } : {}),
+                      }
+                    : projected
+                      ? { hint: `Projected ${formatCompactMoney(projected)} by month end` }
+                      : {}),
                 },
                 {
-                  label: "Requests",
-                  value: formatNumber(usage.totals?.requests ?? 0),
+                  label: "Active members",
+                  value: formatNumber(activeMembers || membersWithUsage),
+                  hint: members.length
+                    ? `of ${formatNumber(members.length)} members${membersWithUsage ? ` · ${formatNumber(membersWithUsage)} used Berry in this period` : ""}`
+                    : "Members with usage in this period",
                 },
                 {
-                  label: "Successful requests",
-                  value:
-                    usage.totals?.successRate == null
-                      ? "—"
-                      : `${Math.round(usage.totals.successRate * 100)}%`,
-                  status:
-                    (usage.totals?.successRate ?? 1) < 0.9 ? "warning" : "good",
+                  label: "Tokens",
+                  value: formatCompact(totalTokens),
+                  exactValue: formatNumber(totalTokens),
+                  trend: points.map((x) => x.tokens).some(Boolean) ? points.map((x) => x.tokens) : points.map((x) => x.requests),
+                  hint: `${formatCompact(inputTokens)} in · ${formatCompact(outputTokens)} out · ${formatCompact(usage.totals?.requests ?? 0)} requests`,
                 },
                 {
-                  label: "Input tokens",
-                  value: formatNumber(usage.totals?.inputTokens ?? 0),
-                },
-                {
-                  label: cacheMetric.label,
-                  value: cacheMetric.value == null ? "—" : `${Math.round(cacheMetric.value * 100)}%`,
-                  hint: cacheMetric.hint,
-                },
-                {
-                  label: "Cache-read tokens",
-                  value: formatNumber(usage.performance?.cacheReadTokens ?? 0),
-                },
-                {
-                  label: "P95 latency",
-                  value: usage.performance?.latencyP95Ms == null ? "—" : `${Math.round(usage.performance.latencyP95Ms)} ms`,
+                  label: "Success rate",
+                  value: formatPercent(successRate),
+                  ...((successRate ?? 1) < 0.95 ? { status: "warning" as const } : {}),
+                  trend: points.map((x) => (x.successes + x.failures > 0 ? x.successes / (x.successes + x.failures) : 1)),
+                  hint: usage.performance?.latencyP95Ms == null ? "Share of requests that completed" : `P95 latency ${formatDuration(usage.performance.latencyP95Ms)}`,
                 },
               ]}
             />
-            <div className="grid gap-4 xl:grid-cols-2">
-              <Section title="Spend and request trend">
-                <DualTrend
-                  label="Billed spend"
-                  points={(usage.series ?? usage.burnDown ?? []).map(
-                    (x: any) => ({
-                      label: (x.ts ?? x.date).slice(0, 10),
-                      spend:
-                        Number(x.billedCostMicros ?? x.costBilledMicros) / 1e6,
-                      requests: Number(x.requests ?? 0),
-                    }),
-                  )}
-                  spendFormat={(v) => formatMoney(v * 1e6)}
-                />
-              </Section>
-              <Section title="System health">
-                <div className="grid divide-y divide-border [&>p]:flex [&>p]:items-center [&>p]:justify-between [&>p]:gap-4 [&>p]:py-2.5 [&_span]:text-xs [&_span]:text-muted-foreground">
-                  <p>
-                    <StatusPill
-                      tone={health?.status === "healthy" ? "good" : "warning"}
-                    >
-                      {health?.status ?? "Demo"}
-                    </StatusPill>
-                    <span>Billing and reservations</span>
-                  </p>
-                  <p>
-                    <StatusPill tone="good">Healthy</StatusPill>
-                    <span>Usage ingestion</span>
-                  </p>
-                  <p>
-                    <StatusPill tone="good">Healthy</StatusPill>
-                    <span>Audit chain</span>
-                  </p>
-                </div>
-              </Section>
-            </div>
-            <div className="grid gap-4 xl:grid-cols-2">
-              <Section title="Request outcomes">
-                <OutcomeBars
-                  points={(usage.series ?? usage.burnDown ?? []).map(
-                    (x: any) => ({
-                      label: (x.ts ?? x.date).slice(0, 10),
-                      successes: Number(x.successes ?? x.requests ?? 0),
-                      failures: Number(x.failures ?? 0),
-                    }),
-                  )}
-                />
-              </Section>
-              <Section title="Adoption and reliability">
-                <HealthRings
-                  successRate={
-                    usage.totals?.successRate ??
-                    derivedSuccessRate(usage.series ?? usage.burnDown ?? [])
-                  }
-                  cacheRate={cacheMetric.value}
-                  attributionRate={
-                    (usage.totals?.requests ?? 0) > 0
-                      ? (
-                          usage.breakdowns?.members ??
-                          usage.breakdowns?.users ??
-                          usage.byUser ??
-                          []
-                        ).reduce(
-                          (sum: number, row: any) =>
-                            sum +
-                            (row.id == null && row.userId == null
-                              ? 0
-                              : Number(row.requests ?? 0)),
-                          0,
-                        ) / usage.totals.requests
-                      : null
-                  }
-                />
-              </Section>
-            </div>
-            <div className="grid gap-4 xl:grid-cols-2">
-              <Section title="Model request mix">
-                <BreakdownBars
-                  label="Requests"
-                  rows={(
-                    usage.breakdowns?.models ??
-                    usage.byModel ??
-                    []
-                  ).map((row: any) => ({
-                    label: row.label ?? row.model ?? "Unknown",
-                    value: Number(row.requests ?? 0),
-                  }))}
-                />
-              </Section>
-              <Section title="Department spend">
-                <BreakdownBars
-                  label="Billed spend"
-                  rows={(
-                    usage.breakdowns?.departments ??
-                    usage.byDepartment ??
-                    []
-                  ).map((row: any) => ({
-                    label:
-                      row.label ?? row.departmentId ?? "Unattributed",
-                    value:
-                      Number(
-                        row.billedCostMicros ?? row.costBilledMicros ?? 0,
-                      ) / 1e6,
-                  }))}
-                  format={(value) => formatMoney(value * 1e6)}
-                />
-              </Section>
-            </div>
-            <Section title="Recent admin activity">
-              <DataTable
-                label="Recent activity"
-                columns={["Action", "Actor", "When"]}
-                rows={audit.map((x: any) => [
-                  <b>{human(x.action)}</b>,
-                  x.actorUserId ?? "System",
-                  formatDateTime(x.ts ?? x.createdAt),
-                ])}
+            <Attention usage={usage} health={health} onOpen={open} />
+            <Section
+              title="Spend and requests"
+              description="Daily billed spend beside request volume."
+              actions={<Button variant="ghost" onClick={() => open("analytics")}>Open usage<ArrowRight aria-hidden /></Button>}
+            >
+              <DualTrend
+                label="Billed spend"
+                points={points}
+                spendFormat={(v) => formatMoney(v * 1e6)}
               />
             </Section>
+            <div className="grid gap-5 xl:grid-cols-2">
+              <Section title="Spend by department">
+                <BreakdownBars
+                  label="Department"
+                  limit={6}
+                  rows={(usage.breakdowns?.departments ?? usage.byDepartment ?? []).map((row: any) => ({
+                    label: row.label ?? row.departmentId ?? "Unattributed",
+                    value: Number(row.billedCostMicros ?? row.costBilledMicros ?? 0) / 1e6,
+                  }))}
+                  format={(value) => formatCompactMoney(value * 1e6)}
+                />
+              </Section>
+              <Section title="Spend by model">
+                <ShareDonut
+                  caption="Spend by model"
+                  centerLabel="Spend"
+                  rows={aggregateModelSpendRows(
+                    (usage.breakdowns?.models ?? usage.byModel ?? []).map((row: any) => ({
+                      label: row.label ?? row.model ?? "Unknown",
+                      value: Number(row.billedCostMicros ?? row.costBilledMicros ?? 0) / 1e6,
+                    })),
+                    6,
+                  )}
+                  format={(value) => formatCompactMoney(value * 1e6)}
+                />
+              </Section>
+            </div>
+            <div className="grid gap-5 xl:grid-cols-2">
+              <Section title="Reliability" description="Share of requests that failed each day.">
+                <OutcomeBars points={points} />
+              </Section>
+              <Section title="Top members" description="Highest billed spend in this period.">
+                <BreakdownBars
+                  label="Member"
+                  limit={6}
+                  rows={memberRows.filter((row: any) => (row.id ?? row.userId) != null).map((row: any) => ({
+                    label: row.name ?? row.label ?? memberName(row.id ?? row.userId),
+                    value: Number(row.billedCostMicros ?? row.costBilledMicros ?? 0) / 1e6,
+                  }))}
+                  format={(value) => formatCompactMoney(value * 1e6)}
+                />
+              </Section>
+            </div>
+            <div className="grid gap-5 xl:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)]">
+              <Section
+                title="Recent admin activity"
+                flush
+                actions={<Button variant="ghost" onClick={() => open("audit-log")}>Audit log<ArrowRight aria-hidden /></Button>}
+              >
+                <DataTable
+                  label="Recent activity"
+                  searchable={false}
+                  columns={["Event", "Actor", "When"]}
+                  rows={audit.map((x: any) => [
+                    <CellStack primary={human(x.action)} secondary={[human(x.category ?? ""), x.targetType ? human(x.targetType) : ""].filter(Boolean).join(" · ")} />,
+                    memberName(x.actorUserId),
+                    <span className="whitespace-nowrap text-muted-foreground" data-sort={new Date(x.ts ?? x.createdAt).getTime()}>{formatDateTime(x.ts ?? x.createdAt)}</span>,
+                  ])}
+                />
+              </Section>
+              <Section title="System health" flush>
+                <ul className="grid divide-y divide-border">
+                  <HealthRow
+                    label="Billing"
+                    detail={health?.explanation ?? "Billing status is not reported in this environment."}
+                    tone={!health ? "neutral" : health.status === "healthy" ? "good" : health.status === "not_configured" ? "neutral" : health.status === "blocked" ? "danger" : "warning"}
+                    status={!health ? "Unknown" : human(health.status)}
+                  />
+                  <HealthRow
+                    label="Spend reservations"
+                    detail="Holds placed before a request runs, so limits are enforced."
+                    tone={!health ? "neutral" : health.reservationHealthy ? "good" : "warning"}
+                    status={!health ? "Unknown" : health.reservationHealthy ? "Healthy" : "Degraded"}
+                  />
+                  <HealthRow
+                    label="Usage ingestion"
+                    detail="Metering events arriving from the router."
+                    tone={!health ? "neutral" : health.ingestHealthy ? "good" : "warning"}
+                    status={!health ? "Unknown" : health.ingestHealthy ? "Healthy" : "Degraded"}
+                  />
+                </ul>
+              </Section>
+            </div>
           </>
         ) : null}
       </AsyncState>
     </ManagementPage>
   );
+}
+
+/** What is waiting on an admin. Renders nothing when there is nothing to do. */
+function Attention({ usage, health, onOpen }: { usage: any; health: any; onOpen: (tab: string) => void }) {
+  const anomalies: any[] = usage?.anomalies ?? [];
+  const billingProblem = health && (health.status === "degraded" || health.status === "blocked");
+  if (!anomalies.length && !billingProblem) return null;
+  return (
+    <div className="grid gap-2" aria-label="Needs attention">
+      {billingProblem ? (
+        <InlineNotice
+          tone={health.status === "blocked" ? "danger" : "warning"}
+          title={health.status === "blocked" ? "Billing is blocking requests" : "Billing is degraded"}
+          action={<Button variant="secondary" onClick={() => onOpen("credits-billing")}>Open billing</Button>}
+        >
+          {health.explanation}
+        </InlineNotice>
+      ) : null}
+      {anomalies.slice(0, 3).map((item) => (
+        <InlineNotice
+          key={item.id}
+          tone={item.severity === "error" ? "danger" : item.severity === "info" ? "info" : "warning"}
+          title={`${item.label} · ${item.dimension?.label ?? "Organization"}`}
+          action={<Button variant="secondary" onClick={() => onOpen("analytics")}>Investigate</Button>}
+        >
+          {item.explanation}
+        </InlineNotice>
+      ))}
+    </div>
+  );
+}
+
+function HealthRow({ label, detail, status, tone }: { label: string; detail: string; status: string; tone: "good" | "warning" | "danger" | "neutral" }) {
+  return (
+    <li className="flex items-center justify-between gap-4 px-4 py-3">
+      <span className="grid min-w-0 gap-0.5">
+        <b className="text-md font-medium text-foreground">{label}</b>
+        <small className="text-xs leading-5 text-muted-foreground">{detail}</small>
+      </span>
+      <StatusPill tone={tone}>{status}</StatusPill>
+    </li>
+  );
+}
+
+function shortId(value: string) {
+  return value.length <= 12 ? value : `${value.slice(0, 8)}…`;
 }
 
 function derivedSuccessRate(
@@ -263,6 +305,11 @@ function derivedSuccessRate(
   );
   return totals.requests ? totals.successes / totals.requests : null;
 }
+const ACRONYMS: Record<string, string> = { oauth: "OAuth", sso: "SSO", scim: "SCIM", mcp: "MCP", api: "API", acl: "ACL", csv: "CSV", id: "ID" };
+/** `connector_oauth-connected` → "Connector OAuth connected". */
 function human(value: string) {
-  return value.replaceAll("_", " ").replaceAll("-", " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  const words = value.replaceAll("_", " ").replaceAll("-", " ").replaceAll(".", " ").trim().split(/\s+/).filter(Boolean);
+  return words
+    .map((word, index) => ACRONYMS[word.toLowerCase()] ?? (index === 0 ? word.charAt(0).toUpperCase() + word.slice(1).toLowerCase() : word.toLowerCase()))
+    .join(" ");
 }

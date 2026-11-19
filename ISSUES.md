@@ -3013,6 +3013,17 @@ SSM code-only verification at2026-10-14T08:15:37Z: deployed API connector SHA `a
 **Implementation (14 October):** child listing now infers and keeps the folder's shared-drive ID, and an empty unscoped search retries once across the user's drives; results report `searchScope` and `incompleteSearch`. Not deployed.
 
 
+## Task-specific follow-up — 15 October 2026: generated task card fails after preview shrinks to one page
+
+Task `9688abaa-bd0a-43c9-999c-3b6e75c1e097`, run `ba11f74a-b668-4fab-8058-12d382e1d509`: **confirmed fresh H-046 incident**, with related H-024/H-068/H-069/H-064/H-058/H-016/H-045 friction. Full diagnosis: [task investigation](output/task-investigation-2026-10-15/9688abaa-bd0a-43c9-999c-3b6e75c1e097.md).
+
+- **Exact crash:** after a successful two-page render and completed reads of both preview images, a formatting adjustment deletes the old images and successfully renders one page. The next model preparation rereads obsolete page-2.png from history and fails with lstat no-such-file. Run 09:01:17→09:10:25 Dubai; final model step fails in approximately206 ms. This is an image-replay harness failure after generation, not a failed renderer or inferred provider outage.
+- **Current production check:** read-only SSM at 09:28:24 Dubai confirms all six running workers still have sandbox-continuity.js SHA 0978f3bb5e56366b4fbde40a3211a76ac241b74a94d8c9bae72729c3a7e80759, with no per-image missing-path guard. Existing local fix f2bace0 and its regression fixture are present; not deployed. Verify/release the existing targeted worker fix rather than duplicating it.
+- **Other avoidable work:** seven imports for four source files, three available-without-path first responses followed by library=true on identical retry; render_artifact.py staged without office_converter.py; valid “Client Name” label rejected as placeholder; validator failure masked by tail; task-card skill points at a temporary polish script absent from its resource bundle, so the model writes it anew. Small helper dependency closure should preserve lazy loading of large templates.
+- **Outcome:** workbook generation is evidenced, but no published output association is recorded. A complete failed-run snapshot exists; its contents were not inspected. Recovery should restore verified existing work and finish QA/publication.
+- **Acceptance:** two-page→one-page rerender retains the workbook and valid preview, reports the missing historical image without terminal failure, preserves explicit missing-inspection errors, and publishes the exact checked file. Recheck all worker hashes after authorized rollout; publish the appropriate skill fixes separately. No application or production change was made during this investigation.
+
+
 ## Error-boundary follow-up — 15 October 2026
 
 The existing missing-preview fix covers task `9688abaa-bd0a-43c9-999c-3b6e75c1e097`, but does not isolate all preparation/publication failures. [Targeted report](output/error-boundary-audit-2026-10-15/report.md) includes source hashes, fault cases, coverage, current-fix mapping and acceptance criteria. This is current working-tree code review plus retained production evidence, not a new complete history review. No application or production changes.

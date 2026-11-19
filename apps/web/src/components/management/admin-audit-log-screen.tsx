@@ -1,99 +1,34 @@
 import * as React from "react";
-import {
-  Activity,
-  Check,
-  Copy,
-  Download,
-  Plus,
-  Save,
-  ShieldCheck,
-  Trash2,
-  Upload,
-} from "lucide-react";
-import {
-  ORGANIZATION_SKILL_PACKAGE_MAX_BYTES,
-  OrgPermissionSchema,
-  type OrgCapabilityAssignment,
-  type OrgPermission,
-  type PersonalSkillReview,
-} from "@berry/shared";
-import { readBrowserSkillImport } from "@/lib/skill-import";
+import { Download } from "lucide-react";
 import {
   AsyncState,
   Button,
-  Checkbox,
+  CellStack,
   DataTable,
   DefinitionList,
   DetailDrawer,
   FilterSelect,
-  FormSelect,
-  Input,
-  ManagementDialog,
   ManagementPage,
-  ManagementSwitch,
-  MetricGrid,
-  PermissionDenied,
   SearchInput,
-  Section,
   StatusPill,
-  SuccessMessage,
-  TabBar,
-  Textarea,
   Toolbar,
-  formatDate,
   formatDateTime,
   formatNumber,
 } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
+import { AdminAuditLogSkeleton } from "./management-screen-skeletons";
 
-/* ------------------------------------------------------------------ helpers */
-const ALL_PERMISSIONS = OrgPermissionSchema.options as OrgPermission[];
-const PERMISSION_DOMAINS: Array<{ id: string; label: string }> = [
-  { id: "org", label: "Organization" },
-  { id: "org_settings", label: "Organization settings" },
-  { id: "members", label: "People" },
-  { id: "departments", label: "Departments" },
-  { id: "rbac", label: "Roles" },
-  { id: "acl", label: "Resource access" },
-  { id: "models", label: "Models" },
-  { id: "skills", label: "Skills" },
-  { id: "mcp", label: "MCP" },
-  { id: "feature_flags", label: "Feature access" },
-  { id: "guardrails", label: "Execution & network" },
-  { id: "usage", label: "Usage" },
-  { id: "budgets", label: "Budgets" },
-  { id: "billing", label: "Billing" },
-  { id: "reports", label: "Reports" },
-  { id: "alerts", label: "Alerts" },
-  { id: "sso", label: "SSO & SCIM" },
-  { id: "policy", label: "Managed policy" },
-  { id: "auth_policy", label: "Authentication" },
-  { id: "data_policy", label: "Data governance" },
-  { id: "service_accounts", label: "Service accounts" },
-  { id: "audit", label: "Audit" },
-];
-function humanize(value: string) {
-  return value
-    .replaceAll("_", " ")
-    .replaceAll("-", " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
-}
-function domainOf(permission: string) {
-  return permission.split(":")[0];
-}
-function actionOf(permission: string) {
-  return permission.split(":")[1] ?? "read";
-}
-function copyText(value: string) {
-  void navigator.clipboard?.writeText(value).catch(() => {});
-}
-function formatPackageBytes(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+const EVENT_LIMIT = 100;
+
+function sentence(value: string) {
+  const text = String(value).replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[_\-.:]+/g, " ").trim().toLowerCase();
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
-/* -------------------------------------------------------------------- roles */
+function shortId(value: string) {
+  return value.length > 14 ? `${value.slice(0, 8)}…${value.slice(-4)}` : value;
+}
+
 export function AdminAuditLogScreen({ client, config, tenantId, permissions }: ManagementScreenProps) {
   const r = useResource(
     `audit:${tenantId}`,
@@ -111,20 +46,37 @@ export function AdminAuditLogScreen({ client, config, tenantId, permissions }: M
   const actorLabel = (actorUserId: string | null) => {
     if (!actorUserId) return "System";
     const member = memberById.get(actorUserId);
-    return member ? member.name || member.email : actorUserId;
+    return member ? member.name || member.email : "Unknown member";
+  };
+  const actorSecondary = (actorUserId: string | null) =>
+    actorUserId ? memberById.get(actorUserId)?.email ?? <span className="font-mono">{shortId(actorUserId)}</span> : "Automatic";
+  /** People are shown by name; everything else by its type and a shortened id. */
+  const targetCell = (event: any) => {
+    if (!event.targetId) return "—";
+    const member = memberById.get(event.targetId);
+    if (member) return <CellStack primary={<span className="font-normal">{member.name || member.email}</span>} secondary={sentence(event.targetType ?? "member")} />;
+    return (
+      <CellStack
+        primary={<span className="font-normal">{event.targetType ? sentence(event.targetType) : "Item"}</span>}
+        secondary={<span className="font-mono" title={event.targetId}>{shortId(event.targetId)}</span>}
+      />
+    );
   };
   const [query, setQuery] = React.useState("");
   const [category, setCategory] = React.useState("all");
   const [active, setActive] = React.useState<number | null>(null);
-  const categories = [...new Set(events.map((x: any) => x.category))];
-  const rows = events.filter(
-    (x: any) =>
-      `${x.action} ${x.category} ${actorLabel(x.actorUserId)} ${memberById.get(x.actorUserId)?.email ?? ""} ${x.targetId ?? ""} ${x.workspaceId ?? ""} ${x.taskId ?? ""} ${x.sessionId ?? ""}`
-        .toLowerCase()
-        .includes(query.toLowerCase()) &&
-      (category === "all" || x.category === category),
-  );
+  const categories = [...new Set(events.map((x: any) => x.category))].sort();
+  const rows = events
+    .filter(
+      (x: any) =>
+        `${x.action} ${x.category} ${actorLabel(x.actorUserId)} ${memberById.get(x.actorUserId)?.email ?? ""} ${memberById.get(x.targetId)?.name ?? ""} ${x.targetType ?? ""} ${x.targetId ?? ""} ${x.workspaceId ?? ""} ${x.taskId ?? ""} ${x.sessionId ?? ""}`
+          .toLowerCase()
+          .includes(query.toLowerCase()) &&
+        (category === "all" || x.category === category),
+    )
+    .sort((left: any, right: any) => String(right.ts ?? right.createdAt).localeCompare(String(left.ts ?? left.createdAt)));
   const detail = active != null ? rows[active] : null;
+  const filtered = query.length > 0 || category !== "all";
   const exportCsv = () => {
     const header = [
       "sequence",
@@ -156,14 +108,13 @@ export function AdminAuditLogScreen({ client, config, tenantId, permissions }: M
     URL.revokeObjectURL(a.href);
   };
   return (
-    <ManagementPage
+    <ManagementPage width="wide"
       title="Audit log"
-      description="Tamper-evident administration activity with a verifiable hash chain."
-      eyebrow="Security & data"
+      description="Who changed what in this organization. Each event is chained to the one before it, so edits and gaps are detectable."
       actions={
-        <Button variant="secondary" onClick={exportCsv}>
+        <Button variant="secondary" disabled={rows.length === 0} onClick={exportCsv}>
           <Download aria-hidden />
-          Export
+          Export CSV
         </Button>
       }
     >
@@ -171,151 +122,127 @@ export function AdminAuditLogScreen({ client, config, tenantId, permissions }: M
         <SearchInput
           label="Search audit events"
           value={query}
-          onChange={setQuery}
+          onChange={(next) => { setActive(null); setQuery(next); }}
           placeholder="Search action, actor, or target"
         />
         <FilterSelect
           label="Category"
           value={category}
-          onChange={setCategory}
+          onChange={(next) => { setActive(null); setCategory(next); }}
           options={[
             { value: "all", label: "All categories" },
             ...categories.map((c) => ({
               value: String(c),
-              label: humanize(String(c)),
+              label: sentence(String(c)),
             })),
           ]}
         />
       </Toolbar>
-      <div className={detail ? "min-w-0" : undefined}>
-        <AsyncState
-          loading={r.loading}
-          error={r.error}
-          onRetry={r.retry}
-          empty={rows.length === 0}
+      <AsyncState
+        loading={r.loading}
+        error={r.error}
+        onRetry={r.retry}
+        skeleton={<AdminAuditLogSkeleton />}
+        empty={rows.length === 0}
+        emptyTitle={filtered ? "No matching events" : "No audit events yet"}
+        emptyText={filtered ? "Clear the search or pick another category." : "Changes to members, policies, billing, and settings are recorded here as they happen."}
+      >
+        <DataTable
+          label="Audit events"
+          searchable={false}
+          initialPageSize={25}
+          columns={["Time", "Actor", "Action", "Target", "Category"]}
+          onRowSelect={setActive}
+          activeRow={active}
+          rowLabel={(i) => `${rows[i].category} ${rows[i].action}`}
+          rows={rows.map((x: any) => [
+            <span data-sort={new Date(x.ts ?? x.createdAt).getTime()} className="whitespace-nowrap tabular-nums">{formatDateTime(x.ts ?? x.createdAt)}</span>,
+            <CellStack primary={actorLabel(x.actorUserId)} secondary={actorSecondary(x.actorUserId)} />,
+            sentence(x.action),
+            targetCell(x),
+            <StatusPill tone="neutral">{sentence(x.category)}</StatusPill>,
+          ])}
+        />
+        <p className="text-xs text-muted-foreground">
+          {filtered
+            ? `${formatNumber(rows.length)} of the latest ${formatNumber(events.length)} events match.`
+            : events.length >= EVENT_LIMIT
+              ? `Showing the latest ${formatNumber(EVENT_LIMIT)} events.`
+              : `${formatNumber(events.length)} ${events.length === 1 ? "event" : "events"}.`}{" "}
+          Export CSV saves the events listed here.
+        </p>
+      </AsyncState>
+      {detail ? (
+        <DetailDrawer
+          title={sentence(detail.action)}
+          subtitle={<span className="font-mono">{detail.category}.{detail.action}</span>}
+          badge={<StatusPill tone="neutral">{sentence(detail.category)}</StatusPill>}
+          onClose={() => setActive(null)}
         >
-          <DataTable
-            label="Audit events"
-            columns={["Time", "Actor", "Category", "Action", "Target", "Context", "Sequence"]}
-            onRowSelect={setActive}
-            activeRow={active}
-            rowLabel={(i) => `${rows[i].category} ${rows[i].action}`}
-            rows={rows.map((x: any) => [
-              formatDateTime(x.ts ?? x.createdAt),
-              <span className="grid min-w-0 gap-0.5 [&_b]:truncate [&_small]:text-xs [&_small]:text-muted-foreground"><b>{actorLabel(x.actorUserId)}</b><small>{memberById.get(x.actorUserId)?.email ?? x.actorUserId ?? "Service initiated"}</small></span>,
-              humanize(x.category),
-              <span className="grid min-w-0 gap-0.5 [&_b]:truncate [&_b]:text-sm [&_small]:text-xs [&_small]:text-muted-foreground">
-                <b>{humanize(x.action)}</b>
-                <small>
-                  {x.category}.{x.action}
-                </small>
-              </span>,
-              x.targetId
-                ? `${humanize(x.targetType ?? "")}: ${x.targetId}`
-                : "—",
-              x.workspaceId ? `Workspace ${x.workspaceId}` : x.taskId ? `Task ${x.taskId}` : x.sessionId ? `Session ${x.sessionId}` : "Organization",
-              <code>#{x.sequence}</code>,
-            ])}
+          <DefinitionList
+            items={[
+              {
+                term: "Time",
+                detail: formatDateTime(detail.ts ?? detail.createdAt),
+              },
+              {
+                term: "Actor",
+                detail: <CellStack primary={<span className="font-normal">{actorLabel(detail.actorUserId)}</span>} secondary={actorSecondary(detail.actorUserId)} />,
+              },
+              { term: "Target", detail: targetCell(detail) },
+              ...(detail.targetId ? [{ term: "Target ID", detail: <Mono value={detail.targetId} /> }] : []),
+              ...(detail.actorUserId ? [{ term: "Actor ID", detail: <Mono value={detail.actorUserId} /> }] : []),
+            ]}
           />
-        </AsyncState>
-        {detail ? (
-          <DetailDrawer
-            title={humanize(detail.action)}
-            subtitle={`${detail.category}.${detail.action}`}
-            badge={<code>#{detail.sequence}</code>}
-            onClose={() => setActive(null)}
-          >
+          {detail.before || detail.after ? (
+            <div className="grid gap-2">
+              <h3 className="text-xs font-medium text-muted-foreground">Change</h3>
+              <JsonBlock label="Before" value={detail.before ?? null} />
+              <JsonBlock label="After" value={detail.after ?? null} />
+            </div>
+          ) : null}
+          {detail.metadata && Object.keys(detail.metadata).length ? (
+            <div className="grid gap-2">
+              <h3 className="text-xs font-medium text-muted-foreground">Details</h3>
+              <JsonBlock value={detail.metadata} />
+            </div>
+          ) : null}
+          <div className="grid gap-2">
+            <h3 className="text-xs font-medium text-muted-foreground">Record</h3>
             <DefinitionList
               items={[
-                {
-                  term: "Time",
-                  detail: formatDateTime(detail.ts ?? detail.createdAt),
-                },
-                { term: "Actor", detail: actorLabel(detail.actorUserId) },
-                { term: "Actor ID", detail: detail.actorUserId ?? "System" },
-                {
-                  term: "Target",
-                  detail: detail.targetId
-                    ? `${humanize(detail.targetType ?? "")}: ${detail.targetId}`
-                    : "—",
-                },
-                { term: "Event ID", detail: detail.id },
-                { term: "Workspace", detail: detail.workspaceId ?? "—" },
-                { term: "Task", detail: detail.taskId ?? "—" },
-                { term: "Session", detail: detail.sessionId ?? "—" },
-                { term: "Retained until", detail: formatDateTime(detail.expiresAt) },
+                { term: "Sequence", detail: <span className="tabular-nums">#{detail.sequence}</span> },
+                { term: "Event ID", detail: <Mono value={detail.id} /> },
+                ...(detail.workspaceId ? [{ term: "Workspace", detail: <Mono value={detail.workspaceId} /> }] : []),
+                ...(detail.taskId ? [{ term: "Task", detail: <Mono value={detail.taskId} /> }] : []),
+                ...(detail.sessionId ? [{ term: "Session", detail: <Mono value={detail.sessionId} /> }] : []),
+                ...(detail.expiresAt ? [{ term: "Kept until", detail: formatDateTime(detail.expiresAt) }] : []),
+                ...(detail.eventHash
+                  ? [
+                      { term: "Previous hash", detail: <Mono value={String(detail.previousHash ?? "—")} /> },
+                      { term: "Event hash", detail: <Mono value={String(detail.eventHash)} /> },
+                    ]
+                  : []),
               ]}
             />
-            {detail.before || detail.after ? (
-              <>
-                <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                  Change
-                </h3>
-                <div className="grid gap-2 sm:grid-cols-2 [&>div]:min-w-0 [&>div]:rounded-lg [&>div]:border [&>div]:border-border [&>div]:bg-muted/30 [&>div]:p-2 [&_span]:mb-1 [&_span]:block [&_span]:text-xs [&_span]:font-semibold [&_span]:uppercase [&_span]:text-muted-foreground [&_pre]:max-h-52 [&_pre]:overflow-auto [&_pre]:whitespace-pre-wrap [&_pre]:break-words [&_pre]:font-mono [&_pre]:text-xs">
-                  <div>
-                    <span>Before</span>
-                    <pre>{JSON.stringify(detail.before ?? null, null, 2)}</pre>
-                  </div>
-                  <div>
-                    <span>After</span>
-                    <pre>{JSON.stringify(detail.after ?? null, null, 2)}</pre>
-                  </div>
-                </div>
-              </>
-            ) : null}
-            {detail.metadata && Object.keys(detail.metadata).length ? (
-              <>
-                <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                  Metadata
-                </h3>
-                <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words bg-transparent font-mono text-xs leading-5 text-muted-foreground">
-                  {JSON.stringify(detail.metadata, null, 2)}
-                </pre>
-              </>
-            ) : null}
-            {detail.eventHash ? (
-              <>
-                <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                  Hash chain
-                </h3>
-                <DefinitionList
-                  items={[
-                    {
-                      term: "Previous hash",
-                      detail: (
-                        <code className="inline-flex items-center gap-1 font-mono text-xs">
-                          <span className="break-all">{String(detail.previousHash ?? "—")}</span>
-                        </code>
-                      ),
-                    },
-                    {
-                      term: "Event hash",
-                      detail: (
-                        <code className="inline-flex items-center gap-1 font-mono text-xs">
-                          <span className="break-all">{String(detail.eventHash)}</span>
-                        </code>
-                      ),
-                    },
-                  ]}
-                />
-              </>
-            ) : null}
-          </DetailDrawer>
-        ) : null}
-      </div>
+          </div>
+        </DetailDrawer>
+      ) : null}
     </ManagementPage>
   );
 }
 
-/* ------------------------------------------------------------- dispatcher */
-const PERMISSION_FOR: Record<string, OrgPermission> = {
-  roles: "rbac:read",
-  "resource-access": "acl:read",
-  providers: "models:read",
-  models: "models:read",
-  "skills-mcp": "org:read",
-  "feature-access": "feature_flags:read",
-  "sso-scim": "sso:read",
-  "managed-policy": "policy:read",
-  "audit-log": "audit:read",
-};
+function Mono({ value }: { value: string }) {
+  return <span className="break-all font-mono text-xs">{value}</span>;
+}
+
+function JsonBlock({ label, value }: { label?: string; value: unknown }) {
+  return (
+    <div className="min-w-0">
+      {label ? <span className="mb-1 block text-xs text-muted-foreground">{label}</span> : null}
+      <pre className="max-h-52 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-[var(--berry-surface-under)] p-3 font-mono text-xs leading-5 text-foreground">
+        {JSON.stringify(value, null, 2)}
+      </pre>
+    </div>
+  );
+}

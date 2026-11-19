@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { DURABLE_BASE_BUILT_IN_TOOLS, DurableTurnRuntimeRequestSchema, parseAdmittedRuntimeRequest } from "@berry/shared";
 import { CloudDatabaseService, type SqlExecutor } from "../db/cloud-database.service.js";
 import { compactReplayEvents, DurableTurnService } from "./durable-turn.service.js";
+import { contextEnvelopeKey } from "@berry/shared";
 
 const tenantId = "00000000-0000-7000-8000-000000000001";
 const userId = "00000000-0000-7000-8000-000000000002";
@@ -399,6 +400,7 @@ describe("DurableTurnService", () => {
                   stopReason: "toolUse",
                   content: [{ type: "text", text: "answer" }],
                   usage: { input: 4_800, output: 200, totalTokens: 5_000 },
+                  contextBudget: { version: 1, envelopeKey: contextEnvelopeKey({}, {}), projectedTokens: 5_000, requestMessageCount: 2, requestHash: "a".repeat(64) },
                 },
               },
             },

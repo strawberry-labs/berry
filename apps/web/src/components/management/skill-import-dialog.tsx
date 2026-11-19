@@ -3,7 +3,7 @@ import * as React from "react";
 import type { BerryApiClient } from "@berry/api-client";
 import { PERSONAL_SKILL_PACKAGE_MAX_BYTES } from "@berry/shared";
 import { Upload, LoaderCircle } from "lucide-react";
-import { Button, Input, Textarea, ManagementDialog } from "./management-primitives";
+import { Button, InlineNotice, Input, ManagementDialog, SegmentedControl, Textarea } from "./management-primitives";
 
 export function SkillImportDialog({ client, tenantId, ownerId, open, onOpenChange, onSuccess }: {
   client: BerryApiClient | null; tenantId: string; ownerId?: string; open: boolean;
@@ -59,20 +59,46 @@ export function SkillImportDialog({ client, tenantId, ownerId, open, onOpenChang
       locked.current = false; abort.current = null; setPhase("idle");
     }
   }
-  return <ManagementDialog open={open} onOpenChange={(value) => { if (!locked.current) onOpenChange(value); }} title="Import a skill" description={ownerId ? "Add and enable a personal skill for this member." : "Add a package, paste instructions, or import from GitHub."} size="lg">
-    <form onSubmit={submit} className="grid gap-4" aria-busy={busy}>
-      <fieldset disabled={busy} className="grid min-w-0 gap-4">
-        <div className="flex gap-2" role="group" aria-label="Import source">{([ ["upload", "Package"], ["text", "Paste instructions"], ["git", "GitHub URL"] ] as const).map(([value, label]) => <Button key={value} type="button" variant={source === value ? "default" : "secondary"} aria-pressed={source === value} onClick={() => { setSource(value); setError(""); }}>{label}</Button>)}</div>
-        {source === "upload" ? <label className="settings-skill-dropzone min-h-32" onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); choose(e.dataTransfer.files[0]); }}>
-          <input type="file" accept=".skill,.zip,.md" onChange={(e) => choose(e.currentTarget.files?.[0])} /><Upload aria-hidden /><span className="min-w-0"><b className="break-all">{file?.name || "Choose or drop a skill package"}</b><small>{file ? `${(file.size / 1024 / 1024).toFixed(1)} MB · Click to replace` : ".skill or .zip up to 500 MB · SKILL.md up to 256 KB"}</small></span>
-        </label> : source === "text" ? <Textarea aria-label="SKILL.md instructions" required value={content} onChange={(e) => setContent(e.target.value)} className="min-h-48" placeholder="Paste SKILL.md including its name and description…" /> : <Input aria-label="GitHub SKILL.md URL" type="url" required value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://github.com/org/repo/blob/main/skill/SKILL.md" />}
+  const formId = React.useId();
+  return <ManagementDialog
+    open={open}
+    onOpenChange={(value) => { if (!locked.current) onOpenChange(value); }}
+    title="Import a skill"
+    description={ownerId ? "Add a skill to this member’s account. It is turned on as soon as it is imported." : "Add a skill to your account from a package, pasted instructions or GitHub. It is turned on as soon as it is imported."}
+    size="lg"
+    footer={<>
+      <Button type="button" variant="secondary" disabled={busy} onClick={() => onOpenChange(false)}>Cancel</Button>
+      <Button type="submit" form={formId} disabled={busy || !client || (source === "upload" && !file)}>{busy ? "Importing…" : "Import skill"}</Button>
+    </>}
+  >
+    <form id={formId} onSubmit={submit} className="grid gap-4" aria-busy={busy}>
+      <fieldset disabled={busy} className="grid min-w-0 gap-3">
+        <div><SegmentedControl label="Import source" value={source} onChange={(value) => { setSource(value); setError(""); }} options={[{ value: "upload", label: "Package" }, { value: "text", label: "Paste instructions" }, { value: "git", label: "GitHub URL" }]} /></div>
+        {source === "upload" ? <label className="relative flex min-h-28 cursor-pointer items-center gap-3 rounded-lg border border-dashed border-border px-4 py-3 transition-colors hover:bg-[var(--berry-hover)] focus-within:ring-2 focus-within:ring-ring motion-reduce:transition-none" onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); choose(e.dataTransfer.files[0]); }}>
+          <input className="sr-only" type="file" accept=".skill,.zip,.md" onChange={(e) => choose(e.currentTarget.files?.[0])} />
+          <Upload className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+          <span className="grid min-w-0 gap-0.5">
+            <b className="break-all text-md font-medium text-foreground">{file?.name || "Choose or drop a skill package"}</b>
+            <small className="text-xs text-muted-foreground">{file ? `${formatFileSize(file.size)} · Click to replace` : ".skill or .zip up to 500 MB, or a SKILL.md up to 256 KB"}</small>
+          </span>
+        </label> : source === "text" ? <div className="grid gap-1.5">
+          <Textarea aria-label="SKILL.md instructions" required value={content} onChange={(e) => setContent(e.target.value)} className="min-h-48 font-mono text-xs" placeholder={"---\nname: weekly-report\ndescription: Prepare my weekly status report\n---\n\nInstructions for Berry…"} />
+          <p className="text-xs leading-5 text-muted-foreground">Paste the full SKILL.md, including the name and description at the top.</p>
+        </div> : <div className="grid gap-1.5">
+          <Input aria-label="GitHub SKILL.md URL" type="url" required value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://github.com/org/repo/blob/main/skill/SKILL.md" />
+          <p className="text-xs leading-5 text-muted-foreground">Link to a SKILL.md file in a public GitHub repository.</p>
+        </div>}
       </fieldset>
-      {busy ? <div className="flex items-center gap-3 text-sm" role="status">
-        {phase === "uploading" ? <svg width="32" height="32" viewBox="0 0 36 36" role="progressbar" aria-label="Uploading skill" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}><circle cx="18" cy="18" r="15" fill="none" stroke="currentColor" opacity=".15" strokeWidth="3" /><circle cx="18" cy="18" r="15" fill="none" stroke="currentColor" strokeWidth="3" pathLength="100" strokeDasharray={`${progress} 100`} transform="rotate(-90 18 18)" /></svg> : <LoaderCircle className="size-6 motion-safe:animate-spin" />}
-        {phase === "uploading" ? `Uploading… ${progress}%` : "Verifying and installing…"}
+      {busy ? <div className="flex items-center gap-3 text-md text-muted-foreground" role="status">
+        {phase === "uploading" ? <svg width="24" height="24" viewBox="0 0 36 36" role="progressbar" aria-label="Uploading skill" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}><circle cx="18" cy="18" r="15" fill="none" stroke="currentColor" opacity=".15" strokeWidth="3" /><circle cx="18" cy="18" r="15" fill="none" stroke="currentColor" strokeWidth="3" pathLength="100" strokeDasharray={`${progress} 100`} transform="rotate(-90 18 18)" /></svg> : <LoaderCircle className="size-5 motion-safe:animate-spin" aria-hidden />}
+        {phase === "uploading" ? `Uploading… ${progress}%` : "Checking and installing…"}
       </div> : null}
-      {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
-      <div className="flex justify-end gap-2"><Button type="button" variant="secondary" disabled={busy} onClick={() => onOpenChange(false)}>Cancel</Button><Button type="submit" disabled={busy || !client || (source === "upload" && !file)}>{busy ? "Importing…" : "Import and enable"}</Button></div>
+      {error ? <InlineNotice tone="danger">{error}</InlineNotice> : null}
     </form>
   </ManagementDialog>;
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }

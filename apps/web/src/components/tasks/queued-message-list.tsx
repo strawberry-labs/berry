@@ -178,7 +178,7 @@ function QueuedMessageRow({
           <Queue01Icon className="berry-queued-message-queue-icon" />
         </span>
         <div className="flex min-w-0 flex-1 items-center gap-2">
-          <span className="shrink-0 text-[11px] text-[var(--berry-text-tertiary)]">Expired, not sent</span>
+          <span className="shrink-0 text-xs text-[var(--berry-text-tertiary)]">Expired, not sent</span>
           <p className="berry-queued-message-text" title={followUp.input}>{followUp.input}</p>
         </div>
         <span className="sr-only">This message expired before it could be sent. Copy it to send it again.</span>

@@ -1,30 +1,28 @@
-import { SkillImportDialog } from "./skill-import-dialog";
 import { toast } from "sonner";
 import * as React from "react";
+import { Skeleton } from "@berry/desktop-ui/components/ui/skeleton";
 import { useRefreshModelCatalog } from "@/lib/model-catalog";
 import { useNavigate } from "@tanstack/react-router";
 import {
   ArrowLeft,
+  BookOpen,
   Check,
   ChevronDown,
-  Code2,
   Download,
   EllipsisVertical,
-  Eye,
   File,
   FileCode2,
   FileImage,
-  FlaskConical,
   Folder,
-  Info,
   LoaderCircle,
   MessageCircle,
   Plus,
+  Sparkles,
   Trash2,
   X,
 } from "lucide-react";
 import { BerryApiError, type BerryApiClient } from "@berry/api-client";
-import { Markdown } from "@berry/desktop-ui/components/berry-markdown";
+import { cn } from "@berry/desktop-ui/lib/utils";
 import {
   Dialog,
   DialogClose,
@@ -39,32 +37,28 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@berry/desktop-ui/components/ui/dropdown-menu";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@berry/desktop-ui/components/ui/tooltip";
-import type {
-  EffectiveCapability,
-  PersonalMcpServer,
-  PersonalSkill,
-} from "@berry/shared";
+import type { EffectiveCapability, PersonalSkill } from "@berry/shared";
 import { createBrowserSkillExport } from "@/lib/skill-import";
 import {
   AsyncState,
   Button,
+  CellStack,
   DataTable,
-  DetailDrawer,
-  Input,
+  EmptyPanel,
+  InlineNotice,
+  ManagementDialog,
   ManagementPage,
   ManagementSwitch,
-  SearchInput,
+  Section,
+  SegmentedControl,
   StatusPill,
-  SuccessMessage,
-  Toolbar,
 } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
+
+// Loaded on demand so the skills list stays light: the import dialog (and its archive reader)
+// only when someone imports a skill, and the Markdown renderer only when a skill is opened.
+const SkillImportDialog = React.lazy(() => import("./skill-import-dialog").then((module) => ({ default: module.SkillImportDialog })));
+const Markdown = React.lazy(() => import("@berry/desktop-ui/components/berry-markdown").then((module) => ({ default: module.Markdown })));
 
 type SkillCatalogRow = {
   key: string;
@@ -114,17 +108,47 @@ export async function loadSkillPackageForDownload(
   return { content: skill.content, resourceFiles: [] };
 }
 
+/** Builds the portable .skill package and hands it to the browser as a download. */
+async function downloadSkillPackage(client: BerryApiClient | null, tenantId: string, skill: SkillCatalogRow) {
+  const skillPackage = await loadSkillPackageForDownload(client, tenantId, skill);
+  const exported = await createBrowserSkillExport(skill.name, skillPackage.content, skillPackage.resourceFiles);
+  const url = URL.createObjectURL(exported.blob);
+  try {
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = exported.fileName;
+    anchor.hidden = true;
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+  } finally {
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+  }
+}
+
+/** Skill takes the spare width; source and status stay just wide enough for their text. */
+const SKILL_COLUMN_WIDTHS = [undefined, 150, 300];
+
+function skillDisplayName(skill: Pick<SkillCatalogRow, "name">): string {
+  return skill.name.startsWith("$") ? skill.name : `$${skill.name}`;
+}
+
 export function PersonalSkillsScreen({
   client,
   config,
   tenantId,
+  supportView,
+  permissions,
 }: ManagementScreenProps) {
   const navigate = useNavigate();
+  // Organization skills can be deleted by people who manage the org's skills.
+  const canDeleteOrgSkills = Boolean(client) && !supportView && permissions.includes("skills:write");
   const refreshCatalog = useRefreshModelCatalog();
-  const [query, setQuery] = React.useState("");
   const [creating, setCreating] = React.useState(false);
   const [selected, setSelected] = React.useState<SkillCatalogRow | null>(null);
-  const [message, setMessage] = React.useState("");
+  const [pendingRemove, setPendingRemove] = React.useState<SkillCatalogRow | null>(null);
+  const [removing, setRemoving] = React.useState(false);
+  const [removeError, setRemoveError] = React.useState("");
   const resource = useResource(
     `personal-skills:${tenantId}`,
     async () =>
@@ -137,12 +161,8 @@ export function PersonalSkillsScreen({
         resource.data.personal,
         resource.data.effective,
         config.skills,
-      ).filter((skill) =>
-        `${skill.name} ${skill.description}`
-          .toLowerCase()
-          .includes(query.toLowerCase()),
-      ),
-    [resource.data, config.skills, query],
+      ).map((skill) => supportView && !skill.personal ? { ...skill, locked: true } : skill),
+    [resource.data, config.skills, supportView],
   );
 
   async function toggle(skill: SkillCatalogRow, enabled: boolean) {
@@ -163,12 +183,59 @@ export function PersonalSkillsScreen({
     refreshCatalog();
   }
 
-  async function remove(skill: PersonalSkill) {
+  async function remove(skill: SkillCatalogRow) {
     if (!client) return;
-    await client.deletePersonalSkill(skill.id);
+    if (skill.personal) {
+      await client.deletePersonalSkill(skill.personal.id);
+    } else if (skill.provenance === "organization") {
+      // The effective list names the skill; deleting needs the organization's own record.
+      const records = await client.listOrganizationCapabilities(tenantId);
+      const record = records.find((item) => item.kind === "skill" && (item.capabilityId === skill.capabilityId || item.name.toLowerCase() === skill.name.toLowerCase()));
+      if (!record) throw new Error("This skill is no longer in your organization’s catalog.");
+      const result = await client.deleteOrganizationCapability(tenantId, record.id);
+      if (!result.ok) throw new Error("The skill could not be deleted.");
+    } else {
+      throw new Error("Skills built into this deployment cannot be deleted here.");
+    }
     setSelected(null);
     resource.retry();
     refreshCatalog();
+  }
+
+  async function confirmRemove() {
+    if (!pendingRemove) return;
+    setRemoving(true);
+    setRemoveError("");
+    try {
+      await remove(pendingRemove);
+      toast.success(`Deleted ${skillDisplayName(pendingRemove)}`);
+      setPendingRemove(null);
+    } catch (cause) {
+      setRemoveError(cause instanceof Error ? cause.message : "Could not delete this skill");
+    } finally {
+      setRemoving(false);
+    }
+  }
+
+  /** Who may delete this skill, and if not, why not. */
+  function deleteAccess(skill: SkillCatalogRow): { allowed: boolean; reason?: string } {
+    if (!client) return { allowed: false, reason: "Connect to Berry to delete skills" };
+    if (skill.personal) return { allowed: true };
+    if (skill.provenance === "organization") {
+      return canDeleteOrgSkills
+        ? { allowed: true }
+        : { allowed: false, reason: "Only admins who manage skills can delete organization skills. You can turn it off instead." };
+    }
+    return { allowed: false, reason: "Built into this deployment, so it cannot be deleted here" };
+  }
+
+  function requestRemove(skill: SkillCatalogRow) {
+    setRemoveError("");
+    setPendingRemove(skill);
+  }
+
+  function download(skill: SkillCatalogRow) {
+    void downloadSkillPackage(client, tenantId, skill).catch((cause) => toast.error(cause instanceof Error ? cause.message : "Could not download this skill"));
   }
 
   function tryInChat(skill: SkillCatalogRow) {
@@ -180,8 +247,7 @@ export function PersonalSkillsScreen({
   return (
     <ManagementPage
       title="Skills"
-      description="Import your own skills or use capabilities provided by your organization."
-      eyebrow="Tools & connections"
+      description="Skills are packaged instructions Berry follows for a kind of work. Turn on the ones you want, or import your own."
       actions={
         <Button
           disabled={!client}
@@ -194,63 +260,71 @@ export function PersonalSkillsScreen({
         </Button>
       }
     >
-      <Toolbar>
-        <SearchInput
-          label="Search skills"
-          value={query}
-          onChange={setQuery}
-          placeholder="Search skills"
-        />
-      </Toolbar>
-      {message ? <SuccessMessage>{message}</SuccessMessage> : null}
-      <SkillImportDialog client={client} tenantId={tenantId} open={creating} onOpenChange={setCreating} onSuccess={() => { toast.success("Skill imported and enabled"); resource.retry(); refreshCatalog(); }} />
+      {creating ? (
+        <React.Suspense fallback={null}>
+          <SkillImportDialog client={client} tenantId={tenantId} open={creating} onOpenChange={setCreating} onSuccess={() => { toast.success("Skill imported and enabled"); resource.retry(); refreshCatalog(); }} />
+        </React.Suspense>
+      ) : null}
       <AsyncState
         loading={resource.loading}
         error={resource.error}
         onRetry={resource.retry}
-        empty={rows.length === 0}
       >
+        {rows.length === 0 ? (
+          <EmptyPanel
+            icon={Sparkles}
+            title="No skills yet"
+            description="Your organization has not shared any skills, and you have not imported one. Import a .skill package or a SKILL.md file to add your own."
+            action={<Button variant="secondary" disabled={!client} onClick={() => setCreating(true)}><Plus />Import skill</Button>}
+          />
+        ) : (
+        <Section flush>
         <DataTable
           label="Skills"
-          columns={["Skill", "Provided by", "Policy", "Status"]}
+          columns={["Skill", "Provided by", "Status", ""]}
+          flexColumn={0}
+          columnWidths={SKILL_COLUMN_WIDTHS}
+          onRowSelect={(index) => setSelected(rows[index] ?? null)}
+          rowLabel={(index) => `Opened ${rows[index]?.name ?? "skill"}`}
           rows={rows.map((skill) => {
             const controlHint = skillControlHint(skill, Boolean(client));
             const hintId = `skill-control-${skill.key.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
             return [
-              <Button
-                variant="ghost"
-                className="grid h-auto max-w-80 justify-start gap-0.5 p-0 text-left [&_b]:truncate [&_small]:truncate [&_small]:text-xs [&_small]:text-muted-foreground"
-                onClick={() => setSelected(skill)}
+              <span className="block max-w-[34rem]">
+                <CellStack
+                  primary={skillDisplayName(skill)}
+                  secondary={skill.description}
+                />
+              </span>,
+              skillProviderLabel(skill),
+              <span
+                className="inline-flex items-center gap-2.5"
+                data-sort={skill.enabled ? 0 : 1}
+                onClick={(event) => event.stopPropagation()}
               >
-                <b>
-                  {skill.name.startsWith("$") ? skill.name : `$${skill.name}`}
-                </b>
-                <small>{skill.description}</small>
-              </Button>,
-              skill.provenance === "organization"
-                ? "Organization"
-                : skill.provenance === "personal"
-                  ? "You"
-                  : "Deployment",
-              <StatusPill tone={skill.locked ? "neutral" : "info"}>
-                {skill.assignment
-                  ? skill.assignment.replace("-", " ")
-                  : skill.reason}
-              </StatusPill>,
-              <span className="inline-flex items-center gap-2 [&_small]:max-w-40 [&_small]:text-xs [&_small]:text-[var(--berry-text-secondary)]">
                 <ManagementSwitch
                   checked={skill.enabled}
                   disabled={!client || skill.locked}
-                  onCheckedChange={(enabled) => void toggle(skill, enabled)}
+                  onCheckedChange={(enabled) => void toggle(skill, enabled).catch((cause) => toast.error(cause instanceof Error ? cause.message : "Could not update this skill"))}
                   aria-label={`${skill.enabled ? "Disable" : "Enable"} ${skill.name}`}
                   aria-describedby={hintId}
                   title={controlHint}
                 />
-                <small id={hintId}>{controlHint}</small>
+                <span id={hintId} className="whitespace-nowrap text-xs text-muted-foreground">{controlHint}</span>
               </span>,
+              <SkillRowMenu
+                skill={skill}
+                onOpen={() => setSelected(skill)}
+                onTryInChat={() => tryInChat(skill)}
+                onDownload={() => download(skill)}
+                deleteAccess={deleteAccess(skill)}
+                onDelete={() => requestRemove(skill)}
+              />,
             ];
           })}
         />
+        </Section>
+        )}
       </AsyncState>
       {selected ? (
         <SkillDetailsDialog
@@ -262,11 +336,93 @@ export function PersonalSkillsScreen({
           onClose={() => setSelected(null)}
           onToggle={(enabled) => toggle(selected, enabled)}
           onTryInChat={() => tryInChat(selected)}
-          onUninstall={selected.personal ? () => remove(selected.personal!) : undefined}
+          deleteAccess={deleteAccess(selected)}
+          onDelete={() => requestRemove(selected)}
+          onDownload={() => downloadSkillPackage(client, tenantId, selected)}
         />
       ) : null}
+      <ManagementDialog
+        open={pendingRemove !== null}
+        onOpenChange={(open) => { if (!open && !removing) setPendingRemove(null); }}
+        title={`Delete ${pendingRemove ? skillDisplayName(pendingRemove) : "skill"}?`}
+        description={pendingRemove?.personal
+          ? "The skill and its files are removed from your account. Download it first if you want to keep a copy."
+          : "The skill is removed from your organization’s catalog for every member, including anyone it is required for. Download it first if you want to keep a copy."}
+        size="sm"
+        footer={<>
+          <Button variant="secondary" disabled={removing} onClick={() => setPendingRemove(null)}>Cancel</Button>
+          <Button variant="destructive" disabled={removing} onClick={() => void confirmRemove()}><Trash2 />{removing ? "Deleting…" : pendingRemove?.personal ? "Delete skill" : "Delete for everyone"}</Button>
+        </>}
+      >
+        {removeError ? <InlineNotice tone="danger">{removeError}</InlineNotice> : <p className="text-md leading-5 text-muted-foreground">Tasks that already ran with this skill are not affected.</p>}
+      </ManagementDialog>
     </ManagementPage>
   );
+}
+
+function SkillRowMenu({
+  skill,
+  onOpen,
+  onTryInChat,
+  onDownload,
+  deleteAccess,
+  onDelete,
+}: {
+  skill: SkillCatalogRow;
+  onOpen: () => void;
+  onTryInChat: () => void;
+  onDownload: () => void;
+  deleteAccess: { allowed: boolean; reason?: string };
+  onDelete: () => void;
+}) {
+  const name = skillDisplayName(skill);
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="ghost" size="icon-sm" aria-label={`Actions for ${name}`} title="Actions">
+          <EllipsisVertical aria-hidden />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-52">
+        <DropdownMenuItem onSelect={onOpen}><BookOpen aria-hidden />View instructions</DropdownMenuItem>
+        <DropdownMenuItem disabled={!skill.enabled} onSelect={onTryInChat} title={skill.enabled ? undefined : "Turn the skill on to use it in a task"}>
+          <MessageCircle aria-hidden />Try in a task
+        </DropdownMenuItem>
+        <DropdownMenuItem disabled={!skill.content} onSelect={onDownload} title={skill.content ? undefined : "The skill definition is not loaded, so there is nothing to download"}>
+          <Download aria-hidden />Download .skill
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <SkillDeleteItem skill={skill} access={deleteAccess} onDelete={onDelete} />
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+/** Delete is always listed; when it is not allowed, it stays visible with the reason. */
+function SkillDeleteItem({ skill, access, onDelete, disabled = false }: { skill: SkillCatalogRow; access: { allowed: boolean; reason?: string }; onDelete: () => void; disabled?: boolean }) {
+  const label = skill.personal ? "Delete skill…" : skill.provenance === "organization" ? "Delete from organization…" : "Delete skill";
+  return (
+    <>
+      <DropdownMenuItem variant="destructive" disabled={!access.allowed || disabled} onSelect={onDelete} title={access.reason}>
+        <Trash2 aria-hidden />{label}
+      </DropdownMenuItem>
+      {!access.allowed && access.reason ? <p className="max-w-52 px-2 pb-1.5 pt-0.5 text-xs leading-snug text-muted-foreground">{access.reason}</p> : null}
+    </>
+  );
+}
+
+function skillProviderLabel(skill: Pick<SkillCatalogRow, "provenance">): string {
+  return skill.provenance === "organization" ? "Organization" : skill.provenance === "personal" ? "You" : "Built in";
+}
+
+/** Why the skill is on or off for this person, in plain words. */
+function skillPolicy(skill: Pick<SkillCatalogRow, "assignment" | "provenance" | "locked" | "enabled">): { label: string; tone: "neutral" | "info" | "danger" } {
+  if (skill.provenance === "personal") return { label: "Personal", tone: "neutral" };
+  if (skill.assignment === "required") return { label: "Required", tone: "info" };
+  if (skill.assignment === "blocked") return { label: "Blocked", tone: "danger" };
+  if (skill.assignment === "default-on") return { label: "On by default", tone: "neutral" };
+  if (skill.assignment === "available") return { label: "Optional", tone: "neutral" };
+  return { label: skill.locked ? "Managed" : "Optional", tone: "neutral" };
 }
 
 type SkillViewMode = "rendered" | "source";
@@ -330,7 +486,9 @@ function SkillDetailsDialog({
   onClose,
   onToggle,
   onTryInChat,
-  onUninstall,
+  deleteAccess,
+  onDelete,
+  onDownload,
 }: {
   skill: SkillCatalogRow;
   client: BerryApiClient | null;
@@ -339,22 +497,18 @@ function SkillDetailsDialog({
   onClose: () => void;
   onToggle: (enabled: boolean) => Promise<void>;
   onTryInChat: () => void;
-  onUninstall?: (() => Promise<void>) | undefined;
+  deleteAccess: { allowed: boolean; reason?: string };
+  onDelete: () => void;
+  onDownload: () => Promise<void>;
 }) {
   const [view, setView] = React.useState<SkillViewMode>("rendered");
   const [selectedPath, setSelectedPath] = React.useState("SKILL.md");
   const [loadedFiles, setLoadedFiles] = React.useState<Array<{ path: string; contentBase64: string; mode?: number | undefined }>>([]);
   const [packageLoading, setPackageLoading] = React.useState(false);
   const [packageError, setPackageError] = React.useState("");
-  const [descriptionExpanded, setDescriptionExpanded] = React.useState(false);
-  const [busy, setBusy] = React.useState<"toggle" | "download" | "uninstall" | null>(null);
+  const [busy, setBusy] = React.useState<"toggle" | "download" | null>(null);
   const [actionError, setActionError] = React.useState("");
-  const provider = skill.provenance === "organization"
-    ? "your organization"
-    : skill.provenance === "personal"
-      ? "you"
-      : "this deployment";
-  const descriptionCanExpand = skill.description.length > 220;
+  const policy = skillPolicy(skill);
   const markdown = skill.content ? skillMarkdownBody(skill.content) : "";
   const controlHint = skillControlHint(skill, hasClient);
   const packagePaths = React.useMemo(() => [
@@ -365,6 +519,8 @@ function SkillDetailsDialog({
   const selectedResource = loadedFiles.find((file) => file.path === selectedPath) ?? null;
   const selectedContent = selectedPath === "SKILL.md" ? skill.content : selectedResource ? decodeSkillTextFile(selectedResource) : null;
   const selectedIsMarkdown = /\.md$/i.test(selectedPath) && selectedContent !== null;
+  const name = skillDisplayName(skill);
+  const packageSize = skill.packageBytes > 0 ? formatBytes(skill.packageBytes) : null;
 
   React.useEffect(() => {
     setSelectedPath("SKILL.md");
@@ -428,37 +584,12 @@ function SkillDetailsDialog({
     }
   }
 
-  async function uninstall() {
-    if (!onUninstall) return;
-    setActionError("");
-    setBusy("uninstall");
-    try {
-      await onUninstall();
-    } catch (cause) {
-      setActionError(cause instanceof Error ? cause.message : "Could not uninstall this skill");
-      setBusy(null);
-    }
-  }
-
   async function download() {
     if (!skill.content) return;
     setActionError("");
     setBusy("download");
     try {
-      const skillPackage = await loadSkillPackageForDownload(client, tenantId, skill);
-      const exported = await createBrowserSkillExport(skill.name, skillPackage.content, skillPackage.resourceFiles);
-      const url = URL.createObjectURL(exported.blob);
-      try {
-        const anchor = document.createElement("a");
-        anchor.href = url;
-        anchor.download = exported.fileName;
-        anchor.hidden = true;
-        document.body.append(anchor);
-        anchor.click();
-        anchor.remove();
-      } finally {
-        window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
-      }
+      await onDownload();
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "Could not download this skill");
     } finally {
@@ -466,199 +597,194 @@ function SkillDetailsDialog({
     }
   }
 
+  const details: Array<{ term: string; detail: React.ReactNode }> = [
+    { term: "Provided by", detail: skill.provenance === "organization" ? "Your organization" : skill.provenance === "personal" ? "You" : "This deployment" },
+    { term: "Policy", detail: <StatusPill tone={policy.tone}>{policy.label}</StatusPill> },
+    { term: "Use it", detail: <code className="rounded bg-[var(--berry-selected)] px-1.5 py-0.5 font-mono text-xs text-foreground">{name}</code> },
+    { term: "Package", detail: `${packagePaths.length} ${packagePaths.length === 1 ? "file" : "files"}${packageSize ? ` · ${packageSize}` : ""}` },
+  ];
+
+  const fileList = (
+    <ul className="grid gap-px" aria-label="Files in this skill">
+      {treeEntries.map((entry) => entry.kind === "folder" ? (
+        <li
+          className="flex h-8 items-center gap-2 pe-2 text-xs font-medium text-muted-foreground"
+          key={`folder:${entry.path}`}
+          style={{ paddingInlineStart: `${10 + entry.depth * 14}px` }}
+        >
+          <Folder className="size-4 shrink-0" aria-hidden />
+          <span className="truncate">{entry.name}</span>
+        </li>
+      ) : (
+        <li key={`file:${entry.path}`}>
+          <button
+            type="button"
+            className={cn(
+              "flex h-8 w-full items-center gap-2 rounded-md pe-2 text-start text-md outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/50",
+              entry.path === selectedPath ? "bg-[var(--berry-selected)] font-medium text-foreground" : "text-[var(--berry-text-secondary)] hover:bg-[var(--berry-hover)] hover:text-foreground",
+            )}
+            style={{ paddingInlineStart: `${10 + entry.depth * 14}px` }}
+            aria-current={entry.path === selectedPath ? "true" : undefined}
+            onClick={() => setSelectedPath(entry.path)}
+          >
+            <SkillFileIcon path={entry.path} />
+            <span className="truncate">{entry.name}</span>
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+
   return (
     <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
       <DialogContent
         showCloseButton={false}
-        className="flex h-[min(92dvh,920px)] w-[calc(100vw-1rem)] max-w-none flex-col gap-0 overflow-hidden rounded-[18px] border border-[var(--berry-border)] bg-[var(--berry-main-bg)] p-0 shadow-[var(--berry-shadow-floating)] sm:w-[calc(100vw-2rem)] sm:max-w-[min(1440px,calc(100vw-2rem))]"
+        className="berry-mgmt inset-0 top-0 left-0 flex h-dvh w-screen max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 bg-[var(--berry-main-bg)] p-0 shadow-none sm:max-w-none data-[state=closed]:zoom-out-100 data-[state=open]:zoom-in-100"
       >
-        <div className="flex h-14 shrink-0 items-center justify-between px-3 sm:px-5">
+        {/* Top bar: way back, the skill, and what you can do with it. */}
+        <header className="flex h-14 shrink-0 items-center gap-2 border-b border-border px-2 sm:gap-3 sm:px-4">
           <DialogClose asChild>
-            <Button variant="ghost" className="h-8 gap-2 px-2 text-sm font-medium">
+            <Button variant="ghost" className="shrink-0">
               <ArrowLeft aria-hidden />
-              Skills
+              <span className="hidden sm:inline">Skills</span>
             </Button>
           </DialogClose>
-          <DialogClose asChild>
-            <Button variant="ghost" size="icon-sm" aria-label="Close skill details">
-              <X aria-hidden />
-            </Button>
-          </DialogClose>
-        </div>
-
-        <div className="flex min-h-0 flex-1 flex-col gap-4 p-4 sm:p-5">
-          <div className="grid shrink-0 gap-3">
-            <div className="flex items-start justify-between gap-4">
-              <div className="min-w-0">
-                <div className="flex min-w-0 items-center gap-2">
-                  <DialogTitle className="truncate text-lg leading-6 font-semibold text-[var(--berry-text-primary)]">
-                    {skill.name}
-                  </DialogTitle>
-                  <TooltipProvider>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button variant="ghost" size="icon-xs" aria-label={`About ${skill.name}`}>
-                          <Info aria-hidden />
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent sideOffset={6}>
-                        {skill.assignment ? `${skill.assignment.replace("-", " ")} organization skill` : `${skill.reason.replace("-", " ")} skill`}
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                </div>
-                <p className="mt-0.5 text-xs text-[var(--berry-text-secondary)]">by {provider}</p>
-              </div>
-
-              <div className="flex shrink-0 items-center gap-1.5">
-                <ManagementSwitch
-                  checked={skill.enabled}
-                  disabled={!hasClient || skill.locked || busy !== null}
-                  onCheckedChange={(enabled) => void changeEnabled(enabled)}
-                  aria-label={`${skill.enabled ? "Disable" : "Enable"} ${skill.name}`}
-                  title={controlHint}
-                />
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button variant="ghost" size="icon-sm" aria-label={`More actions for ${skill.name}`}>
-                      <EllipsisVertical aria-hidden />
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="w-48 border-[var(--berry-border)] bg-[var(--berry-card-bg)]">
-                    <DropdownMenuItem onSelect={onTryInChat}>
-                      <MessageCircle aria-hidden />
-                      Try in a task
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      disabled={!skill.content || busy !== null}
-                      title={skill.content ? "Download a portable skill package" : "This deployment has not loaded the skill definition"}
-                      onSelect={() => void download()}
-                    >
-                      <Download aria-hidden />
-                      {busy === "download" ? "Downloading…" : "Download .skill"}
-                    </DropdownMenuItem>
-                    {onUninstall ? (
-                      <>
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem
-                          variant="destructive"
-                          disabled={busy !== null}
-                          onSelect={() => void uninstall()}
-                        >
-                          <Trash2 aria-hidden />
-                          {busy === "uninstall" ? "Uninstalling…" : "Uninstall"}
-                        </DropdownMenuItem>
-                      </>
-                    ) : null}
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </div>
-            </div>
-
-            <DialogDescription
-              className={`max-w-none text-sm leading-6 text-[var(--berry-text-primary)] ${descriptionExpanded ? "" : "line-clamp-2"}`}
-            >
-              {skill.description}
-            </DialogDescription>
-            {descriptionCanExpand ? (
-              <Button
-                variant="ghost"
-                className="h-auto w-fit p-0 text-xs text-[var(--berry-accent)] hover:bg-transparent"
-                onClick={() => setDescriptionExpanded((expanded) => !expanded)}
-                aria-expanded={descriptionExpanded}
-              >
-                {descriptionExpanded ? "See less" : "See more"}
-              </Button>
-            ) : null}
-            {skill.personal?.diagnostics.length ? (
-              <p role="note" className="text-xs leading-5 text-[var(--berry-text-secondary)]">
-                {skill.personal.diagnostics.join(" ")}
-              </p>
-            ) : null}
-            {actionError ? (
-              <p role="alert" className="text-xs text-[var(--berry-danger)]">{actionError}</p>
-            ) : null}
+          <span className="h-5 w-px shrink-0 bg-border" aria-hidden />
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <DialogTitle className="truncate text-title font-semibold text-foreground">{name}</DialogTitle>
+            <span className="hidden shrink-0 sm:inline-flex"><StatusPill tone={policy.tone}>{policy.label}</StatusPill></span>
           </div>
+          <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
+            <label className="flex items-center gap-2 pe-1 text-xs text-muted-foreground">
+              <span className="hidden lg:inline">{controlHint}</span>
+              <ManagementSwitch
+                checked={skill.enabled}
+                disabled={!hasClient || skill.locked || busy !== null}
+                onCheckedChange={(enabled) => void changeEnabled(enabled)}
+                aria-label={`${skill.enabled ? "Turn off" : "Turn on"} ${name}`}
+                title={controlHint}
+              />
+            </label>
+            <Button variant="secondary" disabled={!skill.enabled} onClick={onTryInChat} title={skill.enabled ? `Start a task with ${name}` : "Turn the skill on to use it in a task"}>
+              <MessageCircle aria-hidden />
+              <span className="hidden sm:inline">Try in a task</span>
+            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="icon-sm" aria-label={`More actions for ${name}`}>
+                  <EllipsisVertical aria-hidden />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-52">
+                <DropdownMenuItem
+                  disabled={!skill.content || busy !== null}
+                  title={skill.content ? "Download a portable skill package" : "The skill definition is not loaded, so there is nothing to download"}
+                  onSelect={() => void download()}
+                >
+                  <Download aria-hidden />
+                  {busy === "download" ? "Downloading…" : "Download .skill"}
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <SkillDeleteItem skill={skill} access={deleteAccess} onDelete={onDelete} disabled={busy !== null} />
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <span className="mx-0.5 hidden h-5 w-px bg-border sm:block" aria-hidden />
+            <DialogClose asChild>
+              <Button variant="ghost" size="icon-sm" aria-label="Close skill">
+                <X aria-hidden />
+              </Button>
+            </DialogClose>
+          </div>
+        </header>
 
-          <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-[var(--berry-border)] bg-[var(--berry-surface-inset)]" aria-label={`${skill.name} files`}>
-            <div className="flex min-h-12 shrink-0 items-center justify-between gap-3 bg-[var(--berry-control-bg)] px-3">
-              <div className="flex min-w-0 items-center gap-2">
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button variant="secondary" className="h-8 max-w-[min(55vw,420px)] gap-2 px-3 text-sm font-medium">
-                      <SkillFileIcon path={selectedPath} />
-                      <span className="truncate">{selectedPath}</span>
-                      <ChevronDown className="size-3.5 shrink-0" aria-hidden />
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="start" className="max-h-[min(60vh,520px)] w-[min(380px,calc(100vw-3rem))] overflow-y-auto border-[var(--berry-border)] bg-[var(--berry-card-bg)] p-1.5">
-                    {treeEntries.map((entry) => entry.kind === "folder" ? (
-                      <div
-                        className="flex h-8 items-center gap-2 rounded-md pe-2 text-xs font-medium text-[var(--berry-text-secondary)]"
-                        key={`folder:${entry.path}`}
-                        style={{ paddingInlineStart: `${8 + entry.depth * 16}px` }}
-                      >
-                        <Folder className="size-4 shrink-0" aria-hidden />
-                        <span className="truncate">{entry.name}</span>
-                      </div>
-                    ) : (
-                      <DropdownMenuItem
-                        className="h-8 gap-2 text-xs"
-                        key={`file:${entry.path}`}
-                        onSelect={() => setSelectedPath(entry.path)}
-                        style={{ paddingInlineStart: `${8 + entry.depth * 16}px` }}
-                      >
-                        <SkillFileIcon path={entry.path} />
-                        <span className="truncate">{entry.name}</span>
-                        {entry.path === selectedPath ? <Check className="ms-auto size-3.5" aria-hidden /> : null}
-                      </DropdownMenuItem>
-                    ))}
-                  </DropdownMenuContent>
-                </DropdownMenu>
-                <span className="whitespace-nowrap text-xs text-[var(--berry-text-tertiary)]">
-                  {packagePaths.length} {packagePaths.length === 1 ? "file" : "files"}
-                </span>
-                {packageLoading ? <LoaderCircle className="size-3.5 animate-spin text-[var(--berry-text-tertiary)] motion-reduce:animate-none" aria-label="Loading package files" /> : null}
-              </div>
-              {selectedContent !== null ? <div className="flex rounded-lg bg-[var(--berry-control-bg)] p-0.5" role="group" aria-label="Skill content view">
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  className={view === "rendered" ? "bg-[var(--berry-selected)] text-[var(--berry-text-primary)]" : "text-[var(--berry-text-secondary)]"}
-                  onClick={() => setView("rendered")}
-                  aria-label="Rendered Markdown"
-                  aria-pressed={view === "rendered"}
-                  disabled={!selectedIsMarkdown}
-                >
-                  <Eye aria-hidden />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  className={view === "source" ? "bg-[var(--berry-selected)] text-[var(--berry-text-primary)]" : "text-[var(--berry-text-secondary)]"}
-                  onClick={() => setView("source")}
-                  aria-label="Markdown source"
-                  aria-pressed={view === "source"}
-                >
-                  <Code2 aria-hidden />
-                </Button>
-              </div> : null}
+        <div className="flex min-h-0 flex-1">
+          {/* Side panel: what the skill is for, its files, and the facts about it. */}
+          <aside className="hidden w-72 shrink-0 flex-col overflow-y-auto overscroll-contain border-e border-border md:flex xl:w-80" aria-label={`About ${name}`}>
+            <section className="grid gap-2 border-b border-border px-5 py-5">
+              <h3 className="text-xs font-medium text-muted-foreground">About</h3>
+              <DialogDescription className="text-md leading-relaxed text-foreground text-pretty">{skill.description}</DialogDescription>
+              {skill.personal?.diagnostics.length ? <InlineNotice tone="warning">{skill.personal.diagnostics.join(" ")}</InlineNotice> : null}
+            </section>
+            <section className="grid gap-2 border-b border-border px-3 py-4">
+              <h3 className="flex items-center justify-between px-2 text-xs font-medium text-muted-foreground">
+                Files
+                {packageLoading ? <LoaderCircle className="size-3.5 animate-spin motion-reduce:animate-none" aria-label="Loading package files" /> : <span className="tabular-nums">{packagePaths.length}</span>}
+              </h3>
+              {fileList}
+            </section>
+            <section className="px-5 py-4">
+              <h3 className="sr-only">Details</h3>
+              <dl className="grid gap-3">
+                {details.map((item) => (
+                  <div className="grid gap-1" key={item.term}>
+                    <dt className="text-xs text-muted-foreground">{item.term}</dt>
+                    <dd className="text-md text-foreground">{item.detail}</dd>
+                  </div>
+                ))}
+              </dl>
+            </section>
+          </aside>
+
+          {/* The selected file. */}
+          <main className="flex min-w-0 flex-1 flex-col">
+            {/* On narrow screens the side panel folds into this bar. */}
+            <div className="border-b border-border px-4 py-3 md:hidden">
+              <p className="line-clamp-2 text-md leading-snug text-[var(--berry-text-secondary)]">{skill.description}</p>
             </div>
+            <div className="flex h-12 shrink-0 items-center justify-between gap-3 border-b border-border px-3 sm:px-5">
+              <div className="flex min-w-0 items-center gap-2">
+                <div className="md:hidden">
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button variant="secondary" className="max-w-[60vw]">
+                        <SkillFileIcon path={selectedPath} />
+                        <span className="truncate">{selectedPath}</span>
+                        <ChevronDown className="size-3.5 shrink-0" aria-hidden />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="start" className="max-h-[60vh] w-[min(320px,calc(100vw-2rem))] overflow-y-auto p-1.5">
+                      {treeEntries.filter((entry) => entry.kind === "file").map((entry) => (
+                        <DropdownMenuItem className="gap-2" key={entry.path} onSelect={() => setSelectedPath(entry.path)}>
+                          <SkillFileIcon path={entry.path} />
+                          <span className="truncate">{entry.path}</span>
+                          {entry.path === selectedPath ? <Check className="ms-auto size-3.5" aria-hidden /> : null}
+                        </DropdownMenuItem>
+                      ))}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
+                <span className="hidden min-w-0 items-center gap-2 text-md font-medium text-foreground md:flex">
+                  <SkillFileIcon path={selectedPath} />
+                  <span className="truncate">{selectedPath}</span>
+                </span>
+              </div>
+              {selectedIsMarkdown ? (
+                <SegmentedControl
+                  label="Skill content view"
+                  value={view}
+                  onChange={setView}
+                  options={[{ value: "rendered", label: "Preview" }, { value: "source", label: "Source" }]}
+                />
+              ) : null}
+            </div>
+            {actionError ? <div className="px-5 pt-4"><InlineNotice tone="danger">{actionError}</InlineNotice></div> : null}
 
             <div className="min-h-0 flex-1 overflow-auto overscroll-contain">
               {selectedPath === "SKILL.md" && !skill.content ? (
                 <div className="grid min-h-full place-items-center p-8 text-center">
                   <div className="max-w-md">
-                    <p className="text-sm font-medium text-[var(--berry-text-primary)]">SKILL.md is not available</p>
+                    <p className="text-sm font-medium text-foreground">SKILL.md is not available</p>
                     <p className="mt-1 text-xs leading-5 text-[var(--berry-text-secondary)]">
-                      This offline deployment entry only publishes skill metadata. Connect to Berry to load the organization definition.
+                      Only this skill’s name and description are available offline. Connect to Berry to load its instructions.
                     </p>
                   </div>
                 </div>
               ) : selectedContent !== null && view === "rendered" && selectedIsMarkdown ? (
-                <Markdown className="mx-auto max-w-5xl px-5 py-6 text-[14px] leading-7 tracking-normal text-[var(--berry-text-primary)] sm:px-8 sm:py-8">
-                  {selectedPath === "SKILL.md" ? markdown : selectedContent}
-                </Markdown>
+                <React.Suspense fallback={<div className="mx-auto max-w-3xl space-y-3 px-5 py-8 sm:px-10 sm:py-10"><Skeleton className="h-6 w-2/5" /><Skeleton className="h-4 w-full" /><Skeleton className="h-4 w-11/12" /><Skeleton className="h-4 w-3/4" /></div>}>
+                  <Markdown className="mx-auto max-w-3xl px-5 py-8 text-base leading-7 tracking-normal text-foreground sm:px-10 sm:py-10">
+                    {selectedPath === "SKILL.md" ? markdown : selectedContent}
+                  </Markdown>
+                </React.Suspense>
               ) : selectedContent !== null ? <SkillSource content={selectedContent} /> : (
                 <SkillResourceSummary
                   file={selectedResource}
@@ -669,7 +795,7 @@ function SkillDetailsDialog({
                 />
               )}
             </div>
-          </section>
+          </main>
         </div>
       </DialogContent>
     </Dialog>

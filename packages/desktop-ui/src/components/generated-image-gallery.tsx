@@ -1,10 +1,5 @@
 import * as React from "react";
-import {
-  GeneratedImageContentSchema,
-  type GeneratedImageContent,
-  type ImageAspectRatio,
-  type MessagePart,
-} from "@berry/shared";
+import type { ImageAspectRatio, MessagePart } from "@berry/shared";
 import {
   ArrowUp,
   ArrowUpRight01Icon,
@@ -34,9 +29,9 @@ import { cn } from "@berry/desktop-ui/lib/utils";
 
 import styles from "./generated-image-gallery.module.css";
 
-export interface GeneratedImageView extends GeneratedImageContent {
-  id: string;
-}
+import { generatedImageFromPart, type GeneratedImageView } from "@berry/client-core/thread-turns";
+// Moved to @berry/client-core so the native thread parses images the same way.
+export { generatedImageFromPart, type GeneratedImageView } from "@berry/client-core/thread-turns";
 
 export interface ImageEditAnnotation {
   index: number;
@@ -59,12 +54,6 @@ const ASPECT_RATIOS: Array<{ value: ImageAspectRatio; label: string }> = [
   { value: "4:3", label: "Landscape 4:3" },
   { value: "16:9", label: "Widescreen 16:9" },
 ];
-
-export function generatedImageFromPart(part: MessagePart): GeneratedImageView | null {
-  if (part.kind !== "image") return null;
-  const parsed = GeneratedImageContentSchema.safeParse(part.content);
-  return parsed.success ? { id: part.id, ...parsed.data } : null;
-}
 
 export function GeneratedImageGallery({
   parts,

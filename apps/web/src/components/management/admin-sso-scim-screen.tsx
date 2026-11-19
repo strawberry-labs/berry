@@ -1,99 +1,27 @@
 import * as React from "react";
-import {
-  Activity,
-  Check,
-  Copy,
-  Download,
-  Plus,
-  Save,
-  ShieldCheck,
-  Trash2,
-  Upload,
-} from "lucide-react";
-import {
-  ORGANIZATION_SKILL_PACKAGE_MAX_BYTES,
-  OrgPermissionSchema,
-  type OrgCapabilityAssignment,
-  type OrgPermission,
-  type PersonalSkillReview,
-} from "@berry/shared";
-import { readBrowserSkillImport } from "@/lib/skill-import";
+import { Check, Copy, KeyRound, Plus, Save, UsersRound } from "lucide-react";
 import {
   AsyncState,
   Button,
+  CellStack,
   Checkbox,
   DataTable,
   DefinitionList,
   DetailDrawer,
-  FilterSelect,
-  FormSelect,
+  EmptyPanel,
+  InlineNotice,
   Input,
   ManagementDialog,
   ManagementPage,
-  ManagementSwitch,
-  MetricGrid,
-  PermissionDenied,
-  SearchInput,
   Section,
+  SettingList,
+  SettingRow,
   StatusPill,
   SuccessMessage,
-  TabBar,
-  Textarea,
-  Toolbar,
-  formatDate,
   formatDateTime,
-  formatNumber,
 } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
 
-/* ------------------------------------------------------------------ helpers */
-const ALL_PERMISSIONS = OrgPermissionSchema.options as OrgPermission[];
-const PERMISSION_DOMAINS: Array<{ id: string; label: string }> = [
-  { id: "org", label: "Organization" },
-  { id: "org_settings", label: "Organization settings" },
-  { id: "members", label: "People" },
-  { id: "departments", label: "Departments" },
-  { id: "rbac", label: "Roles" },
-  { id: "acl", label: "Resource access" },
-  { id: "models", label: "Models" },
-  { id: "skills", label: "Skills" },
-  { id: "mcp", label: "MCP" },
-  { id: "feature_flags", label: "Feature access" },
-  { id: "guardrails", label: "Execution & network" },
-  { id: "usage", label: "Usage" },
-  { id: "budgets", label: "Budgets" },
-  { id: "billing", label: "Billing" },
-  { id: "reports", label: "Reports" },
-  { id: "alerts", label: "Alerts" },
-  { id: "sso", label: "SSO & SCIM" },
-  { id: "policy", label: "Managed policy" },
-  { id: "auth_policy", label: "Authentication" },
-  { id: "data_policy", label: "Data governance" },
-  { id: "service_accounts", label: "Service accounts" },
-  { id: "audit", label: "Audit" },
-];
-function humanize(value: string) {
-  return value
-    .replaceAll("_", " ")
-    .replaceAll("-", " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
-}
-function domainOf(permission: string) {
-  return permission.split(":")[0];
-}
-function actionOf(permission: string) {
-  return permission.split(":")[1] ?? "read";
-}
-function copyText(value: string) {
-  void navigator.clipboard?.writeText(value).catch(() => {});
-}
-function formatPackageBytes(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-/* -------------------------------------------------------------------- roles */
 export function AdminSsoScimScreen({
   client,
   config,
@@ -109,19 +37,18 @@ export function AdminSsoScimScreen({
         : config.ssoConnections.filter((x) => x.tenantId === tenantId),
     [] as any[],
   );
-  const [active, setActive] = React.useState<number | null>(null);
+  const [activeId, setActiveId] = React.useState<string | null>(null);
   const [adding, setAdding] = React.useState(false);
   const [message, setMessage] = React.useState("");
   const [error, setError] = React.useState("");
-  const [callbackUrl, setCallbackUrl] = React.useState(
-    "https://ai.aesg.com/v1/auth/callback/google",
-  );
+  const [copied, setCopied] = React.useState(false);
+  const [callbackUrl, setCallbackUrl] = React.useState("");
   React.useEffect(() => {
     setCallbackUrl(`${window.location.origin}/v1/auth/callback/google`);
   }, []);
-  const detail = active != null ? r.data[active] : null;
-  const enabledCount = r.data.filter((c: any) => c.status === "enabled").length;
+  const detail = activeId ? r.data.find((c: any) => c.id === activeId) ?? null : null;
   const googleConnection = r.data.find((c: any) => c.provider === "google");
+  const failing = r.data.filter((c: any) => c.lastErrorCode);
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
@@ -155,45 +82,44 @@ export function AdminSsoScimScreen({
       };
       r.setData([next, ...r.data.filter((connection: any) => connection.id !== next.id)]);
       setAdding(false);
-      setMessage(input.status === "enabled" ? "Google Workspace sign-in is enabled." : "Google Workspace settings saved. Sign-in remains disabled.");
+      setMessage(input.status === "enabled" ? "Google Workspace sign-in is on." : "Google Workspace settings saved. Sign-in is still off.");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not save Google Workspace SSO.");
     }
   };
+  const openSetup = () => {
+    setError("");
+    setCopied(false);
+    setAdding(true);
+  };
+  const copyCallback = () => {
+    void navigator.clipboard?.writeText(callbackUrl).then(() => setCopied(true)).catch(() => {});
+  };
+  const setupButton = canWrite ? (
+    <Button onClick={openSetup}>
+      <Plus aria-hidden />
+      {googleConnection ? "Configure Google" : "Set up Google"}
+    </Button>
+  ) : null;
   return (
     <ManagementPage
       title="SSO & SCIM"
-      description="Let AESG staff sign in with Google Workspace while keeping local password accounts available."
-      eyebrow="Security & data"
-      actions={
-        canWrite ? (
-          <Button onClick={() => setAdding(true)}>
-            <Plus aria-hidden />
-            {googleConnection ? "Configure Google" : "Set up Google"}
-          </Button>
-        ) : null
-      }
+      description="Let members sign in with your identity provider. Password sign-in stays available alongside it."
+      eyebrow="Identity & security"
+      actions={r.data.length ? setupButton : null}
     >
-      <MetricGrid
-        items={[
-          { label: "Connections", value: formatNumber(r.data.length) },
-          {
-            label: "Enabled",
-            value: formatNumber(enabledCount),
-            status: enabledCount ? "good" : "warning",
-          },
-          {
-            label: "Provisioning",
-            value: "JIT now · SCIM later",
-          },
-        ]}
-      />
       {message ? <SuccessMessage>{message}</SuccessMessage> : null}
+      {failing.map((connection: any) => (
+        <InlineNotice key={connection.id} tone="danger" title={`${connection.displayName} failed its last test`}>
+          Error code <span className="font-mono text-xs">{connection.lastErrorCode}</span>
+          {connection.lastTestedAt ? `, ${formatDateTime(connection.lastTestedAt)}` : ""}. Members may not be able to sign in with it.
+        </InlineNotice>
+      ))}
       <ManagementDialog
         open={adding}
         onOpenChange={setAdding}
         title="Configure Google Workspace"
-        description="Use a dedicated Google OAuth web client. Berry requests only OpenID, email, and profile for sign-in."
+        description="Create an OAuth web client in Google Cloud for this. Berry asks Google only for the member’s identity, email, and profile."
         footer={
           <>
             <Button
@@ -212,138 +138,149 @@ export function AdminSsoScimScreen({
       >
         <form
           id="create-sso-connection-form"
-          className="grid gap-3 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground"
+          className="grid gap-3"
           onSubmit={submit}
         >
-          <label>
-            Authorized redirect URI
-            <div className="flex gap-2">
-              <Input value={callbackUrl} readOnly />
-              <Button type="button" variant="secondary" onClick={() => copyText(callbackUrl)} aria-label="Copy redirect URI">
-                <Copy data-icon="inline-start" aria-hidden />
+          <Field label="Authorized redirect URI" hint="Add this to the OAuth client in Google Cloud.">
+            <span className="flex gap-2">
+              <Input value={callbackUrl} readOnly className="font-mono text-xs" />
+              <Button type="button" variant="secondary" onClick={copyCallback} aria-label="Copy redirect URI">
+                {copied ? <Check data-icon="inline-start" aria-hidden /> : <Copy data-icon="inline-start" aria-hidden />}
+                {copied ? "Copied" : "Copy"}
               </Button>
-            </div>
-          </label>
-          <label>
-            Google OAuth client ID
+            </span>
+          </Field>
+          <Field label="Client ID">
             <Input name="clientId" defaultValue={googleConnection?.clientId ?? ""} autoComplete="off" autoFocus required placeholder="123456.apps.googleusercontent.com" />
-          </label>
-          <label>
-            Google OAuth client secret
+          </Field>
+          <Field label="Client secret" hint={googleConnection?.clientSecretConfigured ? "A secret is saved. Leave blank to keep it." : "Stored encrypted. It cannot be shown again after saving."}>
             <Input name="clientSecret" type="password" autoComplete="new-password" required={!googleConnection?.clientSecretConfigured} placeholder={googleConnection?.clientSecretConfigured ? "Leave blank to keep the saved secret" : "GOCSPX-…"} />
-          </label>
-          <label>
-            Workspace hosted domain
-            <Input name="domain" defaultValue={googleConnection?.domains?.[0] ?? "aesg.com"} required placeholder="aesg.com" />
-          </label>
-          <label className="flex items-start gap-2 rounded-lg border border-border bg-muted/40 p-3 text-xs text-muted-foreground">
-            <Checkbox name="jitProvisioning" defaultChecked={googleConnection?.jitProvisioning ?? true} />
-            <span><b className="block text-foreground">Create members on first sign-in</b>New Google users join as members. Existing accounts link by verified email.</span>
-          </label>
-          <label className="flex items-start gap-2 rounded-lg border border-border bg-muted/40 p-3 text-xs text-muted-foreground">
-            <Checkbox name="enabled" defaultChecked={googleConnection?.status === "enabled"} />
-            <span><b className="block text-foreground">Enable Google sign-in</b>The button appears on the login screen for everyone.</span>
-          </label>
-          {error ? <p className="text-xs text-destructive">{error}</p> : null}
+          </Field>
+          <Field label="Workspace domain" hint="Only Google accounts on this domain can sign in.">
+            <Input name="domain" defaultValue={googleConnection?.domains?.[0] ?? ""} required placeholder="example.com" />
+          </Field>
+          <div className="grid gap-2.5 border-t border-border pt-3">
+            <CheckRow name="jitProvisioning" defaultChecked={googleConnection?.jitProvisioning ?? true} title="Create members on first sign-in" description="New Google users join with the Member role. Existing accounts are linked by verified email." />
+            <CheckRow name="enabled" defaultChecked={googleConnection?.status === "enabled"} title="Turn on Google sign-in" description="Shows the Google button on the sign-in page for everyone." />
+          </div>
+          {error ? <InlineNotice tone="danger">{error}</InlineNotice> : null}
         </form>
       </ManagementDialog>
-      <div className={detail ? "min-w-0" : undefined}>
-        <AsyncState
-          loading={r.loading}
-          error={r.error}
-          onRetry={r.retry}
-          empty={r.data.length === 0}
-          emptyTitle="No identity connections"
-          emptyText="Set up the AESG Google Workspace OAuth client to enable enterprise sign-in."
-        >
-          <div className="grid gap-3 sm:grid-cols-2">
-            {r.data.map((connection: any, index: number) => (
-              <Button
-                key={connection.id}
-                type="button"
-                variant="ghost"
-                className="grid h-auto gap-3 rounded-xl border border-border p-3 text-left"
-                aria-current={active === index ? "true" : undefined}
-                onClick={() => setActive(index)}
-              >
-                <div className="flex items-center justify-between gap-3 text-sm font-medium">
-                  <b>{connection.displayName}</b>
-                  <StatusPill
-                    tone={
-                      connection.status === "enabled"
-                        ? "good"
-                        : connection.status === "disabled"
-                          ? "danger"
-                          : "warning"
-                    }
-                  >
-                    {humanize(connection.status)}
-                  </StatusPill>
-                </div>
-                <dl className="grid grid-cols-3 gap-2 [&_dt]:text-xs [&_dt]:text-muted-foreground [&_dd]:truncate [&_dd]:text-xs">
-                  <div>
-                    <dt>Sign-in</dt>
-                    <dd>{connection.kind.toUpperCase()}</dd>
-                  </div>
-                  <div>
-                    <dt>Provisioning</dt>
-                    <dd>{connection.jitProvisioning ? "JIT" : "Existing users"}</dd>
-                  </div>
-                  <div>
-                    <dt>Domains</dt>
-                    <dd>{connection.domains.join(", ") || "—"}</dd>
-                  </div>
-                </dl>
-              </Button>
-            ))}
-          </div>
-        </AsyncState>
-        {detail ? (
-          <DetailDrawer
-            title={detail.displayName}
-            subtitle={detail.kind.toUpperCase()}
-            badge={
-              <StatusPill
-                tone={
-                  detail.status === "enabled"
-                    ? "good"
-                    : detail.status === "disabled"
-                      ? "danger"
-                      : "warning"
-                }
-              >
-                {humanize(detail.status)}
-              </StatusPill>
-            }
-            onClose={() => setActive(null)}
-          >
-            <DefinitionList
-              items={[
-                { term: "Slug", detail: detail.slug },
-                { term: "Provider", detail: humanize(detail.provider ?? "generic") },
-                {
-                  term: "Sign-in",
-                  detail: detail.kind === "oidc" ? "OIDC" : "SAML 2.0",
-                },
-                { term: "Issuer", detail: detail.issuer ?? "Not configured" },
-                {
-                  term: "New members",
-                  detail: detail.jitProvisioning ? "Created on first sign-in" : "Must already exist",
-                },
-                { term: "Client secret", detail: detail.clientSecretConfigured ? "Encrypted and saved" : "Missing" },
-                {
-                  term: "Verified domains",
-                  detail: detail.domains.join(", ") || "—",
-                },
-                { term: "Updated", detail: formatDateTime(detail.updatedAt) },
-                { term: "SCIM", detail: "Reserved for a future release" },
-              ]}
+      <AsyncState
+        loading={r.loading}
+        error={r.error}
+        onRetry={r.retry}
+      >
+        {r.data.length ? (
+          <Section title="Sign-in connections" flush>
+            <DataTable
+              label="Identity connections"
+              columns={["Connection", "Status", "Domains", "New members", "Last tested", "Updated"]}
+              onRowSelect={(index) => setActiveId(r.data[index]?.id ?? null)}
+              activeRow={detail ? r.data.indexOf(detail) : null}
+              rowLabel={(index) => `${r.data[index]?.displayName ?? "Connection"} details`}
+              rows={r.data.map((connection: any) => [
+                <CellStack primary={connection.displayName} secondary={connection.kind === "oidc" ? "OpenID Connect" : "SAML 2.0"} />,
+                <StatusPill tone={statusTone(connection.status)}>{statusLabel(connection.status)}</StatusPill>,
+                connection.domains.join(", ") || "Any domain",
+                connection.jitProvisioning ? "Created on first sign-in" : "Must already exist",
+                connection.lastTestedAt ? (
+                  <span className="inline-flex flex-wrap items-center gap-2">
+                    {formatDateTime(connection.lastTestedAt)}
+                    {connection.lastErrorCode ? <StatusPill tone="danger">Failed</StatusPill> : null}
+                  </span>
+                ) : "Never",
+                formatDateTime(connection.updatedAt),
+              ])}
             />
-          </DetailDrawer>
-        ) : null}
-      </div>
+          </Section>
+        ) : (
+          <EmptyPanel
+            icon={KeyRound}
+            title="No identity connections"
+            description="Members sign in with a password. Connect Google Workspace to let them use their work account."
+            action={setupButton}
+          />
+        )}
+        <Section title="Directory sync" flush>
+          <SettingList>
+            <SettingRow
+              icon={UsersRound}
+              title="SCIM provisioning"
+              description="Not available yet. Until it is, members are created on first sign-in or invited from People, and are not removed automatically when they leave your directory."
+            >
+              <StatusPill tone="neutral">Not available</StatusPill>
+            </SettingRow>
+          </SettingList>
+        </Section>
+      </AsyncState>
+      {detail ? (
+        <DetailDrawer
+          title={detail.displayName}
+          subtitle={detail.kind === "oidc" ? "OpenID Connect" : "SAML 2.0"}
+          badge={<StatusPill tone={statusTone(detail.status)}>{statusLabel(detail.status)}</StatusPill>}
+          onClose={() => setActiveId(null)}
+          footer={canWrite && detail.provider === "google" ? (
+            <Button variant="secondary" onClick={openSetup}>Edit settings</Button>
+          ) : undefined}
+        >
+          {detail.lastErrorCode ? (
+            <InlineNotice tone="danger" title="Last test failed">
+              Error code <span className="font-mono text-xs">{detail.lastErrorCode}</span>
+            </InlineNotice>
+          ) : null}
+          <DefinitionList
+            items={[
+              { term: "Sign-in", detail: detail.status === "enabled" ? "Shown on the sign-in page" : "Hidden from the sign-in page" },
+              { term: "Domains", detail: detail.domains.join(", ") || "Any domain" },
+              {
+                term: "New members",
+                detail: detail.jitProvisioning ? "Created on first sign-in with the Member role" : "Must already exist",
+              },
+              { term: "Last tested", detail: detail.lastTestedAt ? formatDateTime(detail.lastTestedAt) : "Never" },
+              { term: "Updated", detail: formatDateTime(detail.updatedAt) },
+            ]}
+          />
+          <DefinitionList
+            items={[
+              { term: "Issuer", detail: detail.issuer ?? "Not set" },
+              { term: "Client ID", detail: detail.clientId ? <span className="break-all font-mono text-xs">{detail.clientId}</span> : "Not set" },
+              { term: "Client secret", detail: detail.clientSecretConfigured ? "Saved (encrypted)" : "Missing" },
+              { term: "Connection ID", detail: <span className="font-mono text-xs">{detail.slug}</span> },
+            ]}
+          />
+        </DetailDrawer>
+      ) : null}
     </ManagementPage>
   );
 }
 
-/* --------------------------------------------------------- managed policy */
+function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+  return (
+    <label className="grid content-start gap-1.5 text-xs font-medium text-muted-foreground">
+      <span>{label}</span>
+      {children}
+      {hint ? <span className="font-normal leading-4">{hint}</span> : null}
+    </label>
+  );
+}
+
+function CheckRow({ name, defaultChecked, title, description }: { name: string; defaultChecked: boolean; title: string; description: string }) {
+  return (
+    <label className="flex items-start gap-2.5">
+      <Checkbox className="mt-0.5" name={name} defaultChecked={defaultChecked} />
+      <span className="grid gap-0.5">
+        <span className="text-md font-medium leading-5 text-foreground">{title}</span>
+        <span className="text-xs leading-5 text-muted-foreground">{description}</span>
+      </span>
+    </label>
+  );
+}
+
+function statusTone(status: string): "good" | "warning" | "neutral" {
+  return status === "enabled" ? "good" : status === "disabled" ? "neutral" : "warning";
+}
+
+function statusLabel(status: string) {
+  return status === "enabled" ? "On" : status === "disabled" ? "Off" : status === "draft" ? "Not finished" : status;
+}

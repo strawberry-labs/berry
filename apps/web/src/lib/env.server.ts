@@ -6,6 +6,7 @@ const ADMIN_PERMISSIONS = OWNER_PERMISSIONS.filter((permission) => !(["billing:w
 
 const DEFAULT_CONFIG: WebConfig = {
   apiBaseUrl: null,
+  mobileApp: { appStoreUrl: null, playStoreUrl: null },
   deploymentMode: "self-hosted",
   workspaceId: "self-host",
   workspacePath: "/workspace",
@@ -610,6 +611,10 @@ export function getWebConfig(): WebConfig {
     providers: parseJsonEnv("BERRY_WEB_PROVIDERS_JSON", defaults.providers),
     mcpServers: parseJsonEnv("BERRY_WEB_MCP_HTTP_JSON", defaults.mcpServers),
     skills: parseJsonEnv("BERRY_WEB_SKILLS_JSON", defaults.skills),
+    mobileApp: {
+      appStoreUrl: envUrl("BERRY_MOBILE_APP_STORE_URL"),
+      playStoreUrl: envUrl("BERRY_MOBILE_PLAY_STORE_URL"),
+    },
   });
   return parsed;
 }

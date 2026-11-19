@@ -1426,14 +1426,26 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       if (!CORE_TOOL_NAMES.has(toolName)) throw error;
       throw new ToolArgumentError(notRunMessage(toolName, (error as Error).message));
     }
-    // Strictly validate names before workspace preparation or any provider I/O.
+    const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     const environmentInput = toolName === "check_environment" ? environmentCheckInput(step.input.arguments) : null;
-    const uploadInput = toolName === "upload_file" ? fileUploadInput(step.input.arguments) : null;
+    const upload = toolName === "upload_file"
+      ? { input: fileUploadInput(step.input.arguments), policy: networkPolicy(snapshot.runtimeRequest.networkPolicy) }
+      : null;
+    let uploadPath: string | null = null;
+    if (upload) {
+      const blocked = uploadNetworkProblem(upload.input.url, upload.policy);
+      if (blocked) throw new ToolArgumentError(notRunMessage(toolName, blocked));
+      try {
+        uploadPath = safeSandboxPath(upload.input.path, workspaceRoot, [workspaceRoot], "Uploads must stay in the workspace");
+      } catch {
+        throw new ToolArgumentError(notRunMessage(toolName, "Uploads must stay in the workspace"));
+      }
+      if (uploadPath === workspaceRoot) throw new ToolArgumentError(notRunMessage(toolName, "Choose a workspace file"));
+    }
     const inputRepairDetails = prepared.repairs.length > 0
       ? { inputRepairs: prepared.repairs }
       : {};
     const sandbox = await this.ensureSandbox(snapshot, signal);
-    const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     const referencedInputIds = referencedInputFileIds(args, workspaceRoot);
     if (referencedInputIds.size > 0) {
       await this.stageInputFiles(snapshot, sandbox.id, this.repository, referencedInputIds, signal, reportProgress, undefined, true);
@@ -1464,24 +1476,29 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         sandbox,
       };
     }
-    if (uploadInput) {
-      // The worker sends the bytes, under the same network policy as the sandbox.
-      const policy = networkPolicy(snapshot.runtimeRequest.networkPolicy);
-      const blocked = uploadNetworkProblem(uploadInput.url, policy);
-      if (blocked) throw new Error(blocked);
-      const path = safeReadablePath(uploadInput.path, workspaceRoot);
+    if (upload && uploadPath) {
+      const path = uploadPath;
+      const directories = path.slice(workspaceRoot.length + 1).split("/").slice(0, -1);
+      let parent = workspaceRoot;
+      for (const directory of directories) {
+        parent += "/" + directory;
+        const entry = await sandboxFileEntry(this.provider, sandbox.id, parent, signal);
+        if (entry?.type !== "directory") {
+          throw new ToolArgumentError(notRunMessage(toolName, "The file path must use existing workspace directories without symbolic links"));
+        }
+      }
       const entry = await sandboxFileEntry(this.provider, sandbox.id, path, signal);
-      if (!entry || entry.type !== "file") throw new Error(`${path} does not exist in the workspace. Nothing was sent.`);
+      if (!entry || entry.type !== "file") throw new ToolArgumentError(notRunMessage(toolName, "The workspace file does not exist"));
       const maxBytes = Math.min(FILE_UPLOAD_MAX_BYTES, this.options.maxInputBytes ?? DEFAULT_SANDBOX_INPUT_MAX_BYTES);
-      if (entry.size_bytes > maxBytes) throw new Error(`${path} has ${entry.size_bytes} bytes, which exceeds the ${maxBytes}-byte upload limit. Nothing was sent.`);
+      if (entry.size_bytes > maxBytes) throw new ToolArgumentError(notRunMessage(toolName, "The file exceeds the upload size limit"));
       const source = await this.provider.files.read({ sandbox_id: sandbox.id, path, encoding: "base64" }, signal ? { signal } : undefined);
       const bytes = Buffer.from(source.content, "base64");
-      if (bytes.byteLength > maxBytes) throw new Error(`${path} exceeds the ${maxBytes}-byte upload limit. Nothing was sent.`);
+      if (bytes.byteLength > maxBytes) throw new ToolArgumentError(notRunMessage(toolName, "The file exceeds the upload size limit"));
       reportProgress?.();
       const uploaded = await uploadFileBytes({
-        upload: { ...uploadInput, path },
+        upload: { ...upload.input, path },
         bytes,
-        policy,
+        policy: upload.policy,
         ...(signal ? { signal } : {}),
         ...(this.options.uploadFetch ? { fetch: this.options.uploadFetch } : {}),
       });
@@ -3071,7 +3088,7 @@ function requestedInspectionImagePaths(snapshot: DurableTurnSnapshot, workspaceR
 const NON_WRITING_TOOLS = new Set([
   "read", "find", "ls", "grep", "activate_skill", "ask_user_question", "compose_message",
   "inspect_images", "persist_artifact", "create_image", "save_personal_skill",
-  "remember_memory", "forget_memory", "upload_file",
+  "remember_memory", "forget_memory", "check_environment", "upload_file",
 ]);
 
 function runMayHaveWrittenFiles(snapshot: DurableTurnSnapshot): boolean {
@@ -4302,6 +4319,22 @@ class ImageProviderCreditError extends Error {
   }
 }
 
+/**
+ * Marks a failure after a state-changing request was sent. The target may
+ * have acted on it, whatever a later error's wording or status says (H-003).
+ */
+function afterToolDispatch(error: unknown): unknown {
+  if (error && typeof error === "object") {
+    try {
+      Object.defineProperty(error, "toolCallPhase", { value: "dispatched", configurable: true, enumerable: true });
+      return error;
+    } catch {
+      // A frozen error is wrapped below.
+    }
+  }
+  return Object.assign(new Error(error instanceof Error ? error.message : String(error), { cause: error }), { toolCallPhase: "dispatched" });
+}
+
 async function generateDurableImage(
   config: NonNullable<ConstructorParameters<typeof SandboxContinuityManager>[3]["imageGeneration"]>,
   input: {
@@ -4531,22 +4564,6 @@ async function fromSandbox<T>(operation: () => Promise<T>): Promise<T> {
     if (error && typeof error === "object") sandboxFailures.add(error);
     throw error;
   }
-}
-
-/**
- * Marks a failure after a state-changing request was sent. The target may
- * have acted on it, whatever a later error's wording or status says (H-003).
- */
-function afterToolDispatch(error: unknown): unknown {
-  if (error && typeof error === "object") {
-    try {
-      Object.defineProperty(error, "toolCallPhase", { value: "dispatched", configurable: true, enumerable: true });
-      return error;
-    } catch {
-      // A frozen error is wrapped below.
-    }
-  }
-  return Object.assign(new Error(error instanceof Error ? error.message : String(error), { cause: error }), { toolCallPhase: "dispatched" });
 }
 
 /** A sandbox operation failed because the sandbox is gone, unreachable or refused access (H-009, H-014). */

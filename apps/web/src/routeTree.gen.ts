@@ -9,37 +9,27 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as LoginRouteImport } from './routes/login'
 import { Route as IndexRouteImport } from './routes/index'
-import { Route as TasksTaskIdRouteImport } from './routes/tasks.$taskId'
-import { Route as SettingsTabRouteImport } from './routes/settings.$tab'
-import { Route as PlatformTabRouteImport } from './routes/platform.$tab'
-import { Route as LibraryTabRouteImport } from './routes/library.$tab'
+import { Route as LoginRouteImport } from './routes/login'
 import { Route as AdminTabRouteImport } from './routes/admin.$tab'
+import { Route as LibraryTabRouteImport } from './routes/library.$tab'
+import { Route as PlatformTabRouteImport } from './routes/platform.$tab'
+import { Route as SettingsTabRouteImport } from './routes/settings.$tab'
+import { Route as TasksTaskIdRouteImport } from './routes/tasks.$taskId'
 
-const LoginRoute = LoginRouteImport.update({
-  id: '/login',
-  path: '/login',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
-const TasksTaskIdRoute = TasksTaskIdRouteImport.update({
-  id: '/tasks/$taskId',
-  path: '/tasks/$taskId',
+const LoginRoute = LoginRouteImport.update({
+  id: '/login',
+  path: '/login',
   getParentRoute: () => rootRouteImport,
 } as any)
-const SettingsTabRoute = SettingsTabRouteImport.update({
-  id: '/settings/$tab',
-  path: '/settings/$tab',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const PlatformTabRoute = PlatformTabRouteImport.update({
-  id: '/platform/$tab',
-  path: '/platform/$tab',
+const AdminTabRoute = AdminTabRouteImport.update({
+  id: '/admin/$tab',
+  path: '/admin/$tab',
   getParentRoute: () => rootRouteImport,
 } as any)
 const LibraryTabRoute = LibraryTabRouteImport.update({
@@ -47,9 +37,19 @@ const LibraryTabRoute = LibraryTabRouteImport.update({
   path: '/library/$tab',
   getParentRoute: () => rootRouteImport,
 } as any)
-const AdminTabRoute = AdminTabRouteImport.update({
-  id: '/admin/$tab',
-  path: '/admin/$tab',
+const PlatformTabRoute = PlatformTabRouteImport.update({
+  id: '/platform/$tab',
+  path: '/platform/$tab',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SettingsTabRoute = SettingsTabRouteImport.update({
+  id: '/settings/$tab',
+  path: '/settings/$tab',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const TasksTaskIdRoute = TasksTaskIdRouteImport.update({
+  id: '/tasks/$taskId',
+  path: '/tasks/$taskId',
   getParentRoute: () => rootRouteImport,
 } as any)
 
@@ -123,13 +123,6 @@ export interface RootRouteChildren {
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/login': {
-      id: '/login'
-      path: '/login'
-      fullPath: '/login'
-      preLoaderRoute: typeof LoginRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/': {
       id: '/'
       path: '/'
@@ -137,25 +130,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/tasks/$taskId': {
-      id: '/tasks/$taskId'
-      path: '/tasks/$taskId'
-      fullPath: '/tasks/$taskId'
-      preLoaderRoute: typeof TasksTaskIdRouteImport
+    '/login': {
+      id: '/login'
+      path: '/login'
+      fullPath: '/login'
+      preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/settings/$tab': {
-      id: '/settings/$tab'
-      path: '/settings/$tab'
-      fullPath: '/settings/$tab'
-      preLoaderRoute: typeof SettingsTabRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/platform/$tab': {
-      id: '/platform/$tab'
-      path: '/platform/$tab'
-      fullPath: '/platform/$tab'
-      preLoaderRoute: typeof PlatformTabRouteImport
+    '/admin/$tab': {
+      id: '/admin/$tab'
+      path: '/admin/$tab'
+      fullPath: '/admin/$tab'
+      preLoaderRoute: typeof AdminTabRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/library/$tab': {
@@ -165,11 +151,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LibraryTabRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/admin/$tab': {
-      id: '/admin/$tab'
-      path: '/admin/$tab'
-      fullPath: '/admin/$tab'
-      preLoaderRoute: typeof AdminTabRouteImport
+    '/platform/$tab': {
+      id: '/platform/$tab'
+      path: '/platform/$tab'
+      fullPath: '/platform/$tab'
+      preLoaderRoute: typeof PlatformTabRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/settings/$tab': {
+      id: '/settings/$tab'
+      path: '/settings/$tab'
+      fullPath: '/settings/$tab'
+      preLoaderRoute: typeof SettingsTabRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/tasks/$taskId': {
+      id: '/tasks/$taskId'
+      path: '/tasks/$taskId'
+      fullPath: '/tasks/$taskId'
+      preLoaderRoute: typeof TasksTaskIdRouteImport
       parentRoute: typeof rootRouteImport
     }
   }

@@ -1,90 +1,54 @@
 import * as React from "react";
 import { useRefreshModelCatalog } from "@/lib/model-catalog";
-import { McpApprovalsLink } from "./admin-mcp-approvals-screen";
-import {
-  Activity,
-  Check,
-  Copy,
-  Download,
-  Plus,
-  Save,
-  ShieldCheck,
-  Trash2,
-  Upload,
-} from "lucide-react";
+import { Check, Copy, Plus, ShieldCheck, Trash2, Upload } from "lucide-react";
 import {
   ORGANIZATION_SKILL_PACKAGE_MAX_BYTES,
-  OrgPermissionSchema,
   type OrgCapabilityAssignment,
-  type OrgPermission,
   type PersonalSkillReview,
 } from "@berry/shared";
 import { readBrowserSkillImport } from "@/lib/skill-import";
 import {
   AsyncState,
   Button,
-  Checkbox,
+  CellStack,
   DataTable,
   DefinitionList,
   DetailDrawer,
-  FilterSelect,
+  EmptyPanel,
   FormSelect,
+  InlineNotice,
   Input,
   ManagementDialog,
   ManagementPage,
   ManagementSwitch,
-  MetricGrid,
-  PermissionDenied,
-  SearchInput,
   Section,
+  SegmentedControl,
+  SettingList,
+  SettingRow,
   StatusPill,
   SuccessMessage,
-  TabBar,
   Textarea,
-  Toolbar,
   formatDate,
   formatDateTime,
-  formatNumber,
 } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
 
-/* ------------------------------------------------------------------ helpers */
-const ALL_PERMISSIONS = OrgPermissionSchema.options as OrgPermission[];
-const PERMISSION_DOMAINS: Array<{ id: string; label: string }> = [
-  { id: "org", label: "Organization" },
-  { id: "org_settings", label: "Organization settings" },
-  { id: "members", label: "People" },
-  { id: "departments", label: "Departments" },
-  { id: "rbac", label: "Roles" },
-  { id: "acl", label: "Resource access" },
-  { id: "models", label: "Models" },
-  { id: "skills", label: "Skills" },
-  { id: "mcp", label: "MCP" },
-  { id: "feature_flags", label: "Feature access" },
-  { id: "guardrails", label: "Execution & network" },
-  { id: "usage", label: "Usage" },
-  { id: "budgets", label: "Budgets" },
-  { id: "billing", label: "Billing" },
-  { id: "reports", label: "Reports" },
-  { id: "alerts", label: "Alerts" },
-  { id: "sso", label: "SSO & SCIM" },
-  { id: "policy", label: "Managed policy" },
-  { id: "auth_policy", label: "Authentication" },
-  { id: "data_policy", label: "Data governance" },
-  { id: "service_accounts", label: "Service accounts" },
-  { id: "audit", label: "Audit" },
+const ASSIGNMENTS: Array<{ value: OrgCapabilityAssignment; label: string; tone: "info" | "good" | "neutral" | "danger"; help: string }> = [
+  { value: "required", label: "Required", tone: "info", help: "Always on. Members cannot turn it off." },
+  { value: "default-on", label: "On by default", tone: "good", help: "On for every member until they turn it off." },
+  { value: "available", label: "Available", tone: "neutral", help: "Off until a member turns it on." },
+  { value: "blocked", label: "Blocked", tone: "danger", help: "Nobody in the organization can use it." },
 ];
-function humanize(value: string) {
-  return value
-    .replaceAll("_", " ")
-    .replaceAll("-", " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
-}
-function domainOf(permission: string) {
-  return permission.split(":")[0];
-}
-function actionOf(permission: string) {
-  return permission.split(":")[1] ?? "read";
+const ASSIGNMENT_OPTIONS = ASSIGNMENTS.map(({ value, label }) => ({ value, label }));
+const assignmentInfo = (value: string) => ASSIGNMENTS.find((item) => item.value === value) ?? { value, label: value, tone: "neutral" as const, help: "" };
+/** Required and blocked items leave the member no choice, so the opt-out switch does not apply. */
+const optOutFixed = (assignment: string) => assignment === "required" || assignment === "blocked";
+const fieldLabel = "grid gap-1.5 text-xs font-medium text-muted-foreground";
+const help = "text-xs font-normal leading-4";
+
+function AssignmentPill({ value }: { value: string }) {
+  const info = assignmentInfo(value);
+  return <StatusPill tone={info.tone}>{info.label}</StatusPill>;
 }
 function copyText(value: string) {
   void navigator.clipboard?.writeText(value).catch(() => {});
@@ -94,8 +58,15 @@ function formatPackageBytes(bytes: number) {
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
+function packageSummary(capability: any) {
+  const files = Number(capability.resources?.length ?? 0) + 1;
+  return `${files} ${files === 1 ? "file" : "files"} · ${formatPackageBytes(Number(capability.packageBytes ?? 0))}`;
+}
+function serverUrl(capability: any): string | null {
+  const url = capability?.config && typeof capability.config === "object" ? (capability.config as any).url : null;
+  return typeof url === "string" && url ? url : null;
+}
 
-/* -------------------------------------------------------------------- roles */
 export function AdminSkillsMcpScreen({
   client,
   tenantId,
@@ -117,11 +88,12 @@ export function AdminSkillsMcpScreen({
         : { skills: true, mcp: true },
     { skills: true, mcp: true },
   );
-  const [tab, setTab] = React.useState("skill");
+  const [tab, setTab] = React.useState<"skill" | "mcp">("skill");
   const [skillSource, setSkillSource] = React.useState<"upload" | "paste">("upload");
-  const [query, setQuery] = React.useState("");
-  const [assignment, setAssignment] = React.useState("all");
-  const [active, setActive] = React.useState<number | null>(null);
+  const [activeId, setActiveId] = React.useState<string | null>(null);
+  const [actionError, setActionError] = React.useState("");
+  const [actionBusy, setActionBusy] = React.useState(false);
+  const [removing, setRemoving] = React.useState<any>(null);
   const [message, setMessage] = React.useState("");
   const [adding, setAdding] = React.useState(false);
   const [review, setReview] = React.useState<PersonalSkillReview | null>(null);
@@ -149,26 +121,29 @@ export function AdminSkillsMcpScreen({
     allowUserDisable: true,
   });
   const canWrite = tab === "skill" ? canWriteSkills : canWriteMcp;
-  const scoped = r.data.filter((c: any) => c.kind === tab);
-  const rows = scoped.filter(
-    (c: any) =>
-      `${c.name} ${c.capabilityId}`
-        .toLowerCase()
-        .includes(query.toLowerCase()) &&
-      (assignment === "all" || c.assignment === assignment),
-  );
-  const detail = active != null ? rows[active] : null;
-  const counts = (value: string) =>
-    r.data.filter((c: any) => c.assignment === value).length;
-  const assignmentTone = (value: string) =>
-    value === "required"
-      ? "info"
-      : value === "blocked"
-        ? "danger"
-        : value === "default-on"
-          ? "good"
-          : "neutral";
-  const setAllowDisable = async (capability: any, allow: boolean) => {
+  const ASSIGNMENT_ORDER: Record<string, number> = { blocked: 0, required: 1, "default-on": 2, available: 3 };
+  // Restrictions first (blocked, required), then by name.
+  const rows = r.data
+    .filter((c: any) => c.kind === tab)
+    .sort((left: any, right: any) =>
+      (ASSIGNMENT_ORDER[left.assignment] ?? 9) - (ASSIGNMENT_ORDER[right.assignment] ?? 9)
+      || String(left.name).localeCompare(String(right.name)),
+    );
+  const activeIndex = rows.findIndex((c: any) => c.id === activeId);
+  const detail = activeIndex >= 0 ? rows[activeIndex] : null;
+  /** Runs a quick change and shows a failure instead of dropping it. */
+  const guarded = async (action: () => Promise<void>, fallback: string) => {
+    setActionBusy(true);
+    setActionError("");
+    try {
+      await action();
+    } catch (cause) {
+      setActionError(cause instanceof Error && cause.message ? cause.message : fallback);
+    } finally {
+      setActionBusy(false);
+    }
+  };
+  const setAllowDisable = (capability: any, allow: boolean) => guarded(async () => {
     await client?.upsertOrganizationCapability(tenantId, {
       kind: capability.kind,
       capabilityId: capability.capabilityId,
@@ -183,9 +158,9 @@ export function AdminSkillsMcpScreen({
       ),
     );
     refreshCatalog();
-    setMessage("Capability updated and recorded in the audit log.");
-  };
-  const setAssignmentValue = async (capability: any, value: string) => {
+    setMessage(`${capability.name} updated and recorded in the audit log.`);
+  }, "The change could not be saved.");
+  const setAssignmentValue = (capability: any, value: string) => guarded(async () => {
     await client?.upsertOrganizationCapability(tenantId, {
       kind: capability.kind,
       capabilityId: capability.capabilityId,
@@ -200,8 +175,8 @@ export function AdminSkillsMcpScreen({
       ),
     );
     refreshCatalog();
-    setMessage("Capability assignment updated and recorded in the audit log.");
-  };
+    setMessage(`${capability.name} is now ${assignmentInfo(value).label.toLowerCase()}. Recorded in the audit log.`);
+  }, "The assignment could not be saved.");
   const discardSkillArchive = (fileId = skillArchiveFileId) => {
     skillUploadController.current?.abort();
     skillUploadController.current = null;
@@ -387,94 +362,212 @@ export function AdminSkillsMcpScreen({
       setImportError(cause instanceof Error ? cause.message : "Could not add this MCP server.");
     }
   };
-  const removeCapability = async (capability: any) => {
+  const removeCapability = (capability: any) => guarded(async () => {
     if (!client) return;
     await client.deleteOrganizationCapability(tenantId, capability.id);
     refreshCatalog();
     r.setData(r.data.filter((item: any) => item.id !== capability.id));
-    setActive(null);
-    setMessage(`${capability.name} was removed from the organization catalog.`);
-  };
-  const updatePersonalPolicy = async (next: {
+    setActiveId(null);
+    setRemoving(null);
+    setMessage(`${capability.name} was removed from the organization.`);
+  }, "The item could not be removed.");
+  const updatePersonalPolicy = (next: {
     skills: boolean;
     mcp: boolean;
-  }) => {
+  }) => guarded(async () => {
     if (!client) return;
     policy.setData(
       await client.updateOrganizationCapabilitySettings(tenantId, next),
     );
     refreshCatalog();
-    setMessage("Personal capability policy saved.");
+    setMessage(next.mcp ? "Members can now add their own MCP servers." : "Members can no longer add their own MCP servers.");
+  }, "The setting could not be saved.");
+  const noun = tab === "skill" ? "skill" : "MCP server";
+  const openAdd = () => {
+    setAdding(true);
+    setReview(null);
+    setImportError("");
   };
+  const addButton = canWrite ? (
+    <Button onClick={openAdd}>
+      <Plus aria-hidden />
+      {tab === "skill" ? "Add skill" : "Add MCP server"}
+    </Button>
+  ) : null;
+  const optOutRow = (checked: boolean, assignment: string, disabled: boolean, onChange: (next: boolean) => void, label: string) => (
+    <div className="flex items-center justify-between gap-4">
+      <span className="grid gap-0.5">
+        <b className="text-md font-medium text-foreground">Members can turn it off</b>
+        <small className="text-xs leading-5 text-muted-foreground">
+          {assignment === "required" ? "Does not apply: required items are always on."
+            : assignment === "blocked" ? "Does not apply: blocked items are never on."
+            : "Each member can switch this off for themselves."}
+        </small>
+      </span>
+      <ManagementSwitch
+        checked={optOutFixed(assignment) ? false : checked}
+        disabled={disabled || optOutFixed(assignment)}
+        onCheckedChange={onChange}
+        aria-label={label}
+      />
+    </div>
+  );
   return (
     <ManagementPage
       title="Skills & MCP"
-      description="Choose organization capabilities and how they are assigned to members."
-      eyebrow="AI controls"
-      actions={<>
-        <McpApprovalsLink permissions={permissions} />
-        {canWrite ? (
-          <Button
-            onClick={() => {
-              setAdding(true);
-              setReview(null);
-              setImportError("");
-            }}
-          >
-            <Plus aria-hidden />
-            {tab === "skill" ? "Add organization skill" : "Add MCP server"}
-          </Button>
-        ) : null}
-      </>}
+      description="The skills and MCP servers the organization gives its members, and whether each one is required, on by default, optional, or blocked."
+      eyebrow="AI & tools"
+      actions={addButton}
     >
-      <MetricGrid
-        items={[
-          {
-            label: "Required",
-            value: formatNumber(counts("required")),
-            hint: "Cannot be disabled",
-            status: "info" as any,
-          },
-          {
-            label: "Default on",
-            value: formatNumber(counts("default-on")),
-            hint: "Enabled by default",
-            status: "good",
-          },
-          {
-            label: "Available",
-            value: formatNumber(counts("available")),
-            hint: "Can be enabled",
-          },
-          {
-            label: "Blocked",
-            value: formatNumber(counts("blocked")),
-            hint: "Not available",
-            status: "danger",
-          },
-        ]}
-      />
-      <TabBar
-        label="Capability kind"
-        active={tab}
-        onSelect={(id) => {
+      <SegmentedControl
+        label="Kind"
+        value={tab}
+        onChange={(id) => {
           setTab(id);
-          setActive(null);
+          setActiveId(null);
+          setActionError("");
         }}
-        tabs={[
-          { id: "skill", label: "Skills" },
-          { id: "mcp", label: "MCP servers" },
+        options={[
+          { value: "skill", label: "Skills" },
+          { value: "mcp", label: "MCP servers" },
         ]}
       />
+      {message ? <SuccessMessage>{message}</SuccessMessage> : null}
+      {actionError && !detail && !removing ? <InlineNotice tone="danger">{actionError}</InlineNotice> : null}
+      <AsyncState loading={r.loading} error={r.error} onRetry={r.retry}>
+        {rows.length === 0 ? (
+          <EmptyPanel
+            title={tab === "skill" ? "No organization skills" : "No organization MCP servers"}
+            description={tab === "skill"
+              ? "Add a skill package to give every member the same instructions and tools."
+              : "Add a remote MCP server to assign it to members as required, on by default, or optional."}
+            action={addButton}
+          />
+        ) : (
+          <DataTable
+            label={tab === "skill" ? "Organization skills" : "Organization MCP servers"}
+            columns={[tab === "skill" ? "Skill" : "Server", "Assignment", "Members can turn off", tab === "skill" ? "Package" : "Address", "Updated"]}
+            onRowSelect={(index) => { setActionError(""); setActiveId(rows[index]?.id ?? null); }}
+            activeRow={activeIndex >= 0 ? activeIndex : null}
+            rowLabel={(i) => rows[i].name}
+            rows={rows.map((c: any) => [
+              <CellStack primary={c.name} secondary={c.description || <span className="font-mono">{c.capabilityId}</span>} />,
+              <AssignmentPill value={c.assignment} />,
+              optOutFixed(c.assignment) ? <span className="text-muted-foreground">—</span> : c.allowUserDisable ? "Yes" : "No",
+              c.kind === "skill"
+                ? packageSummary(c)
+                : serverUrl(c) ? <span className="block max-w-72 truncate font-mono text-xs" title={serverUrl(c) ?? undefined}>{serverUrl(c)}</span> : <span className="text-muted-foreground">—</span>,
+              formatDate(c.updatedAt),
+            ])}
+          />
+        )}
+      </AsyncState>
+      {tab === "mcp" ? (
+        <Section flush title="Member-added servers" description="Separate from the organization servers above. Servers that members ask to share with everyone are reviewed under MCP approvals.">
+          <SettingList>
+            <SettingRow
+              title="Members can add their own MCP servers"
+              description={canWriteMcp ? "When off, members can only use servers the organization provides." : "Changing this needs the “Connectors & MCP: manage” permission."}
+            >
+              <ManagementSwitch
+                checked={policy.data.mcp}
+                disabled={!canWriteMcp || actionBusy || policy.loading}
+                onCheckedChange={(mcp) =>
+                  void updatePersonalPolicy({ ...policy.data, mcp })
+                }
+                aria-label="Allow personal MCP servers"
+              />
+            </SettingRow>
+          </SettingList>
+        </Section>
+      ) : (
+        <p className="text-xs leading-5 text-muted-foreground">Members can always add personal skills for themselves. An administrator can review a member’s skills from People → Members.</p>
+      )}
+
+      {detail ? (
+        <DetailDrawer
+          title={detail.name}
+          subtitle={<code>{detail.capabilityId}</code>}
+          badge={<AssignmentPill value={detail.assignment} />}
+          onClose={() => setActiveId(null)}
+          footer={canWrite ? (
+            <Button variant="ghost" disabled={actionBusy} onClick={() => setRemoving(detail)}>
+              <Trash2 aria-hidden />
+              Remove {noun}
+            </Button>
+          ) : undefined}
+        >
+          {!canWrite ? <InlineNotice tone="info">You can view this {noun}. Changing it needs the “{tab === "skill" ? "Skills" : "Connectors & MCP"}: manage” permission.</InlineNotice> : null}
+          {actionError ? <InlineNotice tone="danger">{actionError}</InlineNotice> : null}
+          {detail.description ? (
+            <p className="text-md leading-5 text-muted-foreground">
+              {detail.description}
+            </p>
+          ) : null}
+          <label className={fieldLabel}>
+            Assignment
+            <FormSelect
+              ariaLabel="Assignment"
+              value={detail.assignment}
+              disabled={!canWrite || actionBusy}
+              onChange={(v) => { if (v !== detail.assignment) void setAssignmentValue(detail, v); }}
+              options={ASSIGNMENT_OPTIONS}
+            />
+            <small className={help}>{assignmentInfo(detail.assignment).help} Changes save immediately.</small>
+          </label>
+          {optOutRow(Boolean(detail.allowUserDisable), detail.assignment, !canWrite || actionBusy, (checked) => void setAllowDisable(detail, checked), "Members can turn it off")}
+          <DefinitionList
+            items={[
+              ...(detail.kind === "mcp" && serverUrl(detail) ? [{ term: "Address", detail: <code className="break-all">{serverUrl(detail)}</code> }] : []),
+              ...(detail.kind === "skill" ? [{ term: "Package", detail: packageSummary(detail) }] : []),
+              {
+                term: "Content hash",
+                detail: detail.contentHash ? (
+                  <span className="inline-flex items-center gap-1">
+                    <code title={detail.contentHash}>{detail.contentHash.slice(0, 16)}…</code>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => copyText(detail.contentHash)}
+                      aria-label="Copy content hash"
+                    >
+                      <Copy aria-hidden />
+                    </Button>
+                  </span>
+                ) : (
+                  "None recorded"
+                ),
+              },
+              { term: "Updated", detail: formatDateTime(detail.updatedAt) },
+            ]}
+          />
+        </DetailDrawer>
+      ) : null}
+
+      <ManagementDialog
+        open={Boolean(removing)}
+        onOpenChange={(open) => { if (!open && !actionBusy) setRemoving(null); }}
+        title={`Remove ${removing?.name ?? ""}?`}
+        description={`Members lose this ${removing?.kind === "mcp" ? "MCP server" : "skill"} immediately. To offer it again you will need to add it again.`}
+        size="sm"
+        footer={<>
+          <Button type="button" variant="secondary" disabled={actionBusy} onClick={() => setRemoving(null)}>Cancel</Button>
+          <Button type="button" variant="destructive" disabled={actionBusy} onClick={() => void removeCapability(removing)}>{actionBusy ? "Removing…" : "Remove"}</Button>
+        </>}
+      >
+        {actionError ? <InlineNotice tone="danger">{actionError}</InlineNotice> : <p className="text-md leading-5 text-muted-foreground">To stop members using it without deleting it, set its assignment to Blocked instead.</p>}
+      </ManagementDialog>
+
       <ManagementDialog
         open={adding && tab === "skill"}
         onOpenChange={(open) => open ? setAdding(true) : requestCloseSkillDialog()}
-        title={review ? "Review organization skill" : "Add organization skill"}
-        description={review ? "Confirm the reviewed package and organization assignment." : "Select one source, provide the skill, then review it before publishing."}
+        title={review ? "Review skill" : "Add skill"}
+        description={review ? "Check what was found in the package, then choose how it is assigned to members." : "Upload a skill package or paste a SKILL.md. Berry checks it before anything is published."}
         size="lg"
         footer={!review ? <>
           <Button type="button" variant="secondary" disabled={skillOperation === "reviewing"} onClick={requestCloseSkillDialog}>Cancel</Button>
-          <Button type="submit" form="organization-skill-source-form" disabled={skillOperation !== null}><ShieldCheck aria-hidden />{skillOperation === "uploading" ? "Uploading…" : skillOperation === "reviewing" ? "Reviewing…" : "Review skill"}</Button>
+          <Button type="submit" form="organization-skill-source-form" disabled={skillOperation !== null}><ShieldCheck aria-hidden />{skillOperation === "uploading" ? "Uploading…" : skillOperation === "reviewing" ? "Checking…" : "Check skill"}</Button>
         </> : <>
           <Button type="button" variant="secondary" disabled={skillOperation !== null} onClick={() => setReview(null)}>Back</Button>
           <Button type="button" disabled={skillOperation !== null} onClick={() => void saveSkill()}><Check aria-hidden />{skillOperation === "saving" ? "Adding…" : "Add to organization"}</Button>
@@ -486,8 +579,7 @@ export function AdminSkillsMcpScreen({
             className="grid gap-4"
             onSubmit={reviewSkill}
           >
-            <TabBar label="Skill source" active={skillSource} onSelect={(value) => {
-              const source = value as "upload" | "paste";
+            <SegmentedControl label="Skill source" value={skillSource} onChange={(source) => {
               setSkillSource(source);
               setReview(null);
               setImportError("");
@@ -495,7 +587,7 @@ export function AdminSkillsMcpScreen({
                 discardSkillArchive();
                 setSkillDraft((current) => ({ ...current, fileName: "", packageFiles: [], resourceFiles: [] }));
               }
-            }} tabs={[{ id: "upload", label: "Upload package" }, { id: "paste", label: "Paste SKILL.md" }]} />
+            }} options={[{ value: "upload", label: "Upload package" }, { value: "paste", label: "Paste SKILL.md" }]} />
             {skillSource === "upload" ? (
               <label
                 className="settings-skill-dropzone"
@@ -515,7 +607,7 @@ export function AdminSkillsMcpScreen({
                 </span>
               </label>
             ) : (
-              <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">
+              <label className={fieldLabel}>
                 SKILL.md content
                 <Textarea
                   className="min-h-48 resize-y font-mono text-xs"
@@ -529,57 +621,31 @@ export function AdminSkillsMcpScreen({
                 />
               </label>
             )}
-            {importError ? (
-              <div
-                className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
-                role="alert"
-              >
-                {importError}
-              </div>
-            ) : null}
+            {importError ? <InlineNotice tone="danger">{importError}</InlineNotice> : null}
           </form>
         ) : (
-          <div className="grid gap-3 [&_dl]:grid [&_dl]:gap-3 sm:[&_dl]:grid-cols-3 [&_dt]:text-xs [&_dt]:text-muted-foreground [&_dd]:text-sm">
-            <dl>
-              <div>
-                <dt>Skill</dt>
-                <dd>${review.name}</dd>
-              </div>
-              <div>
-                <dt>Description</dt>
-                <dd>{review.description}</dd>
-              </div>
-              <div>
-                <dt>Content hash</dt>
-                <dd>
-                  <code>{review.hash}</code>
-                </dd>
-              </div>
-              <div>
-                <dt>Package</dt>
-                <dd>
-                  {review.resources.length
-                    ? `${review.resources.length + 1} files`
-                    : "SKILL.md only"}
-                </dd>
-              </div>
-            </dl>
+          <div className="grid gap-4">
+            <DefinitionList
+              items={[
+                { term: "Skill", detail: <code>${review.name}</code> },
+                { term: "Description", detail: review.description || "—" },
+                { term: "Package", detail: review.resources.length ? `${review.resources.length + 1} files` : "SKILL.md only" },
+                { term: "Content hash", detail: <code className="break-all">{review.hash}</code> },
+              ]}
+            />
             {review.warnings.length ? (
-              <div
-                className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
-                role="alert"
-              >
-                {review.warnings.join(" · ")}
-              </div>
+              <InlineNotice tone="warning" title={review.warnings.length === 1 ? "1 thing to check before publishing" : `${review.warnings.length} things to check before publishing`}>
+                <ul className="grid gap-0.5">
+                  {review.warnings.map((warning) => <li key={warning}>{warning}</li>)}
+                </ul>
+              </InlineNotice>
             ) : (
-              <p className="flex items-center gap-2 rounded-lg border border-[var(--berry-success)]/25 bg-[var(--berry-success)]/5 px-3 py-2 text-xs text-[var(--berry-success)]">
-                <Check aria-hidden />
-                No review warnings found.
-              </p>
+              <InlineNotice tone="good">The check found nothing to flag.</InlineNotice>
             )}
-            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">
+            <label className={fieldLabel}>
               Assignment
               <FormSelect
+                ariaLabel="Assignment"
                 value={skillDraft.assignment}
                 onChange={(assignment) =>
                   setSkillDraft({
@@ -587,212 +653,38 @@ export function AdminSkillsMcpScreen({
                     assignment: assignment as OrgCapabilityAssignment,
                   })
                 }
-                options={[
-                  { value: "required", label: "Required" },
-                  { value: "default-on", label: "Default on" },
-                  { value: "available", label: "Available" },
-                  { value: "blocked", label: "Blocked" },
-                ]}
+                options={ASSIGNMENT_OPTIONS}
               />
+              <small className={help}>{assignmentInfo(skillDraft.assignment).help}</small>
             </label>
-            <label className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm">
-              <span className="grid min-w-0 gap-0.5">
-                Allow user disable
-                <small className="text-xs font-normal text-muted-foreground">Members can turn off default-on skills.</small>
-              </span>
-              <ManagementSwitch
-                checked={skillDraft.allowUserDisable}
-                disabled={
-                  skillDraft.assignment === "required" ||
-                  skillDraft.assignment === "blocked"
-                }
-                onCheckedChange={(allowUserDisable) =>
-                  setSkillDraft({ ...skillDraft, allowUserDisable })
-                }
-                aria-label="Allow user disable"
-              />
-            </label>
+            {optOutRow(skillDraft.allowUserDisable, skillDraft.assignment, false, (allowUserDisable) => setSkillDraft({ ...skillDraft, allowUserDisable }), "Members can turn it off")}
+            {importError ? <InlineNotice tone="danger">{importError}</InlineNotice> : null}
           </div>
         )}
       </ManagementDialog>
       <ManagementDialog
         open={adding && tab === "mcp"}
         onOpenChange={setAdding}
-        title="Add organization MCP server"
-        description="Register a remote HTTPS MCP endpoint, then choose how it is assigned to members."
+        title="Add MCP server"
+        description="Register a remote HTTPS MCP server and choose how it is assigned to members."
         size="lg"
         footer={<><Button type="button" variant="secondary" onClick={() => setAdding(false)}>Cancel</Button><Button type="submit" form="organization-mcp-form"><Plus aria-hidden />Add MCP server</Button></>}
       >
-        <form id="organization-mcp-form" className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground" onSubmit={saveMcp}>
-          <label>Name<Input required autoFocus value={mcpDraft.name} onChange={(event) => setMcpDraft({ ...mcpDraft, name: event.currentTarget.value })} placeholder="Company knowledge" /></label>
-          <label>Assignment<FormSelect value={mcpDraft.assignment} onChange={(assignment) => setMcpDraft({ ...mcpDraft, assignment: assignment as OrgCapabilityAssignment })} options={[{ value: "required", label: "Required" }, { value: "default-on", label: "Default on" }, { value: "available", label: "Available" }, { value: "blocked", label: "Blocked" }]} /></label>
-          <label className="sm:col-span-2">Remote MCP URL<Input required type="url" value={mcpDraft.url} onChange={(event) => setMcpDraft({ ...mcpDraft, url: event.currentTarget.value })} placeholder="https://mcp.example.com/mcp" /></label>
-          <label className="sm:col-span-2">Description<Textarea className="min-h-24 resize-y" value={mcpDraft.description} onChange={(event) => setMcpDraft({ ...mcpDraft, description: event.currentTarget.value })} /></label>
-          <label className="sm:col-span-2 flex-row items-center justify-between rounded-lg border border-border px-3 py-2.5 text-sm text-foreground">
-            <span className="grid gap-0.5">Allow member disable<small className="text-xs font-normal text-muted-foreground">Members can turn off this server unless it is required.</small></span>
-            <ManagementSwitch checked={mcpDraft.allowUserDisable} disabled={mcpDraft.assignment === "required" || mcpDraft.assignment === "blocked"} onCheckedChange={(allowUserDisable) => setMcpDraft({ ...mcpDraft, allowUserDisable })} aria-label="Allow member disable" />
+        <form id="organization-mcp-form" className="grid gap-3 sm:grid-cols-2" onSubmit={saveMcp}>
+          <label className={fieldLabel}>Name<Input required autoFocus value={mcpDraft.name} onChange={(event) => setMcpDraft({ ...mcpDraft, name: event.currentTarget.value })} placeholder="Company knowledge" /></label>
+          <label className={fieldLabel}>
+            Assignment
+            <FormSelect ariaLabel="Assignment" value={mcpDraft.assignment} onChange={(assignment) => setMcpDraft({ ...mcpDraft, assignment: assignment as OrgCapabilityAssignment })} options={ASSIGNMENT_OPTIONS} />
+            <small className={help}>{assignmentInfo(mcpDraft.assignment).help}</small>
           </label>
-          {importError ? <p className="sm:col-span-2 text-xs text-destructive" role="alert">{importError}</p> : null}
+          <label className={`${fieldLabel} sm:col-span-2`}>Server URL<Input required type="url" value={mcpDraft.url} onChange={(event) => setMcpDraft({ ...mcpDraft, url: event.currentTarget.value })} placeholder="https://mcp.example.com/mcp" /><small className={help}>Must be HTTPS.</small></label>
+          <label className={`${fieldLabel} sm:col-span-2`}>Description<Textarea className="min-h-24 resize-y" value={mcpDraft.description} onChange={(event) => setMcpDraft({ ...mcpDraft, description: event.currentTarget.value })} /></label>
+          <div className="sm:col-span-2">
+            {optOutRow(mcpDraft.allowUserDisable, mcpDraft.assignment, false, (allowUserDisable) => setMcpDraft({ ...mcpDraft, allowUserDisable }), "Members can turn it off")}
+          </div>
         </form>
+        {importError ? <div className="mt-3"><InlineNotice tone="danger">{importError}</InlineNotice></div> : null}
       </ManagementDialog>
-      <Section
-        title="Personal MCP servers"
-        description="Personal skills are always available. Control whether members can add remote MCP servers."
-      >
-        <div className="grid gap-2">
-          <label className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm">
-            <span className="grid min-w-0 gap-0.5">
-              Personal MCP servers
-              <small className="text-xs font-normal text-muted-foreground">Members can add their own remote MCP servers.</small>
-            </span>
-            <ManagementSwitch
-              checked={policy.data.mcp}
-              disabled={!canWriteMcp}
-              onCheckedChange={(mcp) =>
-                void updatePersonalPolicy({ ...policy.data, mcp })
-              }
-              aria-label="Allow personal MCP servers"
-            />
-          </label>
-        </div>
-      </Section>
-      <Toolbar>
-        <SearchInput
-          label="Search capabilities"
-          value={query}
-          onChange={setQuery}
-          placeholder="Search capabilities"
-        />
-        <FilterSelect
-          label="Assignment"
-          value={assignment}
-          onChange={setAssignment}
-          options={[
-            { value: "all", label: "All" },
-            { value: "required", label: "Required" },
-            { value: "default-on", label: "Default on" },
-            { value: "available", label: "Available" },
-            { value: "blocked", label: "Blocked" },
-          ]}
-        />
-      </Toolbar>
-      {message ? <SuccessMessage>{message}</SuccessMessage> : null}
-      <div className={detail ? "min-w-0" : undefined}>
-        <AsyncState
-          loading={r.loading}
-          error={r.error}
-          onRetry={r.retry}
-          empty={rows.length === 0}
-          emptyTitle="No organization capabilities"
-          emptyText="Skills and MCP servers assigned to the organization will appear here."
-        >
-          <DataTable
-            label="Organization capabilities"
-            columns={["Capability", "Assignment", "User override", "Package"]}
-            onRowSelect={setActive}
-            activeRow={active}
-            rowLabel={(i) => rows[i].name}
-            rows={rows.map((c: any) => [
-              <span className="grid min-w-0 gap-0.5 [&_b]:truncate [&_b]:text-sm [&_small]:text-xs [&_small]:text-muted-foreground">
-                <b>{c.name}</b>
-                <small>{c.capabilityId}</small>
-              </span>,
-              <StatusPill tone={assignmentTone(c.assignment) as any}>
-                {humanize(c.assignment)}
-              </StatusPill>,
-              c.allowUserDisable ? "Allowed" : "Not allowed",
-              c.kind === "skill" ? `${Number(c.resources?.length ?? 0) + 1} files · ${formatPackageBytes(Number(c.packageBytes ?? 0))}` : c.contentHash ? "Signed" : "Unsigned",
-            ])}
-          />
-        </AsyncState>
-        {detail ? (
-          <DetailDrawer
-            title={detail.name}
-            subtitle={detail.capabilityId}
-            badge={
-              <StatusPill tone={assignmentTone(detail.assignment) as any}>
-                {humanize(detail.assignment)}
-              </StatusPill>
-            }
-            onClose={() => setActive(null)}
-          >
-            {detail.description ? (
-              <p className="text-sm leading-6 text-muted-foreground">
-                {detail.description}
-              </p>
-            ) : null}
-            <DefinitionList
-              items={[
-                {
-                  term: "Type",
-                  detail: detail.kind === "skill" ? "Skill" : "MCP server",
-                },
-                {
-                  term: "Content hash",
-                  detail: detail.contentHash ? (
-                    <code className="inline-flex items-center gap-1 font-mono text-xs">
-                      {detail.contentHash.slice(0, 20)}…
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        onClick={() => copyText(detail.contentHash)}
-                        aria-label="Copy hash"
-                      >
-                        <Copy aria-hidden />
-                      </Button>
-                    </code>
-                  ) : (
-                    "Unsigned"
-                  ),
-                },
-                ...(detail.kind === "skill" ? [{
-                  term: "Package",
-                  detail: `${Number(detail.resources?.length ?? 0) + 1} files · ${formatPackageBytes(Number(detail.packageBytes ?? 0))}`,
-                }] : []),
-                { term: "Updated", detail: formatDateTime(detail.updatedAt) },
-              ]}
-            />
-            <fieldset className="grid gap-3 border-0 p-0" disabled={!canWrite}>
-              <legend>Assignment</legend>
-              <FilterSelect
-                label="Assignment"
-                value={detail.assignment}
-                onChange={(v) => setAssignmentValue(detail, v)}
-                options={[
-                  { value: "required", label: "Required" },
-                  { value: "default-on", label: "Default on" },
-                  { value: "available", label: "Available" },
-                  { value: "blocked", label: "Blocked" },
-                ]}
-              />
-            </fieldset>
-            <label className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm">
-              <span className="grid min-w-0 gap-0.5">
-                Allow user disable
-                <small className="text-xs font-normal text-muted-foreground">Members can turn this off for themselves.</small>
-              </span>
-              <ManagementSwitch
-                checked={Boolean(detail.allowUserDisable)}
-                disabled={!canWrite || detail.assignment === "required"}
-                onCheckedChange={(checked) => setAllowDisable(detail, checked)}
-                aria-label="Allow user disable"
-              />
-            </label>
-            {canWrite ? (
-              <Button
-                variant="secondary"
-                onClick={() => void removeCapability(detail)}
-              >
-                <Trash2 aria-hidden />
-                Remove capability
-              </Button>
-            ) : null}
-          </DetailDrawer>
-        ) : null}
-      </div>
     </ManagementPage>
   );
 }
-
-/* ----------------------------------------------------------- feature access */

@@ -41,8 +41,6 @@ import {
 import {
   classifyTurnSegments,
   groupLiveTimeline,
-  settleRunningActivityTools,
-  toolTerminalStatus,
   windowLiveTimeline,
   type ApprovalPrompt,
   type MessageSegment,
@@ -52,7 +50,6 @@ import {
 } from "@berry/desktop-ui/components/thread-stream";
 import {
   WritingBlockController,
-  messageDraftFromToolResult,
 } from "@berry/desktop-ui/components/writing-block";
 import {
   GeneratedImageGallery,
@@ -60,8 +57,41 @@ import {
   type GeneratedImageView,
   type ImageEditAnnotation,
 } from "@berry/desktop-ui/components/generated-image-gallery";
-import { isContinuableAssistantTurn, isImageMessagePart } from "@berry/desktop-ui/components/thread-message-utils";
-export { isContinuableAssistantTurn, isImageMessagePart } from "@berry/desktop-ui/components/thread-message-utils";
+import {
+  collectMessageDraftParts,
+  formatMessageTime,
+  fullUserText,
+  groupSettledTurns,
+  isImageMessagePart,
+  latestArtifactToolCallIds,
+  latestTerminalMessageStatus,
+  liveTurnVisible,
+  mergeAdjacentToolSegments,
+  partitionAssistantParts,
+  settledTurnKey,
+  settledTurnTiming,
+  shouldReplaceLatestSettledAssistantWithLiveTurn,
+  shouldUseLiveMarkdown,
+  stableTurnGroupKey,
+  summarizeActivity,
+  type MessageDraftPartResolution,
+} from "@berry/client-core/thread-turns";
+// Moved to @berry/client-core so the native thread renders the same turns.
+export {
+  collectMessageDraftParts,
+  formatMessageTime,
+  fullUserText,
+  isContinuableAssistantTurn,
+  isImageMessagePart,
+  latestArtifactToolCallIds,
+  latestTerminalMessageStatus,
+  partitionAssistantParts,
+  settledTurnKey,
+  shouldReplaceLatestSettledAssistantWithLiveTurn,
+  shouldUseLiveMarkdown,
+  stableTurnGroupKey,
+  type MessageDraftPartResolution,
+} from "@berry/client-core/thread-turns";
 
 export type ApprovalDecision = "approved_once" | "approved_for_session" | "approved_rule" | "denied" | "abort";
 
@@ -190,20 +220,6 @@ export function historyWindowScrollTop(
   rowStart: number,
 ): number {
   return Math.max(0, viewportScrollTop + historyWindowTop - viewportTop + rowStart);
-}
-
-export function settledTurnKey(sessionId: string, groupKey: string): string {
-  return `${sessionId}:turn-${groupKey}`;
-}
-
-/** Resolve a turn identity from an overlap-aware message-id map. */
-export function stableTurnGroupKey(
-  group: { key: string; user?: Message; assistants: Message[] },
-  knownIdentities?: ReadonlyMap<string, string>,
-): string {
-  const ids = [group.user?.id, ...group.assistants.map((message) => message.id)].filter((id): id is string => Boolean(id));
-  const known = ids.map((id) => knownIdentities?.get(id)).find((key): key is string => Boolean(key));
-  return known ?? group.key;
 }
 
 function useVariableHeightWindow(keys: readonly string[], containerRef: React.RefObject<HTMLElement | null>) {
@@ -443,6 +459,8 @@ export interface BerryThreadViewProps {
   messages: Message[];
   /** Host-owned content rendered inside the active turn's message column. */
   liveContent?: React.ReactNode;
+  /** Host-owned cards shown below the conversation. */
+  afterMessages?: React.ReactNode;
   density?: "full" | "compact";
   autoScroll?: boolean;
   showReasoning?: boolean;
@@ -467,18 +485,6 @@ export interface BerryThreadViewProps {
   autoLoadOlderOnScroll?: boolean;
 }
 
-export function shouldReplaceLatestSettledAssistantWithLiveTurn(input: {
-  liveVisible: boolean;
-  latestTurnHasUser: boolean;
-  continuation: boolean;
-}): boolean {
-  return input.liveVisible && input.latestTurnHasUser && !input.continuation;
-}
-
-export function shouldUseLiveMarkdown(stream: Pick<StreamState, "turnActive">): boolean {
-  return stream.turnActive;
-}
-
 /** Text selected in any message pastes into email without Berry's theme colours (H-044). */
 function copyThreadSelection(event: React.ClipboardEvent<HTMLElement>): void {
   copyMessageSelection(event.nativeEvent, event.currentTarget, event.currentTarget.ownerDocument.getSelection());
@@ -496,6 +502,7 @@ export function BerryThreadView({
   stream,
   messages,
   liveContent,
+  afterMessages,
   density = "full",
   autoScroll = true,
   showReasoning = false,
@@ -521,57 +528,9 @@ export function BerryThreadView({
 
   // Berry shows ONE "Worked for Xs" per user turn; the agent loop persists
   // several assistant messages per turn, so group consecutive ones.
-  const turnGroups = React.useMemo(() => {
-    const groups: Array<{ key: string; user?: Message; assistants: Message[] }> = [];
-    for (const message of settled) {
-      if (message.role === "user") {
-        groups.push({ key: message.id, user: message, assistants: [] });
-      } else {
-        const last = groups[groups.length - 1];
-        if (last) last.assistants.push(message);
-        else groups.push({ key: message.id, assistants: [message] });
-      }
-    }
-    const identities = turnIdentityRef.current;
-    const currentMessageIds = new Set<string>();
-    for (const group of groups) {
-      const ids = [group.user?.id, ...group.assistants.map((message) => message.id)].filter((id): id is string => Boolean(id));
-      const key = stableTurnGroupKey(group, identities);
-      group.key = key;
-      for (const id of ids) {
-        currentMessageIds.add(id);
-        identities.set(id, key);
-      }
-    }
-    for (const id of identities.keys()) {
-      if (!currentMessageIds.has(id)) identities.delete(id);
-    }
-    return groups;
-  }, [settled]);
+  const turnGroups = React.useMemo(() => groupSettledTurns(settled, turnIdentityRef.current), [settled]);
   const latestTurn = turnGroups[turnGroups.length - 1];
-  const liveHasContent =
-    stream.turnActive ||
-    Boolean(stream.approval) ||
-    Boolean(stream.question) ||
-    stream.text.length > 0 ||
-    stream.timeline.length > 0 ||
-    stream.reasoning.length > 0 ||
-    Boolean(stream.error) ||
-    Boolean(liveContent);
-  const liveHasSessionNote = stream.timeline.some((entry) => entry.kind === "note");
-  const latestTurnHasSettledAssistant = Boolean(latestTurn?.user && latestTurn.assistants.length > 0);
-  // The host stores settled assistant messages with database ids, not the
-  // transient stream message id. Use the latest user turn as the handoff
-  // boundary so a stopped turn cannot render both persisted and live activity.
-  const liveVisible =
-    liveHasContent && (
-      stream.turnActive
-      || Boolean(stream.approval)
-      || Boolean(stream.question)
-      || Boolean(liveContent)
-      || liveHasSessionNote
-      || !latestTurnHasSettledAssistant
-    );
+  const liveVisible = liveTurnVisible(stream, latestTurn, Boolean(liveContent));
   const replaceLatestSettledAssistant = shouldReplaceLatestSettledAssistantWithLiveTurn({
     liveVisible,
     latestTurnHasUser: Boolean(latestTurn?.user),
@@ -606,6 +565,11 @@ export function BerryThreadView({
   const liveTimelineWindow = windowLiveTimeline(stream.timeline);
   const omittedLiveActivity = stream.timelineOmitted + liveTimelineWindow.omitted;
   const liveSegments = groupLiveTimeline(liveTimelineWindow.entries);
+  const reviewingWrite = stream.approval?.writePreview !== undefined;
+  const foldedApprovalIntroduction = reviewingWrite && !stream.text
+    ? [...liveSegments].reverse().find((segment) => segment.kind === "text")
+    : undefined;
+  const approvalIntroduction = reviewingWrite ? stream.text || foldedApprovalIntroduction?.text : undefined;
   const liveTimelineOnlyNotes = stream.timeline.length > 0 && stream.timeline.every((entry) => entry.kind === "note");
   let liveThoughtOrdinal = 0;
   const liveActivityNodes = [
@@ -619,6 +583,7 @@ export function BerryThreadView({
       </div>
     )] : []),
     ...liveSegments.map((segment, index) => {
+      if (segment === foldedApprovalIntroduction) return null;
       if (segment.kind === "tools") {
         return (
           <ToolFlow
@@ -914,8 +879,9 @@ export function BerryThreadView({
                       ) : (
                         <TurnActivity
                           turnKey={liveTurnKey}
-                          active={stream.turnActive}
+                          active={stream.turnActive && !reviewingWrite}
                           activeLabel={activeStatus}
+                          inactiveLabel={reviewingWrite ? "Activity" : undefined}
                           elapsedMs={stream.turnStartedAt ? now - stream.turnStartedAt : undefined}
                           liveAction={
                             stream.turnActive
@@ -927,7 +893,7 @@ export function BerryThreadView({
                         </TurnActivity>
                       )}
                     </BerryActivityStackBlock>
-                  ) : stream.turnActive && stream.text.length === 0 ? (
+                  ) : stream.turnActive && stream.text.length === 0 && !reviewingWrite ? (
                     <BerryActivityStackBlock>
                       {showPendingTurnActivity ? (
                         <TurnActivity
@@ -942,9 +908,10 @@ export function BerryThreadView({
                       )}
                     </BerryActivityStackBlock>
                   ) : null}
+                  {approvalIntroduction ? <BerryAssistantMarkdownBlock>{approvalIntroduction}</BerryAssistantMarkdownBlock> : null}
                   {stream.approval ? (
                     <BerryActivityStackBlock>
-                      <BerryApprovalAccordion approval={stream.approval} adapter={adapter} />
+                      <BerryApprovalAccordion key={stream.approval.approvalId} approval={stream.approval} adapter={adapter} />
                     </BerryActivityStackBlock>
                   ) : null}
                   {showQuestions && stream.question ? (
@@ -952,12 +919,13 @@ export function BerryThreadView({
                       <BerryQuestionAccordion question={stream.question} adapter={adapter} />
                     </BerryActivityStackBlock>
                   ) : null}
-                  {stream.text ? <BerryAssistantMarkdownBlock live={shouldUseLiveMarkdown(stream)}>{stream.text}</BerryAssistantMarkdownBlock> : null}
+                  {!reviewingWrite && stream.text ? <BerryAssistantMarkdownBlock live={shouldUseLiveMarkdown(stream)}>{stream.text}</BerryAssistantMarkdownBlock> : null}
                   {stream.error ? <BerryAssistantErrorBlock>{stream.error}</BerryAssistantErrorBlock> : null}
                   {liveContent}
                 </div>
               </MessageScrollerItem>
             ) : null}
+            {afterMessages}
           </MessageScrollerContent>
         </MessageScrollerViewport>
         <MessageScrollerButton />
@@ -1000,21 +968,6 @@ function messageAttachmentNames(parts: MessagePart[]): string[] {
 }
 
 /** "May 7, 2:07 PM" for every message so a thread remains legible in captures and history. */
-export function formatMessageTime(iso: string): string {
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return "";
-  const time = date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-  return `${date.toLocaleDateString(undefined, { month: "short", day: "numeric" })}, ${time}`;
-}
-
-/** Full, untruncated user text for editing/copying (parts joined verbatim). */
-export function fullUserText(message: Message): string {
-  return message.parts
-    .filter((part) => part.kind === "text")
-    .map((part) => String(part.content))
-    .join("\n");
-}
-
 /** Return the rendered row owner for a transcript search match. */
 export function findMessageSearchTarget(messages: Message[], query: string): string | null {
   const needle = query.trim().toLocaleLowerCase();
@@ -1214,47 +1167,12 @@ export const BerryAssistantTurnGroup = React.memo(function BerryAssistantTurnGro
     terminalStatus,
   );
   // Merge tool runs that were split across adjacent assistant messages.
-  const merged: typeof segments = [];
-  for (const segment of segments) {
-    const last = merged[merged.length - 1];
-    if (segment.kind === "tools" && last && last.kind === "tools") last.tools.push(...segment.tools);
-    else merged.push(segment);
-  }
+  const merged = mergeAdjacentToolSegments(segments);
 
-  // Wall-clock turn duration from message timestamps ("Worked for 1m 22s");
-  // falls back to the live handoff duration, model generation time, then the
-  // summed tool durations. Single-message turns often persist created/updated
-  // at the same instant, so timestamps alone can collapse to plain "Worked".
+  // Wall time and model decoding are separate, matching DeepSeek Harness.
   const first = messages[0];
   const last = messages[messages.length - 1];
-  const wallMs = first && last ? Date.parse(last.updatedAt) - Date.parse(first.createdAt) : Number.NaN;
-
-  // Raw inference decode throughput: output tokens ÷ the time the model spent
-  // generating (first token → last token per message, summed across the turn).
-  // This excludes tool execution, approvals, and idle gaps — it's the API's
-  // generation speed, not wall-clock. Prefer the model's reported token count;
-  // when the endpoint returns no usage, estimate from output length (~4 chars/token).
-  const reportedOutputTokens = messages.reduce((sum, message) => sum + (message.outputTokens ?? 0), 0);
-  const generatedChars = allParts
-    .filter((part) => part.kind === "text" || part.kind === "reasoning")
-    .reduce((sum, part) => sum + String(part.content).length, 0);
-  const totalOutputTokens = reportedOutputTokens > 0 ? reportedOutputTokens : Math.ceil(generatedChars / 4);
-  const generationMs = messages.reduce((sum, message) => sum + (message.generationMs ?? 0), 0);
-  const elapsedCandidates = [
-    Number.isFinite(wallMs) && wallMs > 0 ? wallMs : undefined,
-    rememberedTurnElapsedMs(turnKey),
-    generationMs > 0 ? generationMs : undefined,
-    totalMs > 0 ? totalMs : undefined,
-  ].filter((value): value is number => value !== undefined);
-  const elapsedMs = elapsedCandidates.length > 0 ? Math.max(...elapsedCandidates) : undefined;
-  // Historical cloud messages created before generation duration was persisted
-  // can still report a useful, clearly-labelled turn-average rate.
-  const tokenRateDurationMs = generationMs > 0 ? generationMs : elapsedMs;
-  const tokenRateIsEstimated = generationMs <= 0 && tokenRateDurationMs != null;
-  const tokensPerSecond =
-    totalOutputTokens > 0 && tokenRateDurationMs != null && tokenRateDurationMs > 0
-      ? totalOutputTokens / (tokenRateDurationMs / 1000)
-      : undefined;
+  const { elapsedMs, tokensPerSecond, modelMs, firstTokenMs, decodeMs, decodeTokens, toolMs } = settledTurnTiming(messages, totalMs, rememberedTurnElapsedMs(turnKey));
 
   // When the turn's reply landed.
   const turnTimestamp = last?.createdAt ?? first?.createdAt;
@@ -1354,15 +1272,13 @@ export const BerryAssistantTurnGroup = React.memo(function BerryAssistantTurnGro
           {tokensPerSecond != null ? (
             <span
               className="inline-flex select-none items-center gap-1 px-2 tabular-nums"
-              title={
-                tokenRateIsEstimated
-                  ? reportedOutputTokens > 0
-                    ? "Estimated turn rate (output tokens ÷ available turn duration)"
-                    : "Estimated turn rate (output tokens estimated from length ÷ available turn duration)"
-                  : reportedOutputTokens > 0
-                    ? "Inference decode speed (output tokens ÷ generation time)"
-                    : "Inference decode speed (output tokens estimated from length ÷ generation time)"
-              }
+              title={[
+                `Decoding: ${decodeTokens.toLocaleString()} output tokens ÷ ${(decodeMs / 1000).toFixed(1)}s`,
+                `Model time: ${(modelMs / 1000).toFixed(1)}s`,
+                `Time to first token (summed): ${(firstTokenMs / 1000).toFixed(1)}s`,
+                `Tool time: ${(toolMs / 1000).toFixed(1)}s`,
+                "Includes reasoning tokens. First-token wait and tool execution are excluded from tok/s.",
+              ].join("\n")}
             >
               <GaugeIcon className="size-3.5" />
               {tokensPerSecond >= 10 ? tokensPerSecond.toFixed(0) : tokensPerSecond.toFixed(1)} tok/s
@@ -1386,23 +1302,6 @@ export const BerryAssistantTurnGroup = React.memo(function BerryAssistantTurnGro
     </MessageRow>
   );
 });
-
-function summarizeActivity(segments: MessageSegment[]): string | undefined {
-  const tools = segments.flatMap((segment) => segment.kind === "tools" ? segment.tools : []);
-  const reads = tools.filter((tool) => tool.name === "read").length;
-  const writes = tools.flatMap((tool) => {
-    if (!/^(?:write|edit)$/.test(tool.name)) return [];
-    const args = tool.args ?? {};
-    const path = [args.path, args.file_path, args.filePath, args.file].find((value) => typeof value === "string");
-    return typeof path === "string" ? [path.replace(/^.*[\\/]/, "")] : [];
-  });
-  const details: string[] = [];
-  if (reads > 0) details.push(`read ${reads} ${reads === 1 ? "file" : "files"}`);
-  if (writes.length > 0) details.push(`wrote ${writes.slice(0, 2).join(", ")}`);
-  const remaining = tools.length - reads - writes.length;
-  if (details.length === 0 && remaining > 0) details.push(`ran ${remaining} ${remaining === 1 ? "tool" : "tools"}`);
-  return details.length > 0 ? details.join(", ") : undefined;
-}
 
 export function BerryUserMessageStack({ children }: { children: React.ReactNode }) {
   return (
@@ -1590,234 +1489,64 @@ export function BerryActivityStackBlock({ children }: { children: React.ReactNod
   return <div className="berry-activity-stack flex max-w-[1360px] flex-col gap-2">{children}</div>;
 }
 
-export function latestTerminalMessageStatus(
-  messages: readonly Message[],
-): Exclude<Message["status"], "streaming"> | undefined {
-  const status = messages.at(-1)?.status;
-  return status && status !== "streaming" ? status : undefined;
-}
-
-/**
- * Splits a settled agent turn into an ordered stream of reasoning, tool runs,
- * and prose — walking parts in document order like Berry. Consecutive tools
- * merge into one run (ToolFlow then groups them into "Explore"); reasoning
- * renders inline as a "Thought" row. Tool-call/tool-result parts sharing a
- * call id collapse to one entry with the final status/output.
- */
-export function partitionAssistantParts(
-  parts: MessagePart[],
-  writingBlockParts: Map<string, MessageDraftPartResolution> = new Map(),
-  visibleArtifactToolCallIds?: ReadonlySet<string>,
-  terminalStatus?: Message["status"],
-): {
-  segments: MessageSegment[];
-  totalMs: number;
-  hadTools: boolean;
-} {
-  const toolMap = new Map<string, ActivityTool>();
-  const segments: MessageSegment[] = [];
-
-  const upsertTool = (id: string, meta: Record<string, unknown>, fromResult: boolean) => {
-    const existing = toolMap.get(id);
-    const args =
-      meta.arguments && typeof meta.arguments === "object" && !Array.isArray(meta.arguments)
-        ? (meta.arguments as Record<string, unknown>)
-        : existing?.args ?? null;
-    const output =
-      typeof meta.output === "string"
-        ? meta.output
-        : meta.output !== undefined && meta.output !== null
-          ? JSON.stringify(meta.output)
-          : existing?.output;
-    // Persisted sub-agent child tool calls (on the `task` tool) → nested tools.
-    const children: ActivityTool[] | undefined = Array.isArray(meta.children)
-      ? (meta.children as Array<Record<string, unknown>>).map((child) => ({
-          toolCallId: typeof child.toolCallId === "string" ? child.toolCallId : "",
-          name: typeof child.name === "string" ? child.name : "tool",
-          args:
-            child.args && typeof child.args === "object" && !Array.isArray(child.args)
-              ? (child.args as Record<string, unknown>)
-              : null,
-          status: toolStatusFromMeta(child.status),
-          ...(typeof child.output === "string" ? { output: child.output } : {}),
-          ...(typeof child.durationMs === "number" ? { durationMs: child.durationMs } : {}),
-          startedAt: typeof child.startedAt === "number" ? child.startedAt : 0,
-        }))
-      : existing?.children;
-    const tool: ActivityTool = {
-      toolCallId: id,
-      name: typeof meta.name === "string" ? meta.name : existing?.name ?? "tool",
-      title: typeof meta.title === "string" ? meta.title : existing?.title,
-      args,
-      ...(output !== undefined ? { output } : {}),
-      ...(children ? { children } : {}),
-      status: fromResult ? toolStatusFromMeta(meta.status) : existing?.status ?? toolStatusFromMeta(meta.status),
-      summary: typeof meta.summary === "string" ? meta.summary : existing?.summary,
-      durationMs: typeof meta.durationMs === "number" ? meta.durationMs : existing?.durationMs,
-      startedAt: existing?.startedAt ?? 0,
-    };
-    toolMap.set(id, tool);
-    if (existing) {
-      // Update in place inside whichever segment holds it.
-      for (const segment of segments) {
-        if (segment.kind !== "tools") continue;
-        const at = segment.tools.findIndex((candidate) => candidate.toolCallId === id);
-        if (at !== -1) {
-          segment.tools[at] = tool;
-          return;
-        }
-      }
-      return;
-    }
-    const last = segments[segments.length - 1];
-    if (last && last.kind === "tools") last.tools.push(tool);
-    else segments.push({ kind: "tools", tools: [tool] });
-  };
-
-  for (const part of parts) {
-    if (part.kind === "tool-call" || part.kind === "tool-result") {
-      const meta =
-        part.content && typeof part.content === "object" && !Array.isArray(part.content)
-          ? (part.content as Record<string, unknown>)
-          : {};
-      const id = typeof meta.toolCallId === "string" ? meta.toolCallId : part.id;
-      if (meta.name === "compose_message") {
-        if (part.kind === "tool-result") {
-          const resolved = writingBlockParts.get(part.id);
-          const draft = resolved?.draft ?? messageDraftFromToolResult(part.content);
-          if (draft) {
-            segments.push({ kind: "writing-block", id: `writing-block-${part.id}`, draft });
-          }
-        }
-        continue;
-      }
-      // Finalization can discover files left in /workspace/outputs by an
-      // earlier turn and project result-only persist_artifact messages for
-      // them. When a settled turn has an explicit, completed publication
-      // batch, keep both the cards and activity rows scoped to that batch.
-      // Otherwise stale result-only rows land after the final answer and make
-      // it look like the current turn published every historical output.
-      const visibleArtifactActivity = meta.name !== "persist_artifact"
-        || !visibleArtifactToolCallIds
-        || visibleArtifactToolCallIds.has(id);
-      if (visibleArtifactActivity) upsertTool(id, meta, part.kind === "tool-result");
-      if (
-        part.kind === "tool-result"
-        && meta.name === "persist_artifact"
-        && (!visibleArtifactToolCallIds || visibleArtifactToolCallIds.has(id))
-      ) {
-        const result = meta.output && typeof meta.output === "object" && !Array.isArray(meta.output)
-          ? (meta.output as Record<string, unknown>)
-          : undefined;
-        const artifact = result?.artifact && typeof result.artifact === "object" && !Array.isArray(result.artifact)
-          ? (result.artifact as Record<string, unknown>)
-          : undefined;
-        const path = typeof artifact?.path === "string" ? artifact.path : typeof result?.path === "string" ? result.path : undefined;
-        const name = typeof artifact?.name === "string" ? artifact.name : undefined;
-        if (path && name) {
-          segments.push({
-            kind: "artifact",
-            id: `${part.id}-artifact`,
-            name,
-            path,
-            ...(typeof artifact?.mediaType === "string" ? { mediaType: artifact.mediaType } : {}),
-            ...(typeof artifact?.size === "number" ? { size: artifact.size } : {}),
-          });
-        }
-      }
-    } else if (part.kind === "reasoning") {
-      const text = String(part.content);
-      // Always keep reasoning so "Thought" rows expand to the real text.
-      if (text.trim().length > 0) segments.push({ kind: "thought", id: part.id, text });
-    } else if (part.kind === "text") {
-      const text = String(part.content);
-      if (text.trim().length > 0) segments.push({ kind: "text", id: part.id, text });
-    } else if (part.kind === "error") {
-      segments.push({ kind: "error", id: part.id, text: String(part.content) });
-    }
-  }
-
-  if (terminalStatus && terminalStatus !== "streaming") {
-    const status = toolTerminalStatus(terminalStatus);
-    for (const segment of segments) {
-      if (segment.kind === "tools") segment.tools = settleRunningActivityTools(segment.tools, status);
-    }
-  }
-  const tools = segments.flatMap((segment) => segment.kind === "tools" ? segment.tools : []);
-  const totalMs = tools.reduce((sum, tool) => sum + (tool.durationMs ?? 0), 0);
-  return { segments, totalMs, hadTools: tools.length > 0 };
-}
-
-/**
- * A durable user turn can contain many model/tool iterations. Each model
- * message that calls persist_artifact declares one publication batch. Only
- * the latest batch with settled results belongs in the visible response;
- * earlier batches remain available in the task files and activity history.
- */
-export function latestArtifactToolCallIds(messages: Message[]): ReadonlySet<string> | undefined {
-  const completed = new Set<string>();
-  for (const message of messages) {
-    for (const part of message.parts) {
-      if (part.kind !== "tool-result") continue;
-      const meta = part.content && typeof part.content === "object" && !Array.isArray(part.content)
-        ? part.content as Record<string, unknown>
-        : undefined;
-      if (meta?.name !== "persist_artifact" || meta.status !== "completed") continue;
-      const toolCallId = typeof meta.toolCallId === "string" ? meta.toolCallId : undefined;
-      if (toolCallId) completed.add(toolCallId);
-    }
-  }
-
-  let latest: Set<string> | undefined;
-  for (const message of messages) {
-    const batch = new Set<string>();
-    for (const part of message.parts) {
-      if (part.kind !== "tool-call") continue;
-      const meta = part.content && typeof part.content === "object" && !Array.isArray(part.content)
-        ? part.content as Record<string, unknown>
-        : undefined;
-      if (meta?.name !== "persist_artifact") continue;
-      const toolCallId = typeof meta.toolCallId === "string" ? meta.toolCallId : part.id;
-      if (completed.has(toolCallId)) batch.add(toolCallId);
-    }
-    if (batch.size > 0) latest = batch;
-  }
-  return latest;
-}
-
-export interface MessageDraftPartResolution {
-  draft: MessageDraft;
-}
-
-/**
- * Every completed compose_message result remains attached to its own timeline
- * part. The stable draft id still identifies the logical artifact for model
- * follow-ups, while the part id preserves each revision as a separate card.
- */
-export function collectMessageDraftParts(messages: Message[]): Map<string, MessageDraftPartResolution> {
-  const resolved = new Map<string, MessageDraftPartResolution>();
-  for (const message of messages) {
-    for (const part of message.parts) {
-      if (part.kind !== "tool-result") continue;
-      const draft = messageDraftFromToolResult(part.content);
-      if (!draft) continue;
-      resolved.set(part.id, { draft });
-    }
-  }
-  return resolved;
-}
-
 export function BerryApprovalAccordion({ approval, adapter }: { approval: ApprovalPrompt; adapter: BerryThreadAdapter }) {
   const [pending, setPending] = React.useState(false);
+  const [decisionError, setDecisionError] = React.useState<string>();
   const decide = async (decision: ApprovalDecision) => {
-    if (!adapter.onApprovalDecide) return;
+    if (pending || !adapter.onApprovalDecide) return;
     setPending(true);
+    setDecisionError(undefined);
     try {
       await adapter.onApprovalDecide(approval, decision);
+    } catch {
+      setDecisionError("Berry couldn’t record your decision. Try again.");
     } finally {
       setPending(false);
     }
   };
+
+  const preview = approval.writePreview;
+  if (preview) {
+    return (
+      <section aria-label={`Review ${preview.service} action`} aria-busy={pending} className="berry-activity-surface w-full max-w-[560px] overflow-hidden">
+        <div className="flex items-center gap-3 px-4 pt-4">
+          <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-accent text-foreground">
+            <ShieldQuestion className="size-4" aria-hidden="true" />
+          </span>
+          <div className="min-w-0">
+            <p className="text-xs text-muted-foreground">{preview.service} · {preview.action}</p>
+            <h3 className="break-words text-sm font-semibold text-foreground">{approval.title}</h3>
+          </div>
+        </div>
+        {preview.fields.length > 0 ? (
+          <dl className="mx-4 mt-4 grid max-h-64 grid-cols-[5.5rem_minmax(0,1fr)] gap-x-3 gap-y-2 overflow-auto border-t border-border/60 pt-3 text-xs">
+            {preview.fields.map(({ label, value }, index) => (
+              <React.Fragment key={`${label}-${index}`}>
+                <dt className="break-words text-muted-foreground">{label}</dt>
+                <dd className="whitespace-pre-wrap break-words text-foreground" dir="auto">{value}</dd>
+              </React.Fragment>
+            ))}
+          </dl>
+        ) : null}
+        {approval.detail ? (
+          <p className="mx-4 mt-3 max-h-44 overflow-auto whitespace-pre-wrap break-words text-xs text-muted-foreground" dir="auto">
+            {approval.detail}
+          </p>
+        ) : null}
+        {adapter.onApprovalDecide ? (
+          <div className="flex flex-wrap items-center gap-2 px-4 py-4">
+            <Button size="sm" className="min-h-10" disabled={pending} onClick={() => void decide("approved_once")}>
+              {preview.approveLabel}
+            </Button>
+            <Button size="sm" className="min-h-10" variant="outline" disabled={pending} onClick={() => void decide("denied")}>
+              Decline
+            </Button>
+          </div>
+        ) : null}
+        {decisionError ? <p className="px-4 pb-4 text-xs text-destructive" role="alert">{decisionError}</p> : null}
+      </section>
+    );
+  }
 
   return (
     <div className="berry-activity-surface overflow-hidden">
@@ -1861,6 +1590,7 @@ export function BerryApprovalAccordion({ approval, adapter }: { approval: Approv
           </Button>
         </div>
       ) : null}
+      {decisionError ? <p className="px-3 pb-3 text-xs text-destructive" role="alert">{decisionError}</p> : null}
     </div>
   );
 }
@@ -1971,11 +1701,6 @@ export function BerryMessagePartBody({ part, plain = false }: { part: MessagePar
   }
   if (plain) return <DirectedText text={content} />;
   return <Markdown>{content}</Markdown>;
-}
-
-function toolStatusFromMeta(value: unknown): ToolEntry["status"] {
-  if (value === "running" || value === "failed" || value === "denied" || value === "completed" || value === "cancelled") return value;
-  return "completed";
 }
 
 function useNow(active: boolean): number {

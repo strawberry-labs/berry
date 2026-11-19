@@ -32,113 +32,36 @@ import {
 import { AnimatedCollapse } from "@berry/desktop-ui/components/animated-collapse";
 import { cn } from "@berry/desktop-ui/lib/utils";
 
-export type ToolStatus = "running" | "completed" | "failed" | "denied" | "cancelled";
+import type { ActivityTool, ToolStatus } from "@berry/client-core/activity";
+import {
+  exploreBucket as bucketFor,
+  exploreSummary,
+  familyFromTool,
+  formatDuration,
+  isExploreEligible,
+  isFetchTool,
+  isLikelyUrl,
+  isSkillTool,
+  namedToolLabel,
+  prettyToolKind,
+  relativizeToolPath,
+  splitToolPath,
+  todosFromTool,
+  toolBrowserSession as browserSessionOf,
+  toolBrowserUrl as browserUrlOf,
+  toolCommand as commandOf,
+  toolFailureLabel as failureLabel,
+  toolFilePath as filePathOf,
+  toolMetaText as metaTextOf,
+  toolOutput as outputOf,
+  toolQuery as queryOf,
+  toolStringArg as stringArg,
+  type TodoStatus,
+} from "@berry/client-core/activity-rows";
+// Moved to @berry/client-core so the native rows say exactly the same thing.
+export { familyFromTool, formatDuration, isExploreEligible, type ToolFamily } from "@berry/client-core/activity-rows";
 
-export interface ActivityTool {
-  toolCallId: string;
-  name: string;
-  title?: string | undefined;
-  status: ToolStatus;
-  /** Truncated output preview from tool.end / tool.update. */
-  summary?: string | undefined;
-  /** Full output text when persisted (settled messages). */
-  output?: string | undefined;
-  /** Tool input arguments (command, path, pattern, …). */
-  args?: Record<string, unknown> | null | undefined;
-  durationMs?: number | undefined;
-  startedAt: number;
-  /** Live child tool calls when this is a `task` (sub-agent) dispatch. */
-  children?: ActivityTool[] | undefined;
-}
-
-/* ------------------------------------------------------------------------ */
-/* Berry tool-family classification (Ka/Ga/$_ mapped to Berry tool names).  */
-/* ------------------------------------------------------------------------ */
-
-export type ToolFamily = "file-read" | "file-write" | "shell" | "search" | "explore" | "other";
-
-const EXACT_FAMILY: Record<string, ToolFamily> = {
-  read: "file-read",
-  write: "file-write",
-  edit: "file-write",
-  bash: "shell",
-  todo_write: "other",
-  grep: "search",
-  find: "search",
-  ls: "search",
-  webfetch: "search",
-  websearch: "search",
-  web_search: "search",
-  web_fetch: "search",
-  inspect_images: "other",
-};
-
-export function familyFromTool(name: string): ToolFamily {
-  const key = name.trim().toLowerCase();
-  const exact = EXACT_FAMILY[key];
-  if (exact) return exact;
-  // Normalize dot- and dash-separated names before classifying provider tools.
-  const n = key.replace(/[.-]/g, "_");
-  if (/^(?:read|view|open|cat|head|tail)(?:_|$)/.test(n)) return "file-read";
-  if (/(?:^|_)(?:edit|patch|replace|multi_edit|multiedit|write|create|save)(?:_|$)/.test(n)) return "file-write";
-  if (/^(?:execute|run|exec|bash|shell|command|terminal)(?:_|$)/.test(n)) return "shell";
-  if (/^(?:search|grep|find|fetch|web_search|web_fetch|webfetch|query|lookup|list|ls|dir|tree)(?:_|$)/.test(n)) return "search";
-  if (/^(?:explore|inspect)(?:_|$)/.test(n)) return "explore";
-  return "other";
-}
-
-/* ---------------------- input extraction helpers ------------------------ */
-
-function stringArg(args: ActivityTool["args"], ...keys: string[]): string | undefined {
-  if (!args) return undefined;
-  for (const key of keys) {
-    const value = args[key];
-    if (typeof value === "string" && value.trim().length > 0) return value;
-  }
-  return undefined;
-}
-
-function commandOf(tool: ActivityTool): string | undefined {
-  return stringArg(tool.args, "command", "cmd", "script") ?? (familyFromTool(tool.name) === "shell" ? tool.title : undefined);
-}
-
-function filePathOf(tool: ActivityTool): string | undefined {
-  return stringArg(tool.args, "path", "file_path", "filePath", "file") ?? tool.title;
-}
-
-function queryOf(tool: ActivityTool): string | undefined {
-  return stringArg(tool.args, "pattern", "query", "url", "path", "glob") ?? tool.title;
-}
-
-function browserSessionOf(tool: ActivityTool): string | undefined {
-  return stringArg(tool.args, "id", "sessionId", "session_id");
-}
-
-function browserUrlOf(tool: ActivityTool): string | undefined {
-  const value = stringArg(tool.args, "url", "currentUrl", "current_url") ?? tool.title;
-  return value && isLikelyUrl(value) ? value : undefined;
-}
-
-function outputOf(tool: ActivityTool): string | undefined {
-  return tool.output ?? tool.summary;
-}
-
-function metaTextOf(tool: ActivityTool): string | undefined {
-  const segments: string[] = [];
-  if (typeof tool.durationMs === "number" && Number.isFinite(tool.durationMs)) {
-    segments.push(tool.durationMs >= 1000 ? `${(tool.durationMs / 1000).toFixed(1)}s` : `${Math.round(tool.durationMs)}ms`);
-  }
-  const args = tool.args ?? {};
-  const truncated =
-    args.truncated === true ||
-    args.outputTruncated === true ||
-    args.output_truncated === true ||
-    args.bytesTruncated === true ||
-    args.linesTruncated === true ||
-    /\btruncat(?:ed|ion)\b/i.test(tool.summary ?? "");
-  if (truncated) segments.push("truncated");
-  return segments.length > 0 ? segments.join(" · ") : undefined;
-}
+export type { ActivityTool, ToolStatus };
 
 /** Workspace root used to relativize file paths (Berry shows "apps/desktop/"). */
 let workspaceRoot = "";
@@ -147,71 +70,13 @@ export function setActivityWorkspaceRoot(root: string | null | undefined): void 
 }
 
 function relativizePath(path: string): string {
-  if (workspaceRoot && path.startsWith(`${workspaceRoot}/`)) return path.slice(workspaceRoot.length + 1);
-  if (workspaceRoot && path === workspaceRoot) return "";
-  return path;
+  return relativizeToolPath(path, workspaceRoot);
 }
 
 function splitPath(path: string): { base: string; dir?: string } {
-  const rel = relativizePath(path);
-  const slash = rel.lastIndexOf("/");
-  if (slash === -1) return { base: rel };
-  return { base: rel.slice(slash + 1), dir: rel.slice(0, slash + 1) };
+  return splitToolPath(path, workspaceRoot);
 }
 
-/* --------------- Berry Explore grouping (get/CX/pet/met) ---------------- */
-
-const READ_CMD =
-  /\b(rg|grep|find|ls|cat|head|tail|wc|stat|pwd|which|readlink|tree|sed\s+-n|get-childitem|gci|dir|get-content|gc|type|select-string|sls|get-location|test-path|resolve-path)\b|^git\s+(status|log|show|diff)\b/i;
-const WRITE_CMD =
-  /\b(sed\s+-i|perl\s+-pi|tee|mv|cp|rm|mkdir|rmdir|touch|truncate|chmod|chown|remove-item|del|erase|set-content|add-content|clear-content|out-file|new-item|move-item|copy-item|rename-item|set-item)\b|^git\s+(add|commit|rm|mv|checkout|switch|restore|reset|clean|revert|cherry-pick|merge|rebase)\b/i;
-const REDIRECT = /(^|[^\d<])>>?\s*\S|&>\s*\S/i;
-const LOOP = /\b(for|while)\b/i;
-
-export function isExploreEligible(tool: ActivityTool): boolean {
-  const family = familyFromTool(tool.name);
-  if (family === "file-write") return false;
-  if (family === "file-read" || family === "search" || family === "explore") return true;
-  if (family !== "shell") return false;
-  const command = commandOf(tool);
-  if (!command) return false;
-  const commands = command.split(/&&|\|\||;|\|/).map((part) => part.trim()).filter(Boolean);
-  if (commands.length === 0) return false;
-  if (commands.some((cmd) => WRITE_CMD.test(cmd) || REDIRECT.test(cmd))) return false;
-  if (commands.some((cmd) => READ_CMD.test(cmd))) return true;
-  return commands.some((cmd) => LOOP.test(cmd) && READ_CMD.test(cmd));
-}
-
-/* -------------------- Explore bucket counts (itt/att) ------------------- */
-
-type ExploreBucket = "search" | "list" | "file";
-
-function bucketFor(tool: ActivityTool): ExploreBucket {
-  // Normalize separators before deriving the compact activity bucket.
-  const label = `${tool.name} ${tool.title ?? ""}`.toLowerCase().replace(/[._-]/g, " ");
-  const cmd = (commandOf(tool) ?? "").toLowerCase();
-  if (/(\bgrep\b|\bsearch\b|\bfetch\b|\bweb.?search\b|\bweb.?fetch\b)/.test(label) || /(^|\s)(rg|grep|ripgrep|git\s+grep)(\s|$)/.test(cmd)) {
-    return "search";
-  }
-  if (/(\bglob\b|\bfind\b|\blist\b|\btree\b|\bdir\b|\bls\b)/.test(label) || /(^|\s)(ls|find|tree|dir)(\s|$)/.test(cmd)) {
-    return "list";
-  }
-  return "file";
-}
-
-function exploreSummary(tools: ActivityTool[]): string {
-  const counts: Record<ExploreBucket, number> = { search: 0, list: 0, file: 0 };
-  for (const tool of tools) counts[bucketFor(tool)] += 1;
-  const label: Record<ExploreBucket, [string, string]> = {
-    search: ["search", "searches"],
-    list: ["list", "lists"],
-    file: ["file", "files"],
-  };
-  const segments = (Object.keys(counts) as ExploreBucket[])
-    .filter((bucket) => counts[bucket] > 0)
-    .map((bucket) => `${counts[bucket]} ${label[bucket][counts[bucket] === 1 ? 0 : 1]}`);
-  return segments.length > 0 ? segments.join(", ") : "0 files";
-}
 
 /* ---------------- rolling summary (Berry Xq, implemented directly) ----------------- */
 
@@ -556,7 +421,9 @@ function ToolLayout({
             sequence={summarySequence}
           />
           {metaText ? <span className="shrink-0 whitespace-nowrap text-muted-foreground">{metaText}</span> : null}
-          {statusLabel ? <span className="shrink-0 whitespace-nowrap text-destructive">{statusLabel}</span> : null}
+          {/* Failures stay quiet: the agent usually recovers on the next step, so
+              a red label reads as alarm for something routine. */}
+          {statusLabel ? <span className="shrink-0 whitespace-nowrap text-muted-foreground/80">{statusLabel.toLowerCase()}</span> : null}
         </span>
         {canToggle ? (
           <ChevronRight
@@ -578,13 +445,6 @@ function ToolLayout({
 }
 
 /* --------------------------- per-family rows ----------------------------- */
-
-function failureLabel(status: ToolStatus): string | undefined {
-  if (status === "failed") return "Failed";
-  if (status === "denied") return "Denied";
-  if (status === "cancelled") return "Cancelled";
-  return undefined;
-}
 
 /** Shell ("Ran") row: inline mono command; expands to the $-prefixed box. */
 function ShellRow({ tool, showIcon }: { tool: ActivityTool; showIcon: boolean }) {
@@ -680,10 +540,6 @@ function openBrowserTarget(url?: string, sessionId?: string) {
   window.dispatchEvent(new CustomEvent("berry:open-browser", { detail: { ...(url ? { url } : {}), ...(sessionId ? { sessionId } : {}) } }));
 }
 
-function isLikelyUrl(value: string): boolean {
-  return /^(https?:|file:|about:)/i.test(value.trim());
-}
-
 function BrowserUrlButton({ url, sessionId, label }: { url?: string | undefined; sessionId?: string | undefined; label: string }) {
   return (
     <span
@@ -713,7 +569,9 @@ function SearchRow({ tool, showIcon }: { tool: ActivityTool; showIcon: boolean }
   const running = tool.status === "running";
   const isWeb = /web|fetch|url/i.test(tool.name);
   const isList = bucketFor(tool) === "list";
-  const kind = running ? (isList ? "Listing" : "Searching") : isList ? "Listed" : "Searched";
+  const kind = isFetchTool(tool)
+    ? running ? "Opening" : "Opened"
+    : running ? (isList ? "Listing" : "Searching") : isList ? "Listed" : "Searched";
   const query = queryOf(tool);
   const display = query && query.startsWith("/") ? relativizePath(query) : query;
   return (
@@ -782,11 +640,9 @@ function EditRow({ tool, showIcon }: { tool: ActivityTool; showIcon: boolean }) 
 /** Fallback row for MCP/unknown tools: capitalized kind + raw args box. */
 function DefaultRow({ tool, showIcon }: { tool: ActivityTool; showIcon: boolean }) {
   const running = tool.status === "running";
-  const kind = tool.name
-    .split(/[._-]/)
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
+  const named = namedToolLabel(tool);
+  const kind = named?.label ?? prettyToolKind(tool.name);
+  const detail = named ? named.detail : tool.title && tool.title !== tool.name ? tool.title : undefined;
   const output = outputOf(tool);
   const raw = tool.args && Object.keys(tool.args).length > 0 ? JSON.stringify(tool.args, null, 2) : undefined;
   const browserUrl = /^browser[._-]/i.test(tool.name) ? browserUrlOf(tool) : undefined;
@@ -802,8 +658,8 @@ function DefaultRow({ tool, showIcon }: { tool: ActivityTool; showIcon: boolean 
       primaryText={
         browserUrl || browserSessionId
           ? <BrowserUrlButton url={browserUrl} sessionId={browserSessionId} label={browserUrl ?? browserSessionId ?? "Browser session"} />
-          : tool.title && tool.title !== tool.name
-            ? <span className="min-w-0 truncate">{tool.title}</span>
+          : detail
+            ? <span className="min-w-0 truncate">{detail}</span>
             : undefined
       }
       metaText={metaTextOf(tool)}
@@ -955,28 +811,6 @@ function SessionContextRow({ tool, showIcon }: { tool: ActivityTool; showIcon: b
 
 /* ------------------------------ Todo (Jtt) ------------------------------- */
 
-type TodoStatus = "pending" | "in_progress" | "completed";
-interface TodoItem {
-  content: string;
-  status: TodoStatus;
-}
-
-/** Read the checklist off the `todo_write` call's arguments. */
-function todosFromTool(tool: ActivityTool): TodoItem[] {
-  const raw = tool.args && typeof tool.args === "object" ? (tool.args as Record<string, unknown>).todos : undefined;
-  if (!Array.isArray(raw)) return [];
-  const items: TodoItem[] = [];
-  for (const entry of raw) {
-    if (!entry || typeof entry !== "object") continue;
-    const record = entry as Record<string, unknown>;
-    const content = typeof record.content === "string" ? record.content : "";
-    if (!content) continue;
-    const status: TodoStatus = record.status === "completed" || record.status === "in_progress" ? record.status : "pending";
-    items.push({ content, status });
-  }
-  return items;
-}
-
 const TODO_ICON: Record<TodoStatus, typeof CircleCheckIcon> = {
   completed: CircleCheckIcon,
   in_progress: ArrowRight02,
@@ -1041,7 +875,7 @@ function TodoRow({ tool, showIcon = true }: { tool: ActivityTool; showIcon?: boo
 
 function ToolRow({ tool, showIcon = true }: { tool: ActivityTool; showIcon?: boolean }) {
   if (tool.name === "todo_write") return <TodoRow tool={tool} showIcon={showIcon} />;
-  if (/^(?:skill|skill[._-]invoke|invoke_skill)$/i.test(tool.name)) return <SkillRow tool={tool} showIcon={showIcon} />;
+  if (isSkillTool(tool.name)) return <SkillRow tool={tool} showIcon={showIcon} />;
   if (/^(?:ask_user_question|ask[._-]user[._-]question|question[._-]ask)$/i.test(tool.name)) return <AskUserQuestionRow tool={tool} showIcon={showIcon} />;
   if (/^(?:goal|session[._-]target|target[._-]set|goal[._-](?:set|update))$/i.test(tool.name)) return <GoalRow tool={tool} showIcon={showIcon} />;
   if (/^(?:session[._-]context|read[._-]session[._-]context|context[._-]read)$/i.test(tool.name)) return <SessionContextRow tool={tool} showIcon={showIcon} />;
@@ -1054,15 +888,6 @@ function ToolRow({ tool, showIcon = true }: { tool: ActivityTool; showIcon?: boo
 }
 
 /* ------------------------ Explore group (utt) ---------------------------- */
-
-/** DefaultRow's label: "workspace.scan" → "Workspace Scan". */
-function prettyToolKind(name: string): string {
-  return name
-    .split(/[._-]/)
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
-}
 
 /**
  * Live verb + rich label for one tool call (Berry `aZ`): mono command for
@@ -1114,7 +939,7 @@ function toolAction(active: ActivityTool): { key: string; node: React.ReactNode 
     const query = queryOf(active);
     if (query) {
       const display = query.startsWith("/") ? relativizePath(query) : query;
-      const verb = bucketFor(active) === "list" ? "Listing" : "Searching";
+      const verb = isFetchTool(active) ? "Opening" : bucketFor(active) === "list" ? "Listing" : "Searching";
       return {
         key: `${verb}:${active.toolCallId}:${display}`,
         node: (
@@ -1125,6 +950,18 @@ function toolAction(active: ActivityTool): { key: string; node: React.ReactNode 
         ),
       };
     }
+  }
+  const named = namedToolLabel(active);
+  if (named) {
+    return {
+      key: `named:${active.toolCallId}:${named.label}:${named.detail ?? ""}`,
+      node: (
+        <>
+          <span className="shrink-0">{named.label}</span>
+          {named.detail ? <span className="min-w-0 truncate">{named.detail}</span> : null}
+        </>
+      ),
+    };
   }
   // MCP / todo / unknown tools: prettified name plus the human title.
   return {
@@ -1210,12 +1047,6 @@ export function latestTurnAction(tools: ActivityTool[]): { key: string; node: Re
 
 function ExploreGroup({ tools, active, latest = false }: { tools: ActivityTool[]; active: boolean; latest?: boolean }) {
   const anyRunning = tools.some((tool) => tool.status === "running");
-  // Exploration probes files that may not exist, so individual failed reads are
-  // routine; only flag the group when nothing in it succeeded.
-  const allProblem =
-    tools.length > 0 && tools.every((tool) =>
-      tool.status === "failed" || tool.status === "denied" || tool.status === "cancelled"
-    );
   const groupId = `${tools[0]?.toolCallId ?? "explore"}:explore`;
   // Berry utt: while running, the collapsed summary is the newest child action
   // (rolling); the trailing group of a live turn keeps its action up between
@@ -1235,7 +1066,7 @@ function ExploreGroup({ tools, active, latest = false }: { tools: ActivityTool[]
       toolId={groupId}
       icon={<Search className="size-4 shrink-0" />}
       canToggle
-      kindLabel="Explore"
+      kindLabel={live ? "Exploring" : "Explored"}
       isRunning={live}
       separator="·"
       primaryText={liveAction ? liveAction.node : counts}
@@ -1243,8 +1074,9 @@ function ExploreGroup({ tools, active, latest = false }: { tools: ActivityTool[]
       animateSummaryContent
       summaryContentKey={liveAction?.key ?? `explore:${groupId}:${live ? "running" : "done"}:${exploreSummary(tools)}`}
       summarySequence={liveSequence}
-      metaText={tools.length > 0 ? metaTextOf(tools[tools.length - 1]!) : undefined}
-      statusLabel={allProblem ? "Failed" : undefined}
+      // A group of lookups never reads as failed: probing for files that
+      // aren't there is routine, and each row still says so when expanded.
+      statusLabel={undefined}
     >
       <div className="ml-2 space-y-2 border-l border-border pl-3.5">
         {tools.map((tool) => (
@@ -1415,9 +1247,9 @@ function SubagentActivity({ tool, active = false }: { tool: ActivityTool; active
       toolId={`${tool.toolCallId}:subagent`}
       icon={<Bot className="size-4 shrink-0" />}
       canToggle
-      defaultOpen={active || running}
+      defaultOpen={false}
       autoCollapseOnComplete
-      kindLabel="SubAgent"
+      kindLabel="Agent"
       isRunning={running}
       strongLabel
       kindDetail={
@@ -1433,13 +1265,12 @@ function SubagentActivity({ tool, active = false }: { tool: ActivityTool; active
       animateSummaryContent
       summaryContentKey={liveAction?.key ?? `agent:${tool.toolCallId}:${description}`}
       summarySequence={liveSequence}
-      metaText={metaTextOf(tool)}
       statusLabel={failureLabel(tool.status)}
     >
       <div className="ml-2 flex flex-col gap-3 border-l border-border pl-3.5">
         {prompt ? <SubagentBox label="Prompt">{prompt}</SubagentBox> : null}
         {output ? (
-          <SubagentBox label="Subagent output" tinted>
+          <SubagentBox label="Result" tinted>
             {output}
           </SubagentBox>
         ) : null}
@@ -1516,6 +1347,7 @@ export function TurnActivity({
   active,
   elapsedMs,
   activeLabel,
+  inactiveLabel,
   liveAction = null,
   summary,
   children,
@@ -1525,6 +1357,7 @@ export function TurnActivity({
   elapsedMs?: number | undefined;
   /** Current durable phase. Elapsed time remains explicitly turn-wide. */
   activeLabel?: string | undefined;
+  inactiveLabel?: string | undefined;
   /** Latest tool action, rolled in under the header while active + collapsed. */
   liveAction?: { key: string; node: React.ReactNode } | null;
   /** Compact mode's lossless roll-up; expanding still renders every tool row. */
@@ -1539,7 +1372,7 @@ export function TurnActivity({
     ? activeLabel
       ? `${activeLabel}${totalElapsed}`
       : `Working${time || "..."}`
-    : `Worked${time}${summary ? ` — ${summary}` : ""}`;
+    : inactiveLabel ?? `Worked${time}${summary ? ` — ${summary}` : ""}`;
   const hasChildren = React.Children.toArray(children).some(Boolean);
   const [, rerender] = React.useReducer((count: number) => count + 1, 0);
   // Derived: open for the whole live run, collapsed once settled — unless the
@@ -1748,12 +1581,4 @@ export function ActivityNote({
       <span className={cn("h-px min-w-0 flex-1", active ? "bg-primary/30" : "bg-border/70")} />
     </div>
   );
-}
-
-export function formatDuration(ms: number): string {
-  const seconds = ms / 1000;
-  if (seconds < 60) return `${Math.max(1, Math.round(seconds))}s`;
-  const minutes = Math.floor(seconds / 60);
-  const rest = Math.round(seconds % 60);
-  return rest > 0 ? `${minutes}m ${rest}s` : `${minutes}m`;
 }

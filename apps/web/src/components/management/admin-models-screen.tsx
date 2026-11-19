@@ -1,50 +1,29 @@
 import * as React from "react";
-import {
-  Activity,
-  Check,
-  Copy,
-  Download,
-  Plus,
-  Save,
-  ShieldCheck,
-  Trash2,
-  Upload,
-} from "lucide-react";
-import {
-  ORGANIZATION_SKILL_PACKAGE_MAX_BYTES,
-  OrgPermissionSchema,
-  type OrgCapabilityAssignment,
-  type OrgPermission,
-  type PersonalSkillReview,
-} from "@berry/shared";
-import { readBrowserSkillImport } from "@/lib/skill-import";
+import { Plus, Save, ShieldCheck } from "lucide-react";
 import {
   AsyncState,
   Button,
-  Checkbox,
+  CellStack,
   DataTable,
-  DefinitionList,
   DetailDrawer,
-  FilterSelect,
+  EmptyPanel,
   FormSelect,
+  InlineNotice,
   Input,
   ManagementDialog,
   ManagementPage,
   ManagementSwitch,
-  MetricGrid,
-  PermissionDenied,
-  SearchInput,
+  Num,
   Section,
+  SegmentedControl,
+  SettingList,
+  SettingRow,
   StatusPill,
   SuccessMessage,
-  TabBar,
-  Textarea,
-  Toolbar,
   formatDate,
-  formatDateTime,
-  formatNumber,
 } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
+import { AdminModelsSkeleton } from "./management-screen-skeletons";
 
 export async function saveNewTaskDefaultSafely<T>(
   save: () => T | Promise<T>,
@@ -62,54 +41,41 @@ export async function saveNewTaskDefaultSafely<T>(
   }
 }
 
-/* ------------------------------------------------------------------ helpers */
-const ALL_PERMISSIONS = OrgPermissionSchema.options as OrgPermission[];
-const PERMISSION_DOMAINS: Array<{ id: string; label: string }> = [
-  { id: "org", label: "Organization" },
-  { id: "org_settings", label: "Organization settings" },
-  { id: "members", label: "People" },
-  { id: "departments", label: "Departments" },
-  { id: "rbac", label: "Roles" },
-  { id: "acl", label: "Resource access" },
-  { id: "models", label: "Models" },
-  { id: "skills", label: "Skills" },
-  { id: "mcp", label: "MCP" },
-  { id: "feature_flags", label: "Feature access" },
-  { id: "guardrails", label: "Execution & network" },
-  { id: "usage", label: "Usage" },
-  { id: "budgets", label: "Budgets" },
-  { id: "billing", label: "Billing" },
-  { id: "reports", label: "Reports" },
-  { id: "alerts", label: "Alerts" },
-  { id: "sso", label: "SSO & SCIM" },
-  { id: "policy", label: "Managed policy" },
-  { id: "auth_policy", label: "Authentication" },
-  { id: "data_policy", label: "Data governance" },
-  { id: "service_accounts", label: "Service accounts" },
-  { id: "audit", label: "Audit" },
+const API_OPTIONS = [
+  { value: "openai-chat-completions", label: "OpenAI chat completions" },
+  { value: "openai-responses", label: "OpenAI responses" },
+  { value: "anthropic-messages", label: "Anthropic messages" },
 ];
-function humanize(value: string) {
-  return value
-    .replaceAll("_", " ")
-    .replaceAll("-", " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
+const SCOPE_LABEL: Record<string, string> = { org: "Organization", department: "Department", user: "Member" };
+const fieldLabel = "grid gap-1.5 text-xs font-medium text-muted-foreground";
+const help = "text-xs font-normal leading-4";
+const drawerHeading = "text-xs font-medium text-muted-foreground";
+const pricePerMillion = new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 4 });
+
+function sentence(value: string) {
+  const text = String(value ?? "").replaceAll("_", " ").replaceAll("-", " ");
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
-function domainOf(permission: string) {
-  return permission.split(":")[0];
+function shortId(value: string) {
+  const text = String(value ?? "");
+  return text.length > 18 ? `${text.slice(0, 8)}…${text.slice(-4)}` : text;
 }
-function actionOf(permission: string) {
-  return permission.split(":")[1] ?? "read";
-}
-function copyText(value: string) {
-  void navigator.clipboard?.writeText(value).catch(() => {});
-}
-function formatPackageBytes(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+const keyOf = (item: { providerId: string; model: string }) => `${item.providerId}:${item.model}`;
+/** The editable part of a model policy, for change detection. */
+function policyFingerprint(model: any) {
+  return JSON.stringify([
+    model?.status,
+    Boolean(model?.enforce),
+    model?.capabilities?.cost ?? {},
+    model?.capabilities?.context ?? {},
+  ]);
 }
 
-/* -------------------------------------------------------------------- roles */
+function PriceCell({ value }: { value: unknown }) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return <span data-sort={-1} className="text-muted-foreground">—</span>;
+  return <span data-sort={value} className="tabular-nums">{pricePerMillion.format(value)}</span>;
+}
+
 export function AdminModelsScreen({
   client,
   config,
@@ -146,64 +112,80 @@ export function AdminModelsScreen({
     [[], [], [], [], [], [], []] as any,
   );
   const [models, defaults, auxiliaryDefaults, registeredProviders, accessRules, members, departments]: [any[], any[], any[], any[], any[], any[], any[]] = r.data;
-  const [query, setQuery] = React.useState("");
-  const [provider, setProvider] = React.useState("all");
-  const [status, setStatus] = React.useState("all");
-  const [active, setActive] = React.useState<number | null>(null);
+  const [activeKey, setActiveKey] = React.useState<string | null>(null);
   const [draft, setDraft] = React.useState<any>(null);
   const [message, setMessage] = React.useState("");
+  const [actionError, setActionError] = React.useState("");
   const [newTaskDefaultKey, setNewTaskDefaultKey] = React.useState("");
   const [savingNewTaskDefault, setSavingNewTaskDefault] = React.useState(false);
   const [newTaskDefaultError, setNewTaskDefaultError] = React.useState("");
+  const [visionKey, setVisionKey] = React.useState("");
+  const [savingVision, setSavingVision] = React.useState(false);
   const [adding, setAdding] = React.useState(false);
   const [addingRule, setAddingRule] = React.useState(false);
+  const [dialogError, setDialogError] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
   const [ruleScope, setRuleScope] = React.useState<"org" | "department" | "user">("department");
   const providers = [...new Set([
     ...(registeredProviders ?? []).map((item) => item.providerId),
     ...(models ?? []).map((m) => m.providerId),
   ])];
-  const rows = (models ?? []).filter(
-    (m) =>
-      `${m.displayName ?? ""} ${m.model}`
-        .toLowerCase()
-        .includes(query.toLowerCase()) &&
-      (provider === "all" || m.providerId === provider) &&
-      (status === "all" || m.status === status),
+  const providerNames = new Map<string, string>(
+    (registeredProviders ?? []).map((item) => [item.providerId, item.displayName || item.providerId]),
   );
+  const providerLabel = (providerId: string) => providerNames.get(providerId) ?? providerId;
   const modelNames = new Map(
     (models ?? []).map((item) => [
-      `${item.providerId}:${item.model}`,
+      keyOf(item),
       item.displayName || item.model,
     ]),
   );
   const memberNames = new Map(
     (members ?? []).map((item) => [item.userId, item.name || item.email || item.userId]),
   );
+  const memberEmails = new Map((members ?? []).map((item) => [item.userId, item.email]));
   const departmentNames = new Map(
     (departments ?? []).map((item) => [item.id, item.name || item.id]),
   );
-  const detail = active != null ? rows[active] : null;
+  const currentNewTaskDefault = (defaults ?? []).find((d) => d.mode === "chat") ?? defaults?.[0];
+  const currentNewTaskDefaultKey = currentNewTaskDefault
+    ? keyOf(currentNewTaskDefault)
+    : "";
+  const visionDefault = (auxiliaryDefaults ?? []).find((item) => item.purpose === "vision");
+  const currentVisionKey = visionDefault ? keyOf(visionDefault) : "";
+  const isTaskDefault = (m: any) =>
+    Boolean(currentNewTaskDefault) && currentNewTaskDefault.model === m.model && currentNewTaskDefault.providerId === m.providerId;
+  const isVisionDefault = (m: any) => Boolean(visionDefault) && visionDefault.model === m.model && visionDefault.providerId === m.providerId;
+  // Defaults first, then what members can use, then what is blocked.
+  const rank = (m: any) => (isTaskDefault(m) ? 0 : isVisionDefault(m) ? 1 : m.status === "allowed" ? 2 : 3);
+  const rows = [...(models ?? [])].sort((left, right) =>
+    rank(left) - rank(right) || String(left.displayName || left.model).localeCompare(String(right.displayName || right.model)),
+  );
+  const activeIndex = rows.findIndex((m) => keyOf(m) === activeKey);
+  const detail = activeIndex >= 0 ? rows[activeIndex] : null;
   React.useEffect(() => {
     setDraft(
       detail ? { ...detail } : null,
     );
-    setMessage("");
-  }, [active, r.data]);
-  const currentNewTaskDefault = (defaults ?? []).find((d) => d.mode === "chat") ?? defaults?.[0];
-  const currentNewTaskDefaultKey = currentNewTaskDefault
-    ? `${currentNewTaskDefault.providerId}:${currentNewTaskDefault.model}`
-    : "";
+  }, [activeKey, r.data]);
+  const modelOption = (item: any) => ({
+    value: keyOf(item),
+    label: `${item.displayName || item.model} · ${providerLabel(item.providerId)}`,
+  });
   const newTaskModelOptions = (models ?? [])
     .filter((item) => item.status === "allowed" && (item.modeAllow ?? ["chat"]).length > 0)
-    .map((item) => ({
-      value: `${item.providerId}:${item.model}`,
-      label: `${item.displayName || item.model} · ${item.providerId}`,
-    }));
+    .map(modelOption);
+  const visionModelOptions = (models ?? [])
+    .filter((item) => item.status === "allowed" && item.capabilities?.vision === true)
+    .map(modelOption);
   React.useEffect(() => {
     setNewTaskDefaultKey(currentNewTaskDefaultKey);
   }, [currentNewTaskDefaultKey]);
-  const isTaskDefault = (m: any) =>
-    currentNewTaskDefault && currentNewTaskDefault.model === m.model && currentNewTaskDefault.providerId === m.providerId;
+  React.useEffect(() => {
+    setVisionKey(currentVisionKey);
+  }, [currentVisionKey]);
+  const otherDefaults = (defaults ?? []).filter((item) => item !== currentNewTaskDefault);
+  const otherAuxiliaryDefaults = (auxiliaryDefaults ?? []).filter((item) => item.purpose !== "vision");
   const setCost = (key: "input" | "output" | "cacheRead" | "cacheWrite", value: string) =>
     setDraft((current: any) => ({
       ...current,
@@ -220,7 +202,19 @@ export function AdminModelsScreen({
         context: { ...(current.capabilities?.context ?? {}), [key]: value === "" ? undefined : Number(value) },
       },
     }));
-  const save = async () => {
+  /** Runs a drawer action and shows a failure instead of dropping it. */
+  const guarded = async (action: () => Promise<void>, fallback: string) => {
+    setBusy(true);
+    setActionError("");
+    try {
+      await action();
+    } catch (cause) {
+      setActionError(cause instanceof Error && cause.message ? cause.message : fallback);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const save = () => guarded(async () => {
     if (!draft) return;
     await client?.upsertOrgTaskModelPolicy(tenantId, {
       providerId: draft.providerId,
@@ -241,8 +235,8 @@ export function AdminModelsScreen({
       departments,
     ]);
     setMessage("Model policy saved and recorded in the audit log.");
-  };
-  const makeTaskDefault = async () => {
+  }, "The model policy could not be saved.");
+  const makeTaskDefault = () => guarded(async () => {
     if (!draft) return;
     const enforce = false;
     await client?.upsertOrgTaskDefault(tenantId, {
@@ -262,11 +256,11 @@ export function AdminModelsScreen({
       },
     ];
     r.setData([models, next, auxiliaryDefaults, registeredProviders, accessRules, members, departments]);
-    setMessage("Set as the task default and recorded in the audit log.");
-  };
+    setMessage("Set as the default for new tasks and recorded in the audit log.");
+  }, "The default model could not be changed.");
   const saveNewTaskDefault = async () => {
     const selected = (models ?? []).find(
-      (item) => `${item.providerId}:${item.model}` === newTaskDefaultKey,
+      (item) => keyOf(item) === newTaskDefaultKey,
     );
     if (!selected) return;
     setSavingNewTaskDefault(true);
@@ -307,24 +301,39 @@ export function AdminModelsScreen({
       setSavingNewTaskDefault(false);
     }
   };
-  const makeVisionDefault = async () => {
-    if (!draft || draft.capabilities?.vision !== true) return;
+  const setVisionDefault = async (target: any) => {
+    if (!target || target.capabilities?.vision !== true) return;
     const saved = await client?.upsertOrgAuxiliaryModelDefault(tenantId, "vision", {
-      providerId: draft.providerId,
-      model: draft.model,
+      providerId: target.providerId,
+      model: target.model,
     });
     const next = [
       ...(auxiliaryDefaults ?? []).filter((item) => item.purpose !== "vision"),
       saved ?? {
         tenantId,
         purpose: "vision",
-        providerId: draft.providerId,
-        model: draft.model,
+        providerId: target.providerId,
+        model: target.model,
         updatedAt: new Date().toISOString(),
       },
     ];
     r.setData([models, defaults, next, registeredProviders, accessRules, members, departments]);
     setMessage("Set as the organization vision model and recorded in the audit log.");
+  };
+  const makeVisionDefault = () => guarded(() => setVisionDefault(draft), "The vision model could not be changed.");
+  const saveVisionDefault = async () => {
+    const selected = (models ?? []).find((item) => keyOf(item) === visionKey);
+    if (!selected) return;
+    setSavingVision(true);
+    setMessage("");
+    setNewTaskDefaultError("");
+    try {
+      await setVisionDefault(selected);
+    } catch (cause) {
+      setNewTaskDefaultError(cause instanceof Error && cause.message ? cause.message : "The vision model could not be saved.");
+    } finally {
+      setSavingVision(false);
+    }
   };
   const addModel = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -333,21 +342,29 @@ export function AdminModelsScreen({
       const value = String(form.get(name) ?? "");
       return value === "" ? undefined : Number(value);
     };
-    await client?.upsertOrgTaskModelPolicy(tenantId, {
-      providerId: String(form.get("providerId")),
-      model: String(form.get("model")),
-      displayName: String(form.get("displayName")) || null,
-      apiType: String(form.get("apiType")) as any,
-      status: "allowed",
-      enforce: false,
-      capabilities: {
-        cost: { input: number("inputPrice"), output: number("outputPrice"), cacheRead: number("cacheReadPrice"), cacheWrite: number("cacheWritePrice") },
-        context: { windowTokens: number("contextWindow"), maxOutputTokens: number("maxOutput") },
-      },
-    });
-    setAdding(false);
-    setMessage("Model added with its pricing and context metadata.");
-    r.retry();
+    setBusy(true);
+    setDialogError("");
+    try {
+      await client?.upsertOrgTaskModelPolicy(tenantId, {
+        providerId: String(form.get("providerId")),
+        model: String(form.get("model")),
+        displayName: String(form.get("displayName")) || null,
+        apiType: String(form.get("apiType")) as any,
+        status: "allowed",
+        enforce: false,
+        capabilities: {
+          cost: { input: number("inputPrice"), output: number("outputPrice"), cacheRead: number("cacheReadPrice"), cacheWrite: number("cacheWritePrice") },
+          context: { windowTokens: number("contextWindow"), maxOutputTokens: number("maxOutput") },
+        },
+      });
+      setAdding(false);
+      setMessage("Model added with its pricing and context limits.");
+      r.retry();
+    } catch (cause) {
+      setDialogError(cause instanceof Error && cause.message ? cause.message : "The model could not be added.");
+    } finally {
+      setBusy(false);
+    }
   };
   const addAccessRule = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -361,356 +378,366 @@ export function AdminModelsScreen({
       resourceId: String(form.get("resourceId")),
       effect: String(form.get("effect")) as "allowed" | "blocked",
     };
-    const saved = await client?.upsertOrgAiAccessRule(tenantId, input);
-    const nextRule = saved ?? {
-      id: crypto.randomUUID(),
-      tenantId,
-      ...input,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    const nextRules = [
-      nextRule,
-      ...(accessRules ?? []).filter((rule) =>
-        rule.scopeType !== input.scopeType
-        || rule.scopeId !== input.scopeId
-        || rule.resourceType !== input.resourceType
-        || rule.resourceId !== input.resourceId
-      ),
-    ];
-    r.setData([models, defaults, auxiliaryDefaults, registeredProviders, nextRules, members, departments]);
-    setAddingRule(false);
-    setMessage("Scoped model access saved and recorded in the audit log.");
+    setBusy(true);
+    setDialogError("");
+    try {
+      const saved = await client?.upsertOrgAiAccessRule(tenantId, input);
+      const nextRule = saved ?? {
+        id: crypto.randomUUID(),
+        tenantId,
+        ...input,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      const nextRules = [
+        nextRule,
+        ...(accessRules ?? []).filter((rule) =>
+          rule.scopeType !== input.scopeType
+          || rule.scopeId !== input.scopeId
+          || rule.resourceType !== input.resourceType
+          || rule.resourceId !== input.resourceId
+        ),
+      ];
+      r.setData([models, defaults, auxiliaryDefaults, registeredProviders, nextRules, members, departments]);
+      setAddingRule(false);
+      setMessage("Model access rule saved and recorded in the audit log.");
+    } catch (cause) {
+      setDialogError(cause instanceof Error && cause.message ? cause.message : "The access rule could not be saved.");
+    } finally {
+      setBusy(false);
+    }
   };
+  const modelRules = (accessRules ?? []).filter((rule) => rule.resourceType === "model");
+  const ruleTarget = (rule: any) => {
+    if (rule.scopeType === "org") return <CellStack primary="Everyone" secondary="Organization" />;
+    if (rule.scopeType === "department") {
+      const name = departmentNames.get(rule.scopeId);
+      return <CellStack primary={name ?? "Unknown department"} secondary={name ? "Department" : <span className="font-mono" title={rule.scopeId}>{shortId(rule.scopeId)}</span>} />;
+    }
+    const name = memberNames.get(rule.scopeId);
+    return <CellStack primary={name ?? "Unknown member"} secondary={name ? memberEmails.get(rule.scopeId) ?? "Member" : <span className="font-mono" title={rule.scopeId}>{shortId(rule.scopeId)}</span>} />;
+  };
+  const ruleTargets = ruleScope === "department" ? departments : members;
+  const draftDirty = Boolean(detail && draft) && policyFingerprint(draft) !== policyFingerprint(detail);
+  const capabilityFlags = draft?.capabilities
+    ? Object.entries(draft.capabilities).filter(([, v]) => v === true).map(([k]) => k)
+    : [];
+  const openAddRule = () => { setDialogError(""); setAddingRule(true); };
+
   return (
     <ManagementPage
       title="Models"
-      description="Choose the model new tasks start with, manage provider models, and control availability, pricing, and context limits."
+      description="Which models members can use, which one new tasks start with, and the prices Berry uses to report cost."
       eyebrow="AI & tools"
-      actions={canWrite ? <><Button variant="secondary" onClick={() => setAddingRule(true)}><ShieldCheck />Access rule</Button><Button onClick={() => setAdding(true)}><Plus />Add model</Button></> : null}
+      actions={canWrite ? <Button onClick={() => { setDialogError(""); setAdding(true); }}><Plus />Add model</Button> : null}
     >
-      <AsyncState loading={r.loading} error={r.error} onRetry={r.retry}>
-        <Section
-          title="Default model for new tasks"
-          description="Use this to route new tasks to a healthy model during an outage. The choice is snapshotted when a task is created, so existing tasks keep their current model."
-        >
-          <div className="grid items-end gap-3 rounded-lg border border-border bg-muted/20 p-3 sm:grid-cols-[minmax(0,1fr)_auto]">
-            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">
-              Organization default
-              <FormSelect
-                value={newTaskDefaultKey}
-                onChange={(value) => {
-                  setNewTaskDefaultKey(value);
-                  setNewTaskDefaultError("");
-                }}
-                options={newTaskModelOptions}
-                placeholder="Choose a model"
-                disabled={!canWrite || savingNewTaskDefault || newTaskModelOptions.length === 0}
-                ariaLabel="Default model for new tasks"
-              />
-            </label>
-            <Button
-              onClick={() => void saveNewTaskDefault()}
-              disabled={!canWrite || savingNewTaskDefault || !newTaskDefaultKey || newTaskDefaultKey === currentNewTaskDefaultKey}
-            >
-              <Save aria-hidden />
-              {savingNewTaskDefault ? "Saving…" : "Save default"}
-            </Button>
-          </div>
-          {newTaskDefaultError ? (
-            <p className="text-xs text-[var(--berry-danger)]" role="alert">
-              {newTaskDefaultError}
-            </p>
-          ) : null}
-        </Section>
-        <section
-          className="grid gap-3 sm:grid-cols-2"
-          aria-label="Model defaults"
-        >
-          <article data-status={currentNewTaskDefault ? "good" : "warning"}>
-            <span>Default for tasks</span>
-            <strong>{currentNewTaskDefault ? currentNewTaskDefault.model : "Not set"}</strong>
-            <small>
-              {currentNewTaskDefault
-                ? `${currentNewTaskDefault.providerId}${currentNewTaskDefault.enforce ? " · Enforced" : ""}`
-                : "Choose a model below"}
-            </small>
-          </article>
-          {(() => {
-            const visionDefault = (auxiliaryDefaults ?? []).find((item) => item.purpose === "vision");
-            return (
-              <article data-status={visionDefault ? "good" : "warning"}>
-                <span>Vision adapter</span>
-                <strong>{visionDefault ? modelNames.get(`${visionDefault.providerId}:${visionDefault.model}`) ?? visionDefault.model : "Not set"}</strong>
-                <small>{visionDefault ? `${visionDefault.providerId} · Used by text-only models` : "Choose a vision-capable model below"}</small>
-              </article>
-            );
-          })()}
-        </section>
-        <Toolbar>
-          <SearchInput
-            label="Search models"
-            value={query}
-            onChange={setQuery}
-            placeholder="Search models"
-          />
-          <FilterSelect
-            label="Provider"
-            value={provider}
-            onChange={setProvider}
-            options={[
-              { value: "all", label: "All providers" },
-              ...providers.map((p) => ({ value: String(p), label: String(p) })),
-            ]}
-          />
-          <FilterSelect
-            label="Status"
-            value={status}
-            onChange={setStatus}
-            options={[
-              { value: "all", label: "All status" },
-              { value: "allowed", label: "Allowed" },
-              { value: "blocked", label: "Blocked" },
-            ]}
-          />
-        </Toolbar>
+      <AsyncState loading={r.loading} error={r.error} onRetry={r.retry} skeleton={<AdminModelsSkeleton />}>
         {message ? <SuccessMessage>{message}</SuccessMessage> : null}
-        <div className={detail ? "min-w-0" : undefined}>
-          <AsyncState
-            loading={false}
-            error={null}
-            onRetry={r.retry}
-            empty={rows.length === 0}
-          >
-            <DataTable
-              label="Model catalog"
-              columns={["Model", "Provider", "Policy", "Default"]}
-              onRowSelect={setActive}
-              activeRow={active}
-              rowLabel={(i) => rows[i].model}
-              rows={rows.map((m) => [
-                <span className="grid min-w-0 gap-0.5 [&_b]:truncate [&_b]:text-sm [&_small]:text-xs [&_small]:text-muted-foreground">
-                  <b>{m.displayName || m.model}</b>
-                  <small>{m.model}</small>
-                </span>,
-                m.providerId,
-                <span className="flex flex-wrap gap-1.5">
-                  <StatusPill tone={m.status === "allowed" ? "good" : "danger"}>
-                    {humanize(m.status)}
-                  </StatusPill>
-                  {m.enforce ? (
-                    <StatusPill tone="info">Enforced</StatusPill>
-                  ) : null}
-                </span>,
-                isTaskDefault(m) ? (
-                  <Check
-                    aria-label="Default"
-                    className="size-4 text-[var(--berry-accent)]"
-                  />
-                ) : (
-                  "—"
-                ),
-              ])}
-            />
-          </AsyncState>
-          {detail && draft ? (
-            <DetailDrawer
-              title={draft.displayName || draft.model}
-              subtitle={draft.providerId}
-              badge={
-                <StatusPill
-                  tone={draft.status === "allowed" ? "good" : "danger"}
-                >
-                  {humanize(draft.status)}
-                </StatusPill>
-              }
-              onClose={() => setActive(null)}
-              footer={
-                canWrite ? (
-                  <>
-                    <Button variant="secondary" onClick={() => setActive(null)}>
-                      Cancel
-                    </Button>
-                    <Button onClick={save}>
-                      <Save aria-hidden />
-                      Save policy
-                    </Button>
-                  </>
-                ) : (
-                  <span className="text-xs text-muted-foreground">
-                    Read-only — models:write required to edit.
-                  </span>
-                )
+        {newTaskDefaultError ? <InlineNotice tone="danger">{newTaskDefaultError}</InlineNotice> : null}
+        <Section title="Defaults" flush>
+          <SettingList>
+            <SettingRow
+              title="Default model for new tasks"
+              description={
+                !canWrite
+                  ? "New tasks start with this model. Changing it needs the “Providers & models: manage” permission."
+                  : newTaskModelOptions.length === 0
+                    ? "No allowed model yet. Add a model below, then choose it here."
+                    : "New tasks start with this model; tasks already created keep theirs. Switch it to route new work away from a provider that is down."
               }
             >
-              <fieldset
-                className="grid gap-3 border-0 p-0"
-                disabled={!canWrite}
-              >
-                <legend>Policy</legend>
-                <div
-                  className="inline-flex flex-wrap gap-1 rounded-lg border border-border bg-muted/40 p-1"
-                  role="group"
-                  aria-label="Policy"
-                >
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="w-64 max-w-full">
+                  <FormSelect
+                    value={newTaskDefaultKey}
+                    onChange={(value) => {
+                      setNewTaskDefaultKey(value);
+                      setNewTaskDefaultError("");
+                    }}
+                    options={newTaskModelOptions}
+                    placeholder="Choose a model"
+                    disabled={!canWrite || savingNewTaskDefault || newTaskModelOptions.length === 0}
+                    ariaLabel="Default model for new tasks"
+                  />
+                </div>
+                {canWrite ? (
                   <Button
-                    variant="ghost"
-                    type="button"
-                    aria-selected={draft.status === "allowed"}
-                    onClick={() => setDraft({ ...draft, status: "allowed" })}
+                    variant="secondary"
+                    onClick={() => void saveNewTaskDefault()}
+                    disabled={savingNewTaskDefault || !newTaskDefaultKey || newTaskDefaultKey === currentNewTaskDefaultKey}
                   >
-                    Allowed
+                    <Save aria-hidden />
+                    {savingNewTaskDefault ? "Saving…" : "Save default"}
                   </Button>
-                  <Button
-                    variant="ghost"
-                    type="button"
-                    aria-selected={draft.status === "blocked"}
-                    onClick={() => setDraft({ ...draft, status: "blocked" })}
-                  >
-                    Blocked
+                ) : null}
+              </div>
+            </SettingRow>
+            <SettingRow
+              title="Vision model"
+              description={
+                visionModelOptions.length === 0
+                  ? "Describes images for models that cannot read them. No allowed model declares image input yet."
+                  : "Describes images for models that cannot read them. Only models that declare image input can be chosen."
+              }
+            >
+              <div className="flex flex-wrap items-center gap-2">
+                {!visionDefault && visionModelOptions.length === 0 ? <StatusPill tone="warning">Not set</StatusPill> : (
+                  <div className="w-64 max-w-full">
+                    <FormSelect
+                      value={visionKey}
+                      onChange={(value) => { setVisionKey(value); setNewTaskDefaultError(""); }}
+                      options={visionDefault && !visionModelOptions.some((option) => option.value === currentVisionKey)
+                        ? [{ value: currentVisionKey, label: `${modelNames.get(currentVisionKey) ?? visionDefault.model} · ${providerLabel(visionDefault.providerId)}` }, ...visionModelOptions]
+                        : visionModelOptions}
+                      placeholder="Not set"
+                      disabled={!canWrite || savingVision}
+                      ariaLabel="Vision model"
+                    />
+                  </div>
+                )}
+                {canWrite && visionModelOptions.length ? (
+                  <Button variant="secondary" onClick={() => void saveVisionDefault()} disabled={savingVision || !visionKey || visionKey === currentVisionKey}>
+                    <Save aria-hidden />
+                    {savingVision ? "Saving…" : "Save vision model"}
                   </Button>
-                </div>
-              </fieldset>
-              <label className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm">
-                <span>
-                  Enforce policy
-                  <small>Members cannot override this policy.</small>
-                </span>
-                <ManagementSwitch
-                  checked={Boolean(draft.enforce)}
-                  disabled={!canWrite}
-                  onCheckedChange={(checked) =>
-                    setDraft({ ...draft, enforce: checked })
-                  }
-                  aria-label="Enforce policy"
-                />
-              </label>
-              <fieldset className="grid gap-3 border-0 p-0" disabled={!canWrite}>
-                <legend>Pricing (USD per 1M tokens)</legend>
-                <div className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:text-muted-foreground">
-                  <label>Input<Input type="number" min="0" step="0.0001" value={draft.capabilities?.cost?.input ?? ""} onChange={(event) => setCost("input", event.currentTarget.value)} /></label>
-                  <label>Output<Input type="number" min="0" step="0.0001" value={draft.capabilities?.cost?.output ?? ""} onChange={(event) => setCost("output", event.currentTarget.value)} /></label>
-                  <label>Cache read<Input type="number" min="0" step="0.0001" value={draft.capabilities?.cost?.cacheRead ?? ""} onChange={(event) => setCost("cacheRead", event.currentTarget.value)} /></label>
-                  <label>Cache write<Input type="number" min="0" step="0.0001" value={draft.capabilities?.cost?.cacheWrite ?? ""} onChange={(event) => setCost("cacheWrite", event.currentTarget.value)} /></label>
-                </div>
-              </fieldset>
-              <fieldset className="grid gap-3 border-0 p-0" disabled={!canWrite}>
-                <legend>Context limits</legend>
-                <div className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:text-muted-foreground">
-                  <label>Context window<Input type="number" min="1" step="1" value={draft.capabilities?.context?.windowTokens ?? ""} onChange={(event) => setContext("windowTokens", event.currentTarget.value)} /></label>
-                  <label>Maximum output<Input type="number" min="1" step="1" value={draft.capabilities?.context?.maxOutputTokens ?? ""} onChange={(event) => setContext("maxOutputTokens", event.currentTarget.value)} /></label>
-                </div>
-              </fieldset>
-              {draft.capabilities && Object.keys(draft.capabilities).length ? (
-                <>
-                  <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                    Capabilities
-                  </h3>
-                  <div className="flex flex-wrap gap-1.5">
-                    {Object.entries(draft.capabilities)
-                      .filter(([, v]) => v === true)
-                      .map(([k]) => (
-                        <StatusPill key={k} tone="neutral">
-                          {humanize(k)}
-                        </StatusPill>
-                      ))}
-                  </div>
-                </>
-              ) : null}
-              {canWrite ? (
-                <>
-                  <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                    Make default
-                  </h3>
-                  <div className="flex flex-wrap gap-2">
-                    <Button
-                      variant="secondary"
-                      onClick={() => void makeTaskDefault()}
-                      disabled={isTaskDefault(draft)}
-                    >
-                      Set as task default
-                    </Button>
-                    <Button
-                      variant="secondary"
-                      onClick={makeVisionDefault}
-                      disabled={draft.capabilities?.vision !== true
-                        || (auxiliaryDefaults ?? []).some((item) => item.purpose === "vision" && item.providerId === draft.providerId && item.model === draft.model)}
-                    >
-                      Set as vision model
-                    </Button>
-                  </div>
-                  {draft.capabilities?.vision !== true ? (
-                    <p className="text-xs text-muted-foreground">
-                      Vision defaults must explicitly declare image-input support.
-                    </p>
-                  ) : null}
-                </>
-              ) : null}
-            </DetailDrawer>
-          ) : null}
-        </div>
-        <Section
-          title="Scoped model access"
-          description="Organization blocks are absolute. A member exception can override their primary department default only when the organization policy permits the model."
-        >
+                ) : null}
+              </div>
+            </SettingRow>
+            {otherDefaults.map((item) => (
+              <SettingRow key={`mode:${item.mode}`} title={`Default for ${sentence(String(item.mode)).toLowerCase()} mode`} description={providerLabel(item.providerId)}>
+                <span className="text-md text-foreground">{modelNames.get(keyOf(item)) ?? item.model}</span>
+              </SettingRow>
+            ))}
+            {otherAuxiliaryDefaults.map((item) => (
+              <SettingRow key={`aux:${item.purpose}`} title={`${sentence(String(item.purpose))} model`} description={providerLabel(item.providerId)}>
+                <span className="text-md text-foreground">{modelNames.get(keyOf(item)) ?? item.model}</span>
+              </SettingRow>
+            ))}
+          </SettingList>
+        </Section>
+
+        {rows.length === 0 ? (
+          <EmptyPanel
+            title="No models yet"
+            description={providers.length ? "Add the models your providers serve so members can choose them." : "Add a provider under Providers first, then add its models here."}
+            action={canWrite && providers.length ? <Button onClick={() => { setDialogError(""); setAdding(true); }}><Plus />Add model</Button> : undefined}
+          />
+        ) : (
           <DataTable
-            label="Scoped model access rules"
-            columns={["Model", "Scope", "Target", "Effect", "Updated"]}
-            rows={(accessRules ?? []).filter((rule) => rule.resourceType === "model").map((rule) => [
-              <span className="grid min-w-0 gap-0.5 [&_b]:truncate [&_small]:text-xs [&_small]:text-muted-foreground"><b>{modelNames.get(rule.resourceId) ?? rule.resourceId}</b><small>{rule.resourceId}</small></span>,
-              humanize(rule.scopeType),
-              rule.scopeType === "org"
-                ? "Entire organization"
-                : rule.scopeType === "department"
-                  ? departmentNames.get(rule.scopeId) ?? rule.scopeId
-                  : memberNames.get(rule.scopeId) ?? rule.scopeId,
-              <StatusPill tone={rule.effect === "allowed" ? "good" : "danger"}>{humanize(rule.effect)}</StatusPill>,
-              formatDate(rule.updatedAt),
+            label="Models"
+            columns={["Model", "Provider", "Policy", "Default", "Context", "Input / 1M", "Output / 1M"]}
+            onRowSelect={(index) => { setActionError(""); setActiveKey(rows[index] ? keyOf(rows[index]) : null); }}
+            activeRow={activeIndex >= 0 ? activeIndex : null}
+            rowLabel={(i) => rows[i].displayName || rows[i].model}
+            rows={rows.map((m) => [
+              <CellStack primary={m.displayName || m.model} secondary={m.displayName ? <span className="font-mono">{m.model}</span> : undefined} />,
+              <StatusPill tone="neutral">{providerLabel(m.providerId)}</StatusPill>,
+              <span className="flex flex-wrap gap-1.5">
+                <StatusPill tone={m.status === "allowed" ? "good" : "danger"}>
+                  {sentence(m.status)}
+                </StatusPill>
+                {m.enforce ? (
+                  <StatusPill tone="info">Enforced</StatusPill>
+                ) : null}
+              </span>,
+              isTaskDefault(m) || isVisionDefault(m) ? (
+                <span className="flex flex-wrap gap-1.5">
+                  {isTaskDefault(m) ? <StatusPill tone="info">New tasks</StatusPill> : null}
+                  {isVisionDefault(m) ? <StatusPill tone="info">Vision</StatusPill> : null}
+                </span>
+              ) : (
+                <span className="text-muted-foreground">—</span>
+              ),
+              typeof m.capabilities?.context?.windowTokens === "number"
+                ? <Num value={m.capabilities.context.windowTokens} kind="compact" />
+                : <span data-sort={-1} className="text-muted-foreground">—</span>,
+              <PriceCell value={m.capabilities?.cost?.input} />,
+              <PriceCell value={m.capabilities?.cost?.output} />,
             ])}
           />
+        )}
+
+        <Section
+          flush
+          title="Access rules"
+          description="Narrow or widen a model for one department or member. An organization-wide block always wins; a member rule overrides their primary department’s rule."
+          actions={canWrite && rows.length ? <Button variant="secondary" onClick={openAddRule}><ShieldCheck />Add access rule</Button> : null}
+        >
+          {modelRules.length === 0 ? (
+            <p className="px-4 py-6 text-center text-md text-muted-foreground">No rules. Every member can use every allowed model.</p>
+          ) : (
+            <DataTable
+              label="Model access rules"
+              columns={["Model", "Applies to", "Effect", "Updated"]}
+              rows={modelRules.map((rule) => [
+                <CellStack primary={modelNames.get(rule.resourceId) ?? rule.resourceId} secondary={modelNames.has(rule.resourceId) ? <span className="font-mono">{rule.resourceId}</span> : "No longer in the catalog"} />,
+                ruleTarget(rule),
+                <StatusPill tone={rule.effect === "allowed" ? "good" : "danger"}>{sentence(rule.effect)}</StatusPill>,
+                formatDate(rule.updatedAt),
+              ])}
+            />
+          )}
         </Section>
       </AsyncState>
+
+      {detail && draft ? (
+        <DetailDrawer
+          title={draft.displayName || draft.model}
+          subtitle={<>{providerLabel(draft.providerId)} · <code>{draft.model}</code></>}
+          badge={
+            <StatusPill tone={draft.status === "allowed" ? "good" : "danger"}>
+              {sentence(draft.status)}
+            </StatusPill>
+          }
+          onClose={() => setActiveKey(null)}
+          footer={
+            canWrite ? (
+              <>
+                <Button variant="secondary" onClick={() => setActiveKey(null)} disabled={busy}>
+                  Cancel
+                </Button>
+                <Button onClick={() => void save()} disabled={!draftDirty || busy}>
+                  <Save aria-hidden />
+                  Save policy
+                </Button>
+              </>
+            ) : undefined
+          }
+        >
+          {!canWrite ? <InlineNotice tone="info">You can view this model. Editing it needs the “Providers &amp; models: manage” permission.</InlineNotice> : null}
+          {actionError ? <InlineNotice tone="danger">{actionError}</InlineNotice> : null}
+          <div className="grid gap-2">
+            <h3 className={drawerHeading}>Availability</h3>
+            {canWrite ? (
+              <SegmentedControl
+                label="Availability"
+                value={draft.status === "blocked" ? "blocked" : "allowed"}
+                onChange={(status) => setDraft({ ...draft, status })}
+                options={[{ value: "allowed", label: "Allowed" }, { value: "blocked", label: "Blocked" }]}
+              />
+            ) : null}
+            <p className="text-xs leading-5 text-muted-foreground">
+              {draft.status === "blocked" ? "Nobody in the organization can select this model." : "Members can select this model unless an access rule blocks it for them."}
+            </p>
+          </div>
+          <div className="flex items-center justify-between gap-4">
+            <span className="grid gap-0.5">
+              <b className="text-md font-medium text-foreground">Enforce policy</b>
+              <small className="text-xs leading-5 text-muted-foreground">Members cannot override this policy.</small>
+            </span>
+            <ManagementSwitch
+              checked={Boolean(draft.enforce)}
+              disabled={!canWrite}
+              onCheckedChange={(checked) =>
+                setDraft({ ...draft, enforce: checked })
+              }
+              aria-label="Enforce policy"
+            />
+          </div>
+          <fieldset className="grid gap-2 border-0 p-0" disabled={!canWrite}>
+            <legend className={`${drawerHeading} mb-2`}>Price, USD per 1M tokens</legend>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className={fieldLabel}>Input<Input type="number" min="0" step="0.0001" value={draft.capabilities?.cost?.input ?? ""} onChange={(event) => setCost("input", event.currentTarget.value)} /></label>
+              <label className={fieldLabel}>Output<Input type="number" min="0" step="0.0001" value={draft.capabilities?.cost?.output ?? ""} onChange={(event) => setCost("output", event.currentTarget.value)} /></label>
+              <label className={fieldLabel}>Cache read<Input type="number" min="0" step="0.0001" value={draft.capabilities?.cost?.cacheRead ?? ""} onChange={(event) => setCost("cacheRead", event.currentTarget.value)} /></label>
+              <label className={fieldLabel}>Cache write<Input type="number" min="0" step="0.0001" value={draft.capabilities?.cost?.cacheWrite ?? ""} onChange={(event) => setCost("cacheWrite", event.currentTarget.value)} /></label>
+            </div>
+            <p className="text-xs leading-5 text-muted-foreground">Used for cost estimates and usage reports.</p>
+          </fieldset>
+          <fieldset className="grid gap-2 border-0 p-0" disabled={!canWrite}>
+            <legend className={`${drawerHeading} mb-2`}>Context limits, tokens</legend>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className={fieldLabel}>Context window<Input type="number" min="1" step="1" value={draft.capabilities?.context?.windowTokens ?? ""} onChange={(event) => setContext("windowTokens", event.currentTarget.value)} /></label>
+              <label className={fieldLabel}>Maximum output<Input type="number" min="1" step="1" value={draft.capabilities?.context?.maxOutputTokens ?? ""} onChange={(event) => setContext("maxOutputTokens", event.currentTarget.value)} /></label>
+            </div>
+          </fieldset>
+          {capabilityFlags.length ? (
+            <div className="grid gap-2">
+              <h3 className={drawerHeading}>Capabilities</h3>
+              <div className="flex flex-wrap gap-1.5">
+                {capabilityFlags.map((k) => (
+                  <StatusPill key={k} tone="neutral">
+                    {sentence(k)}
+                  </StatusPill>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {canWrite ? (
+            <div className="grid gap-2">
+              <h3 className={drawerHeading}>Use as a default</h3>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  variant="secondary"
+                  onClick={() => void makeTaskDefault()}
+                  disabled={busy || isTaskDefault(draft)}
+                >
+                  {isTaskDefault(draft) ? "Default for new tasks" : "Set as default for new tasks"}
+                </Button>
+                <Button
+                  variant="secondary"
+                  onClick={() => void makeVisionDefault()}
+                  disabled={busy || draft.capabilities?.vision !== true || isVisionDefault(draft)}
+                >
+                  {isVisionDefault(draft) ? "Vision model" : "Set as vision model"}
+                </Button>
+              </div>
+              {draft.capabilities?.vision !== true ? (
+                <p className="text-xs text-muted-foreground">
+                  This model does not declare image input, so it cannot be the vision model.
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+        </DetailDrawer>
+      ) : null}
+
       <ManagementDialog
         open={adding}
-        onOpenChange={setAdding}
+        onOpenChange={(next) => { if (!busy) setAdding(next); }}
         title="Add model"
-        description="Register a model identifier and the pricing Berry will use for cost estimates and usage reporting."
+        description="Register a model a provider serves, with the prices Berry uses for cost estimates and usage reports."
         size="lg"
-        footer={<><Button type="button" variant="secondary" onClick={() => setAdding(false)}>Cancel</Button><Button type="submit" form="add-model-form"><Save />Add model</Button></>}
+        footer={<><Button type="button" variant="secondary" onClick={() => setAdding(false)} disabled={busy}>Cancel</Button><Button type="submit" form="add-model-form" disabled={busy || providers.length === 0}><Save />{busy ? "Adding…" : "Add model"}</Button></>}
       >
-        <form id="add-model-form" className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground" onSubmit={addModel}>
-          <label>Provider<FormSelect name="providerId" options={providers.map((item) => ({ value: String(item), label: String(item) }))} required /></label>
-          <label>Model ID<Input name="model" placeholder="gpt-5.4" autoFocus required /></label>
-          <label>Display name<Input name="displayName" placeholder="GPT-5.4" /></label>
-          <label>API protocol<FormSelect name="apiType" defaultValue="openai-chat-completions" options={[{ value: "openai-chat-completions", label: "OpenAI chat completions" }, { value: "openai-responses", label: "OpenAI responses" }, { value: "anthropic-messages", label: "Anthropic messages" }]} /></label>
-          <label>Input price / 1M tokens<Input name="inputPrice" type="number" min="0" step="0.0001" /></label>
-          <label>Output price / 1M tokens<Input name="outputPrice" type="number" min="0" step="0.0001" /></label>
-          <label>Cache-read price / 1M<Input name="cacheReadPrice" type="number" min="0" step="0.0001" /></label>
-          <label>Cache-write price / 1M<Input name="cacheWritePrice" type="number" min="0" step="0.0001" /></label>
-          <label>Context window<Input name="contextWindow" type="number" min="1" step="1" /></label>
-          <label>Maximum output<Input name="maxOutput" type="number" min="1" step="1" /></label>
+        {providers.length === 0 ? <div className="mb-3"><InlineNotice tone="warning">Add a provider under Providers before adding models.</InlineNotice></div> : null}
+        <form id="add-model-form" className="grid gap-3 sm:grid-cols-2" onSubmit={addModel}>
+          <label className={fieldLabel}>Provider<FormSelect name="providerId" options={providers.map((item) => ({ value: String(item), label: providerLabel(String(item)) }))} required /></label>
+          <label className={fieldLabel}>Model ID<Input name="model" placeholder="gpt-5.4" autoFocus required /><small className={help}>Exactly as the provider names it.</small></label>
+          <label className={fieldLabel}>Display name<Input name="displayName" placeholder="GPT-5.4" /><small className={help}>Optional. Shown to members in the model picker.</small></label>
+          <label className={fieldLabel}>API protocol<FormSelect name="apiType" defaultValue="openai-chat-completions" options={API_OPTIONS} /></label>
+          <label className={fieldLabel}>Input price, USD per 1M tokens<Input name="inputPrice" type="number" min="0" step="0.0001" /></label>
+          <label className={fieldLabel}>Output price, USD per 1M tokens<Input name="outputPrice" type="number" min="0" step="0.0001" /></label>
+          <label className={fieldLabel}>Cache-read price, USD per 1M tokens<Input name="cacheReadPrice" type="number" min="0" step="0.0001" /></label>
+          <label className={fieldLabel}>Cache-write price, USD per 1M tokens<Input name="cacheWritePrice" type="number" min="0" step="0.0001" /></label>
+          <label className={fieldLabel}>Context window, tokens<Input name="contextWindow" type="number" min="1" step="1" /></label>
+          <label className={fieldLabel}>Maximum output, tokens<Input name="maxOutput" type="number" min="1" step="1" /></label>
         </form>
+        {dialogError ? <div className="mt-3"><InlineNotice tone="danger">{dialogError}</InlineNotice></div> : null}
       </ManagementDialog>
       <ManagementDialog
         open={addingRule}
-        onOpenChange={setAddingRule}
+        onOpenChange={(next) => { if (!busy) setAddingRule(next); }}
         title="Add model access rule"
-        description="Set the normal department policy or a specific member exception. Organization blocks remain the final ceiling."
-        footer={<><Button type="button" variant="secondary" onClick={() => setAddingRule(false)}>Cancel</Button><Button type="submit" form="add-model-access-rule-form"><Save />Save rule</Button></>}
+        description="Allow or block one model for the whole organization, a department, or a single member. A rule for the same model and target replaces the existing one."
+        footer={<><Button type="button" variant="secondary" onClick={() => setAddingRule(false)} disabled={busy}>Cancel</Button><Button type="submit" form="add-model-access-rule-form" disabled={busy}><Save />{busy ? "Saving…" : "Save rule"}</Button></>}
       >
-        <form id="add-model-access-rule-form" className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground" onSubmit={addAccessRule}>
-          <label className="sm:col-span-2">Model<FormSelect name="resourceId" options={(models ?? []).map((item) => ({ value: `${item.providerId}:${item.model}`, label: `${item.displayName || item.model} · ${item.providerId}` }))} required /></label>
-          <label>Scope<FormSelect name="scopeType" value={ruleScope} onChange={(value) => setRuleScope(value as typeof ruleScope)} options={[{ value: "department", label: "Department default" }, { value: "user", label: "Member exception" }, { value: "org", label: "Organization ceiling" }]} /></label>
+        <form id="add-model-access-rule-form" className="grid gap-3 sm:grid-cols-2" onSubmit={addAccessRule}>
+          <label className={`${fieldLabel} sm:col-span-2`}>Model<FormSelect name="resourceId" options={(models ?? []).map(modelOption)} required /></label>
+          <label className={fieldLabel}>Applies to<FormSelect name="scopeType" value={ruleScope} onChange={(value) => setRuleScope(value as typeof ruleScope)} options={[{ value: "department", label: SCOPE_LABEL.department! }, { value: "user", label: SCOPE_LABEL.user! }, { value: "org", label: "Whole organization" }]} /></label>
           {ruleScope === "org" ? (
-            <label>Target<Input value="Entire organization" disabled /></label>
+            <label className={fieldLabel}>Target<Input value="Everyone" disabled /></label>
           ) : (
-            <label>Target<FormSelect name="scopeId" options={(ruleScope === "department" ? departments : members).map((item) => ({ value: String(ruleScope === "department" ? item.id : item.userId), label: ruleScope === "department" ? String(item.name) : `${item.name || item.email} · ${item.email}` }))} required /></label>
+            <label className={fieldLabel}>
+              {SCOPE_LABEL[ruleScope]}
+              <FormSelect name="scopeId" disabled={ruleTargets.length === 0} options={ruleTargets.map((item) => ({ value: String(ruleScope === "department" ? item.id : item.userId), label: ruleScope === "department" ? String(item.name) : item.name ? `${item.name} · ${item.email}` : String(item.email) }))} required />
+              {ruleTargets.length === 0 ? <small className={help}>{ruleScope === "department" ? "No departments are available, or you cannot view departments." : "No members are available, or you cannot view members."}</small> : null}
+            </label>
           )}
-          <label className="sm:col-span-2">Policy<FormSelect name="effect" defaultValue="blocked" options={[{ value: "allowed", label: "Allow" }, { value: "blocked", label: "Block" }]} /></label>
+          <label className={`${fieldLabel} sm:col-span-2`}>Effect<FormSelect name="effect" defaultValue="blocked" options={[{ value: "allowed", label: "Allow" }, { value: "blocked", label: "Block" }]} /></label>
         </form>
+        {dialogError ? <div className="mt-3"><InlineNotice tone="danger">{dialogError}</InlineNotice></div> : null}
       </ManagementDialog>
     </ManagementPage>
   );
 }
-
-/* ------------------------------------------------------------- skills & mcp */

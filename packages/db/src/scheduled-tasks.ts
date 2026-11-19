@@ -25,7 +25,7 @@ type ScheduleRow = {
 type RunRow = {
   id: string; schedule_id: string; scheduled_at: Date | string; trigger: ScheduledTaskRun["trigger"];
   state: ScheduledTaskRun["state"]; task_id: string | null; session_id: string | null; turn_id: string | null;
-  turn_state: string | null; error: string | null; created_at: Date | string; finished_at: Date | string | null;
+  waiting_reason?: string | null; turn_state: string | null; error: string | null; created_at: Date | string; finished_at: Date | string | null;
 };
 const TERMINAL_STATES = "'completed','failed','cancelled','recovery_required'";
 
@@ -153,7 +153,7 @@ export class SqlScheduledTaskRepository {
   async history(scope: ScheduledTaskScope, id: string, limit = 30): Promise<ScheduledTaskRun[]> {
     return this.scoped(scope.tenantId, async (sql) => {
       await this.owned(sql, scope, id);
-      return (await sql.query<RunRow>(`SELECT r.*,t.state AS turn_state,
+      return (await sql.query<RunRow>(`SELECT r.*,t.state AS turn_state,t.waiting_reason,
         COALESCE(r.finished_at,t.completed_at) AS finished_at
         FROM scheduled_task_runs r LEFT JOIN turn_runs t ON t.tenant_id=r.tenant_id AND t.id=r.turn_id
         WHERE r.tenant_id=$1::uuid AND r.schedule_id=$2::uuid ORDER BY r.created_at DESC,r.id DESC LIMIT $3`, [scope.tenantId, id, Math.min(Math.max(limit, 1), 100)])).map(runFromRow);
@@ -300,6 +300,6 @@ function scheduleFromRow(row: ScheduleRow): ScheduledTask {
 }
 function runFromRow(row: RunRow): ScheduledTaskRun {
   return ScheduledTaskRunSchema.parse({ id: row.id, scheduleId: row.schedule_id, scheduledAt: iso(row.scheduled_at), trigger: row.trigger, state: row.state,
-    taskId: row.task_id, sessionId: row.session_id, turnId: row.turn_id, turnState: row.turn_state ?? null, error: row.error,
+    taskId: row.task_id, sessionId: row.session_id, turnId: row.turn_id, turnState: row.turn_state ?? null, waitingReason: row.waiting_reason ?? null, error: row.error,
     createdAt: iso(row.created_at), finishedAt: nullableIso(row.finished_at) });
 }

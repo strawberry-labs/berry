@@ -129,6 +129,25 @@ describe("streaming surface render isolation", () => {
     vi.useRealTimers();
   });
 
+  it("formats an updating response before it settles and flushes the final text", () => {
+    vi.useFakeTimers();
+    ensureFakeBrowserGlobals();
+    let renderer: ReactTestRenderer;
+    act(() => { renderer = create(<Markdown streaming>{""}</Markdown>); });
+    const source = "## Live heading\n\nA **formatted** answer.\n\n- First item\n- Second item\n\n```ts\nconst total = 42;";
+    act(() => { renderer!.update(<Markdown streaming>{source}</Markdown>); });
+    for (let index = 0; index < 40; index += 1) act(() => { vi.advanceTimersByTime(80); });
+    expect(renderer!.root.findAllByType("h2")).toHaveLength(1);
+    expect(renderer!.root.findAllByType("strong")[0]!.children).toEqual(["formatted"]);
+    expect(renderer!.root.findAllByType("li")).toHaveLength(2);
+    expect(renderer!.root.findAllByType("pre")[0]!.props["data-streaming"]).toBe(true);
+    expect(renderer!.root.findAllByProps({ "data-markdown-live": "true" })).toHaveLength(1);
+    act(() => { renderer!.update(<Markdown>{source + "\n```\n\nFinal words."}</Markdown>); });
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Final words.");
+    expect(renderer!.root.findAllByProps({ "data-markdown-live": "true" })).toHaveLength(0);
+    act(() => { renderer!.unmount(); vi.runAllTimers(); });
+  });
+
   it("rerenders only the subscribed task for a coalesced token burst", () => {
     vi.useFakeTimers();
     const previousWindow = (globalThis as typeof globalThis & { window?: unknown }).window;

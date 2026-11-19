@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import json
 import tempfile
 import zipfile
 from io import BytesIO
@@ -13,13 +14,13 @@ from pathlib import Path
 from PIL import Image
 
 from extract_pdf_content import infer_profile_photo
-from extract_pdf_with_llm import mechanical_pdf_payload
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--candidates-dir", type=Path, help="Save eligible images for one visual selection pass")
     return parser.parse_args()
 
 
@@ -80,6 +81,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="cv-creator-photo-") as temporary:
         temporary_path = Path(temporary)
         if suffix == ".pdf":
+            from extract_pdf_with_llm import mechanical_pdf_payload
+
             source, _prompt_pages = mechanical_pdf_payload(
                 args.input,
                 image_output_dir=temporary_path,
@@ -88,6 +91,17 @@ def main() -> int:
             pages = source["pages"]
         else:
             pages = docx_image_pages(args.input, temporary_path)
+        if args.candidates_dir:
+            args.candidates_dir.mkdir(parents=True, exist_ok=True)
+            candidates = []
+            for page in pages:
+                for item in page.get("images", []):
+                    if min(item.get("width", 0), item.get("height", 0)) < 240 or not item.get("base64"):
+                        continue
+                    path = args.candidates_dir / f"candidate-{len(candidates) + 1}.jpg"
+                    width, height = write_jpeg(item["base64"], path)
+                    candidates.append({"path": str(path), "source": item.get("name"), "width": width, "height": height})
+            print(json.dumps({"candidates": candidates}))
         photo = infer_profile_photo(pages)
     encoded = (photo or {}).get("base64")
     if not encoded:
@@ -98,7 +112,7 @@ def main() -> int:
     width, height = write_jpeg(encoded, args.output)
     print(
         f"Wrote {args.output} "
-        f"({width}x{height}, image/jpeg)"
+        f"({width}x{height}, image/jpeg; heuristic selection, verify headshot)"
     )
     return 0
 

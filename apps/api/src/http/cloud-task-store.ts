@@ -32,6 +32,7 @@ import {
 import { SELF_HOST_TENANT_ID, SELF_HOST_WORKSPACE_ID } from "@berry/db";
 import { CloudDatabaseService, type SqlExecutor } from "../db/cloud-database.service.ts";
 import { garbageCollectFileIfUnreferenced } from "../files/file-lifecycle.ts";
+import { modelTimingFromDiagnostics } from "./model-timing.ts";
 
 export const CLOUD_TASK_STORE = Symbol("CLOUD_TASK_STORE");
 
@@ -1365,35 +1366,7 @@ WHERE tenant_id = $1::uuid AND id = $2::uuid
   }
 
   private async messageFromRow(executor: SqlExecutor, row: MessageRow): Promise<Message> {
-    const parts = await executor.query<MessagePartRow>(
-      `
-SELECT id, message_id, type, content, ordinal, created_at
-FROM message_parts
-WHERE tenant_id = $1::uuid AND message_id = $2::uuid
-ORDER BY ordinal ASC
-      `.trim(),
-      [this.tenantId, row.id],
-    );
-    return MessageSchema.parse({
-      id: row.id,
-      sessionId: row.session_id,
-      role: row.role,
-      status: row.status,
-      ...(row.model ? { model: row.model } : {}),
-      parts: parts.map((part) => ({
-        id: part.id,
-        messageId: part.message_id,
-        kind: part.type,
-        content: part.content as JsonValue,
-        position: part.ordinal,
-        createdAt: iso(part.created_at),
-      })),
-      inputTokens: row.input_tokens,
-      outputTokens: row.output_tokens,
-      generationMs: row.generation_ms,
-      createdAt: iso(row.created_at),
-      updatedAt: iso(row.updated_at),
-    });
+    return (await this.messagesFromRows(executor, [row]))[0]!;
   }
 
   private async messagesFromRows(executor: SqlExecutor, rows: readonly MessageRow[]): Promise<Message[]> {
@@ -1414,7 +1387,26 @@ ORDER BY message_id ASC, ordinal ASC
       messageParts.push(part);
       partsByMessage.set(part.message_id, messageParts);
     }
-    return rows.map((row) => messageFromRowParts(row, partsByMessage.get(row.id) ?? []));
+    const assistantIds = rows.filter((row) => row.role === "assistant").map((row) => row.id);
+    const timingByMessage = new Map<string, Message["modelTiming"]>();
+    if (assistantIds.length > 0) {
+      const timings = await executor.query<{ message_id: string; diagnostics: unknown }>(
+        `SELECT s.session_entry_id AS message_id, s.output->'providerDiagnostics' AS diagnostics
+FROM turn_runs r
+JOIN turn_steps s ON s.tenant_id = r.tenant_id AND s.run_id = r.id
+WHERE r.tenant_id = $1::uuid AND r.session_id = ANY($2::uuid[])
+  AND s.session_entry_id = ANY($3::text[])
+  AND s.step_type = 'model.call' AND s.state = 'completed'
+ORDER BY s.completed_at DESC, s.sequence DESC`,
+        [this.tenantId, [...new Set(rows.map((row) => row.session_id))], assistantIds],
+      );
+      for (const timing of timings) {
+        if (!timingByMessage.has(timing.message_id)) {
+          timingByMessage.set(timing.message_id, modelTimingFromDiagnostics(timing.diagnostics));
+        }
+      }
+    }
+    return rows.map((row) => messageFromRowParts(row, partsByMessage.get(row.id) ?? [], timingByMessage.get(row.id)));
   }
 }
 
@@ -1542,7 +1534,7 @@ interface MessagePartRow {
   created_at: Date | string;
 }
 
-function messageFromRowParts(row: MessageRow, parts: MessagePartRow[]): Message {
+function messageFromRowParts(row: MessageRow, parts: MessagePartRow[], modelTiming?: Message["modelTiming"]): Message {
   return MessageSchema.parse({
     id: row.id,
     sessionId: row.session_id,
@@ -1560,6 +1552,7 @@ function messageFromRowParts(row: MessageRow, parts: MessagePartRow[]): Message 
     inputTokens: row.input_tokens,
     outputTokens: row.output_tokens,
     generationMs: row.generation_ms,
+    ...(modelTiming ? { modelTiming } : {}),
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
   });

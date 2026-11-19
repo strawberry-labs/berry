@@ -12,6 +12,7 @@ import {
   SESSION_CHECKPOINT_MAX_ITEMS,
   sessionCheckpointMetrics,
   validateSessionCheckpoint,
+  estimateContextValueTokens,
   type ProviderAttemptReport,
   type ProviderAttemptRetryLayer,
   type CheckpointDeterministicFields,
@@ -24,6 +25,9 @@ import {
   OpenAIChatCompletionsClient,
   PROVIDER_ATTEMPT_ID_HEADER,
   type ChatCompletionUsage,
+  type ChatCompletionOptions,
+  type ChatMessage,
+  type ChatToolDefinition,
 } from "@berry/router-client";
 import type { CompactionJobPayload } from "./jobs.js";
 import type { SqlExecutor } from "./sql-repositories.js";
@@ -113,7 +117,22 @@ export interface CompactionJobResult {
 }
 
 export interface SessionCompactionRunner {
-  compactSession(input: CompactionJobPayload): Promise<CompactionJobResult>;
+  compactSession(input: CompactionJobPayload, context?: CompactionRequestContext): Promise<CompactionJobResult>;
+}
+
+export interface CacheableCheckpointRequest {
+  messages: ChatMessage[];
+  tools: readonly ChatToolDefinition[];
+  reasoningEffort?: ChatCompletionOptions["reasoningEffort"];
+}
+
+/** In-process only: credentials and original prompts never enter a queue payload. */
+export interface CompactionRequestContext {
+  provider: string;
+  model: string;
+  sourceLeafId: string | null;
+  coveredEntryId: string | null;
+  prefixFor(coveredEntryEnd: string): CacheableCheckpointRequest;
 }
 
 export interface CompactionEntryRecord {
@@ -148,7 +167,7 @@ export interface SessionCompactionRepository {
   heartbeat?(input: CompactionJobPayload, leaseOwner: string, leaseSeconds: number): Promise<boolean>;
   load(
     input: CompactionJobPayload,
-    selection: { provider: string; model: string; algorithmVersion: string },
+    selection: CheckpointModelSelection & { algorithmVersion: string; followSessionModel?: boolean },
   ): Promise<CompactionSessionState>;
   persist(input: {
     state: CompactionSessionState;
@@ -183,9 +202,15 @@ export interface GeneratedCheckpoint {
   usage?: CompactionUsage | undefined;
 }
 
+export interface CheckpointModelSelection {
+  provider: string;
+  model: string;
+}
+
 export interface CheckpointGenerator {
   readonly provider: string;
   readonly model: string;
+  readonly contextWindowTokens?: number;
   generate(input: {
     conversation: string;
     deterministic: CheckpointDeterministicFields;
@@ -196,6 +221,7 @@ export interface CheckpointGenerator {
     maxPhysicalAttempts?: number;
     onProviderAttempt?: (report: ProviderAttemptReport) => void;
     signal?: AbortSignal;
+    request?: CacheableCheckpointRequest;
   }): Promise<GeneratedCheckpoint>;
 }
 
@@ -206,6 +232,7 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
     private readonly options: {
       leaseOwner?: string;
       leaseSeconds?: number;
+      generatorForModel?: (selection: CheckpointModelSelection) => CheckpointGenerator | null;
       fallbackProvider?: string;
       fallbackModel?: string;
       maxInputCharacters?: number;
@@ -216,15 +243,16 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
     } = {},
   ) {}
 
-  async compactSession(input: CompactionJobPayload): Promise<CompactionJobResult> {
+  async compactSession(input: CompactionJobPayload, context?: CompactionRequestContext): Promise<CompactionJobResult> {
     const leaseOwner = `${this.options.leaseOwner ?? `compactor:${process.pid}`}:${randomUUID()}`;
     const leaseSeconds = this.options.leaseSeconds ?? 120;
     const claimed = await this.repository.claim(input, leaseOwner, leaseSeconds);
     if (!claimed) throw new CompactionRetryableError("already_running");
 
     try {
-      const provider = this.generator?.provider ?? this.options.fallbackProvider ?? "deterministic";
-      const model = this.generator?.model ?? this.options.fallbackModel ?? "checkpoint-v2";
+      let generator = this.generator;
+      let provider = generator?.provider ?? this.options.fallbackProvider ?? "deterministic";
+      let model = generator?.model ?? this.options.fallbackModel ?? "checkpoint-v2";
       const algorithmVersion = input.algorithmVersion
         ?? this.options.algorithmVersion
         ?? DEFAULT_COMPACTION_ALGORITHM_VERSION;
@@ -232,12 +260,20 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
         MAX_COMPACTION_PHYSICAL_ATTEMPTS,
         Math.max(1, this.options.maxPhysicalAttempts ?? MAX_COMPACTION_PHYSICAL_ATTEMPTS),
       );
-      const state = await this.repository.load(input, { provider, model, algorithmVersion });
+      const state = await this.repository.load(input, {
+        provider, model, algorithmVersion,
+        followSessionModel: Boolean(this.options.generatorForModel),
+      });
       if (state.algorithmVersion !== algorithmVersion) {
         throw new CompactionTerminalError("checkpoint_identity_mismatch");
       }
       if (!state.modelAllowed) {
         throw new CompactionTerminalError("governance_denied");
+      }
+      if (this.options.generatorForModel) {
+        provider = state.modelProviderId?.trim() || provider;
+        model = state.model?.trim() || model;
+        generator = this.options.generatorForModel({ provider, model });
       }
       if (!state.sourceLeafId || state.entries.length === 0) {
         await this.repository.release(input, leaseOwner);
@@ -245,9 +281,13 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
       }
 
       const pendingEntries = entriesAfter(state.entries, state.latestSegmentCoveredEnd);
+      const reusable = context && context.provider === provider && context.model === model
+        && context.sourceLeafId === state.sourceLeafId
+        && context.coveredEntryId === state.latestSegmentCoveredEnd ? context : undefined;
       const selection = selectCompactionPrefix(
         pendingEntries,
         this.options.keepRecentTokens ?? DEFAULT_COMPACTION_SETTINGS.keepRecentTokens,
+        this.options.maxInputCharacters ?? (reusable ? Infinity : Math.floor((generator?.contextWindowTokens ?? 128_000) * 0.65 * 4)),
       );
       const segmentEntries = selection.covered;
       const coveredEntryEnd = segmentEntries.at(-1)?.entryId ?? null;
@@ -270,11 +310,11 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
       }
 
       const deterministic = extractDeterministicEvidence(segmentEntries, state.sourceLeafId);
-      const conversation = serializeEntries(segmentEntries, this.options.maxInputCharacters ?? 240_000);
+      const conversation = serializeEntries(segmentEntries);
       const segmentTokensBefore = estimateTokens(segmentEntries);
       const providerAttempts: ProviderAttemptReport[] = [];
-      const generated = this.generator
-        ? await this.withCompactionDeadline(input, leaseOwner, leaseSeconds, (signal) => this.generator!.generate({
+      const generated = generator
+        ? await this.withCompactionDeadline(input, leaseOwner, leaseSeconds, (signal) => generator!.generate({
             conversation,
             deterministic,
             previousRolling: state.previousRolling,
@@ -284,6 +324,7 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
             maxPhysicalAttempts,
             onProviderAttempt: (report) => providerAttempts.push(report),
             signal,
+            ...(reusable && coveredEntryEnd ? { request: reusable.prefixFor(coveredEntryEnd) } : {}),
           }), input.maxDurationMs ?? this.options.maxDurationMs ?? DEFAULT_COMPACTION_MAX_DURATION_MS)
         : { checkpoint: null, validationStatus: "fallback" as const, attempts: 0, fallbackReason: "generator_unavailable" };
       if (generated.attempts > maxPhysicalAttempts) {
@@ -296,7 +337,7 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
       let validationStatus = generated.validationStatus;
       let fallbackReason = safeFallbackReason(generated.fallbackReason);
       if (!generated.checkpoint && !fallbackReason) {
-        fallbackReason = this.generator ? "checkpoint_generation_failed" : "generator_unavailable";
+        fallbackReason = generator ? "checkpoint_generation_failed" : "generator_unavailable";
       }
       let segmentCheckpointMetrics = sessionCheckpointMetrics(segment);
       const validatedSegment = validateSessionCheckpoint(segment, deterministic, {
@@ -519,10 +560,28 @@ RETURNING lease_owner
 
   async load(
     input: CompactionJobPayload,
-    selection: { provider: string; model: string; algorithmVersion: string },
+    selection: CheckpointModelSelection & { algorithmVersion: string; followSessionModel?: boolean },
   ): Promise<CompactionSessionState> {
     const sessionRows = await this.executor.query<SessionRow>(
       `
+WITH conversation AS (
+  SELECT s.id, s.task_id, s.tenant_id,
+    CASE WHEN $6::boolean THEN COALESCE(
+      NULLIF(active_run.runtime_request #>> '{provider,id}', ''),
+      NULLIF(s.model_provider_id, ''), $4
+    ) ELSE s.model_provider_id END AS model_provider_id,
+    CASE WHEN $6::boolean THEN COALESCE(
+      NULLIF(active_run.runtime_request ->> 'model', ''),
+      NULLIF(active_run.runtime_request #>> '{provider,defaultModel}', ''),
+      NULLIF(s.model, ''), $5
+    ) ELSE s.model END AS model
+  FROM sessions s
+  LEFT JOIN turn_runs active_run
+    ON active_run.tenant_id = s.tenant_id AND active_run.session_id = s.id
+   AND active_run.task_id = s.task_id AND active_run.id = $7::uuid
+  WHERE s.tenant_id = $1::uuid AND s.id = $2::uuid AND s.task_id = $3::uuid
+    AND ($7::uuid IS NULL OR active_run.id IS NOT NULL)
+)
 SELECT s.id, s.task_id, s.model_provider_id, s.model,
        CASE
          WHEN selected.status = 'denied' THEN false
@@ -533,14 +592,14 @@ SELECT s.id, s.task_id, s.model_provider_id, s.model,
          ) THEN false
          ELSE true
        END AS model_allowed
-FROM sessions s
+FROM conversation s
 LEFT JOIN model_governance_policies selected
   ON selected.tenant_id = s.tenant_id
- AND selected.provider_id = $4
- AND selected.model = $5
-WHERE s.tenant_id = $1::uuid AND s.id = $2::uuid AND s.task_id = $3::uuid
+ AND selected.provider_id = CASE WHEN $6::boolean THEN s.model_provider_id ELSE $4 END
+ AND selected.model = CASE WHEN $6::boolean THEN s.model ELSE $5 END
       `.trim(),
-      [input.tenantId, input.sessionId, input.taskId, selection.provider, selection.model],
+      [input.tenantId, input.sessionId, input.taskId, selection.provider, selection.model,
+        selection.followSessionModel ?? false, input.runId ?? null],
     );
     const session = sessionRows[0];
     if (!session) throw new CompactionTerminalError("session_not_found");
@@ -710,6 +769,7 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
     readonly provider: string,
     readonly model: string,
     readonly pricingByModel: CompactionPricingCatalog = {},
+    readonly contextWindowTokens: number = 128_000,
   ) {}
 
   async generate(input: {
@@ -722,6 +782,7 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
     maxPhysicalAttempts?: number;
     onProviderAttempt?: (report: ProviderAttemptReport) => void;
     signal?: AbortSignal;
+    request?: CacheableCheckpointRequest;
   }): Promise<GeneratedCheckpoint> {
     if (!hasCompleteCompactionPricing(this.pricingByModel[this.model])) {
       throw new CompactionTerminalError("pricing_unavailable");
@@ -731,7 +792,7 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
       MAX_COMPACTION_PHYSICAL_ATTEMPTS,
       Math.max(1, Math.floor(input.maxPhysicalAttempts ?? MAX_COMPACTION_PHYSICAL_ATTEMPTS)),
     );
-    const first = await this.complete(messages, input.maxTokens, input.signal, 1, input.onProviderAttempt);
+    const first = await this.complete(messages, input.maxTokens, input.signal, 1, input.onProviderAttempt, "initial", input.request);
     let parsed = parseSessionCheckpoint(checkpointCandidateWithDeterminism(first.text, input.deterministic));
     let candidate = parsed.checkpoint
       ? applyCheckpointDeterminism(parsed.checkpoint, input.deterministic)
@@ -767,10 +828,10 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
         content: [
           `The previous checkpoint failed validation: ${validation.issues.join("; ").slice(0, 4_000)}.`,
           `Invalid output: ${first.text.slice(0, 12_000)}`,
-          "Return one corrected checkpoint_v2 tool call only. Do not invent facts.",
+          input.request ? "Return one corrected JSON checkpoint only. Do not call tools or invent facts." : "Return one corrected checkpoint_v2 tool call only. Do not invent facts.",
         ].join("\n"),
       },
-    ], input.maxTokens, input.signal, 2, input.onProviderAttempt, "other");
+    ], input.maxTokens, input.signal, 2, input.onProviderAttempt, "other", input.request);
     parsed = parseSessionCheckpoint(checkpointCandidateWithDeterminism(repaired.text, input.deterministic));
     candidate = parsed.checkpoint
       ? applyCheckpointDeterminism(parsed.checkpoint, input.deterministic)
@@ -794,12 +855,13 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
   }
 
   private async complete(
-    messages: Array<{ role: "system" | "user"; content: string }>,
+    messages: ChatMessage[],
     maxTokens: number,
     signal: AbortSignal | undefined,
     physicalAttempt: number,
     onProviderAttempt: ((report: ProviderAttemptReport) => void) | undefined,
     attemptLayer: ProviderAttemptRetryLayer = "initial",
+    request?: CacheableCheckpointRequest,
   ): Promise<{ text: string; usage: ChatCompletionUsage; usageEstimated: boolean; model: string }> {
     const result = await this.client.complete({
       model: this.model,
@@ -810,7 +872,8 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
       ...(onProviderAttempt ? { onProviderAttempt } : {}),
       providerAttemptOrdinal: physicalAttempt,
       providerAttemptLayer: attemptLayer,
-      tools: [{
+      ...(request?.reasoningEffort ? { reasoningEffort: request.reasoningEffort } : {}),
+      tools: request ? [...request.tools] : [{
         type: "function",
         function: {
           name: "checkpoint_v2",
@@ -818,10 +881,10 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
           parameters: { type: "object", additionalProperties: true },
         },
       }],
-      toolChoice: { type: "function", function: { name: "checkpoint_v2" } },
+      toolChoice: request ? "none" : { type: "function", function: { name: "checkpoint_v2" } },
     });
     const call = result.toolCalls?.find((candidate) => candidate.function.name === "checkpoint_v2");
-    const text = call?.function.arguments ?? result.content;
+    const text = result.finishReason === "length" ? "" : request ? result.content : call?.function.arguments ?? result.content;
     const estimatedInputTokens = Math.max(1, Math.ceil(Buffer.byteLength(JSON.stringify(messages), "utf8") / 4));
     const estimatedOutputTokens = Math.max(1, Math.ceil(Buffer.byteLength(text, "utf8") / 4));
     return {
@@ -917,16 +980,19 @@ function compactionUsageCostMicros(
   };
 }
 
-export function createCheckpointGenerator(env: NodeJS.ProcessEnv): CheckpointGenerator | null {
+export function createCheckpointGenerator(
+  env: NodeJS.ProcessEnv,
+  selection?: CheckpointModelSelection,
+): CheckpointGenerator | null {
   const baseUrl = env.BERRY_ROUTER_INFERENCE_BASE_URL?.trim();
   const apiKey = env.BERRY_ROUTER_API_KEY?.trim();
-  // Checkpoint generation forces a structured tool call. Keep it isolated from
-  // the chat default, which an administrator may change to a model that cannot
-  // satisfy that contract during a provider incident.
-  const model = env.BERRY_COMPACTION_MODEL?.trim()
-    || "canopywave/moonshotai/kimi-k2.6";
+  // Conversation selection takes precedence over the deployment default.
+  // Legacy BERRY_COMPACTION_MODEL overrides must never select another model.
+  const model = selection?.model.trim()
+    || env.BERRY_ROUTER_DEFAULT_MODEL?.trim()
+    || "inference-net/deepseek-v4.1-flash-1017";
   if (!baseUrl || !apiKey || !model) return null;
-  const provider = env.BERRY_COMPACTION_PROVIDER?.trim()
+  const provider = selection?.provider.trim()
     || env.BERRY_ROUTER_PROVIDER_ID?.trim()
     || "router";
   const pricingByModel = compactionModelPricingFromEnv(env);
@@ -947,7 +1013,14 @@ export function createCheckpointGenerator(env: NodeJS.ProcessEnv): CheckpointGen
     provider,
     model,
     pricingByModel,
+    compactionContextWindowFromEnv(env, model),
   );
+}
+
+function compactionContextWindowFromEnv(env: NodeJS.ProcessEnv, modelId: string): number {
+  const models = RemoteModelSchema.array().parse(JSON.parse(env.BERRY_ROUTER_MODELS_JSON?.trim() || "[]"));
+  const model = models.find((candidate) => candidate.id === modelId);
+  return model ? resolveModelCapabilities(model).context?.windowTokens ?? 128_000 : 128_000;
 }
 
 export function compactionModelPricingFromEnv(env: NodeJS.ProcessEnv): CompactionPricingCatalog {
@@ -1049,13 +1122,15 @@ function entriesAfter(
 function selectCompactionPrefix(
   entries: readonly CompactionEntryRecord[],
   keepRecentTokens: number,
+  maxCharacters = Infinity,
 ): { covered: readonly CompactionEntryRecord[]; retained: readonly CompactionEntryRecord[] } {
   if (entries.length < 2) return { covered: [], retained: entries };
   const target = Math.max(1, Math.floor(keepRecentTokens));
   let accumulated = 0;
   let searchStart = entries.length - 1;
   for (let index = entries.length - 1; index >= 0; index -= 1) {
-    accumulated += estimateTokens([entries[index]!]);
+    // Connector/date context is regenerated; retain recent conversation messages.
+    if (entries[index]!.entryType !== "context") accumulated += estimateTokens([entries[index]!]);
     searchStart = index;
     if (accumulated >= target) break;
   }
@@ -1077,6 +1152,22 @@ function selectCompactionPrefix(
     }
   }
   if (firstKept <= 0) return { covered: [], retained: entries };
+  // Bound complete message/tool units, never delete the middle of a transcript
+  // while claiming the checkpoint covers it. Unselected entries stay verbatim.
+  if (Number.isFinite(maxCharacters)) {
+    let characters = 0;
+    let boundary = 0;
+    for (let index = 0; index <= firstKept; index += 1) {
+      const role = compactionEntryRole(entries[index]?.payload);
+      if ((role === "user" || role === "assistant") && characters <= maxCharacters) boundary = index;
+      if (index === firstKept) break;
+      const entry = entries[index]!;
+      if (entry.entryType !== "context") characters += JSON.stringify(entry).length + 1;
+      if (characters > maxCharacters) break;
+    }
+    firstKept = boundary;
+    if (firstKept <= 0) return { covered: [], retained: entries };
+  }
   return {
     covered: entries.slice(0, firstKept),
     retained: entries.slice(firstKept),
@@ -1266,20 +1357,16 @@ function contentText(value: unknown): string {
   }).join("\n").trim();
 }
 
-function serializeEntries(entries: readonly CompactionEntryRecord[], maxCharacters: number): string {
+function serializeEntries(entries: readonly CompactionEntryRecord[]): string {
   // Journaled turn context (grounding, date, guidance) is Berry-supplied and
   // rebuilt each turn; summarising it would repeat stale grounding (H-032).
-  const serialized = entries.filter((entry) => entry.entryType !== "context").map((entry) => JSON.stringify({
+  return entries.filter((entry) => entry.entryType !== "context").map((entry) => JSON.stringify({
     entryId: entry.entryId,
     parentEntryId: entry.parentEntryId,
     entryType: entry.entryType,
     sequence: entry.sequence,
     payload: entry.payload,
   })).join("\n");
-  if (serialized.length <= maxCharacters) return serialized;
-  const marker = "\n[...middle omitted from compaction model input...]\n";
-  const side = Math.max(0, Math.floor((maxCharacters - marker.length) / 2));
-  return `${serialized.slice(0, side)}${marker}${serialized.slice(-side)}`;
 }
 
 function checkpointMessages(input: {
@@ -1287,7 +1374,22 @@ function checkpointMessages(input: {
   deterministic: CheckpointDeterministicFields;
   previousRolling: SessionCheckpointV2 | null;
   algorithmVersion?: string;
-}): Array<{ role: "system" | "user"; content: string }> {
+  request?: CacheableCheckpointRequest;
+}): ChatMessage[] {
+  if (input.request) {
+    const { request: _request, ...standalone } = input;
+    const schemaInstruction = checkpointMessages(standalone);
+    return [...input.request.messages, {
+      role: "user",
+      content: [
+        "Compaction request supplied by Berry. Summarize the preceding conversation into one portable checkpoint JSON object. Do not continue the task or call tools.",
+        String(schemaInstruction[0]!.content),
+        `Deterministic evidence (overrides prose):\n${JSON.stringify(input.deterministic)}`,
+        input.previousRolling ? `Previous checkpoint:\n${JSON.stringify(boundedRollingContext(input.previousRolling))}` : "",
+        "Keep constraints, source references, corrections, unresolved facts and remaining work. Distinguish tool failures from success. Preserve exact identifiers when needed; never invent completion or evidence. Return only JSON with every required field.",
+      ].filter(Boolean).join("\n\n"),
+    }];
+  }
   return [
     {
       role: "system",
@@ -1297,6 +1399,8 @@ function checkpointMessages(input: {
         "Preserve durable constraints and decisions. Never invent completion, approvals, commands, files, or provenance.",
         "Store retrieval snapshot IDs and artifact references, not full retrieved documents or binary/file contents.",
         "Every schema field is required. Use empty arrays, empty strings, or null when evidence is absent.",
+        "Required keys: schema, version, generatedAt, goal, successCriteria, constraints, standingInstructions, completedWork, currentWork, blockers, waitingState, decisions, unresolvedQuestions, nextAction, filesRead, filesModified, artifacts, commands, toolCalls, approvals, promptManifestHash, retrievalSnapshotIds, coveredEntryStart, coveredEntryEnd, currentLeafId, narrative.",
+        'Use schema="berry.session-checkpoint" and version=2.',
       ].join("\n"),
     },
     {
@@ -1308,8 +1412,6 @@ function checkpointMessages(input: {
           ? `Previous rolling checkpoint (bounded context only):\n${JSON.stringify(boundedRollingContext(input.previousRolling))}`
           : "",
         `New persisted session entries:\n${input.conversation}`,
-        "Required keys: schema, version, generatedAt, goal, successCriteria, constraints, standingInstructions, completedWork, currentWork, blockers, waitingState, decisions, unresolvedQuestions, nextAction, filesRead, filesModified, artifacts, commands, toolCalls, approvals, promptManifestHash, retrievalSnapshotIds, coveredEntryStart, coveredEntryEnd, currentLeafId, narrative.",
-        'Use schema="berry.session-checkpoint" and version=2.',
       ].filter(Boolean).join("\n\n"),
     },
   ];
@@ -1484,7 +1586,7 @@ RETURNING id
 }
 
 function estimateTokens(entries: readonly CompactionEntryRecord[]): number {
-  return Math.ceil(entries.reduce((sum, entry) => sum + JSON.stringify(entry.payload).length, 0) / 4);
+  return entries.reduce((sum, entry) => sum + estimateContextValueTokens(entry.payload), 0);
 }
 
 function estimateCheckpointCoverageTokens(

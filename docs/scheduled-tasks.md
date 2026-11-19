@@ -1,6 +1,6 @@
-# Scheduled agent tasks
+# Automations
 
-Scheduled opens from the sidebar directly below Library. Users can create daily,
+Automations opens from the sidebar directly below Library. Users can create daily,
 weekday, weekly, monthly, custom cron, one-time, or relative-delay tasks. Each run
 creates its own chat in the selected project. Run history links to those chats.
 
@@ -11,6 +11,35 @@ self-contained because a run starts a new conversation. Conversational creation
 inherits the source chat's model; creation in the UI uses organization defaults.
 Every admission resolves current model permissions, connectors, memory, and
 allowance through the ordinary agent admission path.
+
+Active organization owners and administrators can manage a selected member’s
+automations in support view, including creating, editing, pausing, running,
+deleting, and reading run history. The support API uses the member as the owner
+and records the administrator as the audit actor. The same view provides the
+member’s usage, library, and personal skills. The sidebar shows support status
+and monthly allowance above the member’s name. Hover or focus the allowance for
+the balance and reset date; click it to open usage details.
+
+## Browser work
+
+Automations can use the native Berrycrawl browser controls described in
+[MCP servers](./mcp.md#native-browser-control-in-web-chats-and-automations).
+Berry Chat's agent performs the actions itself through the admitted connector.
+Include the destination, steps, allowed changes, and expected output in the
+saved instructions. Open a fresh bounded browser session on each run, inspect
+results between actions, and close it when done. Do not save a transient browser
+session ID as the automation's permanent setup. The run uses its owner's current
+connector permissions and task approval mode.
+
+If the browser needs human input, the agent calls `request_browser_handoff` and
+the run waits durably. History displays **Browser needs help** and opens that
+run's chat. Choose **Take control**, unblock the page, then **Return to agent**.
+The agent continues the same run from a fresh page observation. Closing the
+viewer or refreshing does not resume it. This waiting run blocks overlapping
+occurrences and manual starts; human waiting time is excluded from active
+compute time. Browser session lifetime and idle limits still apply, and an
+expired browser requires explicit recovery. Authorized support administrators
+can complete the same handoff for a member.
 
 ## Reference and deliberate differences
 
@@ -64,7 +93,7 @@ Run the focused web/API/worker checks from AGENTS.md. Calendar and form tests co
 timezone conversion, DST, invalid local times, relative delays and cron presets.
 Dispatcher tests cover normal admission, revoked membership, retries, safe errors,
 overlapping polls and shutdown. Client tests cover stable manual operation keys
-and support-view restrictions.
+and support-view routing and tenant isolation.
 
 `scripts/test-scheduled-tasks.mjs` requires a migrated disposable loopback
 PostgreSQL database. It exercises replica claims, downtime, one-time work, worker
@@ -72,3 +101,11 @@ completion and projection, restart recovery, stale leases, editing/deletion,
 transient failures, membership revocation, spend limits, chat tools, ownership and
 restricted-role RLS. `--serve` exposes a loopback-only browser fixture; it does not
 contact live models or use production credentials.
+
+`scripts/test-browser-handoff.mjs` uses the same disposable database convention
+and mocked Berrycrawl transport. It covers owner isolation, concurrent pause and
+return requests, phase-boundary safety, restart recovery, conflicting approval
+waits, fresh context and event replay, cancellation, browser expiry, and a paused
+Automation resuming to completion in its original chat. Build shared, database,
+API and worker packages before running it. The web viewer is also checked
+against Berrycrawl's binary-frame/JSON-control WebSocket protocol.

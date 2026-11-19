@@ -42,6 +42,19 @@ describe("BerryApiClient", () => {
     );
   });
 
+  it("reads the task's reconnect action and starts sign-in with the verified task ID", async () => {
+    const taskId = "00000000-0000-7000-8000-000000000301";
+    const connectorId = "connector_mcp_connect";
+    const action = { taskId, connectorId, name: "Connect", runId: "00000000-0000-7000-8000-000000000401", canReconnect: true };
+    const flow = { connectorId, state: "test-state", authorizationUrl: "https://authorization.example/authorize", expiresAt: "2026-11-17T10:00:00.000Z" };
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValueOnce(json([action])).mockResolvedValueOnce(json(flow));
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl });
+    await expect(client.taskConnectorReconnects(taskId)).resolves.toEqual([action]);
+    await expect(client.startConnectorOAuth(connectorId, "full", "/settings/mcp", taskId)).resolves.toEqual(flow);
+    expect(fetchImpl.mock.calls[0]?.[0]).toBe(`https://api.berry.test/v1/connectors/tasks/${taskId}/reconnect`);
+    expect(fetchImpl.mock.calls[1]?.[1]?.body).toBe(JSON.stringify({ accessLevel: "full", redirectAfter: "/settings/mcp", taskId }));
+  });
+
   it("improves a task prompt without creating a task turn", async () => {
     const fetchImpl = vi.fn(async () => json({
       prompt: "Write a concise executive summary with three recommendations.",
@@ -115,7 +128,7 @@ describe("BerryApiClient", () => {
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
 
-    await expect(client.listPersonalSkills()).rejects.toMatchObject({
+    await expect(client.listOrganizations()).rejects.toMatchObject({
       status: 403,
       body: { code: "support_view_read_not_available" },
     });
@@ -139,10 +152,56 @@ describe("BerryApiClient", () => {
 
     const sessionSource = client.streamEvents("session_1", { onEvent: vi.fn() });
     const taskSource = client.streamTaskEvents("task_1", { onEvent: vi.fn() });
-    expect(sessionSource.url).toBe("https://api.berry.test/v1/orgs/org_1/support/users/user_2/sessions/session_1/events");
-    expect(taskSource.url).toBe("https://api.berry.test/v1/orgs/org_1/support/users/user_2/tasks/task_1/events");
+    expect((sessionSource as unknown as FakeEventSource).url).toBe("https://api.berry.test/v1/orgs/org_1/support/users/user_2/sessions/session_1/events");
+    expect((taskSource as unknown as FakeEventSource).url).toBe("https://api.berry.test/v1/orgs/org_1/support/users/user_2/tasks/task_1/events");
     expect((sessionSource as unknown as FakeEventSource).init).toEqual({ withCredentials: true });
     vi.unstubAllGlobals();
+  });
+
+  it("lets bearer-token clients supply their own event stream transport", () => {
+    const opened: Array<{ url: string; withCredentials: boolean; authorization: string | null }> = [];
+    const source = { onopen: null, onerror: null, onmessage: null as ((event: { data: string; lastEventId: string }) => void) | null, close: vi.fn() };
+    const client = new BerryApiClient({
+      baseUrl: "https://berry.acme.com",
+      headers: { Authorization: "Bearer mobile-token" },
+      credentials: "omit",
+      fetchImpl: vi.fn() as unknown as typeof fetch,
+      eventSource: (url, init) => {
+        opened.push({ url, withCredentials: init.withCredentials, authorization: init.headers.get("authorization") });
+        return source;
+      },
+    });
+    const onEvent = vi.fn();
+    const stream = client.streamEvents("session_1", { onEvent }, "cursor-9");
+    expect(opened).toEqual([{ url: "https://berry.acme.com/v1/sessions/session_1/events?cursor=cursor-9", withCredentials: false, authorization: "Bearer mobile-token" }]);
+    source.onmessage?.({ data: JSON.stringify({ kind: "turn.end", turnId: "turn_1", status: "completed" }), lastEventId: "cursor-10" });
+    expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: "turn.end" }), "cursor-10");
+    stream.close();
+    expect(source.close).toHaveBeenCalled();
+  });
+
+  it("drives the mobile pairing endpoints", async () => {
+    const calls: Array<{ url: string; method: string; credentials: RequestCredentials | undefined; body: unknown }> = [];
+    const responses: Record<string, unknown> = {
+      "POST /v1/mobile/pairings/claim": { pairingId: "6f1c3c1e-2b9a-4f7e-9a51-0c6c2d3e4f50", claimToken: "c".repeat(43), expiresAt: "2026-10-09T10:03:00.000Z", brand: { applicationName: "Acme", logoUrl: null, accentColor: null } },
+      "POST /v1/mobile/pairings/poll": { status: "awaiting" },
+      "DELETE /v1/mobile/session": { ok: true },
+    };
+    const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+      const path = new URL(url).pathname;
+      calls.push({ url: path, method: init.method ?? "GET", credentials: init.credentials, body: init.body ? JSON.parse(String(init.body)) : undefined });
+      return new Response(JSON.stringify(responses[`${init.method} ${path}`]), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const client = new BerryApiClient({ baseUrl: "https://berry.acme.com", credentials: "omit", fetchImpl: fetchImpl as unknown as typeof fetch });
+    const device = { model: "Pixel 8a", platform: "android" as const, osVersion: "16", appVersion: "1.0.0" };
+    const claim = await client.claimMobilePairing({ manualCode: "ABCD-EFGH", device });
+    await expect(client.pollMobilePairing({ pairingId: claim.pairingId, claimToken: claim.claimToken })).resolves.toEqual({ status: "awaiting" });
+    await client.signOutMobileSession();
+    expect(calls).toEqual([
+      { url: "/v1/mobile/pairings/claim", method: "POST", credentials: "omit", body: { manualCode: "ABCD-EFGH", device } },
+      { url: "/v1/mobile/pairings/poll", method: "POST", credentials: "omit", body: { pairingId: claim.pairingId, claimToken: claim.claimToken } },
+      { url: "/v1/mobile/session", method: "DELETE", credentials: "omit", body: undefined },
+    ]);
   });
 
   it("normalizes generated-image URLs to the scoped support endpoint", async () => {

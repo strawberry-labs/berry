@@ -139,7 +139,7 @@ export const PERSONAL_NAV: NavGroup[] = [
     { id: "connectors", label: "Connectors", icon: PlugZap },
     { id: "skills", label: "Skills", icon: Puzzle },
     { id: "mcp", label: "MCP servers", icon: Network },
-    { id: "schedules", label: "Scheduled tasks", icon: CalendarClock },
+    { id: "schedules", label: "Automations", icon: CalendarClock },
     { id: "usage", label: "Usage", icon: LineChart },
     { id: "archived", label: "Archived tasks", icon: MessageSquareText },
   ] },

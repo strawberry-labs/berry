@@ -6,6 +6,7 @@ import {
 } from "./management-primitives";
 import { type ManagementScreenProps } from "./management-context";
 import { adminAreaForTab, resolvedAdminTab } from "./management-navigation";
+import { ManagementScreenFallback } from "./management-screen-skeletons";
 
 const AdminOverviewScreen = React.lazy(async () => ({
   default: (await import("./admin-overview-screen")).AdminOverviewScreen,
@@ -50,16 +51,6 @@ const AdminFeatureAccessScreen = React.lazy(async () => ({ default: (await impor
 const AdminSsoScimScreen = React.lazy(async () => ({ default: (await import("./admin-sso-scim-screen")).AdminSsoScimScreen }));
 const AdminManagedPolicyScreen = React.lazy(async () => ({ default: (await import("./admin-managed-policy-screen")).AdminManagedPolicyScreen }));
 const AdminAuditLogScreen = React.lazy(async () => ({ default: (await import("./admin-audit-log-screen")).AdminAuditLogScreen }));
-
-const fallback = (
-  <div
-    className="flex min-h-24 items-center justify-center text-sm text-muted-foreground"
-    role="status"
-    aria-live="polite"
-  >
-    Loading administration section…
-  </div>
-);
 
 export function AdminScreen({
   tab,
@@ -117,7 +108,7 @@ export function AdminScreen({
         },
       }}
     >
-      <React.Suspense fallback={fallback}>{screen}</React.Suspense>
+      <React.Suspense fallback={<ManagementScreenFallback area="admin" tab={resolvedTab} />}>{screen}</React.Suspense>
     </ManagementPageTabsProvider>
   );
 }

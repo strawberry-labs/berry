@@ -1,5 +1,5 @@
 import * as React from "react";
-import { CalendarClock, DollarSign, LogOut } from "lucide-react";
+import { CalendarClock, LogOut, ShieldCheck, Smartphone } from "lucide-react";
 import type { AllowanceBalance, OrgPermission, Task, Workspace } from "@berry/shared";
 import { BerryConversationSidebarContent, taskHasUnreadActivity, taskIsInProgress } from "@berry/desktop-ui/components/berry-conversation-sidebar";
 import { Button } from "@berry/desktop-ui/components/ui/button";
@@ -20,6 +20,8 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSepara
 import { Input } from "@berry/desktop-ui/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@berry/desktop-ui/components/ui/popover";
 import { Progress } from "@berry/desktop-ui/components/ui/progress";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@berry/desktop-ui/components/ui/tooltip";
+import type { SupportViewSubject } from "@/lib/support-view";
 import {
   Sidebar,
   SidebarFooter,
@@ -30,11 +32,14 @@ import {
   SidebarTrigger,
   useSidebar,
 } from "@berry/desktop-ui/components/ui/sidebar";
-import { Archive, ArrowUp as Upload, CirclePlus, Ellipsis, FolderOpen, LayoutAlignLeft, Pencil, PencilEdit02Icon, Pin, PinOff, Search, Settings as SettingsIcon, Trash2, Wand2 } from "@berry/desktop-ui/lib/icons";
+import { Archive, ArrowUp as Upload, CirclePlus, Ellipsis, FolderOpen, LayoutAlignLeft, Pencil, PencilEdit02Icon, Pin, PinOff, Search, Settings as SettingsIcon, Trash2, Wand2, X } from "@berry/desktop-ui/lib/icons";
 import type { SignedInUser } from "./auth-boundary";
 import type { ManagementKind } from "../management/management-navigation";
 import { WebSettingsNavigation } from "./web-settings-navigation";
 import { DeploymentBrandLogo, useDeploymentBrand } from "./deployment-brand";
+import { accountAvatarInitial, allowanceProgress, formatAllowanceResetDate, formatCurrencyMicros, timeAgo } from "@berry/client-core/format";
+
+export { accountAvatarInitial, allowanceProgress, formatAllowanceResetDate };
 
 const ProjectUploadDialog = React.lazy(() => import("../projects/project-upload-dialog").then((module) => ({ default: module.ProjectUploadDialog })));
 
@@ -49,7 +54,7 @@ export const WEB_SETTINGS_NAV: Array<{ id: SettingsTab; label: string }> = [
   { id: "connectors", label: "Connectors" },
   { id: "skills", label: "Skills" },
   { id: "mcp", label: "MCP servers" },
-  { id: "schedules", label: "Scheduled tasks" },
+  { id: "schedules", label: "Automations" },
   { id: "usage", label: "Usage" },
   { id: "archived", label: "Archived tasks" },
 ];
@@ -58,30 +63,33 @@ export function WebWindowChrome({ onHome, onSearch }: {
   onHome: () => void;
   onSearch: () => void;
 }) {
-  const { isMobile, state, toggleSidebar } = useSidebar();
+  const { state, toggleSidebar } = useSidebar();
   const brand = useDeploymentBrand();
   const sidebarCollapsed = state === "collapsed";
-  const homeControlOpensSidebar = isMobile || sidebarCollapsed;
 
+  // Phone and desktop controls are both rendered and switched by the 767px
+  // media query so the server render already has the right layout. Phones get
+  // the toggle alone on the left; the brand lives in the open sidebar sheet.
   return (
     <div
       className="berry-web-window-chrome pointer-events-none absolute top-0 left-0 z-50 flex h-[var(--berry-titlebar-height)] items-center"
       data-sidebar-state={state}
     >
       <div className="berry-web-window-header pointer-events-auto flex w-full items-center justify-between">
+        <SidebarTrigger aria-label="Open sidebar" title="Open sidebar" className="berry-web-header-icon berry-web-mobile-sidebar-toggle" />
         <button
           type="button"
           className="berry-web-home-link"
-          onClick={homeControlOpensSidebar ? toggleSidebar : onHome}
-          aria-label={homeControlOpensSidebar ? "Open sidebar" : `${brand.applicationName} home`}
-          title={homeControlOpensSidebar ? "Open sidebar" : undefined}
+          onClick={sidebarCollapsed ? toggleSidebar : onHome}
+          aria-label={sidebarCollapsed ? "Open sidebar" : `${brand.applicationName} home`}
+          title={sidebarCollapsed ? "Open sidebar" : undefined}
         >
           <DeploymentBrandLogo className="berry-web-home-logo size-5" alt="" />
           <LayoutAlignLeft className="berry-web-sidebar-expand-icon" aria-hidden="true" />
           <span className="berry-web-home-label">{brand.applicationName}</span>
         </button>
         <div className="berry-web-window-actions flex items-center">
-          {!sidebarCollapsed ? <Button variant="ghost" size="icon-lg" onClick={onSearch} aria-label="Search" title="Search" data-web-search-trigger className="berry-web-header-icon"><Search /></Button> : null}
+          <Button variant="ghost" size="icon-lg" onClick={onSearch} aria-label="Search" title="Search" data-web-search-trigger className="berry-web-header-icon"><Search /></Button>
           {!sidebarCollapsed ? <SidebarTrigger aria-label="Toggle sidebar" title="Toggle sidebar" className="berry-web-header-icon berry-web-sidebar-toggle" /> : null}
         </div>
       </div>
@@ -89,7 +97,40 @@ export function WebWindowChrome({ onHome, onSearch }: {
   );
 }
 
-export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeWorkspaceId, activeTaskId, tasksSelected, librarySelected, management, loadError, user, allowance, allowanceLoading, onRefreshAllowance, onNewTask, onCreateProject, onSelectWorkspace, onSelectTasks, onOpenTask, onToggleTaskPinned, onArchiveTask, onDeleteTask, onRenameTask, onShareTask, onToggleProjectPinned, onRenameProject, onArchiveProjectTasks, onRemoveProject, onRevealProject, onUploadToProject, onSkills, onLibrary, onSchedules, onUsage, onSettings, onSignOut, readOnly = false }: {
+function WebSidebarSheetHeader({ onSearch }: { onSearch: () => void }) {
+  const { mobileTriggerRef, setOpenMobile } = useSidebar();
+  const brand = useDeploymentBrand();
+  return (
+    <div className="berry-web-sheet-header flex shrink-0 items-center justify-between">
+      <div className="berry-web-sheet-brand flex min-w-0 items-center">
+        <DeploymentBrandLogo className="size-5 shrink-0" alt="" />
+        <span className="truncate">{brand.applicationName}</span>
+      </div>
+      <div className="flex shrink-0 items-center">
+        <Button
+          variant="ghost"
+          size="icon-lg"
+          aria-label="Search"
+          title="Search"
+          className="berry-web-header-icon"
+          onClick={() => {
+            // Search takes focus next; don't let the closing sheet hand it back to the toggle.
+            mobileTriggerRef.current = null;
+            setOpenMobile(false);
+            onSearch();
+          }}
+        >
+          <Search />
+        </Button>
+        <Button variant="ghost" size="icon-lg" aria-label="Close sidebar" title="Close sidebar" className="berry-web-header-icon" onClick={() => setOpenMobile(false)}>
+          <X />
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeWorkspaceId, activeTaskId, tasksSelected, librarySelected, management, loadError, user, allowance, allowanceLoading, onRefreshAllowance, onNewTask, onCreateProject, onSelectWorkspace, onSelectTasks, onOpenTask, onToggleTaskPinned, onArchiveTask, onDeleteTask, onRenameTask, onShareTask, onToggleProjectPinned, onRenameProject, onArchiveProjectTasks, onRemoveProject, onRevealProject, onUploadToProject, onSkills, onLibrary, onSchedules, onUsage, onSettings, onSearch, onOpenMobileApp, onSignOut, supportView = null, onExitSupportView, readOnly = false }: {
   workspaces: Workspace[];
   tasksByWorkspace: Record<string, Task[]>;
   generalTasks: Task[];
@@ -102,6 +143,7 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
     tab: string;
     permissions: OrgPermission[];
     platformAuthorized: boolean;
+    supportView?: boolean;
     onNavigate: (kind: ManagementKind, tab: string) => void;
     onBack: () => void;
   } | null;
@@ -109,6 +151,8 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
   user: SignedInUser | null;
   allowance: AllowanceBalance | null;
   allowanceLoading: boolean;
+  supportView?: SupportViewSubject | null;
+  onExitSupportView?: () => void;
   onRefreshAllowance: () => void;
   onNewTask: () => void;
   onCreateProject: () => void;
@@ -131,13 +175,17 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
   onSchedules: () => void;
   onUsage: () => void;
   onSettings: () => void;
+  onSearch: () => void;
+  /** Opens the QR sign-in dialog for the mobile app; omitted where pairing isn't offered. */
+  onOpenMobileApp?: () => void;
   onSignOut: () => void;
   readOnly?: boolean;
 }) {
   const { isMobile, setOpenMobile } = useSidebar();
   const allTasks = [...Object.values(tasksByWorkspace).flat(), ...generalTasks];
   return (
-    <Sidebar variant="inset" className="berry-app-sidebar">
+    <Sidebar variant="inset" className="berry-app-sidebar" mobileClassName="berry-app-sidebar berry-web-sidebar-sheet">
+      {isMobile ? <WebSidebarSheetHeader onSearch={onSearch} /> : null}
       {management ? (
         <WebSettingsNavigation
           {...management}
@@ -177,16 +225,28 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
               {!readOnly ? <SidebarMenuItem><SidebarMenuButton onClick={onNewTask} className="berry-sidebar-command berry-sidebar-command-primary font-medium"><PencilEdit02Icon /><span>New task</span><Kbd className="ml-auto" aria-hidden>⌘⇧O</Kbd></SidebarMenuButton></SidebarMenuItem> : null}
               {!readOnly ? <SidebarMenuItem><SidebarMenuButton aria-label="Open capabilities" onClick={onSkills} className="berry-sidebar-command"><Wand2 /><span>Skills</span></SidebarMenuButton></SidebarMenuItem> : null}
               {!readOnly ? <SidebarMenuItem><SidebarMenuButton isActive={librarySelected} aria-label="Open library" onClick={onLibrary} className="berry-sidebar-command"><FolderOpen /><span>Library</span></SidebarMenuButton></SidebarMenuItem> : null}
-              {!readOnly ? <SidebarMenuItem><SidebarMenuButton aria-label="Open scheduled tasks" onClick={onSchedules} className="berry-sidebar-command"><CalendarClock /><span>Scheduled</span></SidebarMenuButton></SidebarMenuItem> : null}
+              {!readOnly ? <SidebarMenuItem><SidebarMenuButton aria-label="Open automations" onClick={onSchedules} className="berry-sidebar-command"><CalendarClock /><span>Automations</span></SidebarMenuButton></SidebarMenuItem> : null}
             </SidebarMenu>
           </>
         )}
       />}
       <SidebarFooter className="berry-sidebar-footer">
+        {onOpenMobileApp && !readOnly ? (
+          <SidebarMenu className="berry-sidebar-mobile-app">
+            <SidebarMenuItem>
+              <SidebarMenuButton onClick={onOpenMobileApp} className="berry-sidebar-command">
+                <Smartphone />
+                <span>Get the mobile app</span>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          </SidebarMenu>
+        ) : null}
+        {supportView && onExitSupportView ? <SupportViewCard subject={supportView} onExit={onExitSupportView} /> : null}
+        <SidebarAllowance allowance={allowance} loading={allowanceLoading} onRefresh={onRefreshAllowance} onUsage={onUsage} />
         <div className="flex items-center gap-2">
-          <Popover onOpenChange={(open) => { if (open) onRefreshAllowance(); }}>
+          <Popover>
             <PopoverTrigger asChild>
-              <button type="button" className="berry-connect-button flex h-11 min-w-0 flex-1 items-center gap-3 px-2 text-left" aria-label="Open account and allowance">
+              <button type="button" className="berry-connect-button flex h-11 min-w-0 flex-1 items-center gap-3 px-2 text-left" aria-label="Open account">
                 <Avatar size="sm" className="berry-connect-avatar">
                   {user?.image ? <AvatarImage src={user.image} alt="" className="object-cover" /> : null}
                   <AvatarFallback className="bg-[var(--berry-accent-soft)] font-semibold text-[var(--berry-text-primary)]">{accountAvatarInitial(user)}</AvatarFallback>
@@ -195,36 +255,8 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
               </button>
             </PopoverTrigger>
             <PopoverContent side="top" align="start" sideOffset={8} collisionPadding={8} className="w-60 max-w-[calc(100vw-1rem)] p-3">
-              <div className="grid gap-3">
-                <div className="min-w-0">
-                  <strong className="block truncate text-sm">{user?.name || "Berry account"}</strong>
-                  <span className="block truncate text-xs text-muted-foreground">{user?.email}</span>
-                </div>
-                <div className="grid gap-2 rounded-lg border border-[var(--berry-border)] bg-[var(--berry-control-bg)] p-3">
-                  <div className="flex items-start justify-between gap-3">
-                    <span className="text-xs text-[var(--berry-text-secondary)]">Available this cycle</span>
-                    <strong className="text-sm tabular-nums text-[var(--berry-text-primary)]">{allowanceLoading ? "…" : allowance?.availableMicros === null ? "Unlimited" : formatCurrencyMicros(allowance?.availableMicros)}</strong>
-                  </div>
-                  <div className="flex items-start justify-between gap-3">
-                    <span className="text-xs text-[var(--berry-text-secondary)]">Used</span>
-                    <strong className="text-sm tabular-nums text-[var(--berry-text-primary)]">{allowanceLoading ? "…" : formatCurrencyMicros(allowance ? String(BigInt(allowance.usedMicros) + BigInt(allowance.reservedMicros)) : null)}</strong>
-                  </div>
-                  {allowance?.effectiveLimitMicros ? (
-                    <div className="grid gap-1.5">
-                      <div className="flex items-center justify-between text-[11px] text-[var(--berry-text-secondary)]">
-                        <span>Cycle usage</span>
-                        <span className="tabular-nums">{Math.round(allowanceProgress(allowance))}%</span>
-                      </div>
-                      <Progress value={allowanceProgress(allowance)} aria-label={`${Math.round(allowanceProgress(allowance))}% of allowance used`} />
-                    </div>
-                  ) : null}
-                  <span className="text-[11px] text-[var(--berry-text-secondary)]">{allowance ? `Resets ${formatAllowanceResetDate(allowance.cycleEnd)}` : "Allowance information is unavailable."}</span>
-                </div>
-                <Button variant="ghost" className="justify-start" onClick={onUsage}>
-                  <DollarSign />
-                  View personal usage
-                </Button>
-              </div>
+              <strong className="block truncate text-sm">{user?.name || "Berry account"}</strong>
+              <span className="block truncate text-xs text-[var(--berry-text-secondary)]">{user?.email}</span>
             </PopoverContent>
           </Popover>
           {!readOnly ? <Button variant="ghost" size="icon-lg" onClick={onSettings} aria-label="Settings" aria-current={management ? "page" : undefined} data-active={management ? "true" : undefined} className="berry-sidebar-mini-control berry-sidebar-footer-control"><SettingsIcon /></Button> : null}
@@ -235,32 +267,60 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
   );
 }
 
-function formatCurrencyMicros(value: string | null | undefined): string {
-  if (value == null) return "—";
-  return new Intl.NumberFormat(undefined, {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(Number(value) / 1_000_000);
+function SupportViewCard({ subject, onExit }: { subject: SupportViewSubject; onExit: () => void }) {
+  return <section className="berry-support-view-card" aria-label="Support view" data-testid="support-view-card">
+    <div className="flex items-center gap-2 text-xs font-semibold"><ShieldCheck className="size-3.5 shrink-0" aria-hidden /><span>Support view</span></div>
+    <p className="truncate text-xs" title={subject.name || subject.email}>Viewing as {subject.name || subject.email}</p>
+    <p className="text-xs leading-4 text-[var(--berry-text-secondary)]">Changes apply to this member’s account.</p>
+    <Button variant="outline" size="sm" className="mt-1 w-full" onClick={onExit}>Exit support view</Button>
+  </section>;
 }
 
-export function allowanceProgress(allowance: AllowanceBalance): number {
-  if (!allowance.effectiveLimitMicros || allowance.effectiveLimitMicros === "0") return 0;
-  const consumed = Number(allowance.usedMicros) + Number(allowance.reservedMicros);
-  return Math.min(100, (consumed / Number(allowance.effectiveLimitMicros)) * 100);
+export function SupportViewFallback({ subject, onExit }: { subject: SupportViewSubject; onExit: () => void }) {
+  const { state, isMobile, openMobile } = useSidebar();
+  if (isMobile ? openMobile : state !== "collapsed") return null;
+  return <div className="berry-support-view-fallback">
+    <Button variant="outline" size="sm" onClick={onExit} title={`Viewing as ${subject.name || subject.email}. Exit support view`}>
+      <ShieldCheck aria-hidden />Exit support view
+    </Button>
+  </div>;
 }
 
-export function accountAvatarInitial(user: Pick<SignedInUser, "name" | "email"> | null): string {
-  return (user?.name?.trim()[0] || user?.email?.trim()[0] || "?").toUpperCase();
-}
+const SIDEBAR_ALLOWANCE_WARNING_PERCENT = 10;
 
-export function formatAllowanceResetDate(value: string): string {
-  return new Intl.DateTimeFormat(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-  }).format(new Date(value));
+function SidebarAllowance({ allowance, loading, onRefresh, onUsage }: {
+  allowance: AllowanceBalance | null;
+  loading: boolean;
+  onRefresh: () => void;
+  onUsage: () => void;
+}) {
+  const remaining = allowance && allowance.effectiveLimitMicros !== null
+    ? allowance.effectiveLimitMicros === "0" ? 0 : Math.max(0, Math.min(100, 100 - allowanceProgress(allowance)))
+    : null;
+  // Only surface the allowance when it is nearly spent. A constant meter
+  // reads as pressure; the full figures stay on the Usage settings page.
+  if (remaining === null || remaining > SIDEBAR_ALLOWANCE_WARNING_PERCENT) return null;
+  const label = `${Math.floor(remaining)}% left`;
+  return <TooltipProvider delayDuration={250}><Tooltip>
+    <TooltipTrigger asChild>
+      <button type="button" className="berry-sidebar-allowance" aria-label={`Monthly usage: ${label}. View usage details`} aria-busy={loading} onPointerEnter={onRefresh} onFocus={onRefresh} onClick={onUsage} data-testid="sidebar-allowance">
+        <span className="flex items-center justify-between gap-2 text-xs"><span className="text-[var(--berry-text-secondary)]">Monthly usage</span><span className="font-medium tabular-nums">{label}</span></span>
+        {remaining !== null ? <Progress value={remaining} className="h-1" aria-label="Monthly allowance remaining" /> : null}
+      </button>
+    </TooltipTrigger>
+    <TooltipContent side="top" align="start" sideOffset={8} collisionPadding={12} showArrow={false} className="berry-sidebar-allowance-details">
+      <p className="text-xs font-semibold">Monthly allowance</p>
+      {allowance ? <>
+        <dl className="grid grid-cols-[1fr_auto] gap-x-6 gap-y-2 text-xs">
+          <dt>Remaining</dt><dd className="text-right font-medium tabular-nums">{allowance.availableMicros === null ? "Unlimited" : formatCurrencyMicros(allowance.availableMicros)}</dd>
+          <dt>Used</dt><dd className="text-right tabular-nums">{formatCurrencyMicros(allowance.usedMicros)}</dd>
+          <dt>In progress</dt><dd className="text-right tabular-nums">{formatCurrencyMicros(allowance.reservedMicros)}</dd>
+          <dt>Monthly limit</dt><dd className="text-right tabular-nums">{allowance.effectiveLimitMicros === null ? "Unlimited" : formatCurrencyMicros(allowance.effectiveLimitMicros)}</dd>
+        </dl>
+        <p className="text-xs text-[var(--berry-text-secondary)]">Resets {formatAllowanceResetDate(allowance.cycleEnd)}</p>
+      </> : <p className="text-xs text-[var(--berry-text-secondary)]">{loading ? "Loading allowance…" : "Allowance information is unavailable. Click to open usage details."}</p>}
+    </TooltipContent>
+  </Tooltip></TooltipProvider>;
 }
 
 function WebProjectRowActions({ workspace, tasks, onTogglePinned, onRename, onArchiveTasks, onRemove, onReveal, onUpload }: {
@@ -320,15 +380,4 @@ function WebProjectRowActions({ workspace, tasks, onTogglePinned, onRename, onAr
       </AlertDialog>
     </>
   );
-}
-
-function timeAgo(value: string): string {
-  const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1000));
-  if (seconds < 60) return "now";
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h`;
-  const days = Math.floor(hours / 24);
-  return days < 7 ? `${days}d` : new Date(value).toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }

@@ -29,6 +29,15 @@ assert(privacyManifest.includes("<key>NSPrivacyTracking</key>") && privacyManife
 assert(appStorePrivacy.includes("Nothing leaves the device except data sent to endpoints the user configures"), "App Store privacy notes must state endpoint-scoped data flow");
 assert(playSafety.dataCollected === false && playSafety.dataShared === false, "Play data safety must declare no collection/sharing by Berry");
 assert(mobileNotes.includes("No terminal is available on mobile"), "mobile review notes must cover read-only code mode");
+assert(mobileNotes.includes("There is no account creation in the app"), "mobile review notes must explain QR pairing instead of account creation");
+assert(mobileNotes.includes("Enter a code instead"), "mobile review notes must give reviewers the manual-code pairing path");
+assert(!(mobileApp.expo.android.permissions ?? []).includes("POST_NOTIFICATIONS"), "mobile app must not request notification permission while push is deferred");
+const cameraPermissions = mobileApp.expo.plugins.filter((plugin) => Array.isArray(plugin) && ["expo-camera", "expo-image-picker"].includes(plugin[0])).map((plugin) => plugin[1].cameraPermission);
+assert(cameraPermissions.length === 2 && cameraPermissions[0] === cameraPermissions[1], "camera permission text must be identical across plugins");
+const declaredReasonApis = JSON.stringify(mobileApp.expo.ios.privacyManifests.NSPrivacyAccessedAPITypes);
+for (const category of ["FileTimestamp", "UserDefaults", "SystemBootTime"]) {
+  assert(declaredReasonApis.includes(`NSPrivacyAccessedAPICategory${category}`) && privacyManifest.includes(`NSPrivacyAccessedAPICategory${category}`), `privacy manifests must declare ${category}`);
+}
 
 console.log("[store] extension listing and review package OK");
 console.log("[store] mobile privacy manifests and manual-release config OK");

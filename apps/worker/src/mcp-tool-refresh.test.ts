@@ -365,6 +365,7 @@ describe("durable MCP executor tool refresh", () => {
 
   afterEach(async () => {
     await Promise.all(sockets.splice(0).map((cleanup) => cleanup()));
+    vi.unstubAllGlobals();
   });
 
   type Setup = {
@@ -384,10 +385,14 @@ describe("durable MCP executor tool refresh", () => {
     write(options.live);
     const key = randomBytes(32).toString("base64");
     const env = { BERRY_DURABLE_CAPABILITY_KEY: key } as NodeJS.ProcessEnv;
+    vi.stubGlobal("fetch", vi.fn(async (input: URL) => {
+      expect(input.pathname).toBe("/v1/connectors/mcp/runtime-credential");
+      return Response.json({ status: "static" });
+    }));
     const store = new MemorySnapshotStore();
     store.seed(connectorId, options.stored?.tools ?? options.cached, options.stored ? options.stored.checkedAt : Date.now());
     const refresher = new McpToolSnapshotRefresher(store);
-    const tools = new DurableMcpToolExecutor({ execute: vi.fn(async () => ({ output: {}, summary: "base" })) }, [], undefined, 5_000, env, refresher);
+    const tools = new DurableMcpToolExecutor({ execute: vi.fn(async () => ({ output: {}, summary: "base" })) }, [], undefined, 5_000, env, undefined, refresher);
     const input = options.input ?? "Help me with the team's records";
     const snapshot = {
       id: "00000000-0000-7000-8000-000000000901",

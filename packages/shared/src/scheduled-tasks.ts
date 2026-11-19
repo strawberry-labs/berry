@@ -48,7 +48,7 @@ export const ScheduledTaskRunSchema = z.object({
   id: z.string().uuid(), scheduleId: z.string().uuid(), scheduledAt: z.string().datetime({ offset: true }),
   trigger: z.enum(["scheduled", "manual"]), state: z.enum(["pending", "dispatching", "admitted", "failed", "skipped"]),
   taskId: z.string().uuid().nullable(), sessionId: z.string().uuid().nullable(), turnId: z.string().uuid().nullable(),
-  turnState: z.string().nullable(), error: z.string().nullable(),
+  turnState: z.string().nullable(), waitingReason: z.string().nullable().optional(), error: z.string().nullable(),
   createdAt: z.string().datetime({ offset: true }), finishedAt: z.string().datetime({ offset: true }).nullable(),
 });
 export type ScheduledTaskRun = z.infer<typeof ScheduledTaskRunSchema>;

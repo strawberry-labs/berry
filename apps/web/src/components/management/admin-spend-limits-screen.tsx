@@ -1,18 +1,26 @@
 import * as React from "react";
-import { useNavigate } from "@tanstack/react-router";
-import { Copy, Download, FileUp, Plus, Save, Search, UserPlus, Users } from "lucide-react";
+import { CalendarClock, Plus } from "lucide-react";
+import { actionErrorMessage } from "@/lib/action-error";
 import {
-  AsyncState, Button, Checkbox, DataTable, FormSelect, Input, ManagementDialog,
-  ManagementPage, MetricGrid, SearchInput, Section, StatusPill, SuccessMessage,
-  Switch, Toolbar, formatDateTime, formatMoney, formatNumber,
+  AsyncState, Button, CellStack, DataTable, DefinitionList, DetailDrawer, FormSelect, InlineNotice, Input,
+  ManagementDialog, ManagementPage, Meter, MetricGrid, Num, Section, SettingList, SettingRow, StatusPill,
+  SuccessMessage, formatCompactMoney, formatDate, formatDateTime, formatMoney, formatNumber, formatPercent,
 } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
-import {
-  calculateCacheMetric, UsageRangeControl, usageRangeForPreset,
-  type UsageDateRange, type UsageRangePreset,
-} from "./usage-controls";
-import { parseMemberImportCsv, type MemberImportRow } from "../../lib/member-import";
-import { memberAccessStatusOptions, memberStatusUpdate } from "../../lib/member-administration";
+import { TimezoneSelect } from "./timezone-select";
+
+const DAY_MS = 86_400_000;
+
+type BalanceView = {
+  item: any;
+  name: string;
+  spentMicros: number;
+  limitMicros: number | null;
+  ratio: number | null;
+  over: boolean;
+  near: boolean;
+};
+
 export function AdminSpendLimitsScreen({ client, tenantId, permissions }: ManagementScreenProps) {
   const r = useResource(
     `allowances:${tenantId}`,
@@ -33,12 +41,15 @@ export function AdminSpendLimitsScreen({ client, tenantId, permissions }: Manage
   );
   const [limits, profiles, defaults, cycle, balances, members, departments, adjustments] = r.data;
   const [success, setSuccess] = React.useState("");
+  const [formError, setFormError] = React.useState("");
   const [assignOpen, setAssignOpen] = React.useState(false);
   const [topUpOpen, setTopUpOpen] = React.useState(false);
   const [cycleOpen, setCycleOpen] = React.useState(false);
+  const [cycleTimezone, setCycleTimezone] = React.useState("UTC");
   const [memberBaseOpen, setMemberBaseOpen] = React.useState(false);
   const [defaultOpen, setDefaultOpen] = React.useState(false);
   const [scopeType, setScopeType] = React.useState<"department" | "org">("department");
+  const [detailUserId, setDetailUserId] = React.useState<string | null>(null);
   const [topUpUserId, setTopUpUserId] = React.useState("");
   const [memberBaseUserId, setMemberBaseUserId] = React.useState("");
   const [memberBaseMode, setMemberBaseMode] = React.useState<"inherit" | "custom">("inherit");
@@ -59,15 +70,54 @@ export function AdminSpendLimitsScreen({ client, tenantId, permissions }: Manage
       .filter((item: any) => item.role === null && item.departmentId !== null)
       .map((item: any) => [item.departmentId, item]),
   );
-  const totalUsed = balances.reduce((sum: bigint, item: any) => sum + BigInt(item.usedMicros), 0n);
-  const totalAvailable = balances.reduce(
-    (sum: bigint, item: any) => sum + BigInt(item.availableMicros ?? 0),
-    0n,
-  );
 
-  const openMemberBase = (index: number) => {
-    const balance = balances[index];
-    if (!balance) return;
+  // People closest to (or past) their limit come first; members without a limit sink to the bottom.
+  const views: BalanceView[] = balances
+    .map((item: any): BalanceView => {
+      const spentMicros = Number(BigInt(item.usedMicros) + BigInt(item.reservedMicros));
+      const limitMicros = item.effectiveLimitMicros === null ? null : Number(item.effectiveLimitMicros);
+      const ratio = limitMicros === null ? null : limitMicros > 0 ? spentMicros / limitMicros : 1;
+      const over = item.status === "blocked" || (ratio !== null && ratio >= 1);
+      return {
+        item,
+        name: item.userName || item.userEmail || memberNames.get(item.userId) || "Unknown member",
+        spentMicros,
+        limitMicros,
+        ratio,
+        over,
+        near: !over && (item.status === "warning" || (ratio !== null && ratio >= 0.8)),
+      };
+    })
+    .sort((left: BalanceView, right: BalanceView) => (right.ratio ?? -1) - (left.ratio ?? -1) || right.spentMicros - left.spentMicros);
+  const overCount = views.filter((view) => view.over).length;
+  const nearCount = views.filter((view) => view.near).length;
+  const limited = views.filter((view) => view.limitMicros !== null);
+  const totalSpent = views.reduce((sum, view) => sum + view.spentMicros, 0);
+  const limitedSpent = limited.reduce((sum, view) => sum + view.spentMicros, 0);
+  const totalGranted = limited.reduce((sum, view) => sum + (view.limitMicros ?? 0), 0);
+  const cycleStart = balances[0]?.cycleStart ?? null;
+  const cycleEnd = balances[0]?.cycleEnd ?? null;
+  const daysToReset = cycleEnd ? Math.max(0, Math.ceil((new Date(cycleEnd).getTime() - Date.now()) / DAY_MS)) : null;
+  const detail = detailUserId ? views.find((view) => view.item.userId === detailUserId) ?? null : null;
+  const detailAdjustments = detail ? adjustments.filter((item: any) => item.userId === detail.item.userId) : [];
+
+  const attempt = async (action: () => Promise<void>) => {
+    setFormError("");
+    try {
+      await action();
+    } catch (cause) {
+      setFormError(actionErrorMessage(cause, "Could not save this change. Nothing was applied; try again."));
+    }
+  };
+
+  const openTopUp = (userId: string) => {
+    setFormError("");
+    setTopUpUserId(userId);
+    setTopUpOpen(true);
+  };
+
+  const openMemberBase = (balance: any) => {
+    setFormError("");
     setMemberBaseUserId(balance.userId);
     setMemberBaseMode(balance.baseSource === "member" ? "custom" : "inherit");
     setMemberBaseAmount(balance.baseLimitMicros === null ? "" : String(Number(balance.baseLimitMicros) / 1e6));
@@ -79,6 +129,7 @@ export function AdminSpendLimitsScreen({ client, tenantId, permissions }: Manage
       ? organizationDefault
       : departmentDefaults.get(departmentId);
     const profile = assignment?.profileId ? profilesById.get(assignment.profileId) : null;
+    setFormError("");
     setDefaultScope(scope);
     setDefaultDepartmentId(departmentId);
     setDefaultMode(scope === "department" && !profile ? "inherit" : "custom");
@@ -86,180 +137,228 @@ export function AdminSpendLimitsScreen({ client, tenantId, permissions }: Manage
     setDefaultOpen(true);
   };
 
-  const submitAllowance = async (event: React.FormEvent<HTMLFormElement>) => {
+  const submitAllowance = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     const scopeId = scopeType === "org" ? tenantId : String(form.get("scopeId"));
-    await client?.bulkUpsertAllowanceLimits(tenantId, {
-      idempotencyKey: crypto.randomUUID(),
-      reason: String(form.get("reason")),
-      dryRun: false,
-      items: [{
-        scopeType,
-        scopeId,
-        period: String(form.get("period")) as "day" | "month",
-        softLimitMicros: String(Math.round(Number(form.get("soft")) * 1e6)),
-        hardLimitMicros: String(Math.round(Number(form.get("hard")) * 1e6)),
-        requestLimit: Number(form.get("requests")) || null,
-        tokenLimit: Number(form.get("tokens")) || null,
-        sandboxMinuteLimit: Number(form.get("sandbox")) || null,
-      }],
+    return attempt(async () => {
+      await client?.bulkUpsertAllowanceLimits(tenantId, {
+        idempotencyKey: crypto.randomUUID(),
+        reason: String(form.get("reason")),
+        dryRun: false,
+        items: [{
+          scopeType,
+          scopeId,
+          period: String(form.get("period")) as "day" | "month",
+          softLimitMicros: String(Math.round(Number(form.get("soft")) * 1e6)),
+          hardLimitMicros: String(Math.round(Number(form.get("hard")) * 1e6)),
+          requestLimit: Number(form.get("requests")) || null,
+          tokenLimit: Number(form.get("tokens")) || null,
+          sandboxMinuteLimit: Number(form.get("sandbox")) || null,
+        }],
+      });
+      setAssignOpen(false);
+      setSuccess("Spending cap saved. New requests are checked against it immediately.");
+      r.retry();
     });
-    setAssignOpen(false);
-    setSuccess("Allowance updated. New requests use it immediately.");
-    r.retry();
   };
 
-  const submitTopUp = async (event: React.FormEvent<HTMLFormElement>) => {
+  const submitTopUp = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    await client?.createAllowanceAdjustment(tenantId, {
-      userId: String(form.get("userId")),
-      amountMicros: String(Math.round(Number(form.get("amount")) * 1e6)),
-      reason: String(form.get("reason")),
-      idempotencyKey: crypto.randomUUID(),
+    return attempt(async () => {
+      await client?.createAllowanceAdjustment(tenantId, {
+        userId: topUpUserId,
+        amountMicros: String(Math.round(Number(form.get("amount")) * 1e6)),
+        reason: String(form.get("reason")),
+        idempotencyKey: crypto.randomUUID(),
+      });
+      setTopUpOpen(false);
+      setSuccess("Top-up added to this member’s limit for the current cycle.");
+      r.retry();
     });
-    setTopUpOpen(false);
-    setSuccess("Top-up added to this member’s current cycle and enforcement limit.");
-    r.retry();
   };
 
-  const submitMemberBase = async (event: React.FormEvent<HTMLFormElement>) => {
+  const submitMemberBase = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const amountMicros = memberBaseMode === "inherit"
       ? null
       : String(Math.round(Number(memberBaseAmount) * 1e6));
-    await client?.updateMemberAllowanceBase(tenantId, memberBaseUserId, { amountMicros });
-    setMemberBaseOpen(false);
-    setSuccess(memberBaseMode === "inherit"
-      ? "Member now follows the department or organization allowance."
-      : "Member base allowance updated for the current and future cycles.");
-    r.retry();
+    return attempt(async () => {
+      await client?.updateMemberAllowanceBase(tenantId, memberBaseUserId, { amountMicros });
+      setMemberBaseOpen(false);
+      setSuccess(memberBaseMode === "inherit"
+        ? "Member now follows the department or organization default."
+        : "Member allowance updated for this and future cycles.");
+      r.retry();
+    });
   };
 
-  const submitDefault = async (event: React.FormEvent<HTMLFormElement>) => {
+  const submitDefault = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const departmentId = defaultScope === "department" ? defaultDepartmentId : null;
     const existingAssignment = defaultScope === "organization"
       ? organizationDefault
       : departmentDefaults.get(defaultDepartmentId);
-    if (defaultScope === "department" && defaultMode === "inherit") {
-      await client?.upsertAllowanceDefault(tenantId, {
-        profileId: null,
-        role: null,
-        departmentId,
-        priority: 100,
-      });
+    return attempt(async () => {
+      if (defaultScope === "department" && defaultMode === "inherit") {
+        await client?.upsertAllowanceDefault(tenantId, {
+          profileId: null,
+          role: null,
+          departmentId,
+          priority: 100,
+        });
+        setDefaultOpen(false);
+        setSuccess("Department now follows the organization default.");
+        r.retry();
+        return;
+      }
+      const amountMicros = String(Math.round(Number(defaultAmount) * 1e6));
+      const existingProfile = existingAssignment?.profileId
+        ? profilesById.get(existingAssignment.profileId)
+        : null;
+      const departmentName = departmentNames.get(defaultDepartmentId) ?? "Department";
+      const profile = await client?.upsertAllowanceProfile(tenantId, {
+        name: existingProfile?.name ?? (defaultScope === "organization"
+          ? "Organization default allowance"
+          : `${departmentName} default allowance`),
+        description: defaultScope === "organization"
+          ? "Monthly base allowance for organization members"
+          : `Monthly base allowance for members of ${departmentName}`,
+        period: "month",
+        softLimitMicros: String(BigInt(amountMicros) * 8n / 10n),
+        hardLimitMicros: amountMicros,
+        requestLimit: null,
+        tokenLimit: null,
+        sandboxMinuteLimit: null,
+        thresholdPercentages: [80, 100],
+        status: "active",
+      }, existingProfile?.id);
+      if (profile) {
+        await client?.upsertAllowanceDefault(tenantId, {
+          profileId: profile.id,
+          role: null,
+          departmentId,
+          priority: defaultScope === "department" ? 100 : 0,
+        });
+      }
       setDefaultOpen(false);
-      setSuccess("Department now follows the organization default allowance.");
+      setSuccess(`${defaultScope === "organization" ? "Organization" : "Department"} default updated.`);
       r.retry();
-      return;
-    }
-    const amountMicros = String(Math.round(Number(defaultAmount) * 1e6));
-    const existingProfile = existingAssignment?.profileId
-      ? profilesById.get(existingAssignment.profileId)
-      : null;
-    const departmentName = departmentNames.get(defaultDepartmentId) ?? "Department";
-    const profile = await client?.upsertAllowanceProfile(tenantId, {
-      name: existingProfile?.name ?? (defaultScope === "organization"
-        ? "Organization default allowance"
-        : `${departmentName} default allowance`),
-      description: defaultScope === "organization"
-        ? "Monthly base allowance for organization members"
-        : `Monthly base allowance for members of ${departmentName}`,
-      period: "month",
-      softLimitMicros: String(BigInt(amountMicros) * 8n / 10n),
-      hardLimitMicros: amountMicros,
-      requestLimit: null,
-      tokenLimit: null,
-      sandboxMinuteLimit: null,
-      thresholdPercentages: [80, 100],
-      status: "active",
-    }, existingProfile?.id);
-    if (profile) {
-      await client?.upsertAllowanceDefault(tenantId, {
-        profileId: profile.id,
-        role: null,
-        departmentId,
-        priority: defaultScope === "department" ? 100 : 0,
-      });
-    }
-    setDefaultOpen(false);
-    setSuccess(`${defaultScope === "organization" ? "Organization" : "Department"} default allowance updated.`);
-    r.retry();
+    });
   };
 
-  const submitCycle = async (event: React.FormEvent<HTMLFormElement>) => {
+  const submitCycle = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    await client?.updateAllowanceCycle(tenantId, {
-      timezone: String(form.get("timezone")),
-      anchorDay: Number(form.get("anchorDay")),
+    return attempt(async () => {
+      await client?.updateAllowanceCycle(tenantId, {
+        timezone: cycleTimezone,
+        anchorDay: Number(form.get("anchorDay")),
+      });
+      setCycleOpen(false);
+      setSuccess("Cycle updated. Balances and limit checks use it from now on.");
+      r.retry();
     });
-    setCycleOpen(false);
-    setSuccess("Allowance cycle updated for subsequent balance and enforcement checks.");
-    r.retry();
   };
 
   const targetOptions = departments.map((department: any) => ({ value: department.id, label: department.name }));
+  const error = formError ? <InlineNotice tone="danger">{formError}</InlineNotice> : null;
 
   return (
-    <ManagementPage
+    <ManagementPage width="wide"
       title="Allowances"
-      description="Set the monthly organization default, override it by department or member, and add audited one-time top-ups."
+      description="What each member can spend per cycle, who is close to their limit, and the defaults they inherit."
       eyebrow="Usage & billing"
-      actions={canWrite ? (
-        <>
-          <Button variant="secondary" onClick={() => setCycleOpen(true)}>Configure cycle</Button>
-          <Button variant="secondary" onClick={() => { setTopUpUserId(members[0]?.userId ?? ""); setTopUpOpen(true); }}>
-            <Plus />
-            Top up member
-          </Button>
-          <Button variant="secondary" onClick={() => setAssignOpen(true)}>
-            <Plus />
-            Add guardrail
-          </Button>
-          <Button onClick={() => openDefault("organization")}>
-            <Save />
-            Edit organization default
-          </Button>
-        </>
-      ) : null}
     >
       {success ? <SuccessMessage>{success}</SuccessMessage> : null}
       <AsyncState loading={r.loading} error={r.error} onRetry={r.retry}>
-        <MetricGrid items={[
-          { label: "Used this cycle", value: formatMoney(totalUsed) },
-          { label: "Available", value: formatMoney(totalAvailable) },
-          { label: "Members with limits", value: formatNumber(balances.filter((item: any) => item.effectiveLimitMicros !== null).length) },
-          { label: "Needs attention", value: formatNumber(balances.filter((item: any) => item.status === "warning" || item.status === "blocked").length), status: balances.some((item: any) => item.status === "blocked") ? "danger" : "warning" },
-        ]} />
+        {views.length ? (
+          <MetricGrid items={[
+            {
+              label: "Over limit",
+              value: formatNumber(overCount),
+              hint: `of ${formatNumber(limited.length)} members with a limit`,
+              ...(overCount ? { status: "danger" as const } : {}),
+            },
+            {
+              label: "Above 80%",
+              value: formatNumber(nearCount),
+              hint: "Likely to hit their limit this cycle",
+              ...(nearCount ? { status: "warning" as const } : {}),
+            },
+            {
+              label: "Used this cycle",
+              value: formatCompactMoney(totalSpent),
+              exactValue: formatMoney(totalSpent),
+              hint: totalGranted > 0
+                ? `${formatPercent(limitedSpent / totalGranted)} of ${formatCompactMoney(totalGranted)} granted`
+                : "No member has a limit",
+            },
+            {
+              label: "Cycle resets",
+              value: daysToReset === null ? "—" : daysToReset === 0 ? "Today" : `In ${daysToReset} ${daysToReset === 1 ? "day" : "days"}`,
+              hint: cycleEnd ? `${formatDate(cycleEnd)}${cycle ? ` · ${cycle.timezone}` : ""}` : "No cycle data yet",
+            },
+          ]} />
+        ) : null}
+        {overCount ? (
+          <InlineNotice tone="danger" title={`${formatNumber(overCount)} ${overCount === 1 ? "member has" : "members have"} reached their limit`}>
+            Their requests are blocked until the cycle resets. Open a member below to top up or raise their monthly allowance.
+          </InlineNotice>
+        ) : null}
         <Section
-          title="Default allowance hierarchy"
-          description="Every member starts with the organization amount. A department can replace it for its members; a member override wins over both."
+          title="Member balances"
+          description="Sorted by share of limit used. Select a member to top up this cycle or change their monthly allowance."
+          flush
         >
           <DataTable
-            label="Recurring allowance defaults"
-            columns={["Level", "Applies to", "Monthly base", "Behavior"]}
+            label="Member allowance balances"
+            columns={["Member", "Used", "Limit", "Available", "Top-ups", "Source", "State"]}
+            rows={views.map((view) => [
+              <CellStack primary={view.name} secondary={view.item.userEmail ?? shortId(view.item.userId)} />,
+              view.limitMicros === null ? (
+                <Num value={view.spentMicros} kind="money" />
+              ) : (
+                <span className="block w-40" data-sort={view.ratio ?? 0}>
+                  <Meter value={view.spentMicros} max={view.limitMicros} label={formatMoney(view.spentMicros)} detail={formatPercent(view.ratio)} />
+                </span>
+              ),
+              view.limitMicros === null ? <span data-sort={Number.MAX_SAFE_INTEGER}>No limit</span> : <Num value={view.limitMicros} kind="money" />,
+              view.item.availableMicros === null ? <span data-sort={Number.MAX_SAFE_INTEGER}>No limit</span> : <Num value={view.item.availableMicros} kind="money" />,
+              <Num value={view.item.adjustmentMicros} kind="money" />,
+              sourceLabel(view.item.baseSource),
+              <StatusPill tone={view.over ? "danger" : view.near ? "warning" : view.limitMicros === null ? "neutral" : "good"}>
+                {view.over ? "Over limit" : view.near ? "Near limit" : view.limitMicros === null ? "No limit" : "Within limit"}
+              </StatusPill>,
+            ])}
+            onRowSelect={(index) => setDetailUserId(views[index]?.item.userId ?? null)}
+            activeRow={detail ? views.indexOf(detail) : null}
+            rowLabel={(index) => `${views[index]?.name ?? "Member"} allowance`}
+          />
+        </Section>
+        <Section
+          title="Monthly defaults"
+          description="Every member gets the organization amount. A department amount replaces it for that department, and a member allowance replaces both."
+          flush
+        >
+          <DataTable
+            label="Allowance defaults"
+            columns={["Applies to", "Monthly allowance per member", "Source"]}
             rows={[
               [
-                <b>Organization</b>,
-                "All members",
-                organizationBaseMicros === null ? "Not configured" : formatMoney(organizationBaseMicros),
-                "Default for new and existing members",
+                <CellStack primary="Everyone" secondary="Organization default" />,
+                organizationBaseMicros === null ? "Not set" : <Num value={organizationBaseMicros} kind="money" />,
+                <StatusPill tone={organizationBaseMicros === null ? "warning" : "neutral"}>{organizationBaseMicros === null ? "Not set" : "Organization"}</StatusPill>,
               ],
               ...departments.map((department: any) => {
                 const assignment = departmentDefaults.get(department.id);
                 const profile = assignment?.profileId ? profilesById.get(assignment.profileId) : null;
+                const amount = profile?.hardLimitMicros ?? organizationBaseMicros;
                 return [
-                  "Department",
-                  department.name,
-                  profile?.hardLimitMicros
-                    ? formatMoney(profile.hardLimitMicros)
-                    : organizationBaseMicros === null
-                      ? "Not configured"
-                      : formatMoney(organizationBaseMicros),
-                  profile ? "Overrides organization" : "Inherits organization",
+                  <CellStack primary={department.name} secondary="Department" />,
+                  amount === null ? "Not set" : <Num value={amount} kind="money" />,
+                  <StatusPill tone={profile ? "info" : "neutral"}>{profile ? "Department amount" : "Inherits organization"}</StatusPill>,
                 ];
               }),
             ]}
@@ -272,134 +371,176 @@ export function AdminSpendLimitsScreen({ client, tenantId, permissions }: Manage
                 : `Edit ${departments[index - 1]?.name ?? "department"} allowance`,
             } : {})}
           />
+          <SettingList>
+            <SettingRow
+              icon={CalendarClock}
+              title="Cycle"
+              description={cycle
+                ? `Resets on day ${cycle.anchorDay} of each month, ${cycle.timezone} time.${cycleStart && cycleEnd ? ` Current cycle: ${formatDate(cycleStart)} – ${formatDate(cycleEnd)}.` : ""}`
+                : "No cycle is configured yet."}
+            >
+              {canWrite ? (
+                <Button variant="secondary" onClick={() => { setFormError(""); setCycleTimezone(cycle?.timezone ?? "UTC"); setCycleOpen(true); }}>
+                  Change cycle
+                </Button>
+              ) : null}
+            </SettingRow>
+          </SettingList>
         </Section>
         <Section
-          title="Allowance cycle"
-          description="Monthly anchors use local organization time. Days 1–28 avoid short-month ambiguity."
+          title="Group spending caps"
+          description="A ceiling on the combined spend of a department or the whole organization. It applies on top of each member’s own allowance."
+          actions={canWrite ? (
+            <Button variant="secondary" onClick={() => { setFormError(""); setAssignOpen(true); }}>
+              <Plus />
+              Add cap
+            </Button>
+          ) : null}
+          flush
         >
           <DataTable
-            label="Allowance cycle"
-            columns={["Timezone", "Anchor", "Current cycle", "Next reset"]}
-            rows={cycle ? [[
-              cycle.timezone,
-              `Day ${cycle.anchorDay}`,
-              balances[0] ? `${new Date(balances[0].cycleStart).toLocaleDateString()} – ${new Date(balances[0].cycleEnd).toLocaleDateString()}` : "—",
-              balances[0] ? formatDateTime(balances[0].cycleEnd) : "—",
-            ]] : []}
-          />
-        </Section>
-        <Section
-          title="Member balances"
-          description="Select a member to edit their recurring base or return them to the inherited department or organization allowance."
-        >
-          <DataTable
-            label="Member allowance balances"
-            columns={["Member", "Base", "Source", "Top-ups", "Used", "Available", "State", "Reset", ""]}
-            rows={balances.map((item: any) => [
-              <span><b>{item.userName || item.userEmail || memberNames.get(item.userId) || "Unknown member"}</b><small>{item.userEmail ?? item.userId}</small></span>,
-              item.baseLimitMicros === null ? "Unlimited" : formatMoney(item.baseLimitMicros),
-              <StatusPill tone={item.baseSource === "member" ? "warning" : item.baseSource === "unlimited" ? "neutral" : "good"}>{human(item.baseSource)}</StatusPill>,
-              formatMoney(item.adjustmentMicros),
-              formatMoney(BigInt(item.usedMicros) + BigInt(item.reservedMicros)),
-              item.availableMicros === null ? "Unlimited" : formatMoney(item.availableMicros),
-              <StatusPill tone={item.status === "healthy" ? "good" : item.status === "blocked" ? "danger" : item.status === "warning" ? "warning" : "neutral"}>{item.status}</StatusPill>,
-              new Date(item.cycleEnd).toLocaleDateString(),
-              canWrite ? <Button variant="ghost" onClick={(event) => { event.stopPropagation(); setTopUpUserId(item.userId); setTopUpOpen(true); }}>Top up</Button> : null,
-            ])}
-            {...(canWrite ? {
-              onRowSelect: openMemberBase,
-              activeRow: memberBaseOpen ? balances.findIndex((item: any) => item.userId === memberBaseUserId) : null,
-              rowLabel: (index: number) => `Edit ${balances[index]?.userName || balances[index]?.userEmail || "member"} base allowance`,
-            } : {})}
-          />
-        </Section>
-        <Section
-          title="Assigned limits and aggregate guardrails"
-          description="Department and organization rows are aggregate safety ceilings. Recurring member bases are managed in the hierarchy above."
-        >
-          <DataTable
-            label="Assigned allowance limits"
-            columns={["Scope", "Period", "Soft", "Hard", "Requests", "Tokens", "Updated"]}
+            label="Spending caps"
+            columns={["Applies to", "Period", "Warn at", "Block at", "Requests", "Tokens", "Updated"]}
             rows={limits.map((item: any) => [
-              `${human(item.scopeType)}: ${item.scopeType === "user" ? memberNames.get(item.scopeId) ?? item.scopeId : item.scopeType === "department" ? departmentNames.get(item.scopeId) ?? item.scopeId : "Emergency organization guardrail"}`,
-              item.period,
-              formatMoney(item.softLimitMicros),
-              formatMoney(item.hardLimitMicros),
-              item.requestLimit ?? "—",
-              item.tokenLimit ?? "—",
-              new Date(item.updatedAt).toLocaleDateString(),
+              <CellStack
+                primary={item.scopeType === "user"
+                  ? memberNames.get(item.scopeId) ?? "Unknown member"
+                  : item.scopeType === "department"
+                    ? departmentNames.get(item.scopeId) ?? "Unknown department"
+                    : "Whole organization"}
+                secondary={item.scopeType === "user" ? "Member" : item.scopeType === "department" ? "Department" : "Organization"}
+              />,
+              item.period === "day" ? "Daily" : "Monthly",
+              <Num value={item.softLimitMicros} kind="money" />,
+              <Num value={item.hardLimitMicros} kind="money" />,
+              item.requestLimit == null ? "—" : <Num value={item.requestLimit} />,
+              item.tokenLimit == null ? "—" : <Num value={item.tokenLimit} />,
+              formatDate(item.updatedAt),
             ])}
           />
         </Section>
-        <Section title="Current-cycle top-up history" description="Top-ups are append-only and include an administrator reason.">
+        <Section title="Top-ups this cycle" description="One-time additions to a member’s limit. Each records who added it and why, and cannot be edited." flush>
           <DataTable
-            label="Allowance adjustments"
-            columns={["Member", "Amount", "Reason", "Cycle", "Created"]}
-            rows={adjustments.map((item: any) => [
-              memberNames.get(item.userId) ?? item.userId,
-              formatMoney(item.amountMicros),
-              item.reason,
-              `${new Date(item.cycleStart).toLocaleDateString()} – ${new Date(item.cycleEnd).toLocaleDateString()}`,
-              formatDateTime(item.createdAt),
-            ])}
+            label="Top-ups"
+            columns={["Member", "Amount", "Reason", "Added by", "Added"]}
+            rows={[...adjustments]
+              .sort((left: any, right: any) => String(right.createdAt).localeCompare(String(left.createdAt)))
+              .map((item: any) => [
+                memberNames.get(item.userId) ?? "Unknown member",
+                <Num value={item.amountMicros} kind="money" />,
+                item.reason,
+                memberNames.get(item.createdBy) ?? "Unknown member",
+                formatDateTime(item.createdAt),
+              ])}
           />
         </Section>
-        {profiles.length ? <p className="text-xs text-muted-foreground">{profiles.length} reusable allowance {profiles.length === 1 ? "profile" : "profiles"} configured.</p> : null}
       </AsyncState>
+
+      {detail ? (
+        <DetailDrawer
+          title={detail.name}
+          subtitle={detail.item.userEmail ?? shortId(detail.item.userId)}
+          badge={<StatusPill tone={detail.over ? "danger" : detail.near ? "warning" : detail.limitMicros === null ? "neutral" : "good"}>{detail.over ? "Over limit" : detail.near ? "Near limit" : detail.limitMicros === null ? "No limit" : "Within limit"}</StatusPill>}
+          onClose={() => setDetailUserId(null)}
+          footer={canWrite ? (
+            <>
+              <Button variant="secondary" onClick={() => openMemberBase(detail.item)}>Change monthly allowance</Button>
+              <Button onClick={() => openTopUp(detail.item.userId)}>
+                <Plus />
+                Top up
+              </Button>
+            </>
+          ) : undefined}
+        >
+          {detail.limitMicros !== null ? (
+            <Meter
+              value={detail.spentMicros}
+              max={detail.limitMicros}
+              label={`${formatMoney(detail.spentMicros)} used`}
+              detail={`of ${formatMoney(detail.limitMicros)}`}
+            />
+          ) : null}
+          <DefinitionList
+            items={[
+              { term: "Monthly allowance", detail: detail.item.baseLimitMicros === null ? "No limit" : formatMoney(detail.item.baseLimitMicros) },
+              { term: "Comes from", detail: sourceLabel(detail.item.baseSource) },
+              { term: "Top-ups this cycle", detail: formatMoney(detail.item.adjustmentMicros) },
+              { term: "Limit this cycle", detail: detail.limitMicros === null ? "No limit" : formatMoney(detail.limitMicros) },
+              { term: "Spent", detail: formatMoney(detail.item.usedMicros) },
+              { term: "Held for running requests", detail: formatMoney(detail.item.reservedMicros) },
+              { term: "Available", detail: detail.item.availableMicros === null ? "No limit" : formatMoney(detail.item.availableMicros) },
+              { term: "Cycle", detail: `${formatDate(detail.item.cycleStart)} – ${formatDate(detail.item.cycleEnd)}` },
+            ]}
+          />
+          {detailAdjustments.length ? (
+            <DefinitionList
+              items={detailAdjustments.map((item: any) => ({
+                term: `${formatMoney(item.amountMicros)} · ${formatDate(item.createdAt)}`,
+                detail: `${item.reason} — ${memberNames.get(item.createdBy) ?? "Unknown member"}`,
+              }))}
+            />
+          ) : null}
+        </DetailDrawer>
+      ) : null}
 
       <ManagementDialog
         open={assignOpen}
         onOpenChange={setAssignOpen}
-        title="Add aggregate guardrail"
-        description="Cap total department or organization spend independently from each member’s recurring base."
+        title="Add spending cap"
+        description="Cap the combined spend of a department or the whole organization. Members keep their own allowances underneath it."
         size="lg"
-        footer={<><Button type="button" variant="secondary" onClick={() => setAssignOpen(false)}>Cancel</Button><Button type="submit" form="assign-allowance-form"><Save />Apply guardrail</Button></>}
+        footer={<><Button type="button" variant="secondary" onClick={() => setAssignOpen(false)}>Cancel</Button><Button type="submit" form="assign-allowance-form">Save cap</Button></>}
       >
-        <form id="assign-allowance-form" className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground" onSubmit={submitAllowance}>
-          <label>Scope<FormSelect value={scopeType} onChange={(value) => setScopeType(value as typeof scopeType)} options={[{ value: "department", label: "Department aggregate guardrail" }, { value: "org", label: "Emergency organization guardrail" }]} /></label>
-          {scopeType !== "org" ? <label>Department<FormSelect name="scopeId" options={targetOptions} placeholder="Select department" required /></label> : <p className="self-end rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">Applies to all organization spend as an emergency ceiling.</p>}
-          <label>Period<FormSelect name="period" defaultValue="month" options={[{ value: "month", label: "Monthly cycle" }, { value: "day", label: "Daily" }]} /></label>
-          <label>Soft limit (USD)<Input name="soft" type="number" min="0" step=".01" required /></label>
-          <label>Hard limit (USD)<Input name="hard" type="number" min="0" step=".01" required /></label>
-          <label>Request quota<Input name="requests" type="number" min="0" /></label>
-          <label>Token quota<Input name="tokens" type="number" min="0" /></label>
-          <label>Sandbox minutes<Input name="sandbox" type="number" min="0" step=".1" /></label>
-          <label className="sm:col-span-2">Audit reason<Input name="reason" minLength={3} required /></label>
+        <form id="assign-allowance-form" className="grid gap-3 sm:grid-cols-2" onSubmit={submitAllowance}>
+          <Field label="Applies to"><FormSelect ariaLabel="Applies to" value={scopeType} onChange={(value) => setScopeType(value as typeof scopeType)} options={[{ value: "department", label: "One department" }, { value: "org", label: "Whole organization" }]} /></Field>
+          {scopeType !== "org"
+            ? <Field label="Department"><FormSelect name="scopeId" ariaLabel="Department" options={targetOptions} placeholder="Select department" required /></Field>
+            : <p className="self-end pb-1.5 text-xs leading-5 text-muted-foreground">Counts all spend in the organization.</p>}
+          <Field label="Period"><FormSelect name="period" ariaLabel="Period" defaultValue="month" options={[{ value: "month", label: "Each cycle (monthly)" }, { value: "day", label: "Each day" }]} /></Field>
+          <span className="hidden sm:block" />
+          <Field label="Warn at (USD)" hint="Sends a warning; requests continue."><Input name="soft" type="number" min="0" step=".01" required /></Field>
+          <Field label="Block at (USD)" hint="New requests are refused above this."><Input name="hard" type="number" min="0" step=".01" required /></Field>
+          <Field label="Request limit" hint="Optional."><Input name="requests" type="number" min="0" /></Field>
+          <Field label="Token limit" hint="Optional."><Input name="tokens" type="number" min="0" /></Field>
+          <Field label="Sandbox minutes" hint="Optional."><Input name="sandbox" type="number" min="0" step=".1" /></Field>
+          <Field label="Reason" hint="Recorded in the audit log." className="sm:col-span-2"><Input name="reason" minLength={3} required /></Field>
+          {error ? <div className="sm:col-span-2">{error}</div> : null}
         </form>
       </ManagementDialog>
 
       <ManagementDialog
         open={defaultOpen}
         onOpenChange={setDefaultOpen}
-        title={defaultScope === "organization" ? "Organization default allowance" : "Department allowance"}
+        title={defaultScope === "organization" ? "Organization default" : `${departmentNames.get(defaultDepartmentId) ?? "Department"} allowance`}
         description={defaultScope === "organization"
-          ? "This monthly amount is applied to every active member unless a department or member override exists."
-          : "Choose whether this department inherits the organization amount or gives each member a different monthly base."}
+          ? "The monthly amount every member gets unless their department or their own allowance says otherwise."
+          : "Use the organization default for this department, or give its members a different monthly amount."}
         footer={<><Button type="button" variant="secondary" onClick={() => setDefaultOpen(false)}>Cancel</Button><Button type="submit" form="default-allowance-form">Save default</Button></>}
       >
-        <form id="default-allowance-form" className="grid gap-3 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground" onSubmit={submitDefault}>
-          {defaultScope === "department" ? <>
-            <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs font-medium text-foreground">{departmentNames.get(defaultDepartmentId) ?? "Department"}</p>
-            <label>Allowance source<FormSelect value={defaultMode} onChange={(value) => setDefaultMode(value as typeof defaultMode)} options={[{ value: "inherit", label: `Use organization default (${organizationBaseMicros === null ? "not configured" : formatMoney(organizationBaseMicros)})` }, { value: "custom", label: "Set department amount" }]} /></label>
-          </> : null}
-          {defaultScope === "organization" || defaultMode === "custom" ? <label>Monthly base per member (USD)<Input value={defaultAmount} onChange={(event) => setDefaultAmount(event.target.value)} type="number" min="0.01" step=".01" autoFocus required /></label> : (
-            <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs leading-5 text-muted-foreground">Members in this department will receive the organization default. Existing member-specific overrides are unchanged.</p>
-          )}
+        <form id="default-allowance-form" className="grid gap-3" onSubmit={submitDefault}>
+          {defaultScope === "department" ? (
+            <Field label="Allowance"><FormSelect ariaLabel="Allowance" value={defaultMode} onChange={(value) => setDefaultMode(value as typeof defaultMode)} options={[{ value: "inherit", label: `Organization default (${organizationBaseMicros === null ? "not set" : formatMoney(organizationBaseMicros)})` }, { value: "custom", label: "Department amount" }]} /></Field>
+          ) : null}
+          {defaultScope === "organization" || defaultMode === "custom"
+            ? <Field label="Monthly allowance per member (USD)"><Input value={defaultAmount} onChange={(event) => setDefaultAmount(event.target.value)} type="number" min="0.01" step=".01" autoFocus required /></Field>
+            : <p className="text-xs leading-5 text-muted-foreground">Members of this department get the organization default. Members with their own allowance keep it.</p>}
+          {error}
         </form>
       </ManagementDialog>
 
       <ManagementDialog
         open={memberBaseOpen}
         onOpenChange={setMemberBaseOpen}
-        title="Edit member base allowance"
-        description={memberNames.get(memberBaseUserId) ?? "Choose the recurring monthly amount for this member."}
-        footer={<><Button type="button" variant="secondary" onClick={() => setMemberBaseOpen(false)}>Cancel</Button><Button type="submit" form="member-base-form">Save base</Button></>}
+        title="Change monthly allowance"
+        description={`Set the recurring monthly amount for ${memberNames.get(memberBaseUserId) ?? "this member"}.`}
+        footer={<><Button type="button" variant="secondary" onClick={() => setMemberBaseOpen(false)}>Cancel</Button><Button type="submit" form="member-base-form">Save allowance</Button></>}
       >
-        <form id="member-base-form" className="grid gap-3 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground" onSubmit={submitMemberBase}>
-          <label>Allowance source<FormSelect value={memberBaseMode} onChange={(value) => setMemberBaseMode(value as typeof memberBaseMode)} options={[{ value: "inherit", label: "Use inherited default" }, { value: "custom", label: "Set member override" }]} /></label>
-          {memberBaseMode === "custom" ? <label>Monthly base (USD)<Input value={memberBaseAmount} onChange={(event) => setMemberBaseAmount(event.target.value)} type="number" min="0.01" step=".01" autoFocus required /></label> : (
-            <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs leading-5 text-muted-foreground">The department allowance applies first. If the department has no override, this member receives the organization default.</p>
-          )}
+        <form id="member-base-form" className="grid gap-3" onSubmit={submitMemberBase}>
+          <Field label="Allowance"><FormSelect ariaLabel="Allowance" value={memberBaseMode} onChange={(value) => setMemberBaseMode(value as typeof memberBaseMode)} options={[{ value: "inherit", label: "Department or organization default" }, { value: "custom", label: "Amount for this member" }]} /></Field>
+          {memberBaseMode === "custom"
+            ? <Field label="Monthly allowance (USD)"><Input value={memberBaseAmount} onChange={(event) => setMemberBaseAmount(event.target.value)} type="number" min="0.01" step=".01" autoFocus required /></Field>
+            : <p className="text-xs leading-5 text-muted-foreground">The department amount applies if one is set; otherwise the organization default.</p>}
+          {error}
         </form>
       </ManagementDialog>
 
@@ -407,32 +548,53 @@ export function AdminSpendLimitsScreen({ client, tenantId, permissions }: Manage
         open={topUpOpen}
         onOpenChange={setTopUpOpen}
         title="Top up member"
-        description="Add a one-time amount to this member’s current monthly cycle. Department guardrails still apply."
+        description={`Add a one-time amount to ${memberNames.get(topUpUserId) ?? "this member"}’s limit for the current cycle. Group spending caps still apply.`}
         footer={<><Button type="button" variant="secondary" onClick={() => setTopUpOpen(false)}>Cancel</Button><Button type="submit" form="top-up-allowance-form">Add top-up</Button></>}
       >
-        <form id="top-up-allowance-form" className="grid gap-3 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground" onSubmit={submitTopUp}>
-          <label>Member<FormSelect name="userId" value={topUpUserId} onChange={setTopUpUserId} options={members.map((member: any) => ({ value: member.userId, label: member.name || member.email }))} required /></label>
-          <label>Top-up amount (USD)<Input name="amount" type="number" min="0.01" step=".01" autoFocus required /></label>
-          <label>Reason<Input name="reason" minLength={3} maxLength={500} required /></label>
+        <form id="top-up-allowance-form" className="grid gap-3" onSubmit={submitTopUp}>
+          <Field label="Amount (USD)"><Input name="amount" type="number" min="0.01" step=".01" autoFocus required /></Field>
+          <Field label="Reason" hint="Recorded with the top-up and in the audit log."><Input name="reason" minLength={3} maxLength={500} required /></Field>
+          {error}
         </form>
       </ManagementDialog>
 
       <ManagementDialog
         open={cycleOpen}
         onOpenChange={setCycleOpen}
-        title="Configure monthly cycle"
-        description="Choose the organization timezone and reset day. The anchor is limited to days 1–28."
+        title="Change cycle"
+        description="Allowances reset once a month on this day, at midnight in this timezone."
         footer={<><Button type="button" variant="secondary" onClick={() => setCycleOpen(false)}>Cancel</Button><Button type="submit" form="allowance-cycle-form">Save cycle</Button></>}
       >
-        <form id="allowance-cycle-form" className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground" onSubmit={submitCycle}>
-          <label>Timezone<Input name="timezone" defaultValue={cycle?.timezone ?? "UTC"} placeholder="Asia/Dubai" required /></label>
-          <label>Anchor day<Input name="anchorDay" type="number" min="1" max="28" defaultValue={cycle?.anchorDay ?? 1} required /></label>
+        <form id="allowance-cycle-form" className="grid gap-3 sm:grid-cols-2" onSubmit={submitCycle}>
+          <Field label="Timezone"><TimezoneSelect value={cycleTimezone} onChange={setCycleTimezone} /></Field>
+          <Field label="Reset day" hint="1–28, so every month has it."><Input name="anchorDay" type="number" min="1" max="28" defaultValue={cycle?.anchorDay ?? 1} required /></Field>
+          {error ? <div className="sm:col-span-2">{error}</div> : null}
         </form>
       </ManagementDialog>
     </ManagementPage>
   );
 }
 
-function human(value: string) {
-  return value.replaceAll("_", " ").replaceAll("-", " ").replace(/\b\w/g, (c) => c.toUpperCase());
+function Field({ label, hint, className, children }: { label: string; hint?: string; className?: string; children: React.ReactNode }) {
+  return (
+    <label className={`grid content-start gap-1.5 text-xs font-medium text-muted-foreground ${className ?? ""}`}>
+      <span>{label}</span>
+      {children}
+      {hint ? <span className="font-normal leading-4">{hint}</span> : null}
+    </label>
+  );
+}
+
+function sourceLabel(source: string) {
+  return source === "member"
+    ? "Member allowance"
+    : source === "department"
+      ? "Department default"
+      : source === "organization"
+        ? "Organization default"
+        : "No limit";
+}
+
+function shortId(id: string) {
+  return <span className="font-mono">{id.length > 12 ? `${id.slice(0, 8)}…` : id}</span>;
 }

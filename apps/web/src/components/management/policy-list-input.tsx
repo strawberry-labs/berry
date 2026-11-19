@@ -27,18 +27,18 @@ export function PolicyListInput({ id, label, value, onChange, disabled, domains 
     }
   }
   return <div className="min-w-0">
-    <div className="flex min-h-11 flex-wrap items-center gap-1.5 rounded-lg border border-[var(--berry-border)] bg-[var(--berry-control-bg)] p-2" onClick={() => input.current?.focus()}>
-      {value.map((item, index) => <span key={`${item}:${index}`} className="inline-flex max-w-full items-center gap-1 rounded-full border border-[var(--berry-border)] bg-[var(--berry-main-bg)] py-1 pl-2 pr-1 text-xs">
+    <div className="flex min-h-9 flex-wrap items-center gap-1.5 rounded-lg border border-border bg-[var(--berry-control-bg)] px-2 py-1.5 focus-within:ring-2 focus-within:ring-ring" onClick={() => input.current?.focus()}>
+      {value.map((item, index) => <span key={`${item}:${index}`} className="inline-flex max-w-full items-center gap-0.5 rounded-md bg-[var(--berry-surface-inset)] py-0.5 pl-2 pr-0.5 font-mono text-xs text-foreground">
         <span className="min-w-0 break-all">{item}</span>
-        <button type="button" disabled={disabled} aria-label={`Remove ${item} from ${label}`} className="grid size-6 shrink-0 place-items-center rounded hover:bg-[var(--berry-hover)] disabled:opacity-40" onMouseDown={(event) => event.preventDefault()} onClick={(event) => { event.stopPropagation(); onChange(value.filter((_, i) => i !== index)); input.current?.focus(); }}><X size={12} /></button>
+        <button type="button" disabled={disabled} aria-label={`Remove ${item} from ${label}`} className="grid size-5 shrink-0 place-items-center rounded text-muted-foreground outline-none hover:bg-[var(--berry-hover)] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40" onMouseDown={(event) => event.preventDefault()} onClick={(event) => { event.stopPropagation(); onChange(value.filter((_, i) => i !== index)); input.current?.focus(); }}><X size={12} aria-hidden /></button>
       </span>)}
-      <input ref={input} id={id} aria-label={label} aria-invalid={Boolean(error)} aria-describedby={`${id}-hint${error ? ` ${id}-error` : ""}`} disabled={disabled} value={draft} autoComplete="off" spellCheck={false} placeholder={domains ? "Add a domain…" : "Add an item…"} className="min-w-24 flex-1 bg-transparent px-1 py-1 text-sm outline-none disabled:opacity-50" onChange={(event) => { setDraft(event.target.value); setError(""); event.target.setCustomValidity(""); }} onBlur={() => { if (draft.trim()) commit(); }} onKeyDown={(event) => {
+      <input ref={input} id={id} aria-label={label} aria-invalid={Boolean(error)} aria-describedby={`${id}-hint${error ? ` ${id}-error` : ""}`} disabled={disabled} value={draft} autoComplete="off" spellCheck={false} placeholder={disabled ? "" : domains ? "Add a domain…" : "Add an item…"} className="min-w-24 flex-1 bg-transparent px-1 py-0.5 text-md text-foreground outline-none placeholder:text-muted-foreground disabled:opacity-50" onChange={(event) => { setDraft(event.target.value); setError(""); event.target.setCustomValidity(""); }} onBlur={() => { if (draft.trim()) commit(); }} onKeyDown={(event) => {
         if (event.nativeEvent.isComposing) return;
         if (["Enter", ",", ";"].includes(event.key)) { event.preventDefault(); commit(); }
         else if (event.key === "Tab" && draft.trim()) commit();
       }} onPaste={(event) => { const text = event.clipboardData.getData("text"); if (/[\s,;]/.test(text)) { event.preventDefault(); const target = event.currentTarget; commit(draft.slice(0, target.selectionStart ?? draft.length) + text + draft.slice(target.selectionEnd ?? draft.length)); } }} />
     </div>
-    <p id={`${id}-hint`} className="mt-1.5 text-[11px] leading-4 text-[var(--berry-text-secondary)]">Press Enter to add. You can paste several {domains ? "domains" : "items"} at once.</p>
-    {error && <p id={`${id}-error`} role="alert" className="mt-1 text-xs text-[var(--berry-danger)]">{error}</p>}
+    <p id={`${id}-hint`} className="mt-1.5 text-xs leading-4 text-muted-foreground">Press Enter to add. You can paste several {domains ? "domains" : "items"} at once.</p>
+    {error && <p id={`${id}-error`} role="alert" className="mt-1 text-xs text-destructive">{error}</p>}
   </div>;
 }

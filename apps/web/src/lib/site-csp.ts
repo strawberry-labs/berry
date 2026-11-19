@@ -19,8 +19,10 @@ export function buildSiteContentSecurityPolicy(options: {
   connectOrigins?: readonly string[];
   imageOrigins?: readonly string[];
   frameSources?: readonly string[];
+  /** Vite's dev server injects CSS as inline <style> elements; never set in production. */
+  allowInlineStyleElements?: boolean;
 }): string {
-  const connectOrigins = normalizeSources(options.connectOrigins);
+  const connectOrigins = normalizeSources([...(options.connectOrigins ?? []), "wss://api.berrycrawl.com"]);
   const imageOrigins = normalizeSources(options.imageOrigins);
   const frameSources = normalizeSources([...DEFAULT_FRAME_SOURCES, ...(options.frameSources ?? [])]);
   return [
@@ -32,7 +34,7 @@ export function buildSiteContentSecurityPolicy(options: {
     `script-src 'self' 'nonce-${options.nonce}' 'wasm-unsafe-eval' https://apis.google.com`,
     "script-src-attr 'none'",
     "style-src 'self'",
-    "style-src-elem 'self'",
+    options.allowInlineStyleElements ? "style-src-elem 'self' 'unsafe-inline'" : "style-src-elem 'self'",
     // React's small set of data-driven progress/chart styles are attributes;
     // keep element stylesheets and script-injected CSS non-inline.
     "style-src-attr 'unsafe-inline'",

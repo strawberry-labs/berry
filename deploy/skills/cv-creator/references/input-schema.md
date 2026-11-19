@@ -55,6 +55,34 @@ into the structured input consumed by `scripts/generate_cv_from_spec.py`.
 }
 ```
 
+## Explicit choices
+
+- `omit_key_expertise`: optional JSON boolean, default false. Set true when
+  the user requests no expertise section. It overrides supplied expertise,
+  inference and qualification fallback in every orientation and format.
+- `shared_project_description`: optional source-faithful text recorded once.
+  Use only with the user's explicit authorisation to apply shared duties.
+- `selected_projects[].use_shared_description`: optional JSON boolean,
+  default false. If true and this record has no non-empty description, the
+  generator uses shared_project_description. An explicit project description
+  wins. Missing both descriptions remains a validation error.
+
+Example for authorised shared duties and no expertise section:
+
+```json
+{
+  "omit_key_expertise": true,
+  "key_expertise": [],
+  "shared_project_description": "Exact shared responsibilities from the source.",
+  "selected_projects": [
+    {"name": "Project A", "use_shared_description": true},
+    {"name": "Project B", "use_shared_description": true}
+  ]
+}
+```
+
+This is a fragment; include the candidate's other required fields.
+
 ## Required information
 
 - `name`: full display name.

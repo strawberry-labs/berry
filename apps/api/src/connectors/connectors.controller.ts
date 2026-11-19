@@ -17,7 +17,7 @@ import {
   Res,
 } from "@nestjs/common";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
-import { ConnectorAccessLevelSchema, ConnectorWorkspaceAccessModeSchema, type Connector, type JsonValue, type OrgPermission } from "@berry/shared";
+import { ConnectorAccessLevelSchema, ConnectorWorkspaceAccessModeSchema, DurableSecretEnvelopeSchema, type Connector, type JsonValue, type OrgPermission } from "@berry/shared";
 import type { ServerResponse } from "node:http";
 import { z } from "zod";
 import { AUDIT_SERVICE, type AuditService } from "../audit/audit.service.ts";
@@ -32,6 +32,7 @@ const GoogleKeySchema = z.enum(["google-workspace", "gmail", "google-calendar"])
 const OAuthStartSchema = z.object({
   accessLevel: ConnectorAccessLevelSchema.default("read"),
   redirectAfter: z.enum(["/settings/connectors", "/settings/mcp"]).default("/settings/connectors"),
+  taskId: z.string().uuid().optional(),
 }).strict();
 const BearerCredentialSchema = z.object({ credential: z.string().trim().min(1).max(32_768) }).strict();
 const McpRequestSchema = z.object({ url: z.string().url().max(2_048) }).strict();
@@ -109,8 +110,20 @@ export class ConnectorsController {
     const available = await this.connectors.list(tenantId(), request.auth!.user.id);
     const connector = available.find((item) => item.id === id);
     if (!connector) throw new BadRequestException("Connector not found");
-    if (connector.provider === "google") return this.connectors.startGoogleOAuth(tenantId(), request.auth!.user.id, id, input.accessLevel);
+    if (connector.provider === "google") return this.connectors.startGoogleOAuth(tenantId(), request.auth!.user.id, id, input.accessLevel, input.taskId);
+    if (input.taskId) {
+      const admin = connector.authStrategy === "shared" && await this.identity.authorize(request.auth!.user.id, tenantId(), "mcp:write");
+      return this.connectors.startCustomOAuth(tenantId(), request.auth!.user.id, id, admin, input.redirectAfter, input.taskId);
+    }
     return this.connectors.startCustomOAuth(tenantId(), request.auth!.user.id, id, false, input.redirectAfter);
+  }
+
+  @Get("tasks/:taskId/reconnect")
+  @Header("Cache-Control", "private, no-store")
+  async taskReconnects(@Req() request: AuthenticatedRequest, @Param("taskId") taskId: string) {
+    const userId = request.auth!.user.id;
+    const admin = await this.identity.authorize(userId, tenantId(), "mcp:write");
+    return this.connectors.taskMcpReconnects(tenantId(), userId, parse(z.string().uuid(), taskId), admin);
   }
 
   @Post(":id/credentials")
@@ -139,7 +152,7 @@ export class ConnectorsController {
     await this.completeAndRedirect(response, "/settings/connectors", async () => {
       if (!state) throw new BadRequestException("Google OAuth state is missing");
       const result = await this.connectors.completeGoogleOAuth(tenantId(), request.auth!.user.id, { state, ...(code ? { code } : {}), ...(error ? { error } : {}) });
-      await this.record(request.auth!.user.id, "connector-connected", result.connectorId, { provider: "google", authType: "oauth" });
+      if (!result.error) await this.record(request.auth!.user.id, "connector-connected", result.connectorId, { provider: "google", authType: "oauth" });
       return result;
     });
   }
@@ -155,10 +168,24 @@ export class ConnectorsController {
   async mcpCallback(@Req() request: AuthenticatedRequest, @Query("state") state: string | undefined, @Query("code") code: string | undefined, @Query("error") error: string | undefined, @Query("iss") issuer: string | undefined, @Res() response: ServerResponse) {
     await this.completeAndRedirect(response, "/settings/connectors", async () => {
       if (!state) throw new BadRequestException("MCP OAuth state is missing");
-      const result = await this.connectors.completeCustomOAuth(tenantId(), request.auth!.user.id, { state, ...(code ? { code } : {}), ...(error ? { error } : {}), ...(issuer ? { issuer } : {}) });
-      await this.record(request.auth!.user.id, "connector-connected", result.connectorId, { provider: "mcp", authType: "oauth" });
+      const userId = request.auth!.user.id;
+      const admin = await this.identity.authorize(userId, tenantId(), "mcp:write");
+      const result = await this.connectors.completeCustomOAuth(tenantId(), userId, { state, ...(code ? { code } : {}), ...(error ? { error } : {}), ...(issuer ? { issuer } : {}) }, admin);
+      if (!result.error) await this.record(userId, "connector-connected", result.connectorId, { provider: "mcp", authType: "oauth" });
       return result;
     });
+  }
+
+  @PublicAuth()
+  @Post("mcp/runtime-credential")
+  @Header("Cache-Control", "private, no-store")
+  async runtimeMcpCredential(@Body() body: unknown, @Res({ passthrough: true }) response: ServerResponse) {
+    const proof = parse(DurableSecretEnvelopeSchema.extend({ ciphertext: z.string().min(1).max(4096) }), body);
+    const abort = new AbortController();
+    const closed = () => abort.abort();
+    response.once("close", closed);
+    try { return await this.connectors.resolveRunMcpCredential(proof, abort.signal); }
+    finally { response.off("close", closed); }
   }
 
   @PublicAuth()
@@ -193,10 +220,12 @@ export class ConnectorsController {
     return response.end(JSON.stringify(result.body));
   }
 
-  private async completeAndRedirect(response: ServerResponse, fallback: string, complete: () => Promise<{ redirectAfter: string; connectorId: string }>): Promise<void> {
+  private async completeAndRedirect(response: ServerResponse, fallback: string, complete: () => Promise<{ redirectAfter: string; connectorId: string; error?: string }>): Promise<void> {
     try {
       const result = await complete();
-      redirect(response, this.connectors.webRedirect(result.redirectAfter, { connector: result.connectorId, connected: "true" }));
+      redirect(response, this.connectors.webRedirect(result.redirectAfter, result.error
+        ? { connector_error: result.error }
+        : { connector: result.connectorId, connected: "true" }));
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : "Connector authorization failed";
       redirect(response, this.connectors.webRedirect(fallback, { connector_error: message.slice(0, 240) }));

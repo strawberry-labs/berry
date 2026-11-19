@@ -1,4 +1,20 @@
+import { BrowserConnectionSchema, BrowserControlStateSchema, type BrowserControlState, type BrowserConnection } from "@berry/shared";
 import { ScheduledTaskSchema, ScheduledTaskRunSchema, type ScheduledTask, type ScheduledTaskCreate, type ScheduledTaskUpdate, type ScheduledTaskRun } from "@berry/shared";
+import {
+  MobilePairingClaimRequestSchema,
+  MobilePairingClaimResponseSchema,
+  MobilePairingCreateResponseSchema,
+  MobilePairingPollResponseSchema,
+  MobilePairingStatusSchema,
+  MobileServerInfoSchema,
+  type MobilePairingClaimRequest,
+  type MobilePairingClaimResponse,
+  type MobilePairingCreateResponse,
+  type MobilePairingPollRequest,
+  type MobilePairingPollResponse,
+  type MobilePairingStatus,
+  type MobileServerInfo,
+} from "@berry/shared";
 import {
   AgentStreamEventSchema,
   ApprovalRequestSchema,
@@ -87,6 +103,7 @@ import {
   EffectiveCapabilitySchema,
   ConnectorSchema,
   ConnectorOAuthStartSchema,
+  TaskConnectorReconnectSchema,
   GoogleConnectorConfigurationSchema,
   GooglePickerSessionSchema,
   DepartmentSchema,
@@ -293,11 +310,28 @@ const ProjectOutcomeSchema = z.object({
 });
 export type ProjectOutcome = z.infer<typeof ProjectOutcomeSchema>;
 
+/** The subset of `EventSource` the client relies on, so non-browser runtimes can supply their own. */
+export interface BerryEventSourceLike {
+  onopen: ((event: unknown) => void) | null;
+  onerror: ((event: unknown) => void) | null;
+  onmessage: ((event: { data: string; lastEventId: string }) => void) | null;
+  close(): void;
+}
+
+export type BerryEventSourceFactory = (url: string, init: { withCredentials: boolean; headers: Headers }) => BerryEventSourceLike;
+
+/** A live server-sent event subscription; call `close` to stop it. */
+export type BerryEventStream = { close(): void };
+
 export interface BerryApiClientOptions {
   baseUrl: string;
   fetchImpl?: typeof fetch | undefined;
   headers?: HeadersInit | undefined;
   supportView?: { tenantId: string; userId: string } | undefined;
+  /** Browsers send the session cookie ("include"); bearer-token clients pass "omit". */
+  credentials?: RequestCredentials | undefined;
+  /** Defaults to the browser `EventSource`, which cannot send custom headers. */
+  eventSource?: BerryEventSourceFactory | undefined;
 }
 
 export interface CreateTaskRequest {
@@ -595,6 +629,8 @@ export class BerryApiClient {
   readonly #headers: HeadersInit | undefined;
   readonly #useXhrUploads: boolean;
   readonly #supportView: { tenantId: string; userId: string } | undefined;
+  readonly #credentials: RequestCredentials;
+  readonly #eventSource: BerryEventSourceFactory;
 
   constructor(options: BerryApiClientOptions) {
     this.#baseUrl = options.baseUrl.replace(/\/+$/, "");
@@ -605,6 +641,9 @@ export class BerryApiClient {
     this.#fetch = (...args) => fetchImpl(...args);
     this.#headers = options.headers;
     this.#supportView = options.supportView;
+    this.#credentials = options.credentials ?? "include";
+    this.#eventSource = options.eventSource
+      ?? ((url, init) => new EventSource(url, { withCredentials: init.withCredentials }) as unknown as BerryEventSourceLike);
     this.#useXhrUploads = options.fetchImpl === undefined && typeof globalThis.XMLHttpRequest !== "undefined";
   }
 
@@ -688,7 +727,12 @@ export class BerryApiClient {
   async listConnectors(): Promise<Connector[]> { return this.#request("/v1/connectors", z.array(ConnectorSchema)); }
   async listConnectorRequests(): Promise<Connector[]> { return this.#request("/v1/connectors/requests", z.array(ConnectorSchema)); }
   async requestMcpConnector(url: string): Promise<Connector> { return this.#request("/v1/connectors/requests", ConnectorSchema, { method: "POST", body: { url } }); }
-  async startConnectorOAuth(id: string, accessLevel: "read" | "full" = "read", redirectAfter: "/settings/connectors" | "/settings/mcp" = "/settings/connectors"): Promise<ConnectorOAuthStart> { return this.#request(`/v1/connectors/${encodeURIComponent(id)}/oauth/start`, ConnectorOAuthStartSchema, { method: "POST", body: { accessLevel, redirectAfter } }); }
+  async startConnectorOAuth(id: string, accessLevel: "read" | "full" = "read", redirectAfter: "/settings/connectors" | "/settings/mcp" = "/settings/connectors", taskId?: string): Promise<ConnectorOAuthStart> {
+    return this.#request(`/v1/connectors/${encodeURIComponent(id)}/oauth/start`, ConnectorOAuthStartSchema, { method: "POST", body: { accessLevel, redirectAfter, ...(taskId ? { taskId } : {}) } });
+  }
+  async taskConnectorReconnects(taskId: string, signal?: AbortSignal) {
+    return this.#request(`/v1/connectors/tasks/${encodeURIComponent(taskId)}/reconnect`, TaskConnectorReconnectSchema.array(), signal ? { signal } : {});
+  }
   async connectConnectorBearer(id: string, credential: string): Promise<Connector> { return this.#request(`/v1/connectors/${encodeURIComponent(id)}/credentials`, ConnectorSchema, { method: "POST", body: { credential } }); }
   async disconnectConnector(id: string): Promise<{ ok: true }> { return this.#request(`/v1/connectors/${encodeURIComponent(id)}/connection`, z.object({ ok: z.literal(true) }), { method: "DELETE" }); }
   async googlePickerSession(id: string): Promise<GooglePickerSession> { return this.#request(`/v1/connectors/${encodeURIComponent(id)}/google-picker`, GooglePickerSessionSchema); }
@@ -1226,6 +1270,19 @@ export class BerryApiClient {
     return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}`, SessionSchema);
   }
 
+  async browserState(sessionId: string): Promise<BrowserControlState> {
+    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/browser`, BrowserControlStateSchema);
+  }
+  async takeBrowserControl(sessionId: string, browserId: string): Promise<BrowserControlState> {
+    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/browser/take-control`, BrowserControlStateSchema, { method: "POST", body: { browserId } });
+  }
+  async browserConnection(sessionId: string, browserId: string, control: boolean): Promise<BrowserConnection> {
+    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/browser/connection`, BrowserConnectionSchema, { method: "POST", body: { browserId, control } });
+  }
+  async resumeBrowserAgent(sessionId: string, browserId: string, handoffId: string): Promise<BrowserControlState> {
+    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/browser/resume`, BrowserControlStateSchema, { method: "POST", body: { browserId, handoffId } });
+  }
+
   async turnState(sessionId: string): Promise<TurnState> {
     return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/turn-state`, TurnStateSchema);
   }
@@ -1374,6 +1431,66 @@ export class BerryApiClient {
       method: "POST",
       body: input,
     });
+  }
+
+  getMobileServerInfo(): Promise<MobileServerInfo> {
+    return this.#request("/v1/mobile/server-info", MobileServerInfoSchema);
+  }
+
+  /** Shows a QR code on the web; only browser sessions may create one. */
+  createMobilePairing(): Promise<MobilePairingCreateResponse> {
+    return this.#request("/v1/mobile/pairings", MobilePairingCreateResponseSchema, { method: "POST" });
+  }
+
+  getMobilePairing(id: string, signal?: AbortSignal): Promise<MobilePairingStatus> {
+    return this.#request(`/v1/mobile/pairings/${encodeURIComponent(id)}`, MobilePairingStatusSchema, signal ? { signal } : {});
+  }
+
+  approveMobilePairing(id: string): Promise<MobilePairingStatus> {
+    return this.#request(`/v1/mobile/pairings/${encodeURIComponent(id)}/approve`, MobilePairingStatusSchema, { method: "POST" });
+  }
+
+  denyMobilePairing(id: string): Promise<MobilePairingStatus> {
+    return this.#request(`/v1/mobile/pairings/${encodeURIComponent(id)}/deny`, MobilePairingStatusSchema, { method: "POST" });
+  }
+
+  async cancelMobilePairing(id: string): Promise<void> {
+    await this.#request(`/v1/mobile/pairings/${encodeURIComponent(id)}`, z.object({ ok: z.literal(true) }), { method: "DELETE" });
+  }
+
+  claimMobilePairing(input: MobilePairingClaimRequest): Promise<MobilePairingClaimResponse> {
+    return this.#request("/v1/mobile/pairings/claim", MobilePairingClaimResponseSchema, { method: "POST", body: MobilePairingClaimRequestSchema.parse(input) });
+  }
+
+  /** Long-polls (about 25 seconds) until the web user approves or denies the phone. */
+  pollMobilePairing(input: MobilePairingPollRequest, signal?: AbortSignal): Promise<MobilePairingPollResponse> {
+    return this.#request("/v1/mobile/pairings/poll", MobilePairingPollResponseSchema, { method: "POST", body: input, ...(signal ? { signal } : {}) });
+  }
+
+  /** Paired phones for the signed-in user; `current` marks the caller's own phone. */
+  listPairedMobileDevices(): Promise<MobileDeviceRegistration[]> {
+    return this.#request("/v1/mobile/devices", z.array(MobileDeviceRegistrationSchema));
+  }
+
+  async revokePairedMobileDevice(deviceId: string): Promise<void> {
+    await this.#request(`/v1/mobile/devices/${encodeURIComponent(deviceId)}`, z.object({ ok: z.literal(true) }), { method: "DELETE" });
+  }
+
+  /** Signs out the phone making the request. */
+  async signOutMobileSession(): Promise<void> {
+    await this.#request("/v1/mobile/session", z.object({ ok: z.literal(true) }), { method: "DELETE" });
+  }
+
+  listMemberMobileDevices(tenantId: string, userId: string): Promise<MobileDeviceRegistration[]> {
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/members/${encodeURIComponent(userId)}/mobile-devices`, z.array(MobileDeviceRegistrationSchema));
+  }
+
+  async revokeMemberMobileDevice(tenantId: string, userId: string, deviceId: string): Promise<void> {
+    await this.#request(
+      `/v1/orgs/${encodeURIComponent(tenantId)}/members/${encodeURIComponent(userId)}/mobile-devices/${encodeURIComponent(deviceId)}`,
+      z.object({ ok: z.literal(true) }),
+      { method: "DELETE" },
+    );
   }
 
   async listMobileDevices(): Promise<MobileDeviceRegistration[]> {
@@ -1578,8 +1695,8 @@ export class BerryApiClient {
     return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/allowances/members/${encodeURIComponent(userId)}/base`, AllowanceBalanceSchema, { method: "PUT", body: input });
   }
 
-  async myAllowanceBalance(tenantId: string): Promise<AllowanceBalance> {
-    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/allowances/me`, AllowanceBalanceSchema);
+  async myAllowanceBalance(tenantId: string, options: { signal?: AbortSignal } = {}): Promise<AllowanceBalance> {
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/allowances/me`, AllowanceBalanceSchema, options);
   }
 
   async allowanceAdjustments(tenantId: string, userId?: string): Promise<AllowanceAdjustment[]> {
@@ -1611,28 +1728,28 @@ export class BerryApiClient {
     return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/dashboard${usageQuery(filter)}`, CloudUsageDashboardSchema);
   }
 
-  async usageAnalytics(tenantId: string, query: UsageAnalyticsQuery): Promise<UsageAnalytics> {
+  async usageAnalytics(tenantId: string, query: UsageAnalyticsQuery, options: { signal?: AbortSignal } = {}): Promise<UsageAnalytics> {
     const parsed = UsageAnalyticsQuerySchema.parse(query);
-    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/analytics${usageQuery(parsed)}`, UsageAnalyticsSchema);
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/analytics${usageQuery(parsed)}`, UsageAnalyticsSchema, options);
   }
 
-  async usageRequests(tenantId: string, query: UsageAnalyticsQuery): Promise<UsageRequestPage> {
+  async usageRequests(tenantId: string, query: UsageAnalyticsQuery, options: { signal?: AbortSignal } = {}): Promise<UsageRequestPage> {
     const parsed = UsageAnalyticsQuerySchema.parse(query);
-    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/requests${usageQuery(parsed)}`, UsageRequestPageSchema);
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/requests${usageQuery(parsed)}`, UsageRequestPageSchema, options);
   }
 
   async usageRequestDetail(tenantId: string, requestId: string): Promise<UsageRequestDetail> {
     return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/requests/${encodeURIComponent(requestId)}`, UsageRequestDetailSchema);
   }
 
-  async myUsage(tenantId: string, query: UsageAnalyticsQuery): Promise<UsageAnalytics> {
+  async myUsage(tenantId: string, query: UsageAnalyticsQuery, options: { signal?: AbortSignal } = {}): Promise<UsageAnalytics> {
     const parsed = UsageAnalyticsQuerySchema.parse(query);
-    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/me${usageQuery(parsed)}`, UsageAnalyticsSchema);
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/me${usageQuery(parsed)}`, UsageAnalyticsSchema, options);
   }
 
-  async myUsageRequests(tenantId: string, query: UsageAnalyticsQuery): Promise<UsageRequestPage> {
+  async myUsageRequests(tenantId: string, query: UsageAnalyticsQuery, options: { signal?: AbortSignal } = {}): Promise<UsageRequestPage> {
     const parsed = UsageAnalyticsQuerySchema.parse(query);
-    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/me/requests${usageQuery(parsed)}`, UsageRequestPageSchema);
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/me/requests${usageQuery(parsed)}`, UsageRequestPageSchema, options);
   }
 
   async exportMyUsageCsv(tenantId: string, filter: UsageEventFilter = {}): Promise<string> {
@@ -1885,10 +2002,10 @@ export class BerryApiClient {
     onEvent: (event: AgentStreamEvent, cursor: string | null) => void;
     onError?: (error: unknown) => void;
     onOpen?: () => void;
-  }, cursor?: string | null): EventSource {
+  }, cursor?: string | null): BerryEventStream {
     const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
     const path = this.#supportPath(`/v1/sessions/${encodeURIComponent(sessionId)}/events${query}`);
-    const source = new EventSource(`${this.#baseUrl}${path}`, { withCredentials: true });
+    const source = this.#openEventSource(path);
     source.onopen = () => callbacks.onOpen?.();
     source.onerror = (event) => callbacks.onError?.(event);
     source.onmessage = (event) => {
@@ -1907,9 +2024,9 @@ export class BerryApiClient {
     onEvent: (event: HostPushEvent) => void;
     onError?: (error: unknown) => void;
     onOpen?: () => void;
-  }): EventSource {
+  }): BerryEventStream {
     const path = this.#supportPath(`/v1/tasks/${encodeURIComponent(taskId)}/events`);
-    const source = new EventSource(`${this.#baseUrl}${path}`, { withCredentials: true });
+    const source = this.#openEventSource(path);
     source.onopen = () => callbacks.onOpen?.();
     source.onerror = (event) => callbacks.onError?.(event);
     source.onmessage = (event) => {
@@ -1943,6 +2060,12 @@ export class BerryApiClient {
         });
       }
     }
+  }
+
+  #openEventSource(path: string): BerryEventSourceLike {
+    const headers = new Headers(this.#headers);
+    headers.set("Accept", "text/event-stream");
+    return this.#eventSource(`${this.#baseUrl}${path}`, { withCredentials: this.#credentials === "include", headers });
   }
 
   async #request<TSchema extends z.ZodTypeAny>(path: string, schema: TSchema, init: { method?: string | undefined; body?: unknown; headers?: Record<string, string>; signal?: AbortSignal } = {}): Promise<z.output<TSchema>> {
@@ -2004,7 +2127,7 @@ export class BerryApiClient {
     const headers = new Headers(this.#headers);
     for (const [name, value] of Object.entries(init.headers ?? {})) headers.set(name, value);
     headers.set("Accept", "application/json");
-    const request: RequestInit = { method, headers, credentials: "include", ...(init.signal ? { signal: init.signal } : {}) };
+    const request: RequestInit = { method, headers, credentials: this.#credentials, ...(init.signal ? { signal: init.signal } : {}) };
     if (init.body !== undefined) {
       headers.set("Content-Type", "application/json");
       request.body = JSON.stringify(init.body);
@@ -2019,14 +2142,27 @@ export class BerryApiClient {
     const support = this.#supportView;
     if (!support) return path;
     const pathname = path.split("?", 1)[0] ?? path;
+    const prefix = `/v1/orgs/${encodeURIComponent(support.tenantId)}/support/users/${encodeURIComponent(support.userId)}`;
+    const organizationPrefix = `/v1/orgs/${encodeURIComponent(support.tenantId)}`;
+    if (pathname.startsWith(`${organizationPrefix}/`)) {
+      const relative = pathname.slice(organizationPrefix.length);
+      if (isSupportWorkspacePath(relative)) return `${prefix}${path.slice(organizationPrefix.length)}`;
+    }
     if (!isSupportPath(pathname)) {
       throw new BerryApiError("This resource is not available in support view.", 403, { code: "support_view_read_not_available" });
     }
-    return `/v1/orgs/${encodeURIComponent(support.tenantId)}/support/users/${encodeURIComponent(support.userId)}${path.slice(3)}`;
+    return `${prefix}${path.slice(3)}`;
   }
 }
 
+function isSupportWorkspacePath(pathname: string): boolean {
+  return /^\/(?:allowances\/me|usage\/me(?:\/requests|\/export\.csv)?|capabilities\/effective\/me|capabilities\/skills\/[^/]+\/package(?:\/file)?)$/.test(pathname);
+}
+
 function isSupportPath(pathname: string): boolean {
+  if (/^\/v1\/sessions\/[^/]+\/browser(?:\/(?:take-control|connection|resume))?$/.test(pathname)) return true;
+  if (/^\/v1\/scheduled-tasks(?:\/[^/]+(?:\/run|\/runs)?)?$/.test(pathname)) return true;
+  if (/^\/v1\/me\/skills(?:\/(?:review|packages|[^/]+(?:\/package)?))?$/.test(pathname)) return true;
   if (/^\/v1\/(?:workspaces|projects)(?:\/page)?$/.test(pathname)) return true;
   if (/^\/v1\/workspaces\/[^/]+$/.test(pathname)) return true;
   if (pathname === "/v1/tasks" || pathname === "/v1/tasks/page" || pathname === "/v1/tasks/summary") return true;

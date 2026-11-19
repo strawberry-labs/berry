@@ -57,7 +57,7 @@ export class BudgetModule {
       module: BudgetModule,
       controllers: [BudgetController, AllowanceController],
       providers: [serviceProvider, identityProvider, { provide: ALLOWANCE_SERVICE, inject: [BUDGET_SERVICE], useFactory: (budgets: BudgetService) => new AllowanceService(options.allowanceRepository ?? new InMemoryAllowanceRepository(), budgets) }],
-      exports: [BUDGET_SERVICE],
+      exports: [BUDGET_SERVICE, ALLOWANCE_SERVICE],
     };
   }
 }

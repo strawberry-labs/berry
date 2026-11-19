@@ -32,14 +32,18 @@ from cv_template_common import artifact_output_path, fit_profile_name_lines  # n
 from v3.preprocess_cv_data_v3 import (  # noqa: E402
     landscape_first_page_project_capacity_dxa,
     landscape_sidebar_pages,
-    pack_landscape_full_width_project_pages,
     portrait_experience_height_dxa,
     portrait_first_page_row_capacity_dxa,
     portrait_layout_metrics,
     portrait_project_height_dxa,
     portrait_sidebar_block_height_dxa,
+    wrapped_line_count,
     split_landscape_projects,
 )
+
+from v3.word_layout import (
+    verdana_path, experience_tab_dxa, order_ppr, PROJECT_BEFORE_DXA,
+)  # noqa: E402
 
 TEMPLATE_DIR = ROOT / "assets" / "templates" / "v3"
 DATA_PATH = ROOT / "output" / "extracted" / "preprocessed_cv_data.json"
@@ -60,20 +64,8 @@ EXPERIENCE_BODY_SEPARATOR = "\u00a0"
 # same origin; the measured glyph/date width still controls body wrapping.
 EXPERIENCE_BULLET_LEADING_POSITION = 0
 LANDSCAPE_TABLE_FLOW_OVERHEAD_DXA = 180
-# Full-width continuation pages are now planned explicitly. One small
-# page-level tolerance is sufficient; adding a tolerance to every card
-# compounds across rows and rejects a final pair that physically fits.
-LANDSCAPE_PAGE_REFLOW_BUFFER_DXA = 120
-LANDSCAPE_PROJECT_REFLOW_BUFFER_DXA = 0
-# Render validation is deliberately an optional layer over the measured
-# paginator. Passing ``--landscape-pagination-mode estimated`` restores the
-# previous behaviour without reverting code or templates.
+# Native Word table flow is the default. A single render probe is opt-in.
 LANDSCAPE_PAGINATION_MODES = ("estimated", "render-validated")
-# Each lower buffer lets the measured planner try more content on the current
-# page. Only candidates whose physical render still matches the planned page
-# count are accepted. Repeated plan signatures are skipped, so this does not
-# render once per numeric step.
-LANDSCAPE_RENDER_VALIDATION_BUFFERS_DXA = tuple(range(120, -4801, -120))
 DOCX_RENDERER = (
     Path.home()
     / ".codex"
@@ -99,9 +91,9 @@ PORTRAIT_HEADER_VERTICAL_SHIFT_EMU = 280_000
 PROFILE_NAME_BASE_SIZE_PT = 28.0
 PROFILE_NAME_MIN_SIZE_PT = 16.0
 PROFILE_NAME_TEXT_WIDTH_PX = (4_349_750 - 2 * 91_440) / 914_400 * 96
-# Keep a small page-level guard for Word/LibreOffice font-metric differences
-# without charging every project for spacing the template does not render.
-PORTRAIT_PROJECT_PAGE_BUFFER_DXA = 240
+# Reserve only structural table flow, not a whole-project safety margin.
+# A boundary project's narrative can continue naturally on the following page.
+PORTRAIT_PROJECT_FLOW_BUFFER_DXA = 180
 PORTRAIT_SIDEBAR_PAGE_BUFFER_DXA = 300
 # The right lane can render a fraction taller than its measured Verdana line
 # boxes once Word lays out the complete two-column table.  Keep a separate
@@ -171,8 +163,8 @@ def landscape_full_width_project_rows(
     The Word table itself is the pagination engine.  Do not pre-split this
     collection into predicted physical pages: a tiny wrap difference would
     otherwise turn every following hard page break into a blank or sparse
-    page.  Each row remains atomic, so Word may break *between* project pairs
-    but never through one.
+    page. Headings stay with the first narrative line, while long descriptions
+    may flow within a project row when a full pair cannot fit on one page.
     """
     rows: list[dict[str, list[dict[str, Any]]]] = []
     for index in range(0, len(projects), 2):
@@ -191,13 +183,7 @@ def portrait_project_height_for_docx(
     project: dict[str, Any],
     metrics: Any,
 ) -> int:
-    """Measure an atomic portrait project card for this Word template.
-
-    Page one renders the teaser, not the full continuation description. The
-    shared estimator includes paragraph-after spacing for every field, while
-    this DOCX template applies it only after the description. Remove those
-    three non-rendered gaps so the first-page project lane is not underfilled.
-    """
+    """Measure the actual teaser and explicit paragraph gaps on Word page one."""
     measured = copy.deepcopy(project)
     measured["client_line"] = (
         str(project.get("client_line_display") or "").strip()
@@ -209,10 +195,43 @@ def portrait_project_height_for_docx(
         or str(project.get("description") or "").strip()
     )
     height = portrait_project_height_dxa(measured, metrics)
-    for field in ("name", "client_line", "duration_line"):
-        if str(measured.get(field) or "").strip():
-            height -= metrics.paragraph_after_dxa
     return max(metrics.project_body_line_height_dxa, height)
+
+
+def portrait_project_start_height_for_docx(
+    project: dict[str, Any], metrics: Any,
+) -> int:
+    """Reserve metadata and two opening lines so Word never strands a title."""
+    width = metrics.project_width_dxa - metrics.cell_horizontal_padding_dxa
+    line_height = metrics.project_body_line_height_dxa
+    client = (
+        str(project.get("client_line_display") or "").strip()
+        or str(project.get("client_line") or "").strip()
+        or "Confidential"
+    )
+    height = wrapped_line_count([(str(project.get("name") or ""), True)], width) * line_height
+    height += wrapped_line_count([(client, False)], width) * line_height
+    duration = str(project.get("duration_line") or "").strip()
+    if duration:
+        height += wrapped_line_count([(duration, False)], width) * line_height
+    description = str(project.get("description") or project.get("description_teaser") or "")
+    body_lines = min(2, wrapped_line_count([(description, False)], width))
+    return height + PROJECT_BEFORE_DXA + body_lines * line_height
+
+
+def portrait_sidebar_height_for_docx(
+    key_expertise: list[dict[str, Any]],
+    qualifications: list[dict[str, Any]],
+    memberships: list[dict[str, Any]],
+    metrics: Any,
+) -> int:
+    """Measure the complete flowing sidebar, including continuation pages."""
+    return sum(
+        portrait_sidebar_block_height_dxa(items, include_heading=heading, metrics=metrics)
+        for items, heading in (
+            (key_expertise, False), (qualifications, True), (memberships, True)
+        )
+    )
 
 
 def split_portrait_projects_for_docx(
@@ -224,42 +243,40 @@ def split_portrait_projects_for_docx(
     memberships: list[dict[str, Any]],
     overview_text: str = "",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Pack whole projects into the actual portrait Word regions.
+    """Fill the right lane, letting one boundary project continue naturally.
 
-    The source JSON remains complete and template-neutral. This renderer keeps
-    only the projects that fit the measured page-one right lane in the outer
-    two-column table. Every remaining card moves to the native full-width
-    continuation, matching the portrait reference and avoiding a complex Word
-    row whose content only fits when the complete row is moved to page two.
+    The lane stays available beside a sidebar that extends beyond page one.
+    Keep titles and opening lines together, but do not reject a project merely
+    because its complete narrative needs another page. All following projects
+    retain the reference's full-width continuation after the two-column table.
     """
     if not projects:
         return [], []
     metrics = portrait_layout_metrics()
-    first_page_capacity = max(
+    lane_height = max(
+        portrait_first_page_row_capacity_dxa(overview_text, metrics),
+        portrait_sidebar_height_for_docx(key_expertise, qualifications, memberships, metrics),
+    )
+    capacity = max(
         0,
-        portrait_first_page_row_capacity_dxa(overview_text, metrics)
+        lane_height
         - portrait_experience_height_dxa(experience, metrics)
         - metrics.project_heading_height_dxa
-        - PORTRAIT_PROJECT_PAGE_BUFFER_DXA,
+        - PORTRAIT_PROJECT_FLOW_BUFFER_DXA,
     )
-
+    used = 0
     placed = 0
-
-    def fill(capacity: int) -> None:
-        nonlocal placed
-        used = 0
-        while placed < len(projects):
-            card_height = portrait_project_height_for_docx(projects[placed], metrics)
-            if used + card_height > capacity:
-                break
+    for project in projects:
+        card_height = portrait_project_height_for_docx(project, metrics)
+        if used + card_height <= capacity:
             used += card_height
             placed += 1
-
-    # Page one always uses the available right column independently of the
-    # left sidebar. Portrait continuation pages are full-width project pages;
-    # unlike landscape, they do not reuse a later narrow sidebar lane.
-    fill(first_page_capacity)
-
+            continue
+        if used + portrait_project_start_height_for_docx(project, metrics) <= capacity:
+            # Store the whole narrative exactly once. Word splits this last
+            # paragraph at its actual page boundary, not at a guessed word.
+            placed += 1
+        break
     return projects[:placed], projects[placed:]
 
 
@@ -276,24 +293,8 @@ def portrait_sidebar_flows_to_page_two_for_docx(
     still overflow in LibreOffice once the intended font is applied.
     """
     metrics = portrait_layout_metrics()
-    height = sum(
-        (
-            portrait_sidebar_block_height_dxa(
-                key_expertise,
-                include_heading=False,
-                metrics=metrics,
-            ),
-            portrait_sidebar_block_height_dxa(
-                qualifications,
-                include_heading=True,
-                metrics=metrics,
-            ),
-            portrait_sidebar_block_height_dxa(
-                memberships,
-                include_heading=True,
-                metrics=metrics,
-            ),
-        )
+    height = portrait_sidebar_height_for_docx(
+        key_expertise, qualifications, memberships, metrics
     )
     return (
         height + PORTRAIT_SIDEBAR_PAGE_BUFFER_DXA
@@ -331,8 +332,6 @@ def portrait_right_lane_flows_to_page_two_for_docx(
 def docx_render_context(
     cv: dict[str, Any],
     orientation: str,
-    *,
-    landscape_page_reflow_buffer_dxa: int = LANDSCAPE_PAGE_REFLOW_BUFFER_DXA,
 ) -> dict[str, Any]:
     """Derive template-specific pagination without mutating normalized data."""
     context = copy.deepcopy(cv)
@@ -363,6 +362,10 @@ def docx_render_context(
     )
 
     for project in projects:
+        # Word has flowing pages: retain the whole source narrative even when
+        # a shared preprocessed payload also includes a shorter slide teaser.
+        if str(project.get("description") or "").strip():
+            project["description_teaser"] = project["description"]
         # Every project card keeps a usable dedicated client line. When the
         # source CV does not identify a client, use the approved placeholder.
         project["client_line_display"] = (
@@ -451,15 +454,10 @@ def docx_render_context(
         + len(continuation_left)
         + len(continuation_right)
     )
-    # Plan every full-width continuation page with the same measured-height
-    # waterfall used on page one.  This lets a short left card occupy the
-    # remaining page area when its longer paired neighbour must move forward.
-    full_width_pages = pack_landscape_full_width_project_pages(
-        remaining_projects,
-        sidebar_pages,
-        page_reflow_buffer_dxa=landscape_page_reflow_buffer_dxa,
-        project_reflow_buffer_dxa=LANDSCAPE_PROJECT_REFLOW_BUFFER_DXA,
-    )
+    # Keep one flowing project table. Predicted physical page breaks left
+    # half-empty landscape pages whenever a whole second pair did not fit.
+    # Word can split the narrative rows using the template's widow control.
+    full_width_rows = landscape_full_width_project_rows(remaining_projects)
     continuation_pages = sidebar_pages[1:]
     for index, page in enumerate(continuation_pages):
         page["break_after"] = index < len(continuation_pages) - 1
@@ -469,35 +467,22 @@ def docx_render_context(
         page["append_full_width_projects"] = False
         page["full_width_project_rows"] = []
 
-    # The first planned full-width page may share the final sidebar page. Keep
-    # it inside the same outer table so LibreOffice and Word both start it
-    # directly beneath the sidebar row. All later pages use explicit page
-    # models and therefore receive independent 2 → 1 decisions.
-    standalone_full_width_pages = full_width_pages
-    if (
-        continuation_pages
-        and full_width_pages
-        and full_width_pages[0].get("shares_sidebar")
-    ):
-        continuation_pages[-1]["append_full_width_projects"] = True
-        continuation_pages[-1]["full_width_project_rows"] = full_width_pages[0][
-            "project_rows"
-        ]
-        standalone_full_width_pages = full_width_pages[1:]
+    standalone_full_width_pages = []
+    if full_width_rows:
+        if continuation_pages:
+            continuation_pages[-1]["append_full_width_projects"] = True
+            continuation_pages[-1]["full_width_project_rows"] = full_width_rows
+        else:
+            standalone_full_width_pages = [{
+                "project_rows": full_width_rows,
+                "show_heading": True,
+            }]
 
-    full_width_rows = [
-        row
-        for page in full_width_pages
-        for row in page["project_rows"]
-    ]
     context.update(
         {
             "landscape_page1": sidebar_pages[0],
             "landscape_page1_content_row_min_height_dxa": (
                 landscape_page_one_capacity_dxa
-            ),
-            "landscape_page_reflow_buffer_dxa": (
-                landscape_page_reflow_buffer_dxa
             ),
             "landscape_sidebar_continuation_pages": continuation_pages,
             "selected_projects_featured_landscape": projects[:featured_count],
@@ -527,6 +512,118 @@ def render_template(template_path: Path, context: dict[str, Any], output_path: P
     template.render(context, autoescape=True)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     template.save(str(output_path))
+
+
+W14_NS = "http://schemas.microsoft.com/office/word/2010/wordml"
+WP14_NS = "http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing"
+WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+
+
+def _next_hex_identifier(counter: list[int], used: set[str]) -> str:
+    """Return the next unused eight-character OOXML hexadecimal identifier."""
+    while True:
+        value = f"{counter[0]:08X}"
+        counter[0] += 1
+        if value not in used:
+            used.add(value)
+            return value
+
+
+def _next_decimal_identifier(counter: list[int], used: set[str]) -> str:
+    """Return the next unused decimal drawing identifier."""
+    while True:
+        value = str(counter[0])
+        counter[0] += 1
+        if value not in used:
+            used.add(value)
+            return value
+
+
+def repair_ooxml_identifiers(docx_path: Path) -> None:
+    """Make cloned Word drawing/paragraph identifiers unique.
+
+    Docxtpl and the continuation-page builders clone XML fragments. Word
+    tolerates many repeated legacy attributes, but it can reject a document
+    when Word 2010 paragraph/text IDs or drawing IDs are duplicated. Rewrite
+    those identity fields after templating and before later geometry patches.
+    The values are document-internal and changing them does not alter visible
+    content or layout.
+    """
+    tmp_path = docx_path.with_suffix(".ids.tmp.docx")
+    xml_parts: dict[str, etree._Element] = {}
+    with zipfile.ZipFile(docx_path, "r") as source:
+        for item in source.infolist():
+            name = item.filename
+            if (
+                name.startswith("word/")
+                and name.endswith(".xml")
+                and not name.endswith(".rels")
+            ):
+                try:
+                    xml_parts[name] = etree.fromstring(source.read(name))
+                except etree.XMLSyntaxError:
+                    continue
+
+        counters = {
+            "paraId": [1],
+            "textId": [1],
+            "anchorId": [1],
+            "editId": [1],
+            "docPr": [1],
+        }
+        used = {key: set() for key in counters}
+        changed_parts: dict[str, bytes] = {}
+
+        for name, root in xml_parts.items():
+            changed = False
+            for element in root.iter():
+                for key, namespace in (
+                    ("paraId", W14_NS),
+                    ("textId", W14_NS),
+                    ("anchorId", WP14_NS),
+                    ("editId", WP14_NS),
+                ):
+                    attribute = f"{{{namespace}}}{key}"
+                    if attribute not in element.attrib:
+                        continue
+                    element.set(
+                        attribute,
+                        _next_hex_identifier(counters[key], used[key]),
+                    )
+                    changed = True
+
+                if element.tag == f"{{{WP_NS}}}docPr" and "id" in element.attrib:
+                    element.set(
+                        "id",
+                        _next_decimal_identifier(
+                            counters["docPr"],
+                            used["docPr"],
+                        ),
+                    )
+                    changed = True
+
+            if changed:
+                changed_parts[name] = etree.tostring(
+                    root,
+                    xml_declaration=True,
+                    encoding="UTF-8",
+                    standalone="yes",
+                )
+
+        if not changed_parts:
+            return
+
+        with zipfile.ZipFile(
+            tmp_path,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as destination:
+            for item in source.infolist():
+                destination.writestr(
+                    item,
+                    changed_parts.get(item.filename, source.read(item.filename)),
+                )
+    tmp_path.replace(docx_path)
 
 
 def apply_profile_name_font_size(
@@ -1190,19 +1287,10 @@ def align_landscape_profile_text_to_photo(docx_path: Path) -> None:
 
 
 def experience_measurement_font() -> ImageFont.ImageFont:
-    """Load the Verdana face used by the template at a high measurement scale."""
-    size = EXPERIENCE_FONT_SIZE_PT * EXPERIENCE_MEASURE_SCALE
-    candidates = (
-        Path("/System/Library/Fonts/Supplemental/Verdana.ttf"),
-        Path("/Library/Fonts/Verdana.ttf"),
-        Path("C:/Windows/Fonts/verdana.ttf"),
-        Path("/usr/share/fonts/truetype/msttcorefonts/Verdana.ttf"),
-        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    """Measure the actual Verdana face installed in the managed runtime."""
+    return ImageFont.truetype(
+        str(verdana_path()), size=EXPERIENCE_FONT_SIZE_PT * EXPERIENCE_MEASURE_SCALE
     )
-    for candidate in candidates:
-        if candidate.exists():
-            return ImageFont.truetype(str(candidate), size=size)
-    return ImageFont.load_default()
 
 
 EXPERIENCE_FONT = experience_measurement_font()
@@ -1222,7 +1310,7 @@ def experience_body_indent(prefix: str, *, include_bullet: bool) -> tuple[int, i
     # conversion shortens the hanging indent, making a wrapped role begin
     # left of its first word in Microsoft Word.
     width_points = measured_pixels / EXPERIENCE_MEASURE_SCALE
-    return leading_position + math.ceil(width_points * 20), leading_position
+    return leading_position + experience_tab_dxa(width_points), leading_position
 
 
 def shared_experience_body_indent(
@@ -1327,6 +1415,8 @@ def tune_experience_hanging_indents(docx_path: Path, orientation: str) -> None:
             indent.set(f"{W}left", str(position))
             indent.set(f"{W}hanging", str(max(0, position - leading_position)))
 
+            order_ppr(p_pr)
+
             # Normal is 11pt in the source file, while all other CV body copy
             # is 9pt. Force every visible experience run to the template body
             # size without changing its teal/black colour treatment.
@@ -1423,6 +1513,95 @@ def set_portrait_project_continuation_section(
                 else "nextPage"
             ),
         )
+        patched = etree.tostring(
+            document,
+            xml_declaration=True,
+            encoding="UTF-8",
+            standalone="yes",
+        )
+        with zipfile.ZipFile(
+            tmp_path,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as destination:
+            for item in source.infolist():
+                destination.writestr(
+                    item,
+                    patched
+                    if item.filename == "word/document.xml"
+                    else source.read(item.filename),
+                )
+    tmp_path.replace(docx_path)
+
+
+def collapse_landscape_section_break_paragraph(docx_path: Path) -> None:
+    """Keep Word's first landscape section marker on page one.
+
+    The landscape template deliberately places an explicit page break after
+    its first section boundary.  When the page-one table reaches the bottom of
+    the page, Microsoft Word gives the otherwise empty section-break paragraph
+    its inherited 9pt line box and moves that paragraph to page two.  The
+    explicit break then moves the real continuation content to page three,
+    leaving page two blank.  LibreOffice collapses the same paragraph, which is
+    why the defect is Word-only.
+
+    Preserve both the section boundary and the explicit page break, but reduce
+    the empty boundary paragraph to a one-DXA line.  Insert ``w:spacing`` before
+    ``w:rPr``/``w:sectPr`` so the paragraph-property sequence remains valid
+    WordprocessingML and does not trigger Word's repair dialog.
+    """
+    tmp_path = docx_path.with_suffix(".section-mark.tmp.docx")
+    with zipfile.ZipFile(docx_path, "r") as source:
+        document = etree.fromstring(source.read("word/document.xml"))
+        body = document.find(".//w:body", namespaces=WORD_NS)
+        if body is None:
+            return
+
+        boundary_paragraphs = body.xpath(
+            "./w:p[w:pPr/w:sectPr]",
+            namespaces=WORD_NS,
+        )
+        if not boundary_paragraphs:
+            return
+
+        paragraph_properties = boundary_paragraphs[0].find(f"{W}pPr")
+        if paragraph_properties is None:
+            return
+
+        spacing = paragraph_properties.find(f"{W}spacing")
+        if spacing is None:
+            spacing = etree.Element(f"{W}spacing")
+            insert_at = next(
+                (
+                    index
+                    for index, child in enumerate(paragraph_properties)
+                    if child.tag
+                    in {f"{W}rPr", f"{W}sectPr", f"{W}pPrChange"}
+                ),
+                len(paragraph_properties),
+            )
+            paragraph_properties.insert(insert_at, spacing)
+        spacing.set(f"{W}before", "0")
+        spacing.set(f"{W}after", "0")
+        spacing.set(f"{W}line", "1")
+        spacing.set(f"{W}lineRule", "exact")
+
+        run_properties = paragraph_properties.find(f"{W}rPr")
+        if run_properties is None:
+            run_properties = etree.Element(f"{W}rPr")
+            section_properties = paragraph_properties.find(f"{W}sectPr")
+            insert_at = (
+                paragraph_properties.index(section_properties)
+                if section_properties is not None
+                else len(paragraph_properties)
+            )
+            paragraph_properties.insert(insert_at, run_properties)
+        for tag in ("sz", "szCs"):
+            size = run_properties.find(f"{W}{tag}")
+            if size is None:
+                size = etree.SubElement(run_properties, f"{W}{tag}")
+            size.set(f"{W}val", "2")
+
         patched = etree.tostring(
             document,
             xml_declaration=True,
@@ -1594,6 +1773,7 @@ def write_docx_from_context(
 ) -> None:
     """Render and apply every orientation-specific deterministic patch."""
     render_template(template_path, context, output_path)
+    repair_ooxml_identifiers(output_path)
     apply_profile_name_font_size(output_path, context)
     if orientation == "portrait":
         set_portrait_project_continuation_section(
@@ -1606,6 +1786,7 @@ def write_docx_from_context(
             ),
         )
     else:
+        collapse_landscape_section_break_paragraph(output_path)
         set_landscape_first_page_content_row_min_height(
             output_path,
             max(
@@ -1627,65 +1808,6 @@ def write_docx_from_context(
     validate_docx(output_path)
 
 
-def expected_landscape_page_count(context: dict[str, Any]) -> int:
-    """Return the physical pages explicitly represented by the context."""
-    return (
-        1
-        + len(context.get("landscape_sidebar_continuation_pages") or [])
-        + len(context.get("landscape_full_width_project_pages") or [])
-    )
-
-
-def _project_signature(project: dict[str, Any]) -> tuple[Any, str]:
-    return (
-        project.get("source_index", project.get("rank")),
-        str(project.get("name") or ""),
-    )
-
-
-def _project_row_signature(row: dict[str, Any]) -> tuple[Any, ...]:
-    return (
-        tuple(
-            _project_signature(project)
-            for project in row.get("projects_left") or []
-        ),
-        tuple(
-            _project_signature(project)
-            for project in row.get("projects_right") or []
-        ),
-    )
-
-
-def landscape_pagination_signature(context: dict[str, Any]) -> tuple[Any, ...]:
-    """Describe only the page/row decisions that change rendered pagination."""
-    sidebar_pages = []
-    for page in context.get("landscape_sidebar_continuation_pages") or []:
-        sidebar_pages.append(
-            (
-                tuple(
-                    _project_signature(project)
-                    for project in page.get("projects_left") or []
-                ),
-                tuple(
-                    _project_signature(project)
-                    for project in page.get("projects_right") or []
-                ),
-                tuple(
-                    _project_row_signature(row)
-                    for row in page.get("full_width_project_rows") or []
-                ),
-            )
-        )
-    full_width_pages = tuple(
-        tuple(
-            _project_row_signature(row)
-            for row in page.get("project_rows") or []
-        )
-        for page in context.get("landscape_full_width_project_pages") or []
-    )
-    return tuple(sidebar_pages), full_width_pages
-
-
 def rendered_docx_page_count(
     docx_path: Path,
     output_dir: Path,
@@ -1693,7 +1815,7 @@ def rendered_docx_page_count(
     """Render a probe DOCX and return its physical page count.
 
     ``None`` means the render validator is unavailable. The caller then keeps
-    the measured plan, so the optional optimization never blocks generation.
+    the native Word flow, so optional rendering never blocks generation.
     """
     if not DOCX_RENDERER.exists():
         return None
@@ -1714,8 +1836,9 @@ def rendered_docx_page_count(
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            timeout=60,
         )
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.SubprocessError):
         return None
     return len(list(output_dir.glob("page-*.png"))) or None
 
@@ -1727,84 +1850,26 @@ def render_validated_landscape_context(
     *,
     page_count_probe: Callable[[Path, Path], int | None] = rendered_docx_page_count,
 ) -> tuple[dict[str, Any], bool]:
-    """Select the fullest render-safe continuation-page plan.
-
-    The original measured plan is always the first candidate. Progressively
-    fuller plans are accepted only while the physical render has exactly the
-    page count represented by the context. The first overflow ends the search;
-    more aggressive plans cannot restore space to an earlier page.
-    """
-    baseline = docx_render_context(
-        cv,
-        "landscape",
-        landscape_page_reflow_buffer_dxa=LANDSCAPE_PAGE_REFLOW_BUFFER_DXA,
-    )
-    if not baseline.get("selected_projects_remaining_landscape"):
-        baseline["landscape_pagination_mode"] = "estimated"
-        return baseline, False
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(
-        prefix=".landscape-pagination-",
-        dir=str(output_path.parent),
-    ) as temporary_directory:
-        temporary_root = Path(temporary_directory)
-        accepted_context: dict[str, Any] | None = None
-        accepted_docx = temporary_root / "accepted.docx"
-        seen_signatures: set[tuple[Any, ...]] = set()
-        render_validator_available = True
-
-        for candidate_index, buffer_dxa in enumerate(
-            LANDSCAPE_RENDER_VALIDATION_BUFFERS_DXA
-        ):
-            context = docx_render_context(
-                cv,
-                "landscape",
-                landscape_page_reflow_buffer_dxa=buffer_dxa,
-            )
-            signature = landscape_pagination_signature(context)
-            if signature in seen_signatures:
-                continue
-            seen_signatures.add(signature)
-
-            candidate_docx = temporary_root / f"candidate-{candidate_index}.docx"
-            candidate_render = temporary_root / f"render-{candidate_index}"
-            write_docx_from_context(
-                template_path,
-                context,
-                candidate_docx,
-                "landscape",
-            )
-            actual_page_count = page_count_probe(
-                candidate_docx,
-                candidate_render,
-            )
-            if actual_page_count is None:
-                render_validator_available = False
-                break
-            if actual_page_count != expected_landscape_page_count(context):
-                break
-
-            context["landscape_pagination_mode"] = "render-validated"
-            context["landscape_rendered_page_count"] = actual_page_count
-            accepted_context = context
-            shutil.copy2(candidate_docx, accepted_docx)
-
-        if accepted_context is not None:
-            shutil.copy2(accepted_docx, output_path)
-            return accepted_context, True
-
-        baseline["landscape_pagination_mode"] = "estimated"
-        if not render_validator_available:
-            baseline["landscape_render_validation_unavailable"] = True
-        return baseline, False
+    """Optionally inspect one completed Word-flow document; never repack in a loop."""
+    context = docx_render_context(cv, "landscape")
+    write_docx_from_context(template_path, context, output_path, "landscape")
+    with tempfile.TemporaryDirectory(prefix=".landscape-validation-",
+                                     dir=str(output_path.parent)) as directory:
+        actual_page_count = page_count_probe(output_path, Path(directory))
+    if actual_page_count is None:
+        context["landscape_pagination_mode"] = "estimated"
+        context["landscape_render_validation_unavailable"] = True
+    else:
+        context["landscape_pagination_mode"] = "render-validated"
+        context["landscape_rendered_page_count"] = actual_page_count
+    return context, True
 
 
 def render_all(
     data_path: Path,
     output_root: Path,
     requested_orientation: str = "both",
-    landscape_pagination_mode: str = "render-validated",
+    landscape_pagination_mode: str = "estimated",
 ) -> list[Path]:
     if landscape_pagination_mode not in LANDSCAPE_PAGINATION_MODES:
         raise ValueError(
@@ -1881,10 +1946,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--landscape-pagination-mode",
         choices=LANDSCAPE_PAGINATION_MODES,
-        default="render-validated",
+        default="estimated",
         help=(
-            "Use rendered page-count probes for denser continuation pages, "
-            "or restore the previous measured-only estimator."
+            "Use native Word page flow (default), or render one optional "
+            "page-count probe after generation."
         ),
     )
     return parser.parse_args()

@@ -9,6 +9,10 @@ import { ToolArgumentError, notRunMessage } from "./tool-arguments.js";
 export const FILE_UPLOAD_MAX_BYTES = 100 * 1024 * 1024;
 const FILE_UPLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 const RESPONSE_EXCERPT_BYTES = 16 * 1024;
+
+class UploadDispatchError extends Error {
+  readonly toolCallPhase = "dispatched";
+}
 const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,256}$/;
 // The HTTP client derives these from the URL and the bytes. A supplied
 // Content-Length or Host is checked against them instead of being sent.
@@ -117,39 +121,45 @@ export async function uploadFileBytes(input: {
   const name = upload.path.slice(upload.path.lastIndexOf("/") + 1) || upload.path;
   const destination = uploadDestination(upload.url);
   const networkProblem = uploadNetworkProblem(upload.url, input.policy);
-  if (networkProblem) throw new Error(networkProblem);
+  if (networkProblem) throw new ToolArgumentError(notRunMessage("upload_file", networkProblem));
   const sha256Hex = createHash("sha256").update(bytes).digest("hex");
   const sha256Base64 = Buffer.from(sha256Hex, "hex").toString("base64");
   const md5Base64 = createHash("md5").update(bytes).digest("base64");
   const supplied = new Map(upload.headers);
   const mismatch = checksumMismatch(supplied, { size: bytes.byteLength, sha256Hex, sha256Base64, md5Base64 });
   if (mismatch) {
-    throw new Error(`${mismatch}, so ${upload.path} is not the file this upload URL was prepared for. Check the path, or request a new upload URL for this file. Nothing was sent.`);
+    throw new ToolArgumentError(notRunMessage("upload_file", `${mismatch}, so ${upload.path} is not the file this upload URL was prepared for. Check the path or request a new upload URL for this file. Nothing was sent.`));
   }
   const headers = upload.headers
     .filter(([headerName]) => !CONNECTION_HEADERS.has(headerName))
     .map(([headerName, headerValue]): [string, string] => [headerName, headerValue]);
   const send = input.fetch ?? createPublicRemoteFetch({ redirect: "manual", timeoutMs: FILE_UPLOAD_TIMEOUT_MS });
-  const response = await send(upload.url.toString(), {
-    method: "PUT",
-    headers,
-    body: bytes,
-    ...(input.signal ? { signal: input.signal } : {}),
-  });
+  let response: Response;
+  input.signal?.throwIfAborted();
+  try {
+    response = await send(upload.url.toString(), {
+      method: "PUT",
+      headers,
+      body: bytes,
+      ...(input.signal ? { signal: input.signal } : {}),
+    });
+  } catch {
+    throw new UploadDispatchError("The upload response was unavailable. Verify whether the destination stored the file before trying again.");
+  }
   const excerpt = await responseExcerpt(response);
   if (response.status >= 300 && response.status < 400) {
-    throw new Error(`${destination} answered the upload of ${name} with a redirect (HTTP ${response.status}). Berry does not follow redirects for uploads, so the file may not be stored. Request a new upload URL that accepts the file directly.`);
+    throw new UploadDispatchError(`${destination} answered the upload of ${name} with a redirect (HTTP ${response.status}). Berry does not follow redirects for uploads, so the file may not be stored. Request a new upload URL that accepts the file directly.`);
   }
   if (!response.ok) {
     const reason = storageErrorReason(excerpt);
-    throw new Error(`Upload of ${name} to ${destination} failed with HTTP ${response.status}${reason ? ` (${reason})` : ""}. ${statusHint(response.status)}`);
+    throw new UploadDispatchError(`Upload of ${name} to ${destination} failed with HTTP ${response.status}${reason ? ` (${reason})` : ""}. ${statusHint(response.status)}`);
   }
   const etag = response.headers.get("etag");
   const versionId = response.headers.get("x-amz-version-id");
   const serverChecksum = response.headers.get("x-amz-checksum-sha256");
   const checksumConfirmed = serverChecksum === sha256Base64;
   if (serverChecksum && !checksumConfirmed) {
-    throw new Error(`${destination} stored ${name} but reported SHA-256 ${serverChecksum}, while the file sent has ${sha256Base64}. Treat the upload as failed and request a new upload URL.`);
+    throw new UploadDispatchError(`${destination} stored ${name} but reported SHA-256 ${serverChecksum}, while the file sent has ${sha256Base64}. Treat the upload as failed and verify the stored object before trying again.`);
   }
   const contentType = supplied.get("content-type");
   const content = [
@@ -267,6 +277,6 @@ function statusHint(status: number): string {
   if (status === 400) return "The storage service rejected the request; check the signed headers and that this is the file the URL was prepared for.";
   if (status === 404) return "The upload destination does not exist; request a new upload URL.";
   if (status === 413) return "The file is larger than the upload URL allows.";
-  if (status >= 500) return "The storage service failed; one retry of the same upload is reasonable.";
+  if (status >= 500) return "The storage service failed; verify whether the destination stored the file before trying again.";
   return "Request a new upload URL if the problem persists.";
 }

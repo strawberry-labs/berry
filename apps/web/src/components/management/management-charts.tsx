@@ -1,31 +1,131 @@
+import * as React from "react";
 import {
   Area as BklitArea,
   AreaChart as BklitAreaChart,
 } from "@berry/desktop-ui/components/charts/area-chart";
-import { Bar as BklitBar } from "@berry/desktop-ui/components/charts/bar";
-import { BarChart as BklitBarChart } from "@berry/desktop-ui/components/charts/bar-chart";
-import { BarXAxis } from "@berry/desktop-ui/components/charts/bar-x-axis";
-import { BarYAxis } from "@berry/desktop-ui/components/charts/bar-y-axis";
 import { chartCssVars } from "@berry/desktop-ui/components/charts/chart-context";
 import { Grid as BklitGrid } from "@berry/desktop-ui/components/charts/grid";
+import { Legend } from "@berry/desktop-ui/components/charts/legend/legend";
+import { LegendItem } from "@berry/desktop-ui/components/charts/legend/legend-item";
+import { LegendLabel } from "@berry/desktop-ui/components/charts/legend/legend-label";
+import { LegendMarker } from "@berry/desktop-ui/components/charts/legend/legend-marker";
+import { LegendProgress } from "@berry/desktop-ui/components/charts/legend/legend-progress";
+import { LegendValue } from "@berry/desktop-ui/components/charts/legend/legend-value";
+import { PieChart } from "@berry/desktop-ui/components/charts/pie-chart";
+import { PieSlice } from "@berry/desktop-ui/components/charts/pie-slice";
 import { Ring } from "@berry/desktop-ui/components/charts/ring";
-import { RingCenter } from "@berry/desktop-ui/components/charts/ring-center";
 import { RingChart } from "@berry/desktop-ui/components/charts/ring-chart";
-import { ringCssVars } from "@berry/desktop-ui/components/charts/ring-context";
 import { ChartTooltip as BklitTooltip } from "@berry/desktop-ui/components/charts/tooltip/chart-tooltip";
 import { XAxis as BklitXAxis } from "@berry/desktop-ui/components/charts/x-axis";
+import { YAxis as BklitYAxis } from "@berry/desktop-ui/components/charts/y-axis";
+import { cn } from "@berry/desktop-ui/lib/utils";
 
-function compactDateLabel(value: string) {
-  const date = new Date(value.includes("T") ? value : `${value}T00:00:00Z`);
-  if (Number.isNaN(date.getTime())) return value;
-  if (date.getUTCHours() !== 0 || date.getUTCMinutes() !== 0) {
-    return date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-  }
-  return date.toLocaleDateString(undefined, {
-    month: "short",
-    day: "numeric",
-    timeZone: "UTC",
+/** Categorical series colours, in the order series are assigned. */
+const SERIES = [
+  chartCssVars.linePrimary,
+  "var(--chart-4)",
+  "var(--chart-1)",
+  "var(--chart-2)",
+  "var(--chart-5)",
+] as const;
+const OTHER_COLOR = "var(--berry-text-faint)";
+const DANGER_COLOR = "var(--chart-5)";
+
+const compact = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
+const integer = new Intl.NumberFormat();
+function compactValue(value: number) {
+  return Math.abs(value) < 1000 ? integer.format(Math.round(value * 100) / 100) : compact.format(value);
+}
+
+/** The charts use a time scale, so labels become real dates rather than display strings. */
+function toDate(value: string): Date | null {
+  const date = new Date(value.includes("T") ? value : `${value}T00:00:00`);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function withDates<T extends { label: string }>(points: T[]): Array<T & { date: Date }> {
+  return points.flatMap((point) => {
+    const date = toDate(point.label);
+    return date ? [{ ...point, date }] : [];
   });
+}
+
+/** Text in the hole of a donut or ring: the headline at rest, the hovered part on hover. */
+function ChartCenter({ value, label }: { value: string; label: string }) {
+  return (
+    <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center px-9 text-center">
+      <strong className="max-w-full truncate text-lg font-semibold leading-6 tracking-[-0.02em] text-foreground">
+        {value}
+      </strong>
+      <span className="line-clamp-2 max-w-full text-xs leading-[14px] text-muted-foreground">
+        {label}
+      </span>
+    </div>
+  );
+}
+
+function EmptyChart({ children }: { children: React.ReactNode }) {
+  return (
+    <p className="flex h-24 items-center justify-center text-xs text-muted-foreground">
+      {children}
+    </p>
+  );
+}
+
+function TrendPanel({
+  title,
+  total,
+  data,
+  dataKey,
+  color,
+  format,
+  axisFormat = compactValue,
+  short = false,
+}: {
+  title: string;
+  total?: string;
+  data: Array<Record<string, unknown>>;
+  dataKey: string;
+  color: string;
+  format: (value: number) => string;
+  axisFormat?: (value: number) => string;
+  short?: boolean;
+}) {
+  return (
+    <div className="min-w-0">
+      <div className="mb-2 flex items-baseline justify-between gap-3">
+        <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <i className="size-2 rounded-full" style={{ backgroundColor: color }} aria-hidden />
+          {title}
+        </span>
+        {total ? <strong className="text-md font-semibold text-foreground">{total}</strong> : null}
+      </div>
+      <BklitAreaChart
+        data={data}
+        xDataKey="date"
+        aspectRatio="auto"
+        className={cn("settings-chart", short && "settings-chart-short")}
+        margin={{ left: 44, right: 10, top: 8, bottom: 26 }}
+      >
+        <BklitGrid horizontal strokeDasharray="2,4" />
+        <BklitArea
+          dataKey={dataKey}
+          fill={color}
+          fillOpacity={0.2}
+          gradientToOpacity={0}
+          stroke={color}
+          strokeWidth={1.75}
+        />
+        <BklitYAxis numTicks={4} formatValue={axisFormat} />
+        <BklitXAxis numTicks={6} />
+        <BklitTooltip
+          rows={(point: Record<string, unknown>) => [
+            { color, label: title, value: format(Number(point[dataKey])) },
+          ]}
+        />
+      </BklitAreaChart>
+    </div>
+  );
 }
 
 export function MiniSeries({
@@ -37,46 +137,17 @@ export function MiniSeries({
   points: Array<{ label: string; value: number }>;
   format?: (value: number) => string;
 }) {
+  const data = withDates(points);
   return (
     <figure className="settings-chart-series">
-      <figcaption>{label}</figcaption>
-      {points.length ? (
-        <BklitAreaChart
-          data={points}
-          xDataKey="label"
-          aspectRatio="auto"
-          className="settings-chart"
-          margin={{ left: 12, right: 12, top: 12, bottom: 28 }}
-        >
-          <BklitGrid horizontal strokeDasharray="3,3" />
-          <BklitArea
-            dataKey="value"
-            fill={chartCssVars.linePrimary}
-            fillOpacity={0.24}
-            gradientToOpacity={0.02}
-            stroke={chartCssVars.linePrimary}
-            strokeWidth={2}
-          />
-          <BklitXAxis numTicks={5} />
-          <BklitTooltip
-            rows={(point: Record<string, unknown>) => [
-              {
-                color: chartCssVars.linePrimary,
-                label,
-                value: format(Number(point.value)),
-              },
-            ]}
-          />
-        </BklitAreaChart>
+      <figcaption className="sr-only">{label}</figcaption>
+      {data.length ? (
+        <TrendPanel title={label} data={data} dataKey="value" color={SERIES[0]} format={format} />
       ) : (
-        <p className="text-xs text-muted-foreground">
-          No activity in this period.
-        </p>
+        <EmptyChart>No activity in this period.</EmptyChart>
       )}
       <p className="sr-only">
-        {points
-          .map((point) => `${point.label}: ${format(point.value)}`)
-          .join("; ")}
+        {points.map((point) => `${point.label}: ${format(point.value)}`).join("; ")}
       </p>
     </figure>
   );
@@ -93,226 +164,189 @@ export function DualTrend({
   spendFormat: (value: number) => string;
   requestLabel?: string;
 }) {
-  const chartPoints = points.map((point) => ({
-    ...point,
-    label: compactDateLabel(point.label),
-  }));
+  const data = withDates(points);
+  const spendTotal = points.reduce((sum, point) => sum + point.spend, 0);
+  const requestTotal = points.reduce((sum, point) => sum + point.requests, 0);
 
   return (
-    <figure className="settings-chart-series grid gap-4 lg:grid-cols-2">
+    <figure className="settings-chart-series grid gap-x-8 gap-y-5 lg:grid-cols-2">
       <figcaption className="sr-only">
         {label} and {requestLabel}
       </figcaption>
-      {chartPoints.length ? (
+      {data.length ? (
         <>
-          <div>
-            <p className="mb-2 text-xs font-medium text-muted-foreground">
-              {label}
-            </p>
-            <BklitAreaChart
-              data={chartPoints}
-              xDataKey="label"
-              aspectRatio="auto"
-              className="settings-chart"
-              margin={{ left: 12, right: 12, top: 12, bottom: 28 }}
-            >
-              <BklitGrid horizontal strokeDasharray="3,3" />
-              <BklitArea
-                dataKey="spend"
-                fill={chartCssVars.linePrimary}
-                fillOpacity={0.22}
-                gradientToOpacity={0.02}
-                stroke={chartCssVars.linePrimary}
-                strokeWidth={2}
-              />
-              <BklitXAxis numTicks={5} />
-              <BklitTooltip
-                rows={(point: Record<string, unknown>) => [
-                  {
-                    color: chartCssVars.linePrimary,
-                    label,
-                    value: spendFormat(Number(point.spend)),
-                  },
-                ]}
-              />
-            </BklitAreaChart>
-          </div>
-          <div>
-            <p className="mb-2 text-xs font-medium text-muted-foreground">
-              {requestLabel}
-            </p>
-            <BklitAreaChart
-              data={chartPoints}
-              xDataKey="label"
-              aspectRatio="auto"
-              className="settings-chart"
-              margin={{ left: 12, right: 12, top: 12, bottom: 28 }}
-            >
-              <BklitGrid horizontal strokeDasharray="3,3" />
-              <BklitArea
-                dataKey="requests"
-                fill={ringCssVars.ring3}
-                fillOpacity={0.18}
-                gradientToOpacity={0.02}
-                stroke={ringCssVars.ring3}
-                strokeWidth={2}
-              />
-              <BklitXAxis numTicks={5} />
-              <BklitTooltip
-                rows={(point: Record<string, unknown>) => [
-                  {
-                    color: ringCssVars.ring3,
-                    label: requestLabel,
-                    value: new Intl.NumberFormat().format(
-                      Number(point.requests),
-                    ),
-                  },
-                ]}
-              />
-            </BklitAreaChart>
-          </div>
+          <TrendPanel
+            title={label}
+            total={spendFormat(spendTotal)}
+            data={data}
+            dataKey="spend"
+            color={SERIES[0]}
+            format={spendFormat}
+            axisFormat={(value) => `$${compactValue(value)}`}
+          />
+          <TrendPanel
+            title={requestLabel}
+            total={integer.format(requestTotal)}
+            data={data}
+            dataKey="requests"
+            color={SERIES[1]}
+            format={(value) => integer.format(value)}
+          />
         </>
       ) : (
-        <p className="text-xs text-muted-foreground">
-          No activity in this period.
-        </p>
+        <EmptyChart>No activity in this period.</EmptyChart>
       )}
       <p className="sr-only">
-        {chartPoints
-          .map(
-            (point) =>
-              `${point.label}: ${spendFormat(point.spend)}, ${point.requests} ${requestLabel}`,
-          )
+        {points
+          .map((point) => `${point.label}: ${spendFormat(point.spend)}, ${point.requests} ${requestLabel}`)
           .join("; ")}
       </p>
     </figure>
   );
 }
 
+/**
+ * Failed share of requests over time. At production volume a stacked
+ * success/failure bar hides the failures entirely; the rate is the signal.
+ */
 export function OutcomeBars({
   points,
 }: {
   points: Array<{ label: string; successes: number; failures: number }>;
 }) {
-  const chartPoints = points.map((point) => ({
-    ...point,
-    label: compactDateLabel(point.label),
-  }));
+  const data = withDates(points).map((point) => {
+    const total = point.successes + point.failures;
+    return { ...point, errorRate: total > 0 ? (point.failures / total) * 100 : 0 };
+  });
+  const failures = points.reduce((sum, point) => sum + point.failures, 0);
+  const total = points.reduce((sum, point) => sum + point.successes + point.failures, 0);
+  const percent = (value: number) => `${value.toFixed(value < 10 ? 2 : 1)}%`;
 
   return (
     <figure className="settings-chart-series">
-      <figcaption className="sr-only">Request outcomes</figcaption>
-      {chartPoints.length ? (
-        <BklitBarChart
-          data={chartPoints}
-          xDataKey="label"
-          aspectRatio="auto"
-          className="settings-chart"
-          margin={{ left: 12, right: 12, top: 12, bottom: 28 }}
-          stacked
-          stackGap={1}
-        >
-          <BklitGrid horizontal strokeDasharray="3,3" />
-          <BklitBar
-            dataKey="successes"
-            fill={ringCssVars.ring1}
-            lineCap={3}
-          />
-          <BklitBar
-            dataKey="failures"
-            fill={ringCssVars.ring5}
-            lineCap={3}
-          />
-          <BarXAxis maxLabels={6} />
-          <BklitTooltip
-            rows={(point: Record<string, unknown>) => [
-              {
-                color: ringCssVars.ring1,
-                label: "Successful",
-                value: new Intl.NumberFormat().format(
-                  Number(point.successes),
-                ),
-              },
-              {
-                color: ringCssVars.ring5,
-                label: "Failed",
-                value: new Intl.NumberFormat().format(Number(point.failures)),
-              },
-            ]}
-          />
-        </BklitBarChart>
+      <figcaption className="sr-only">Failed request rate</figcaption>
+      {data.length ? (
+        <div className="min-w-0">
+          <div className="mb-2 flex items-baseline justify-between gap-3">
+            <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <i className="size-2 rounded-full" style={{ backgroundColor: DANGER_COLOR }} aria-hidden />
+              Failed requests
+            </span>
+            <strong className="text-md font-semibold text-foreground">
+              {total > 0 ? percent((failures / total) * 100) : "—"}
+              <span className="ml-1.5 font-normal text-muted-foreground">
+                {integer.format(failures)} of {compactValue(total)}
+              </span>
+            </strong>
+          </div>
+          <BklitAreaChart
+            data={data}
+            xDataKey="date"
+            aspectRatio="auto"
+            className="settings-chart"
+            margin={{ left: 44, right: 10, top: 8, bottom: 26 }}
+          >
+            <BklitGrid horizontal strokeDasharray="2,4" />
+            <BklitArea
+              dataKey="errorRate"
+              fill={DANGER_COLOR}
+              fillOpacity={0.18}
+              gradientToOpacity={0}
+              stroke={DANGER_COLOR}
+              strokeWidth={1.75}
+            />
+            <BklitYAxis numTicks={4} formatValue={(value) => `${compactValue(value)}%`} />
+            <BklitXAxis numTicks={6} />
+            <BklitTooltip
+              rows={(point: Record<string, unknown>) => [
+                { color: DANGER_COLOR, label: "Failed rate", value: percent(Number(point.errorRate)) },
+                { color: DANGER_COLOR, label: "Failed", value: integer.format(Number(point.failures)) },
+                { color: SERIES[2], label: "Successful", value: integer.format(Number(point.successes)) },
+              ]}
+            />
+          </BklitAreaChart>
+        </div>
       ) : (
-        <p className="text-xs text-muted-foreground">
-          No outcomes in this period.
-        </p>
+        <EmptyChart>No outcomes in this period.</EmptyChart>
       )}
       <p className="sr-only">
-        {chartPoints
-          .map(
-            (point) =>
-              `${point.label}: ${point.successes} successful, ${point.failures} failed`,
-          )
+        {points
+          .map((point) => `${point.label}: ${point.successes} successful, ${point.failures} failed`)
           .join("; ")}
       </p>
     </figure>
   );
 }
 
+/**
+ * Ranked breakdown of one measure. Rows are a readable list with a magnitude
+ * bar, so long model, department and member names never get clipped by an axis.
+ */
 export function BreakdownBars({
   label,
   rows,
-  format = (value) => new Intl.NumberFormat().format(value),
+  format = (value) => integer.format(value),
+  limit = 8,
 }: {
   label: string;
   rows: Array<{ label: string; value: number }>;
   format?: (value: number) => string;
+  limit?: number;
 }) {
-  const visibleRows = rows.slice(0, 8);
+  const ranked = [...rows].sort((left, right) => right.value - left.value);
+  const visible = ranked.slice(0, limit);
+  const max = Math.max(0, ...visible.map((row) => row.value));
+  const total = ranked.reduce((sum, row) => sum + row.value, 0);
+  const items = visible.map((row) => ({
+    label: row.label,
+    value: row.value,
+    maxValue: max || 1,
+    color: SERIES[0],
+  }));
+  const hidden = ranked.length - visible.length;
+
   return (
     <figure className="settings-chart-series">
-      <figcaption>{label}</figcaption>
-      {visibleRows.length ? (
-        <BklitBarChart
-          data={visibleRows}
-          xDataKey="label"
-          orientation="horizontal"
-          aspectRatio="auto"
-          className="settings-chart settings-chart-tall"
-          margin={{ left: 92, right: 16, top: 8, bottom: 8 }}
-          barGap={0.28}
-        >
-          <BklitGrid vertical fadeVertical />
-          <BklitBar
-            dataKey="value"
-            fill={ringCssVars.ring2}
-            lineCap={4}
-          />
-          <BarYAxis maxLabels={8} />
-          <BklitTooltip
-            showCrosshair={false}
-            rows={(point: Record<string, unknown>) => [
-              {
-                color: ringCssVars.ring2,
-                label,
-                value: format(Number(point.value)),
-              },
-            ]}
-          />
-        </BklitBarChart>
+      <figcaption className="sr-only">{label}</figcaption>
+      {items.length ? (
+        <>
+          <div className="mb-1 flex items-center justify-between px-2 text-xs text-muted-foreground">
+            <span>{label}</span>
+            <span>Share</span>
+          </div>
+          <Legend items={items} className="gap-0">
+            <LegendItem className="grid cursor-default grid-cols-[minmax(0,1fr)_auto_3rem] items-center gap-x-3 gap-y-1.5 rounded-md px-2 py-1.5">
+              <LegendLabel className="truncate text-md font-normal" />
+              <LegendValue className="justify-end text-md text-foreground tabular-nums" formatValue={format} />
+              <ShareCell total={total} />
+              <div className="col-span-3">
+                <LegendProgress height="h-1" />
+              </div>
+            </LegendItem>
+          </Legend>
+          {hidden > 0 ? (
+            <p className="mt-1 px-2 text-xs text-muted-foreground">
+              {hidden} more not shown
+            </p>
+          ) : null}
+        </>
       ) : (
-        <p className="text-xs text-muted-foreground">
-          No breakdown data in this period.
-        </p>
+        <EmptyChart>No breakdown data in this period.</EmptyChart>
       )}
-      <p className="sr-only">
-        {visibleRows
-          .map((row) => `${row.label}: ${format(row.value)}`)
-          .join("; ")}
-      </p>
     </figure>
   );
 }
 
+function ShareCell({ total }: { total: number }) {
+  return (
+    <LegendValue
+      className="justify-end text-xs tabular-nums"
+      formatValue={(value) => (total > 0 ? `${((value / total) * 100).toFixed(value / total < 0.1 ? 1 : 0)}%` : "—")}
+    />
+  );
+}
+
+/** Rings for independent 0–100% rates, with a legend that shares hover state. */
 export function HealthRings({
   successRate,
   cacheRate,
@@ -322,78 +356,122 @@ export function HealthRings({
   cacheRate?: number | null;
   attributionRate?: number | null;
 }) {
-  const data = [
-    ...(successRate == null
-      ? []
-      : [
-          {
-            label: "Success rate",
-            value: Math.round(successRate * 100),
-            maxValue: 100,
-            color: ringCssVars.ring1,
-          },
-        ]),
-    ...(cacheRate == null
-      ? []
-      : [
-          {
-            label: "Cache reuse",
-            value: Math.round(cacheRate * 100),
-            maxValue: 100,
-            color: ringCssVars.ring2,
-          },
-        ]),
-    ...(attributionRate == null
-      ? []
-      : [
-          {
-            label: "Attributed",
-            value: Math.round(attributionRate * 100),
-            maxValue: 100,
-            color: ringCssVars.ring3,
-          },
-        ]),
+  const [hovered, setHovered] = React.useState<number | null>(null);
+  const rates: Array<[string, number | null | undefined]> = [
+    ["Success rate", successRate],
+    ["Cache reuse", cacheRate],
+    ["Attributed to a member", attributionRate],
   ];
+  const data = rates.flatMap(([label, rate], index) =>
+    rate == null
+      ? []
+      : [{ label, value: Math.round(rate * 1000) / 10, maxValue: 100, color: SERIES[[2, 0, 1][index]!]! }],
+  );
 
   return (
     <figure className="settings-chart-series">
-      <figcaption>Operational quality</figcaption>
+      <figcaption className="sr-only">Operational quality</figcaption>
       {data.length ? (
-        <>
-          <div className="mx-auto h-56 w-full max-w-64">
+        <div className="flex flex-col items-center gap-x-6 gap-y-3 sm:flex-row">
+          <div className="relative size-44 shrink-0">
             <RingChart
               data={data}
               className="h-full w-full"
-              strokeWidth={12}
-              ringGap={7}
-              baseInnerRadius={48}
+              strokeWidth={9}
+              ringGap={5}
+              baseInnerRadius={44}
+              hoveredIndex={hovered}
+              onHoverChange={setHovered}
             >
               {data.map((_, index) => (
                 <Ring key={index} index={index} showGlow={false} />
               ))}
-              <RingCenter defaultLabel="Quality signals" suffix="%" />
             </RingChart>
+            <ChartCenter
+              value={`${(data[hovered ?? 0] ?? data[0]!).value}%`}
+              label={(data[hovered ?? 0] ?? data[0]!).label}
+            />
           </div>
-          <div className="mt-2 flex flex-wrap justify-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
-            {data.map((item) => (
-              <span
-                key={item.label}
-                className="inline-flex items-center gap-1.5"
-              >
-                <i
-                  className="size-2 rounded-full"
-                  style={{ backgroundColor: item.color }}
-                  aria-hidden
-                />
-                {item.label} {item.value}%
-              </span>
-            ))}
-          </div>
-        </>
+          <Legend items={data} hoveredIndex={hovered} onHoverChange={setHovered} className="w-full min-w-0 flex-1 gap-0">
+            <LegendItem className="flex items-center gap-2.5 rounded-md px-2 py-2">
+              <LegendMarker className="size-2" />
+              <LegendLabel className="min-w-0 flex-1 truncate text-md font-normal" />
+              <LegendValue className="text-md font-medium text-foreground tabular-nums" formatValue={(value) => `${value}%`} />
+            </LegendItem>
+          </Legend>
+        </div>
       ) : (
-        <p className="text-xs text-muted-foreground">
-          No quality signals in this period.
-        </p>
+        <EmptyChart>No quality signals in this period.</EmptyChart>
+      )}
+    </figure>
+  );
+}
+
+/** Parts of a whole as a donut with a linked legend. */
+export function ShareDonut({
+  caption,
+  centerLabel,
+  rows,
+  format,
+}: {
+  caption: string;
+  centerLabel: string;
+  rows: Array<{ label: string; value: number }>;
+  format: (value: number) => string;
+}) {
+  const [hovered, setHovered] = React.useState<number | null>(null);
+  const total = rows.reduce((sum, row) => sum + row.value, 0);
+  const data = rows.map((row, index) => ({
+    label: row.label,
+    value: row.value,
+    maxValue: total || 1,
+    color: row.label === "Other" ? OTHER_COLOR : SERIES[index % SERIES.length]!,
+  }));
+
+  return (
+    <figure className="settings-chart-series">
+      <figcaption className="sr-only">{caption}</figcaption>
+      {data.length ? (
+        <div className="flex flex-col items-center gap-x-6 gap-y-3 sm:flex-row">
+          <div className="relative size-44 shrink-0">
+            <PieChart
+              data={data}
+              innerRadius={58}
+              padAngle={0.02}
+              cornerRadius={3}
+              hoveredIndex={hovered}
+              onHoverChange={setHovered}
+              hoverOffset={4}
+              className="h-full w-full"
+            >
+              {data.map((_, index) => (
+                <PieSlice key={index} index={index} hoverEffect="grow" hoverOffset={4} />
+              ))}
+            </PieChart>
+            <ChartCenter
+              value={
+                hovered == null || !data[hovered]
+                  ? format(total)
+                  : `${((data[hovered].value / (total || 1)) * 100).toFixed(1)}%`
+              }
+              label={hovered == null || !data[hovered] ? centerLabel : data[hovered].label}
+            />
+          </div>
+          <Legend items={data} hoveredIndex={hovered} onHoverChange={setHovered} className="w-full min-w-0 flex-1 gap-0">
+            <LegendItem className="flex items-center gap-2.5 rounded-md px-2 py-1.5">
+              <LegendMarker className="size-2" />
+              <LegendLabel className="min-w-0 flex-1 truncate text-md font-normal" />
+              <LegendValue
+                className="text-md text-foreground tabular-nums"
+                percentageClassName="w-10 text-right text-xs text-muted-foreground tabular-nums"
+                showPercentage
+                formatValue={format}
+              />
+            </LegendItem>
+          </Legend>
+        </div>
+      ) : (
+        <EmptyChart>Nothing to show in this period.</EmptyChart>
       )}
     </figure>
   );
@@ -406,33 +484,14 @@ export function ModelSpendRings({
   rows: Array<{ label: string; value: number }>;
   format: (value: number) => string;
 }) {
-  const visible = aggregateModelSpendRows(rows);
-  const total = visible.reduce((sum, row) => sum + row.value, 0);
-  const colors = [ringCssVars.ring1, ringCssVars.ring2, ringCssVars.ring3, ringCssVars.ring4, ringCssVars.ring5];
-  const data = visible.map((row, index) => ({
-    label: row.label,
-    value: total > 0 ? Math.round((row.value / total) * 1000) / 10 : 0,
-    maxValue: 100,
-    color: colors[index]!,
-  }));
-
-  return <figure className="settings-chart-series">
-    <figcaption className="sr-only">Model spend distribution</figcaption>
-    {data.length ? <>
-      <div className="mx-auto h-56 w-full max-w-64">
-        <RingChart data={data} className="h-full w-full" strokeWidth={11} ringGap={6} baseInnerRadius={48}>
-          {data.map((_, index) => <Ring key={index} index={index} showGlow={false} />)}
-          <RingCenter defaultLabel="Model share" suffix="%" />
-        </RingChart>
-      </div>
-      <div className="mt-2 grid gap-1.5 text-xs text-muted-foreground">
-        {visible.map((row, index) => <span key={`${row.label}:${index}`} className="flex items-center justify-between gap-3">
-          <span className="inline-flex min-w-0 items-center gap-1.5"><i className="size-2 shrink-0 rounded-full" style={{ backgroundColor: colors[index] }} aria-hidden /><span className="truncate">{row.label}</span></span>
-          <span className="shrink-0 tabular-nums text-foreground">{data[index]?.value ?? 0}% · {format(row.value)}</span>
-        </span>)}
-      </div>
-    </> : <p className="text-xs text-muted-foreground">No model spend in this period.</p>}
-  </figure>;
+  return (
+    <ShareDonut
+      caption="Model spend distribution"
+      centerLabel="Model share"
+      rows={aggregateModelSpendRows(rows)}
+      format={format}
+    />
+  );
 }
 
 export function aggregateModelSpendRows(

@@ -11,12 +11,12 @@ describe("scheduled task API calls", () => {
     await expect(client.runScheduledTask(id, operationId)).resolves.toEqual(run);
     expect(fetchImpl).toHaveBeenCalledWith(`https://api.berry.test/v1/scheduled-tasks/${id}/run`, expect.objectContaining({ method: "POST", body: JSON.stringify({ operationId }) }));
   });
-  it("does not allow schedule changes while impersonating a support view", async () => {
-    const fetchImpl = vi.fn();
+  it("routes automation changes through the selected member's audited support scope", async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ removed: true }), { headers: { "Content-Type": "application/json" } }));
     const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl,
       supportView: { tenantId: "tenant", userId: "member" },
     });
-    await expect(client.deleteScheduledTask("schedule")).rejects.toMatchObject({ status: 403 });
-    expect(fetchImpl).not.toHaveBeenCalled();
+    await expect(client.deleteScheduledTask("schedule")).resolves.toEqual({ removed: true });
+    expect(fetchImpl).toHaveBeenCalledWith("https://api.berry.test/v1/orgs/tenant/support/users/member/scheduled-tasks/schedule", expect.objectContaining({ method: "DELETE" }));
   });
 });

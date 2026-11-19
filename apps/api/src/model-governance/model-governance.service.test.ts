@@ -78,6 +78,44 @@ describe("model governance scoped access", () => {
     );
   });
 
+  it("replaces retired DeepSeek V4 defaults and saved task selections with V4.1 Flash", async () => {
+    const service = new ModelGovernanceService(new InMemoryModelGovernanceRepository(false));
+    const oldModel = "canopywave/deepseek/deepseek-v4-flash";
+    const newModel = "canopywave/deepseek/deepseek-v4.1-flash";
+    await service.upsertPolicy({ tenantId, providerId: "router", model: oldModel, status: "allowed" });
+    await service.upsertDefault({ tenantId, providerId: "router", mode: "chat", model: oldModel });
+    await service.upsertDefault({ tenantId, providerId: "router", mode: "code", model: oldModel, enforce: true });
+    const provider = {
+      id: "router", name: "Berry Router", kind: "berry-router" as const,
+      baseUrl: "https://router.example.test/v1", defaultModel: newModel,
+      models: [{ id: newModel, name: "DeepSeek V4.1 Flash", capabilities: { tools: true, vision: true } }],
+    };
+    await service.synchronizeRuntimeCatalog(tenantId, provider);
+    expect(await service.listDefaults(tenantId)).toEqual([
+      expect.objectContaining({ mode: "chat", model: newModel }),
+      expect.objectContaining({ mode: "code", model: newModel, enforce: true }),
+    ]);
+    expect(await service.listModels(tenantId, { includeBlocked: true })).toContainEqual(
+      expect.objectContaining({ model: oldModel, status: "blocked", metadata: expect.objectContaining({ replacementModel: newModel }) }),
+    );
+    await expect(service.resolveTaskModel({ tenantId, mode: "chat", providerId: "router", model: oldModel }, provider))
+      .resolves.toMatchObject({ allowed: true, model: newModel, requestedModel: oldModel });
+  });
+
+  it.each([false, true])("keeps a deployed DeepSeek V4 route and custom default during staged rollout (replacement: %s)", async (replacement) => {
+    const service = new ModelGovernanceService(new InMemoryModelGovernanceRepository(false));
+    const oldModel = "canopywave/deepseek/deepseek-v4-flash";
+    await service.upsertPolicy({ tenantId, providerId: "router", model: oldModel, status: "allowed" });
+    await service.upsertDefault({ tenantId, providerId: "router", mode: "chat", model: oldModel });
+    await service.synchronizeRuntimeCatalog(tenantId, {
+      id: "router", name: "Berry Router", kind: "berry-router",
+      baseUrl: "https://router.example.test/v1", defaultModel: oldModel,
+      models: [{ id: oldModel }, ...(replacement ? [{ id: "canopywave/deepseek/deepseek-v4.1-flash" }] : [])],
+    });
+    expect(await service.listDefaults(tenantId)).toContainEqual(expect.objectContaining({ mode: "chat", model: oldModel }));
+    expect(await service.listModels(tenantId)).toContainEqual(expect.objectContaining({ model: oldModel, status: "allowed" }));
+  });
+
   it("synchronizes Gemini 3.7 Flash with its runtime capabilities and cost hints", async () => {
     const service = new ModelGovernanceService(new InMemoryModelGovernanceRepository());
     const defaultModel = "canopywave/deepseek/deepseek-v4-flash";
@@ -389,6 +427,84 @@ describe("model governance scoped access", () => {
       allowed: false,
       enforced: true,
       reason: "model_blocked",
+    });
+  });
+});
+
+
+describe("task model fallback", () => {
+  const oldModel = "kimi-retired";
+  const defaultModel = "task-default";
+  const alternateModel = "runtime-default";
+
+  async function taskModels() {
+    const service = new ModelGovernanceService(new InMemoryModelGovernanceRepository(false));
+    for (const model of [oldModel, defaultModel, alternateModel]) {
+      await service.upsertPolicy({ tenantId, providerId: "router", model, status: "allowed", modeAllow: ["chat"] });
+    }
+    await service.upsertDefault({ tenantId, mode: "chat", providerId: "router", model: defaultModel });
+    return service;
+  }
+
+  function provider(models = [oldModel, alternateModel, defaultModel]) {
+    return {
+      id: "router", name: "Task provider", kind: "berry-router" as const,
+      baseUrl: "https://router.example.test/v1", apiType: "openai-chat-completions" as const,
+      defaultModel: alternateModel, models: models.map((id) => ({ id, name: id })),
+    };
+  }
+
+  const selection = { tenantId, mode: "chat" as const, providerId: "router", model: oldModel, userId, departmentId };
+
+  it("replaces a disabled saved model with the allowed organization default", async () => {
+    const service = await taskModels();
+    await service.upsertPolicy({ tenantId, providerId: "router", model: oldModel, status: "blocked" });
+
+    await expect(service.resolveTaskModel(selection, provider())).resolves.toMatchObject({
+      allowed: true, model: defaultModel, requestedModel: oldModel, requestedProviderId: "router",
+    });
+    await expect(service.resolve(selection)).resolves.toMatchObject({ allowed: false, reason: "model_blocked" });
+  });
+
+  it.each([oldModel, "deleted-policy-model"])("replaces a removed model even without an enforced allowlist: %s", async (model) => {
+    const service = await taskModels();
+    await expect(service.resolveTaskModel({ ...selection, model }, provider([defaultModel, alternateModel])))
+      .resolves.toMatchObject({ allowed: true, model: defaultModel, requestedModel: model });
+  });
+
+  it("skips unavailable defaults, blocked models, scoped denials, and auxiliary-only models", async () => {
+    const service = await taskModels();
+    await service.upsertPolicy({ tenantId, providerId: "router", model: oldModel, status: "blocked" });
+    await service.upsertPolicy({ tenantId, providerId: "router", model: "vision-only", status: "allowed", modeAllow: [] });
+    await service.upsertPolicy({ tenantId, providerId: "router", model: "available-task", status: "allowed", modeAllow: ["chat"] });
+    await service.upsertAccessRule(tenantId, {
+      scopeType: "user", scopeId: userId, resourceType: "model", resourceId: "router:" + alternateModel, effect: "blocked",
+    });
+
+    await expect(service.resolveTaskModel(selection, provider([oldModel, alternateModel, "vision-only", "available-task"])))
+      .resolves.toMatchObject({ allowed: true, model: "available-task" });
+  });
+
+  it("keeps an available permitted selection instead of replacing it with a default", async () => {
+    const service = await taskModels();
+    await expect(service.resolveTaskModel(selection, provider())).resolves.toMatchObject({ allowed: true, model: oldModel });
+  });
+
+  it("keeps the rejection when no available model passes governance", async () => {
+    const service = await taskModels();
+    for (const model of [oldModel, defaultModel, alternateModel]) {
+      await service.upsertPolicy({ tenantId, providerId: "router", model, status: "blocked" });
+    }
+    await expect(service.resolveTaskModel(selection, provider())).resolves.toMatchObject({
+      allowed: false, model: oldModel, reason: "model_blocked",
+    });
+    await expect(service.listModels(tenantId)).resolves.toEqual([]);
+  });
+
+  it("does not call a stale configured default when the runtime catalog is empty", async () => {
+    const service = await taskModels();
+    await expect(service.resolveTaskModel(selection, provider([]))).resolves.toMatchObject({
+      allowed: false, reason: "model_unavailable",
     });
   });
 });

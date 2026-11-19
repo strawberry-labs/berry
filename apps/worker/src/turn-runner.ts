@@ -1,6 +1,9 @@
 import { environmentCheckDefinition, environmentCheckFromBash } from "./environment-check.js";
 import { fileUploadDefinition } from "./file-upload.js";
+import { CONTEXT_LIMIT_MESSAGE, isContextLimitFailure } from "./context-limit.js";
+import { BROWSER_HANDOFF_TOOL, BrowserHandoffArgumentsSchema, BrowserHandoffSchema, browserSessionsFromSteps, type BrowserHandoff } from "@berry/shared";
 import { limitModelImagePayload, modelImageLabelPath } from "./model-image.js";
+import { ModelOutputTimer } from "./model-timing.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   DEFAULT_COMPACTION_SETTINGS,
@@ -33,7 +36,15 @@ import {
   MessageDraftSchema,
   PromptManifestSchema,
   SessionCheckpointV2Schema,
+  CONTEXT_SAFETY_TOKENS,
+  contextEnvelopeKey,
+  estimateContextEntryTokens,
+  estimateContextMessageTokens,
+  estimateContextValueTokens,
+  measureContextEntries,
+  resolveContextBudget,
   type AgentStreamEvent,
+  type ApprovalWritePreview,
   type DurableBuiltInToolName,
   type DurableProviderTransport,
   type DurableSkill,
@@ -84,7 +95,7 @@ import {
   operationalDuration,
   persistWorkerOperationalEvent,
 } from "./operational-telemetry.js";
-import { TOOL_FAILURE_OUTCOME_VERSION, classifyToolFailure, storedToolFailure, toolFailureAction, type ToolFailure } from "./tool-failures.js";
+import { classifyToolFailure, storedToolFailure, TOOL_FAILURE_OUTCOME_VERSION, toolFailureAction, type ToolFailure } from "./tool-failures.js";
 import {
   PROVIDER_CREDIT_EXHAUSTED_MESSAGE,
   raiseProviderCreditAlert,
@@ -220,6 +231,7 @@ export interface DurableTurnSnapshot {
   version: number;
   leaseOwner: string;
   cancelledAt: string | null;
+  browserHandoff?: BrowserHandoff | null;
   waitingStartedAt?: string | null;
   humanWaitMs?: number;
   runtimeRequest: Record<string, unknown>;
@@ -276,6 +288,7 @@ export interface DurableStepMutation {
 }
 
 export interface DurableTurnMutation {
+  browserHandoff?: BrowserHandoff;
   expectedState: TurnRunState;
   nextState: TurnRunState;
   steps?: readonly DurableStepMutation[];
@@ -455,8 +468,12 @@ export interface TurnModelResult {
   usage?: Extract<AgentStreamEvent, { kind: "usage" }>;
   promptManifest?: PromptManifest;
   toolCalls: readonly TurnModelToolIntent[];
-  /** Milliseconds from sending the request to the first streamed output. */
+  /** Request duration excludes tool execution and persistence. */
+  requestMs?: number;
+  /** Milliseconds from sending the request to the first nonempty streamed output. */
   firstTokenMs?: number;
+  /** Time from first output to completion, matching DeepSeek Harness. */
+  decodeMs?: number;
 }
 
 export interface DurableToolPolicy {
@@ -549,6 +566,11 @@ export interface DurableTurnToolExecutor {
     reportProgress?: () => void,
   ): Promise<readonly ChatContentPart[]>;
   policy?(snapshot: DurableTurnSnapshot, toolName: string, permissionMode: string): DurableToolPolicy | undefined;
+  requiredWriteApproval?(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<{
+    title: string;
+    detail?: string;
+    writePreview: ApprovalWritePreview;
+  } | undefined>;
   /** Input schema of a tool the model reaches without a declared definition (a connector tool behind use_tool). */
   argumentSchema?(snapshot: DurableTurnSnapshot, toolName: string): unknown;
   /**
@@ -559,6 +581,10 @@ export interface DurableTurnToolExecutor {
   refreshArgumentSchemas?(snapshot: DurableTurnSnapshot, toolNames: readonly string[]): Promise<void>;
   /** Return true only when every awaited part of this tool observes the signal. */
   supportsAbort?(snapshot: DurableTurnSnapshot, step: DurableTurnStep): boolean;
+  /** Host-reviewed capability; tool annotations alone cannot authorize concurrency. */
+  supportsConcurrency?(snapshot: DurableTurnSnapshot, step: DurableTurnStep): boolean;
+  /** Last verified state change or observation that makes this tool's earlier calls stale. Host code only. */
+  repeatContextSince?(snapshot: DurableTurnSnapshot, step: DurableTurnStep): number | undefined;
   /** Return true only when every awaited model-preparation seam observes the signal. */
   supportsModelPreparationAbort?(snapshot: DurableTurnSnapshot): boolean;
   execute(
@@ -605,7 +631,7 @@ export interface ToolExecutionLimit {
 const OUTPUT_REPETITION_WINDOW = 1_024;
 const OUTPUT_REPETITION_MAX_PERIOD = 128;
 const OUTPUT_REPETITION_CHECK_INTERVAL = 128;
-const MODEL_CONTEXT_SAFETY_TOKENS = 1_024;
+const MODEL_CONTEXT_SAFETY_TOKENS = CONTEXT_SAFETY_TOKENS;
 const DEFAULT_NO_PROGRESS_WARNING_THRESHOLD = 3;
 const DEFAULT_NO_PROGRESS_HARD_THRESHOLD = 5;
 const DEFAULT_CUMULATIVE_TOOL_TIME_MS = 30 * 60_000;
@@ -679,6 +705,7 @@ export class DurableTurnRunner {
       toolIdleTimeoutMs?: number;
       toolMaxDurationMs?: number;
       toolClassLimits?: Partial<Record<"read" | "command" | "connector" | "image" | "default", ToolExecutionLimit>>;
+      maxParallelToolCalls?: number;
       maxCumulativeToolTimeMs?: number;
       maxActiveComputeMs?: number;
       noProgressWarningThreshold?: number;
@@ -708,6 +735,16 @@ export class DurableTurnRunner {
         await this.repository.release(snapshot);
         return { runId: snapshot.id, state: snapshot.state, noOp: true };
       }
+      if (snapshot.browserHandoff?.state === "requested" && ["calling_model", "executing_tool"].includes(snapshot.state)) {
+        await this.repository.commit(snapshot, {
+          expectedState: snapshot.state, nextState: "waiting", waitingReason: "browser_handoff",
+          nextAction: "Waiting for human browser control", taskStatus: "running",
+          browserHandoff: { ...snapshot.browserHandoff, state: "ready", resumeState: snapshot.state as "calling_model" | "executing_tool" },
+        });
+        return { runId: snapshot.id, state: "waiting" };
+      }
+      // Validate before running any model or tools, including resumed tool steps.
+      if (snapshot.state !== "waiting") durableRuntimeRequest(snapshot);
       if (snapshot.state === "queued" || snapshot.state === "assembling_context") {
         await this.assemble(snapshot);
         return { runId: snapshot.id, state: "calling_model" };
@@ -782,9 +819,7 @@ export class DurableTurnRunner {
           ? error
           : new DurableTurnRetryableError(message, error);
       }
-      // The next worker settles the interrupted call: a sandbox tool goes back
-      // to the model, any other waits for review.
-      if (hasAmbiguousNonIdempotentTool(snapshot)) {
+      if (hasRunningHeldTool(snapshot)) {
         await this.repository.release(snapshot, message);
         throw new DurableTurnRetryableError(
           "A non-idempotent tool failed after its durable running marker; recovery classification is required.",
@@ -1019,6 +1054,8 @@ export class DurableTurnRunner {
       workflowCategory: stringValue(snapshot.runtimeRequest.workflowCategory) ?? "unknown",
       workflowCategoryVersion: stringValue(snapshot.runtimeRequest.workflowCategoryVersion) ?? "workflow-v1",
     });
+    // Meter the complete request, including the journaled connector catalogue.
+    await this.journalContext(snapshot);
     const activeContextTokens = estimateActiveContextTokensForDecision(
       snapshot,
       definitions,
@@ -1046,10 +1083,11 @@ export class DurableTurnRunner {
             state: "pending",
             input: {
               reason: "token-threshold",
+              contextTailEntryId: compactionTailEntryId(snapshot),
               estimatedUncompactedTokens: estimateUncompactedTokens(snapshot),
             },
             retryClass: "idempotent_with_key",
-            idempotencyKey: `${snapshot.id}:compact:${snapshot.entries.at(-1)?.entryId ?? "empty"}`,
+            idempotencyKey: compactionIdempotencyKey(snapshot),
           },
         ],
         events: [{
@@ -1090,7 +1128,6 @@ export class DurableTurnRunner {
       await this.finishForBudget(snapshot, budget.reason ?? "Your spend limit has been reached.");
       return "completed";
     }
-    await this.journalContext(snapshot);
     const messageId = randomUUID();
     const modelStartedAt = Date.now();
     await this.repository.commit(snapshot, {
@@ -1179,6 +1216,16 @@ export class DurableTurnRunner {
         }
         if (finalAttempt) diagnostics.retryDecision = "terminal";
       }
+      const recoverContextLimit = Boolean(this.options.compactor)
+        && isContextLimitFailure(classifyProviderFailure(error))
+        && !snapshot.steps.some((candidate) =>
+          candidate.type === "session.compact" && candidate.input.reason === "provider-context-limit");
+      if (recoverContextLimit) {
+        diagnostics.retryDecision = "retry";
+        for (const attempt of providerAttempts) {
+          if (attempt.statusClass === "4xx" || attempt.category === "permanent_client") attempt.retryDecision = "retry";
+        }
+      }
       const priorCauses = record(record(step.output)?.providerDiagnostics)?.attemptCauses;
       diagnostics.attemptCauses = [
         ...(Array.isArray(priorCauses) ? priorCauses : []),
@@ -1225,6 +1272,48 @@ export class DurableTurnRunner {
           nextAction: "Release the failed model request for retry or terminal handling",
           keepLease: true,
         });
+      }
+      if (recoverContextLimit) {
+        const sequence = nextStepSequence(snapshot.steps);
+        const iteration = modelIteration(snapshot.steps) + 1;
+        await this.commitAndWake(snapshot, {
+          expectedState: "calling_model",
+          nextState: "compacting",
+          steps: [
+            {
+              ...activeModelStep,
+              state: "failed",
+              output: { ...(record(activeModelStep.output) ?? {}), providerDiagnostics: diagnostics },
+              error: CONTEXT_LIMIT_MESSAGE,
+              completedAt: new Date().toISOString(),
+            },
+            {
+              id: randomUUID(),
+              sequence,
+              type: "session.compact",
+              state: "pending",
+              input: { reason: "provider-context-limit", contextTailEntryId: compactionTailEntryId(snapshot) },
+              retryClass: "idempotent_with_key",
+              idempotencyKey: compactionIdempotencyKey(snapshot),
+            },
+            {
+              id: randomUUID(),
+              sequence: sequence + 1,
+              type: "model.call",
+              state: "pending",
+              input: { iteration, contextLimitRecovery: true },
+              retryClass: "idempotent_with_key",
+              idempotencyKey: `${snapshot.id}:model:${iteration}`,
+            },
+          ],
+          events: [{
+            kind: "session.note",
+            note: "compacting",
+            detail: "The model's context limit was reached. Berry is compacting the conversation and will retry once. Your chat history and files are preserved.",
+          }],
+          nextAction: "Compact the conversation before retrying the rejected model request",
+        });
+        return "compacting";
       }
       throw error;
     }
@@ -1422,6 +1511,21 @@ export class DurableTurnRunner {
         ...(call.extraContent !== undefined ? { extraContent: call.extraContent } : {}),
       };
     }
+    const meteredTools = canonicalToolDefinitions(definitions);
+    const meteredMessages = limitModelImagePayload(modelMessages(modelSnapshot, additionalUserContent).messages, meteredTools);
+    const contextBudget = result.inputTokens > 0 ? {
+      version: 1,
+      envelopeKey: contextEnvelopeKey(snapshot.runtimeRequest, result.promptManifest ?? contextManifest(snapshot)),
+      projectedTokens: result.inputTokens + estimateContextMessageTokens({
+        content: [
+          ...(result.text ? [{ type: "text", text: result.text }] : []),
+          ...result.toolCalls.map((call) => ({ type: "toolCall", name: call.invocation?.name ?? call.name, arguments: call.invocation?.arguments ?? call.input })),
+        ],
+        ...(result.toolCalls.length > 0 && result.reasoning ? { reasoningContent: result.reasoning } : {}),
+      }),
+      requestMessageCount: meteredMessages.length,
+      requestHash: contextRequestHash(meteredMessages, meteredTools),
+    } : undefined;
     const entries: DurableTurnMutation["entries"] = [{
       entryId: messageId,
       entryType: "message",
@@ -1449,6 +1553,7 @@ export class DurableTurnRunner {
           model: stringValue(snapshot.runtimeRequest.model) ?? "unknown",
           stopReason: result.toolCalls.length > 0 ? "toolUse" : "stop",
           timestamp: Date.now(),
+          ...(contextBudget ? { contextBudget } : {}),
           usage: {
             input: result.inputTokens,
             output: result.outputTokens,
@@ -1462,16 +1567,18 @@ export class DurableTurnRunner {
     }];
     const nextSequence = nextStepSequence(snapshot.steps);
     const declaredSchemas = new Map(definitions.map((definition) => [definition.function.name, definition.function.parameters]));
-    const checkArguments = () => result.toolCalls.map((call) => toolArgumentError(
-      call,
-      declaredSchemas,
-      (name) => this.tools.argumentSchema?.(snapshot, name),
-    ));
+    const checkArguments = () => result.toolCalls.map((call) => {
+      if (requiresAdmittedBash(call.name) && !declaredSchemas.has(call.name)) {
+        return notRunMessage(call.name, "This tool was not admitted for this turn");
+      }
+      return toolArgumentError(call, declaredSchemas, (name) => this.tools.argumentSchema?.(snapshot, name));
+    });
     let argumentErrors = checkArguments();
     // A connector may have changed a tool since its schema was stored, so
     // refresh refused connector schemas once before refusing the call.
     const schemaRefusals = [...new Set(result.toolCalls.filter((call, index) =>
       argumentErrors[index] !== null
+      && !requiresAdmittedBash(call.name)
       && !declaredSchemas.has(call.name)
       && unparsedToolArguments(call.invocation?.arguments ?? call.input, declaredSchemas.get(call.invocation?.name ?? call.name)) === null
     ).map((call) => call.name))];
@@ -1532,7 +1639,7 @@ export class DurableTurnRunner {
         ...(result.reasoning ? { reasoning: result.reasoning } : {}),
         inputTokens: result.inputTokens,
         outputTokens: result.outputTokens,
-        generationMs: Math.max(1, Date.now() - modelStartedAt),
+        generationMs: Math.max(1, Math.round(result.requestMs ?? Date.now() - modelStartedAt)),
         toolCalls: result.toolCalls.map((call) => ({
           id: call.id,
           name: call.name,
@@ -1567,6 +1674,13 @@ export class DurableTurnRunner {
       nextAction: "Portable checkpoint generation in progress",
       keepLease: true,
     });
+    const [extensionTools, imageContent] = await this.withHeartbeat(snapshot, ({ signal, reportProgress }) => Promise.all([
+      this.tools.definitions?.(snapshot) ?? Promise.resolve([]),
+      this.tools.modelContent?.(snapshot, signal, reportProgress) ?? Promise.resolve([]),
+    ]), { label: "Prepare compaction request", operation: "model_preparation", maxDurationMs: this.options.modelPreparationTimeoutMs ?? 120_000 });
+    const tools = canonicalToolDefinitions([...durableBuiltInToolDefinitions(snapshot), ...extensionTools]);
+    const runtime = durableRuntimeRequest(snapshot);
+    const selectedModel = stringValue(snapshot.runtimeRequest.model) ?? runtime?.provider.defaultModel ?? "";
     const result = await this.withHeartbeat(snapshot, () => compactor.compactSession({
       runId: snapshot.id,
       tenantId: snapshot.tenantId,
@@ -1575,7 +1689,21 @@ export class DurableTurnRunner {
       reason: "token-threshold",
       maxTokens: Math.min(numberValue(snapshot.runtimeRequest.maxTokens) ?? 4_000, 6_000),
       requestedByUserId: snapshot.userId,
-    }));
+    }, {
+      provider: runtime?.provider.id ?? stringValue(snapshot.runtimeRequest.providerId) ?? "router",
+      model: selectedModel,
+      sourceLeafId: snapshot.entries.at(-1)?.entryId ?? null,
+      coveredEntryId: snapshot.checkpointCoveredEntryId ?? null,
+      prefixFor: (endAtEntryId) => {
+        if (!snapshot.entries.some((entry) => entry.entryId === endAtEntryId)) throw new CompactionRetryableError("checkpoint_identity_mismatch");
+        return {
+          messages: limitModelImagePayload(modelMessages(snapshot, imageContent, { endAtEntryId }).messages, tools),
+          tools,
+          reasoningEffort: snapshot.runtimeRequest.reasoning === "off" && selectedModel.includes("deepseek-v4.1-flash")
+            ? "none" : reasoningEffort(snapshot.runtimeRequest.reasoning),
+        };
+      },
+    }), { label: "Generate portable checkpoint", operation: "compaction", maxDurationMs: 200_000 });
     const retained = await this.repository.heartbeat(
       snapshot.tenantId,
       snapshot.id,
@@ -1630,8 +1758,21 @@ export class DurableTurnRunner {
     const runnableSteps = snapshot.steps
       .filter(isRunnableToolStep)
       .sort((left, right) => left.sequence - right.sequence);
-    if (runnableSteps.length > 1 && runnableSteps.every(isParallelReadOnlyToolStep)) {
-      return this.executeParallelReadOnlyTools(snapshot, runnableSteps);
+    if (runnableSteps.length > 1 && runnableSteps.some((step) => toolNameForStep(step).startsWith("mcp__"))) {
+      // A worker resumed on another process has no connector catalog yet.
+      // Resolve it once before evaluating authoritative read-only policies.
+      await this.withHeartbeat(snapshot, () => this.tools.definitions?.(snapshot) ?? Promise.resolve([]), {
+        label: "Prepare connector concurrency policies", operation: "model_preparation",
+        maxDurationMs: this.options.modelPreparationTimeoutMs ?? 120_000,
+      });
+    }
+    const parallelPrefix: DurableTurnStep[] = [];
+    for (const candidate of runnableSteps) {
+      if (!isParallelReadOnlyToolStep(candidate, this.tools.supportsConcurrency?.(snapshot, candidate) === true)) break;
+      parallelPrefix.push(candidate);
+    }
+    if (parallelPrefix.length > 1) {
+      return this.executeParallelReadOnlyTools(snapshot, parallelPrefix);
     }
     const step = runnableSteps[0];
     if (!step) {
@@ -1665,13 +1806,6 @@ export class DurableTurnRunner {
       identicalFailureLimit,
       Math.max(1, this.options.maxToolRepairAttempts ?? identicalFailureLimit),
     );
-    if (repairBudget < IDENTICAL_TOOL_FAILURE_LIMIT && priorRepairAttempts >= repairBudget) {
-      return this.stopToolUse(snapshot, step, {
-        error: "repair_budget_exhausted",
-        reason: `${toolName} failed ${repairBudget} times in a row and its repair attempts are used up.`,
-        progressKind: "repair_budget",
-      });
-    }
     // An earlier call of this tool may have taken effect: no further call of it
     // runs until an explicit recovery decision (H-003, H-014). Shell commands
     // and edits are never held; the model sees their results (holdsForReview).
@@ -1692,13 +1826,20 @@ export class DurableTurnRunner {
       });
       return "recovery_required";
     }
+    if (!isMcpToolStep(step) && repairBudget < IDENTICAL_TOOL_FAILURE_LIMIT && priorRepairAttempts >= repairBudget) {
+      return this.stopToolUse(snapshot, step, {
+        error: "repair_budget_exhausted",
+        reason: `${toolName} failed ${repairBudget} times in a row and its repair attempts are used up.`,
+        progressKind: "repair_budget",
+      });
+    }
     const repeatedFailure = repeatedToolFailure(snapshot, step);
     if (repeatedFailure) return this.stopToolUse(snapshot, step, identicalFailureGuard(step, repeatedFailure));
     const unchangedRetry = step.state === "pending" ? unchangedFailedRetry(snapshot, step) : null;
     if (unchangedRetry) return this.refuseUnchangedRetry(snapshot, step, unchangedRetry);
-    const repeatAssessment = assessRepeatedToolCall(snapshot, step);
+    const repeatAssessment = assessRepeatedToolCall(snapshot, step, this.tools.repeatContextSince?.(snapshot, step));
     const repeatGuardEnforced = this.toolRepeatGuardMode() === "enforce";
-    if (!(step.state === "running" && step.retryClass === "non_idempotent_manual")) {
+    if (!(step.state === "running" && (step.retryClass === "non_idempotent_manual" || isMcpToolStep(step)))) {
       if (repeatAssessment.decision === "terminate" && repeatGuardEnforced) {
         return this.terminateForDuplicateToolLoop(snapshot, step, repeatAssessment);
       }
@@ -1708,8 +1849,29 @@ export class DurableTurnRunner {
     }
     // Malformed arguments were found when the call arrived; the tool never runs (H-011).
     const storedArgumentError = typeof step.input.argumentError === "string" ? step.input.argumentError : null;
+    if (toolName === BROWSER_HANDOFF_TOOL && !storedArgumentError) {
+      const args = BrowserHandoffArgumentsSchema.safeParse(step.input.arguments);
+      const session = args.success ? browserSessionsFromSteps(snapshot.steps).find((item) => item.sessionId === args.data.session_id) : null;
+      if (session && args.success) {
+        await this.repository.commit(snapshot, {
+          expectedState: "executing_tool", nextState: "waiting",
+          steps: [{ ...step, state: "waiting" }],
+          browserHandoff: {
+            id: randomUUID(), sessionId: session.sessionId, serverId: session.serverId,
+            state: "ready", reason: args.data.reason, requestedAt: new Date().toISOString(),
+            requestedBy: "agent", resumeState: "executing_tool",
+          },
+          events: [{ kind: "tool.start", toolCallId, name: toolName, args: step.input.arguments as JsonValue }],
+          waitingReason: "browser_handoff", nextAction: "Waiting for human browser control", taskStatus: "running",
+        });
+        return "waiting";
+      }
+    }
     const questionProblem = toolName === "ask_user_question" ? questionBatchProblem(step.input.arguments) : null;
-    const argumentError = questionProblem ? null : storedArgumentError;
+    const argumentError = questionProblem ? null : storedArgumentError
+      ?? (requiresAdmittedBash(toolName) && !durableBuiltInToolDefinitions(snapshot).some((tool) => tool.function.name === toolName)
+        ? notRunMessage(toolName, "This tool was not admitted for this turn")
+        : null);
     if (toolName === "ask_user_question" && !questionProblem && !argumentError) {
       const questions = durableQuestionItems(step.input.arguments);
       const first = questions[0];
@@ -1765,7 +1927,7 @@ export class DurableTurnRunner {
     // The worker running this call stopped before it reported back. A sandbox
     // tool goes back to the model as interrupted; any other waits for review.
     // Neither is run again on its own.
-    const interrupted = step.state === "running" && step.retryClass === "non_idempotent_manual" && !argumentError;
+    const interrupted = step.state === "running" && (step.retryClass === "non_idempotent_manual" || isMcpToolStep(step)) && !argumentError;
     if (interrupted && holdsForReview(step)) {
       await this.repository.commit(snapshot, {
         expectedState: "executing_tool",
@@ -1818,8 +1980,10 @@ export class DurableTurnRunner {
     }
 
     const approval = snapshot.approvals.find((candidate) => candidate.stepId === step.id);
-    // An interrupted call already ran after its approval.
-    const requiresApproval = step.input.requiresApproval === true && !argumentError && !interrupted;
+    // Recheck at execution so a pending step journaled under an older policy
+    // still gets the current connector's mandatory approval.
+    const writeApproval = argumentError || interrupted ? undefined : await this.tools.requiredWriteApproval?.(snapshot, step);
+    const requiresApproval = !argumentError && !interrupted && (writeApproval !== undefined || step.input.requiresApproval === true);
     if (requiresApproval && approval?.status !== "approved") {
       if (approval?.status === "denied" || approval?.status === "expired") {
         const entryId = randomUUID();
@@ -1876,7 +2040,10 @@ export class DurableTurnRunner {
       }
       if (!approval) {
         const approvalId = randomUUID();
-        const kind = approvalKind(step.input.approvalKind);
+        const kind = writeApproval ? "mcp" : approvalKind(step.input.approvalKind);
+        const title = writeApproval?.title ?? `Approve ${toolName}`;
+        const detail = writeApproval ? writeApproval.detail : JSON.stringify(step.input.arguments ?? {});
+        const preview = writeApproval ? { writePreview: writeApproval.writePreview } : {};
         await this.repository.commit(snapshot, {
           expectedState: "executing_tool",
           nextState: "waiting",
@@ -1887,8 +2054,9 @@ export class DurableTurnRunner {
             toolCallId,
             kind,
             request: {
-              title: `Approve ${stringValue(step.input.toolName) ?? step.type.slice(5)}`,
-              detail: JSON.stringify(step.input.arguments ?? {}),
+              title,
+              ...(detail !== undefined ? { detail } : {}),
+              ...preview,
               retryClass: step.retryClass,
             },
           },
@@ -1896,9 +2064,10 @@ export class DurableTurnRunner {
             kind: "approval.request",
             approvalId,
             approvalKind: kind,
-            title: `Approve ${stringValue(step.input.toolName) ?? step.type.slice(5)}`,
-            detail: JSON.stringify(step.input.arguments ?? {}).slice(0, 4_000),
-            destructive: step.retryClass === "non_idempotent_manual",
+            title,
+            ...(detail !== undefined ? { detail: detail.slice(0, 4_000) } : {}),
+            ...preview,
+            destructive: !writeApproval && step.retryClass === "non_idempotent_manual",
           }],
           waitingReason: "approval",
           nextAction: "Wait for an approval decision",
@@ -1989,7 +2158,7 @@ export class DurableTurnRunner {
         ? await this.withHeartbeat(snapshot, toolOperation, {
             label: `${toolName} tool`,
             abortable: toolAbortable,
-            preserveResultAfterTimeout: step.retryClass === "non_idempotent_manual",
+            preserveResultAfterTimeout: toolMayChangeState(step),
             operation: "tool",
             idleTimeoutMs: toolLimits.idleTimeoutMs,
             maxDurationMs: toolLimits.maxDurationMs,
@@ -1998,7 +2167,7 @@ export class DurableTurnRunner {
           ?? await this.withHeartbeat(snapshot, toolOperation, {
               label: `${toolName} tool`,
               abortable: toolAbortable,
-              preserveResultAfterTimeout: step.retryClass === "non_idempotent_manual",
+              preserveResultAfterTimeout: toolMayChangeState(step),
               operation: "tool",
               idleTimeoutMs: toolLimits.idleTimeoutMs,
               maxDurationMs: toolLimits.maxDurationMs,
@@ -2008,6 +2177,7 @@ export class DurableTurnRunner {
         await this.transitionAmbiguousToolToRecovery(snapshot, error.message, {
           timedOut: true,
           outcomeCertainty: "unknown",
+          abortAcknowledged: error.abortAcknowledged,
         });
         return "recovery_required";
       }
@@ -2037,9 +2207,9 @@ export class DurableTurnRunner {
         : "";
       // The class and recovery action travel with the step, independent of wording (H-003).
       const failure = error instanceof InterruptedToolCallError
-        ? interruptedToolFailure()
+        ? interruptedToolFailure(step)
         : classifyToolFailure(error, {
-            changesState: step.retryClass === "non_idempotent_manual",
+            changesState: toolMayChangeState(step),
             timedOut,
           });
       // A change outside the sandbox that the target may have applied before
@@ -2057,7 +2227,9 @@ export class DurableTurnRunner {
         });
         return "recovery_required";
       }
-      const typedRepairMessage = `Tool failed (repair attempt ${repairAttempt}/${repairBudget}${sameErrorGuidance}). ${message}`;
+      const typedRepairMessage = isMcpToolStep(step)
+        ? `Tool failed. ${message}`
+        : `Tool failed (repair attempt ${repairAttempt}/${repairBudget}${sameErrorGuidance}). ${message}`;
       const entryId = randomUUID();
       const remaining = snapshot.steps.some((candidate) =>
         candidate.id !== step.id && isRunnableToolStep(candidate)
@@ -2077,8 +2249,7 @@ export class DurableTurnRunner {
             repeatPolicy: repeatAssessment.policy,
             ...(timedOut ? {
               timedOut: true,
-              // A read that timed out changed nothing; a command may have done part of its work.
-              outcomeCertainty: step.retryClass === "non_idempotent_manual" ? "unknown" as const : "known" as const,
+              outcomeCertainty: failure.outcome === "unknown" ? "unknown" as const : "known" as const,
               abortAcknowledged: error instanceof DurableToolTimeoutError
                 ? error.abortAcknowledged
                 : false,
@@ -2255,6 +2426,7 @@ export class DurableTurnRunner {
             toolCallId,
             toolName: stringValue(step.input.toolName) ?? step.type.slice(5),
             content: [{ type: "text", text: durableToolResultText(result.output) }],
+            ...(record(result.output)?.storedResult ? { storedToolResult: record(result.output)!.storedResult as JsonValue } : {}),
             isError: false,
             timestamp: Date.now(),
           },
@@ -2283,7 +2455,7 @@ export class DurableTurnRunner {
       const repeatedFailure = repeatedToolFailure(snapshot, step);
       if (repeatedFailure) return this.stopToolUse(snapshot, step, identicalFailureGuard(step, repeatedFailure));
     }
-    const repeatAssessments = new Map(steps.map((step) => [step.id, assessRepeatedToolCall(snapshot, step)]));
+    const repeatAssessments = new Map(steps.map((step) => [step.id, assessRepeatedToolCall(snapshot, step, this.tools.repeatContextSince?.(snapshot, step))]));
     const guardEnforced = this.toolRepeatGuardMode() === "enforce";
     const terminating = steps.find((step) => repeatAssessments.get(step.id)?.decision === "terminate");
     if (terminating && guardEnforced) {
@@ -2313,7 +2485,11 @@ export class DurableTurnRunner {
       executableSteps.push(step);
     }
     const pendingSteps = executableSteps.filter((step) => step.state === "pending");
-    const toolLimits = toolExecutionLimits("read", this.options);
+    const individualLimits = executableSteps.map((step) => toolExecutionLimits(toolNameForStep(step), this.options));
+    const toolLimits = {
+      idleTimeoutMs: Math.max(...individualLimits.map((limit) => limit.idleTimeoutMs), 1),
+      maxDurationMs: Math.max(...individualLimits.map((limit) => limit.maxDurationMs), 1),
+    };
     const batchStartedAt = Date.now();
     const deadlineAt = new Date(batchStartedAt + toolLimits.maxDurationMs).toISOString();
     const idleDeadlineAt = new Date(batchStartedAt + toolLimits.idleTimeoutMs).toISOString();
@@ -2348,14 +2524,20 @@ export class DurableTurnRunner {
     // reads that finished in time and reports only the others as timed out
     // (H-078). Ownership loss and cancellation still end the batch unsaved.
     const outcomes: Array<{ outcome: PromiseSettledResult<TurnToolResult>; at: number } | undefined> = executableSteps.map(() => undefined);
+    const startedAts: number[] = [];
     let timedOutAt: number | null = null;
     let interrupted = false;
     let settled: PromiseSettledResult<TurnToolResult>[];
     try {
       settled = await this.withHeartbeat(
         snapshot,
-        ({ signal, reportProgress }) => Promise.allSettled(
-          executableSteps.map((step, index) => (typeof step.input.argumentError === "string"
+        ({ signal, reportProgress }) => settleToolPool(
+          executableSteps,
+          this.options.maxParallelToolCalls ?? Number(process.env.BERRY_MCP_MAX_PARALLEL_READS ?? 4),
+          (step, index) => {
+            if (interrupted || timedOutAt !== null || signal?.aborted) throw signal?.reason ?? new Error("Tool batch stopped before dispatch");
+            startedAts[index] = Date.now();
+            return (typeof step.input.argumentError === "string"
             ? Promise.reject(new ToolArgumentError(step.input.argumentError))
             : this.tools.execute(snapshot, step, signal, reportProgress)).then(
             (value) => {
@@ -2366,7 +2548,8 @@ export class DurableTurnRunner {
               outcomes[index] = { outcome: { status: "rejected", reason }, at: Date.now() };
               throw reason;
             },
-          )),
+            );
+          },
         ),
         {
           label: "Parallel read-only tool batch",
@@ -2483,7 +2666,8 @@ export class DurableTurnRunner {
       const entryId = entryIds[index]!;
       const toolName = toolNameForStep(step);
       const toolCallId = toolCallIdForStep(step);
-      const durationMs = Math.max(0, Date.now() - startedAt);
+      const durationMs = Math.max(0, (outcomes[index]?.at ?? Date.now()) - (startedAts[index] ?? startedAt));
+      const batchToolMs = index === 0 ? Math.max(0, Date.now() - startedAt) : 0;
       if (outcome.status === "fulfilled") {
         const result = journalSafeToolResult(outcome.value);
         const resultFingerprint = resultFingerprintForToolResult(snapshot, result);
@@ -2508,7 +2692,7 @@ export class DurableTurnRunner {
         batchProgress = nextProgress(assessmentSnapshot, {
           kind: assessment.kind,
           noProgress: assessment.noProgress,
-          toolMs: durationMs,
+          toolMs: batchToolMs,
         });
         if (assessment.noProgress && batchProgress.consecutiveNoProgress >= noProgressHardThreshold) hardNoProgress = true;
         const repeatAssessment = repeatAssessments.get(step.id);
@@ -2563,6 +2747,7 @@ export class DurableTurnRunner {
               toolCallId,
               toolName,
               content: [{ type: "text", text: durableToolResultText(result.output) }],
+              ...(record(result.output)?.storedResult ? { storedToolResult: record(result.output)!.storedResult as JsonValue } : {}),
               isError: false,
               timestamp: Date.now(),
             },
@@ -2604,7 +2789,7 @@ export class DurableTurnRunner {
       batchProgress = nextProgress({ ...snapshot, progress: batchProgress }, {
         kind: "repair_budget",
         noProgress: false,
-        toolMs: durationMs,
+        toolMs: batchToolMs,
         toolRepairAttempts: 1,
       });
       toolResultMessages.push({
@@ -2638,14 +2823,17 @@ export class DurableTurnRunner {
     }
 
     const iteration = modelIteration(snapshot.steps) + 1;
+    const settledIds = new Set(mutations.map((mutation) => mutation.id));
+    const remaining = snapshot.steps.some((candidate) => isRunnableToolStep(candidate) && !settledIds.has(candidate.id));
+    const nextState = remaining ? "executing_tool" : "calling_model";
     // Repeated reads that change nothing end tool use, not the task (H-004).
-    const wrapUp = hardNoProgress ? noProgressReason(batchProgress.consecutiveNoProgress) : null;
+    const wrapUp = hardNoProgress && !remaining ? noProgressReason(batchProgress.consecutiveNoProgress) : null;
     await this.commitAndWake(snapshot, {
       expectedState: "executing_tool",
-      nextState: "calling_model",
+      nextState,
       steps: [
         ...mutations,
-        {
+        ...(!remaining ? [{
           id: randomUUID(),
           sequence: nextStepSequence(snapshot.steps),
           type: "model.call",
@@ -2653,7 +2841,7 @@ export class DurableTurnRunner {
           input: wrapUp ? { iteration, wrapUp } : { iteration },
           retryClass: "idempotent_with_key" as const,
           idempotencyKey: `${snapshot.id}:model:${iteration}`,
-        },
+        }] : []),
       ],
       events: wrapUp
         ? [...events, {
@@ -2669,13 +2857,13 @@ export class DurableTurnRunner {
       ...(sandbox ? { sandbox } : {}),
       nextAction: wrapUp
         ? "Ask the model for a final answer without tools"
-        : "Continue the model with the persisted read-only tool batch",
+        : remaining ? "Execute the next ordered tool step" : "Continue the model with the persisted read-only tool batch",
       progress: wrapUp ? { ...batchProgress, budgetReason: "no_progress_budget" } : batchProgress,
       ...(sandbox ? {
         outbox: [scheduledSandboxSnapshot(snapshot, this.options.snapshotIntervalSeconds ?? 900)],
       } : {}),
     });
-    return "calling_model";
+    return nextState;
   }
 
   private async suppressRepeatedToolCall(
@@ -3854,20 +4042,25 @@ RETURNING *
       this.executor.query<EntryRow>(
         `
 WITH RECURSIVE leaf AS (
-  SELECT entry_id,parent_entry_id,entry_type,sequence,payload
+  SELECT entry_id,parent_entry_id,entry_type,sequence,payload,step_id
   FROM session_entries
   WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND is_leaf_marker=true
   ORDER BY sequence DESC LIMIT 1
 ), active_entries AS (
   SELECT * FROM leaf
   UNION ALL
-  SELECT parent.entry_id,parent.parent_entry_id,parent.entry_type,parent.sequence,parent.payload
+  SELECT parent.entry_id,parent.parent_entry_id,parent.entry_type,parent.sequence,parent.payload,parent.step_id
   FROM session_entries parent
   JOIN active_entries child ON child.parent_entry_id=parent.entry_id
   WHERE parent.tenant_id=$1::uuid AND parent.session_id=$2::uuid
 )
-SELECT entry_id,parent_entry_id,entry_type,sequence,payload
-FROM active_entries ORDER BY sequence ASC
+SELECT active_entries.entry_id,active_entries.parent_entry_id,active_entries.entry_type,active_entries.sequence,
+  CASE WHEN provider_step.output ? 'providerToolCalls'
+    THEN active_entries.payload || jsonb_build_object('providerToolCalls', provider_step.output->'providerToolCalls')
+    ELSE active_entries.payload END AS payload
+FROM active_entries
+LEFT JOIN turn_steps provider_step ON provider_step.tenant_id=$1::uuid AND provider_step.id=active_entries.step_id
+ORDER BY active_entries.sequence ASC
         `.trim(),
         [input.tenantId, run.session_id],
       ),
@@ -3981,9 +4174,9 @@ RETURNING id
   async appendEvents(snapshot: DurableTurnSnapshot, events: readonly AgentStreamEvent[]): Promise<void> {
     if (events.length === 0) return;
     const run = async (executor: SqlExecutor): Promise<void> => {
-      const locked = await executor.query<{ state: TurnRunState; cancelled_at: Date | string | null }>(
+      const locked = await executor.query<{ state: TurnRunState; cancelled_at: Date | string | null; browser_handoff?: unknown }>(
         `
-SELECT state,cancelled_at FROM turn_runs
+SELECT state,cancelled_at,browser_handoff FROM turn_runs
 WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
   AND lease_expires_at > now()
   AND ($4::bigint IS NULL OR ownership_generation=$4::bigint)
@@ -4004,9 +4197,9 @@ FOR UPDATE
 
   async commit(snapshot: DurableTurnSnapshot, mutation: DurableTurnMutation): Promise<void> {
     const run = async (executor: SqlExecutor): Promise<void> => {
-      const locked = await executor.query<{ state: TurnRunState; cancelled_at: Date | string | null }>(
+      const locked = await executor.query<{ state: TurnRunState; cancelled_at: Date | string | null; browser_handoff?: unknown }>(
         `
-SELECT state,cancelled_at FROM turn_runs
+SELECT state,cancelled_at,browser_handoff FROM turn_runs
 WHERE tenant_id = $1::uuid AND id = $2::uuid AND lease_owner = $3
   AND lease_expires_at > now()
   AND ($4::bigint IS NULL OR ownership_generation=$4::bigint)
@@ -4020,6 +4213,25 @@ FOR UPDATE
       }
       if (locked[0].cancelled_at && mutation.nextState !== "cancelled") {
         throw new DurableTurnRetryableError("Turn was cancelled before state persistence");
+      }
+      // Pause only at a completed phase boundary. A keepLease mutation marks an
+      // operation running; pausing there would leave the operation executing under a human.
+      const requested = BrowserHandoffSchema.safeParse(locked[0].browser_handoff);
+      if (!mutation.keepLease && requested.success && requested.data.state === "requested") {
+        if (["calling_model", "executing_tool"].includes(mutation.nextState)) {
+          mutation = { ...mutation,
+            browserHandoff: { ...requested.data, state: "ready", resumeState: mutation.nextState as "calling_model" | "executing_tool" },
+            nextState: "waiting", waitingReason: "browser_handoff", nextAction: "Waiting for human browser control",
+            outbox: (mutation.outbox ?? []).filter((item) => item.eventType !== "turn.execute" && item.eventType !== "turn.resume"),
+          };
+        } else if (mutation.nextState !== "waiting" || mutation.waitingReason !== "browser_handoff") {
+          // An approval, question or terminal result wins this race; no control
+          // credential is issued for a request that did not reach a safe pause.
+          await executor.execute("UPDATE turn_runs SET browser_handoff=NULL WHERE tenant_id=$1::uuid AND id=$2::uuid", [snapshot.tenantId, snapshot.id]);
+        }
+      }
+      if (mutation.browserHandoff) {
+        await executor.execute("UPDATE turn_runs SET browser_handoff=$3::jsonb WHERE tenant_id=$1::uuid AND id=$2::uuid", [snapshot.tenantId, snapshot.id, JSON.stringify(mutation.browserHandoff)]);
       }
       const persistedStepIds = new Map<string, string>();
       for (const step of mutation.steps ?? []) {
@@ -4049,7 +4261,13 @@ FOR UPDATE
         );
         appendedEntries.push(...terminalEntryIds);
       }
-      await appendEvents(executor, snapshot, mutation.events ?? []);
+      const handoff = mutation.browserHandoff;
+      await appendEvents(executor, snapshot, [
+        ...(mutation.events ?? []),
+        ...(handoff?.state === "ready" && mutation.nextState === "waiting" && mutation.waitingReason === "browser_handoff"
+          ? [{ kind: "browser.handoff" as const, handoffId: handoff.id, browserSessionId: handoff.sessionId, state: "ready" as const, reason: handoff.reason }]
+          : []),
+      ]);
       for (const item of mutation.outbox ?? []) {
         await executor.execute(
           `
@@ -4491,7 +4709,9 @@ export class RouterDurableTurnModel implements DurableTurnModel {
     let finishReason: string | null = null;
     let providerResponseId: string | undefined;
     let routerRequestId: string | undefined;
-    const selectedReasoningEffort = reasoningEffort(snapshot.runtimeRequest.reasoning);
+    const selectedReasoningEffort = snapshot.runtimeRequest.reasoning === "off"
+      && (model.startsWith("inference-net/deepseek-v4.1-flash") || this.cache.provider === "inference-net" && model.startsWith("deepseek-v4.1-flash"))
+      ? "none" : reasoningEffort(snapshot.runtimeRequest.reasoning);
     const kimiSectionStart = "<|tool_calls_section_begin|>";
     const emitVisibleText = async (value: string) => {
       if (!value) return;
@@ -4517,6 +4737,7 @@ export class RouterDurableTurnModel implements DurableTurnModel {
         bufferedText = bufferedText.slice(safeLength);
       }
     };
+    const outputTimer = new ModelOutputTimer();
     for await (const chunk of this.client.stream({
       model,
       messages,
@@ -4531,6 +4752,8 @@ export class RouterDurableTurnModel implements DurableTurnModel {
       ...(cachePlan.cacheKey ? { promptCacheKey: cachePlan.cacheKey } : {}),
       ...(cachePlan.retention !== "none" ? { promptCacheRetention: cachePlan.retention } : {}),
     })) {
+      outputTimer.output(Boolean(chunk.delta || chunk.reasoningDelta
+        || chunk.toolCalls?.some((call) => call.function?.name || call.function?.arguments)));
       context.reportProgress?.();
       servedModel = chunk.attribution?.servedModel || chunk.model || servedModel;
       if (chunk.attribution?.servedProvider) servedProvider = chunk.attribution.servedProvider;
@@ -4562,6 +4785,7 @@ export class RouterDurableTurnModel implements DurableTurnModel {
       }
       if (chunk.usage) finalUsage = chunk.usage;
     }
+    const modelTiming = outputTimer.finish();
     const kimiToolCalls = streamedToolCalls.size === 0 ? parseKimiToolCalls(rawText) : undefined;
     const text = kimiToolCalls?.content ?? rawText;
     if (text.startsWith(emittedText)) {
@@ -4648,6 +4872,7 @@ export class RouterDurableTurnModel implements DurableTurnModel {
       ...(usage ? { usage } : {}),
       promptManifest: cachePlan.manifest,
       toolCalls,
+      ...modelTiming,
     };
   }
 }
@@ -4718,9 +4943,6 @@ export class SnapshotProviderDurableTurnModel implements DurableTurnModel {
   }
 }
 
-/** Stream events that carry model output; the first one marks the time to first token. */
-const MODEL_OUTPUT_EVENTS: ReadonlySet<string> = new Set(["text_delta", "thinking_delta", "toolcall_start", "toolcall_delta"]);
-
 async function callProviderStream(
   provider: DurableProviderTransport,
   apiKey: string | undefined,
@@ -4753,8 +4975,7 @@ async function callProviderStream(
     })),
   };
   const effort = reasoningEffort(snapshot.runtimeRequest.reasoning);
-  const requestStartedAt = Date.now();
-  let firstTokenMs: number | undefined;
+  const outputTimer = new ModelOutputTimer();
   const stream = await streamFn(model, piContext, {
     sessionId: snapshot.sessionId,
     temperature: 0,
@@ -4765,11 +4986,13 @@ async function callProviderStream(
   });
   for await (const event of stream) {
     context.reportProgress?.();
-    if (firstTokenMs === undefined && MODEL_OUTPUT_EVENTS.has(event.type)) firstTokenMs = Date.now() - requestStartedAt;
+    outputTimer.output((event.type === "text_delta" || event.type === "thinking_delta" || event.type === "toolcall_delta")
+      && event.delta.length > 0);
     if (event.type === "text_delta") await context.emitDelta(event.delta, "text");
     else if (event.type === "thinking_delta") await context.emitDelta(event.delta, "reasoning");
   }
   const assistant = await stream.result();
+  const modelTiming = outputTimer.finish();
   if (assistant.stopReason === "error" || assistant.stopReason === "aborted") {
     const providerError = providerErrorFromAssistantMessage(assistant);
     if (providerError) throw providerError;
@@ -4830,7 +5053,7 @@ async function callProviderStream(
     outputTokens: assistant.usage.output,
     usage,
     toolCalls,
-    ...(firstTokenMs !== undefined ? { firstTokenMs } : {}),
+    ...modelTiming,
   };
 }
 
@@ -4965,6 +5188,14 @@ export class DurableTurnRetryableError extends Error {
   }
 }
 
+/** A tool whose worker stopped before reporting a result. */
+class InterruptedToolCallError extends Error {
+  constructor(toolName: string) {
+    super(`${toolName} was interrupted: the worker running it stopped before it reported a result.`);
+    this.name = "InterruptedToolCallError";
+  }
+}
+
 export class DurableToolTimeoutError extends DurableTurnRetryableError {
   constructor(
     message: string,
@@ -4982,24 +5213,6 @@ export class DurableTurnTerminalError extends Error {
     super(message, cause === undefined ? undefined : { cause });
     this.name = "DurableTurnTerminalError";
   }
-}
-
-/** A sandbox tool whose worker stopped before the tool reported back; it is not run again. */
-class InterruptedToolCallError extends Error {
-  constructor(toolName: string) {
-    super(`${toolName} was interrupted: the worker running it stopped before it reported a result.`);
-    this.name = "InterruptedToolCallError";
-  }
-}
-
-function interruptedToolFailure(): ToolFailure {
-  return {
-    category: "unknown_outcome",
-    deterministic: false,
-    outcome: "unknown",
-    outcomeVersion: TOOL_FAILURE_OUTCOME_VERSION,
-    action: toolFailureAction("unknown_outcome"),
-  };
 }
 
 function nextStepSequence(steps: readonly DurableTurnStep[]): number {
@@ -5062,8 +5275,10 @@ function successfulProviderDiagnostics(
     category: "success",
     retryDecision: "none",
     physicalAttempt: Math.max(1, (latestStep(snapshot.steps, "model.call")?.attempt ?? 0) + 1),
-    latencyMs: Math.max(0, Date.now() - startedAt),
+    latencyMs: result.requestMs ?? Math.max(0, Date.now() - startedAt),
     firstTokenMs: result.firstTokenMs ?? null,
+    decodeMs: result.decodeMs ?? null,
+    decodeTokens: result.decodeMs !== undefined && result.outputTokens > 0 ? result.outputTokens : null,
     inputTokens: Math.max(0, Math.floor(result.inputTokens)),
     outputTokens: Math.max(0, Math.floor(result.outputTokens)),
     cacheReadTokens: result.usage?.cacheReadTokens ?? 0,
@@ -5177,6 +5392,7 @@ function creditAlertProvider(snapshot: DurableTurnSnapshot): Pick<ProviderCredit
 function publicProviderFailureMessage(
   failure: ReturnType<typeof classifyProviderFailure>,
 ): string {
+  if (isContextLimitFailure(failure)) return CONTEXT_LIMIT_MESSAGE;
   if (failure.status === 413) {
     return "The model request exceeded the provider's payload size limit (HTTP 413). Reduce the image sizes or number of images, or shorten the conversation before retrying.";
   }
@@ -5331,6 +5547,8 @@ function modelIteration(steps: readonly DurableTurnStep[]): number {
 }
 
 function repeatedToolFailure(snapshot: DurableTurnSnapshot, step: DurableTurnStep): string | null {
+  // MCP error recovery belongs to the model, including repeated failures.
+  if (isMcpToolStep(step)) return null;
   const failureLimit = identicalToolFailureLimit(step);
   const fingerprint = failureArgumentFingerprint(snapshot, step);
   const precedingToolSteps = snapshot.steps
@@ -5447,6 +5665,13 @@ const SANDBOX_INTERRUPTED_ACTION = "It stopped before it finished, so it may hav
 const SANDBOX_EARLIER_EFFECTS = " Whatever it did before the error has already happened. Fix the problem and continue; do not repeat a step that sent or changed something outside the sandbox (for example an API request) unless you know it did not happen.";
 
 function toolFailureNote(failure: ToolFailure, step: DurableTurnStep): string {
+  if (failure.code?.startsWith("mcp_")) return `Failure class: ${failure.category}. ${failure.action}`;
+  if (isMcpToolStep(step) && (!holdsForReview(step) || failure.outcome === "not_applied")) {
+    const outcome = failure.outcome === "unknown"
+      ? " This call may already have changed something. Check the target state before repeating a change-making call."
+      : "";
+    return `Failure class: ${failure.category}.${outcome} ${MCP_FAILURE_ACTION}`;
+  }
   if (!holdsForReview(step)) {
     const action = failure.category === "unknown_outcome" ? SANDBOX_INTERRUPTED_ACTION : failure.action;
     const earlier = failure.outcome === "unknown" ? SANDBOX_EARLIER_EFFECTS : "";
@@ -5459,7 +5684,7 @@ function toolFailureNote(failure: ToolFailure, step: DurableTurnStep): string {
 }
 
 /**
- * The latest identical earlier call (same tool, same arguments up to path
+ * For native tools, the latest identical earlier call (same tool, same arguments up to path
  * spelling) when it failed in a way an unchanged repeat cannot fix (H-003).
  * Credentials, configuration and credit need a person; invalid input and
  * missing resources need a change-making step in between. Transient and
@@ -5476,6 +5701,7 @@ function unchangedFailedRetry(snapshot: DurableTurnSnapshot, step: DurableTurnSt
   if (!previous || previous.state !== "failed") return null;
   const failure = storedToolFailure(previous.output);
   if (!failure) return null;
+  if (isMcpToolStep(step) && !(failure.code?.startsWith("mcp_") && failure.deterministic)) return null;
   const stored = record(record(previous.output)?.failure);
   const previousError = stringValue(stored?.previousError)
     ?? toolFailureIdentity(previous.error).split("\n")[0]?.slice(0, 500)
@@ -5487,6 +5713,7 @@ function unchangedFailedRetry(snapshot: DurableTurnSnapshot, step: DurableTurnSt
       && candidate.error !== DUPLICATE_TOOL_CALL_SUPPRESSED
       && record(record(candidate.output)?.failure)?.refusedUnchangedRetry !== true)));
   const refusal = { previous, failure, previousError };
+  if (isMcpToolStep(step)) return refusal;
   switch (failure.category) {
     case "credentials":
     case "configuration":
@@ -5840,6 +6067,7 @@ function resultFingerprintForToolResult(snapshot: DurableTurnSnapshot, result: T
 function assessRepeatedToolCall(
   snapshot: DurableTurnSnapshot,
   step: DurableTurnStep,
+  contextSince?: number,
 ): ToolRepeatAssessment {
   const signature = toolRepeatSignature(step);
   const policy = repeatPolicyForStep(step);
@@ -5848,9 +6076,15 @@ function assessRepeatedToolCall(
   // after a write, edit or command that names it may publish new bytes; the
   // executor still returns the earlier receipt for identical bytes (H-028).
   // Other external writes keep their dedup.
-  const freshSince = policy === "compare_result"
+  const fileContextSince = policy === "compare_result"
     ? lastEditOfReferencedFile(snapshot, step)
     : toolNameForStep(step) === "persist_artifact" ? lastChangeOfPublishedFile(snapshot, step) : -1;
+  // A reviewed stateful adapter can identify a newer observation of the same
+  // resource. Keep success deduplication within that state, without treating
+  // every future interaction with the resource as the same external write.
+  const freshSince = Math.max(fileContextSince,
+    typeof contextSince === "number" && Number.isSafeInteger(contextSince) && contextSince >= 0 && contextSince < step.sequence
+      ? contextSince : -1);
   const relevant = snapshot.steps
     .filter((candidate) => candidate.id !== step.id
       && candidate.sequence < step.sequence
@@ -6065,11 +6299,7 @@ function shouldCompactSnapshot(
     );
     if (estimatedTokens + safetyTokens < contextWindow) return false;
   }
-  return shouldCompact(
-    estimatedTokens,
-    contextWindow,
-    DEFAULT_COMPACTION_SETTINGS,
-  );
+  return estimatedTokens >= resolveContextBudget(contextWindow, estimatedTokens, numberValue(snapshot.runtimeRequest.maxTokens) ?? 8_000).triggerTokens;
 }
 
 function modelContextWindow(
@@ -6091,22 +6321,28 @@ function contextAwareMaxOutputTokens(
     1,
     Math.floor(numberValue(snapshot.runtimeRequest.maxTokens) ?? 8_000),
   );
-  const safetyTokens = Math.min(
-    MODEL_CONTEXT_SAFETY_TOKENS,
-    Math.max(1, Math.floor(contextWindow * 0.01)),
-  );
-  const remainingOutputTokens = Math.floor(contextWindow - estimatedInputTokens - safetyTokens);
-  return Math.min(requestedMaxOutputTokens, Math.max(0, remainingOutputTokens));
+  return resolveContextBudget(contextWindow, estimatedInputTokens, requestedMaxOutputTokens).maxOutputTokens;
+}
+
+function compactionTailEntryId(snapshot: DurableTurnSnapshot): string {
+  // Appended turn metadata changes request size, not the conversation tail.
+  return [...snapshot.entries].reverse().find((entry) => entry.entryType !== "context")?.entryId ?? "empty";
 }
 
 function completedCompactionForCurrentTail(snapshot: DurableTurnSnapshot): DurableTurnStep | null {
-  const tailEntryId = snapshot.entries.at(-1)?.entryId ?? "empty";
-  const idempotencyKey = `${snapshot.id}:compact:${tailEntryId}`;
+  const tailEntryId = compactionTailEntryId(snapshot);
+  const idempotencyKey = compactionIdempotencyKey(snapshot);
   return [...snapshot.steps].reverse().find((step) =>
     step.type === "session.compact"
     && step.state === "completed"
-    && step.idempotencyKey === idempotencyKey
+    && (step.input.contextTailEntryId === tailEntryId
+      || step.idempotencyKey === idempotencyKey
+      || (!snapshot.checkpointCoveredEntryId && step.idempotencyKey === `${snapshot.id}:compact:${tailEntryId}`))
   ) ?? null;
+}
+
+function compactionIdempotencyKey(snapshot: DurableTurnSnapshot): string {
+  return `${snapshot.id}:compact:${compactionTailEntryId(snapshot)}:${snapshot.checkpointCoveredEntryId ?? "root"}`;
 }
 
 function estimateActiveContextTokensForDecision(
@@ -6114,10 +6350,9 @@ function estimateActiveContextTokensForDecision(
   tools: readonly ChatToolDefinition[] = [],
   additionalUserContent: readonly ChatContentPart[] = [],
 ): number {
-  const serializedRequestTokens = estimateSerializedModelRequestTokens(
-    modelMessages(snapshot, additionalUserContent).messages,
-    tools,
-  );
+  const canonicalTools = canonicalToolDefinitions(tools);
+  const messages = limitModelImagePayload(modelMessages(snapshot, additionalUserContent).messages, canonicalTools);
+  const serializedRequestTokens = estimateSerializedModelRequestTokens(messages, canonicalTools);
   const completedCompaction = completedCompactionForCurrentTail(snapshot);
   const output = record(completedCompaction?.output);
   const tokensAfter = nonnegativeNumber(output?.tokensAfter);
@@ -6128,21 +6363,27 @@ function estimateActiveContextTokensForDecision(
       serializedRequestTokens,
     );
   }
-  return Math.max(estimateActiveContextTokens(snapshot), serializedRequestTokens);
+  return measureContextEntries(uncompactedEntries(snapshot), {
+    envelopeKey: contextEnvelopeKey(snapshot.runtimeRequest, contextManifest(snapshot)),
+    minimumTokens: serializedRequestTokens,
+    acceptsAnchor: (anchor) => anchor.requestMessageCount <= messages.length
+      && contextRequestHash(messages.slice(0, anchor.requestMessageCount), canonicalTools) === anchor.requestHash,
+  }).usedTokens;
 }
 
-const ESTIMATED_MODEL_IMAGE_CHARACTERS = 4_800;
-const ESTIMATED_MODEL_IMAGE_PLACEHOLDER = "x".repeat(ESTIMATED_MODEL_IMAGE_CHARACTERS);
+function contextManifest(snapshot: DurableTurnSnapshot): unknown {
+  return Object.keys(snapshot.promptManifest).length > 0 ? snapshot.promptManifest : snapshot.previousPromptManifest ?? {};
+}
+
+function contextRequestHash(messages: readonly ChatMessage[], tools: readonly ChatToolDefinition[]): string {
+  return createHash("sha256").update(JSON.stringify({ messages, tools })).digest("hex");
+}
 
 function estimateSerializedModelRequestTokens(
   messages: readonly ChatMessage[],
   tools: readonly ChatToolDefinition[],
 ): number {
-  const json = JSON.stringify({ messages, tools }, (_key, value: unknown) => {
-    if (typeof value !== "string" || !value.startsWith("data:image/")) return value;
-    return ESTIMATED_MODEL_IMAGE_PLACEHOLDER;
-  });
-  return Math.ceil(json.length / 4);
+  return estimateContextValueTokens({ messages, tools });
 }
 
 function firstDuplicateToolCallId(toolCalls: readonly TurnModelToolIntent[]): string | null {
@@ -6159,25 +6400,12 @@ function estimateUncompactedTokens(snapshot: DurableTurnSnapshot): number {
 }
 
 function estimateActiveContextTokens(snapshot: DurableTurnSnapshot): number {
-  const entries = uncompactedEntries(snapshot);
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    const message = record(record(entries[index]?.payload)?.message);
-    if (!message || message.stopReason === "aborted" || message.stopReason === "error") continue;
-    const usage = record(message.usage);
-    if (!usage) continue;
-    const total = numberValue(usage.totalTokens);
-    const input = numberValue(usage.input) ?? 0;
-    const output = numberValue(usage.output) ?? 0;
-    const providerTokens = total && total > 0 ? total : input + output;
-    if (providerTokens <= 0) continue;
-    return providerTokens + estimateEntriesTokens(entries.slice(index + 1));
-  }
-  return Math.ceil(JSON.stringify(modelMessages(snapshot).messages).length / 4);
+  return estimateContextValueTokens({ messages: modelMessages(snapshot).messages });
 }
 
 function estimateEntriesTokens(entries: readonly DurableSessionEntry[]): number {
   return entries.reduce((total, entry) => {
-    return total + Math.ceil(JSON.stringify(entry.payload).length / 4);
+    return total + estimateContextEntryTokens(entry.payload);
   }, 0);
 }
 
@@ -6274,13 +6502,27 @@ function compactionResultJson(result: CompactionJobResult): JsonValue {
   return JSON.parse(JSON.stringify(result)) as JsonValue;
 }
 
-function hasAmbiguousNonIdempotentTool(snapshot: DurableTurnSnapshot): boolean {
-  return snapshot.state === "executing_tool"
-    && snapshot.steps.some((step) =>
-      step.type.startsWith("tool.")
-      && step.state === "running"
-      && step.retryClass === "non_idempotent_manual"
-    );
+const MCP_FAILURE_ACTION = "Choose whether to retry this tool, use a different tool, or continue without it.";
+
+function isMcpToolStep(step: DurableTurnStep): boolean {
+  return toolNameForStep(step).startsWith("mcp__");
+}
+
+function toolMayChangeState(step: DurableTurnStep): boolean {
+  return isMcpToolStep(step)
+    ? step.retryClass !== "read_only"
+    : step.retryClass === "non_idempotent_manual";
+}
+
+function interruptedToolFailure(step: DurableTurnStep): ToolFailure {
+  const changesState = toolMayChangeState(step);
+  return {
+    category: changesState ? "unknown_outcome" : "transient",
+    deterministic: false,
+    outcome: changesState ? "unknown" : "not_applied",
+    outcomeVersion: TOOL_FAILURE_OUTCOME_VERSION,
+    action: toolFailureAction(changesState ? "unknown_outcome" : "transient"),
+  };
 }
 
 // Shell commands and edits act inside the task's sandbox, and the model sees
@@ -6322,7 +6564,7 @@ function isRunnableToolStep(step: DurableTurnStep): boolean {
 
 const PARALLEL_READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
 
-function isParallelReadOnlyToolStep(step: DurableTurnStep): boolean {
+function isParallelReadOnlyToolStep(step: DurableTurnStep, trustedExtension = false): boolean {
   const toolName = toolNameForStep(step);
   if (
     PARALLEL_READ_ONLY_TOOLS.has(toolName)
@@ -6335,7 +6577,22 @@ function isParallelReadOnlyToolStep(step: DurableTurnStep): boolean {
   return isRunnableToolStep(step)
     && step.retryClass === "read_only"
     && step.input.requiresApproval !== true
-    && PARALLEL_READ_ONLY_TOOLS.has(toolName);
+    && (PARALLEL_READ_ONLY_TOOLS.has(toolName) || trustedExtension);
+}
+
+/** Rolling bounded pool; results retain model call order, including failures. */
+export async function settleToolPool<T, R>(items: readonly T[], limit: number, execute: (item: T, index: number) => Promise<R>): Promise<PromiseSettledResult<R>[]> {
+  const concurrency = Math.max(1, Math.min(16, Number.isFinite(limit) ? Math.floor(limit) : 4));
+  const results: PromiseSettledResult<R>[] = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      try { results[index] = { status: "fulfilled", value: await execute(items[index]!, index) }; }
+      catch (reason) { results[index] = { status: "rejected", reason }; }
+    }
+  }));
+  return results;
 }
 
 function approvalKind(value: unknown): NonNullable<TurnModelToolIntent["approvalKind"]> {
@@ -6344,6 +6601,10 @@ function approvalKind(value: unknown): NonNullable<TurnModelToolIntent["approval
     || value === "workspace-trust"
     ? value
     : "shell";
+}
+
+function requiresAdmittedBash(name: string): boolean {
+  return name === "check_environment" || name === "upload_file";
 }
 
 function durableToolPolicy(name: string, permissionMode: string): {
@@ -6400,10 +6661,9 @@ function durableToolPolicy(name: string, permissionMode: string): {
     };
   }
   if (name === "upload_file") {
-    // A PUT of the same bytes to the same URL is safe to repeat, so a lost
-    // reply is retried rather than held. It sends data out like bash can.
+    // A signed PUT can create a version of a remote object. Review ambiguous uploads.
     return {
-      retryClass: "idempotent",
+      retryClass: "non_idempotent_manual",
       repeatPolicy: "block_after_success",
       requiresApproval: permissionMode !== "full-access",
       approvalKind: "shell",
@@ -6547,7 +6807,7 @@ const DURABLE_STABLE_SYSTEM_PROMPT = [
   "Use the tools declared for this turn when workspace inspection, changes, or current information are required.",
   "The declared tools are not the complete capability set. Connector and MCP tools may be deferred. When the user asks about a connected service—especially Google Drive, Google Workspace, Shared Drives, Gmail, Calendar, Slack, or another external app—do not substitute the local sandbox filesystem. If tool_search is declared, call it with a capability query such as \"search Google Drive files and documents\" and the matching connector id or name from its catalog, then use the revealed mcp tool on the next model call. Never invent an MCP tool name.",
   "Remote and local resources are different domains: read, ls, find, grep, and bash operate on the runtime sandbox only. A Drive file id, name, or URL is not a local path; a local /home, /workspace, /inputs, or /outputs path is not a Drive resource. If the requested connector is unavailable or unauthorized, say so instead of silently searching the sandbox.",
-  "Batch independent read, grep, find, and ls calls in one assistant turn when possible. Keep shell commands, writes, edits, artifact publishing, skill activation, questions, approvals, image work, and external mutations ordered.",
+      "Batch independent read, grep, find, ls, and read-only MCP calls in one assistant turn when possible. Keep calls that depend on earlier results, shell commands, writes, edits, artifact publishing, skill activation, questions, approvals, image work, and external mutations ordered.",
   "Tool arguments are structured JSON. Send the declared fields directly. Never JSON-stringify the entire argument object inside raw or another field.",
   "The runtime environment below gives the exact workspace root for this turn. Use that exact root. If a skill or example says /workspace, treat it as a placeholder for the runtime root; never assume /workspace exists.",
   "Path and artifact discipline: use the exact runtime workspace root; use the exact Sandbox path supplied for attachments under its inputs directory; keep helper files under tmp or system /tmp; put final deliverables under outputs. Do not guess paths, copy the inputs directory, treat a remote file id as a local path, or report a file as ready until it exists at the requested output path and has been published when persist_artifact is required.",
@@ -6634,10 +6894,17 @@ type ProviderToolCallReplay = {
 
 function providerToolCallReplayById(
   steps: readonly DurableTurnStep[],
+  entries: readonly DurableSessionEntry[],
 ): ReadonlyMap<string, ProviderToolCallReplay> {
   const replayById = new Map<string, ProviderToolCallReplay>();
-  for (const step of steps) {
-    const stored = record(record(step.output)?.providerToolCalls);
+  // Prior runs' metadata is hydrated with active history entries. Looking only
+  // at this run's steps changed historical provider IDs on every follow-up.
+  const outputs = [
+    ...entries.map((entry) => entry.payload),
+    ...steps.map((step) => step.output),
+  ];
+  for (const output of outputs) {
+    const stored = record(record(output)?.providerToolCalls);
     if (!stored) continue;
     for (const [toolCallId, value] of Object.entries(stored)) {
       const replay = record(value);
@@ -6885,6 +7152,10 @@ interface ContextEntryPayload {
   groundingKeys: string[];
   /** When the entry stated the current date and time. */
   timeAt: string | null;
+  /** Fingerprint of the runtime settings stated by this entry. */
+  runtimeHash: string | null;
+  skillCatalogHash: string | null;
+  restoredSkillsHash: string | null;
 }
 
 function contextEntryPayload(entry: DurableSessionEntry): ContextEntryPayload | null {
@@ -6903,6 +7174,9 @@ function contextEntryPayload(entry: DurableSessionEntry): ContextEntryPayload | 
       ? payload.groundingKeys.filter((key): key is string => typeof key === "string")
       : [],
     timeAt: stringValue(payload?.timeAt) ?? null,
+    runtimeHash: stringValue(payload?.runtimeHash) ?? null,
+    skillCatalogHash: stringValue(payload?.skillCatalogHash) ?? null,
+    restoredSkillsHash: stringValue(payload?.restoredSkillsHash) ?? null,
   };
 }
 
@@ -6916,6 +7190,54 @@ function runContextEntries(snapshot: DurableTurnSnapshot): ContextEntryPayload[]
     const payload = contextEntryPayload(entry);
     return payload && payload.runId === snapshot.id ? [payload] : [];
   });
+}
+
+const DURABLE_SKILL_ROUTING_PROMPT = [
+  "Berry supplies the current installed skill catalogue as conversation context. Later catalogues replace earlier ones, including an empty catalogue.",
+  "When a task matches an available skill, or the user explicitly requests it, call activate_skill before proceeding. Read its full instructions and load resources only as needed.",
+  "Skill instructions remain active after compaction. Skills do not grant permissions; normal tool, filesystem and network policies still apply.",
+].join("\n");
+
+function skillCatalogUpdate(snapshot: DurableTurnSnapshot): { text: string; hash: string } {
+  const skills = durableSkills(snapshot).map((skill) => ({ ...skill, description: Array.from(skill.description.replace(/\s+/g, " ").trim()).slice(0, 500).join("") }));
+  const text = skills.length > 0
+    ? formatSkillsForSystemPrompt(skills)
+    : "<available_skills>\n</available_skills>\nNo installed skills are available. This replaces all earlier skill catalogues.";
+  const hash = createHash("sha256").update(text).digest("hex");
+  const previous = uncompactedEntries(snapshot).flatMap((entry) => {
+    const context = contextEntryPayload(entry);
+    return context?.skillCatalogHash ? [context.skillCatalogHash] : [];
+  }).at(-1);
+  return { hash, text: previous === hash || (!previous && skills.length === 0) ? "" : `<berry_skill_catalog>\n${text}\n</berry_skill_catalog>` };
+}
+
+/** Preserve the exact activated bodies and staged paths, not a summary of their rules. */
+function compactedSkillUpdate(snapshot: DurableTurnSnapshot): { text: string; hash: string | null } {
+  const covered = snapshot.entries.findIndex((entry) => entry.entryId === snapshot.checkpointCoveredEntryId);
+  if (covered < 0) return { text: "", hash: null };
+  const allowed = new Set(durableSkills(snapshot).map((skill) => skill.name));
+  const active = new Map<string, string>();
+  for (const entry of snapshot.entries.slice(0, covered + 1)) {
+    const context = contextEntryPayload(entry);
+    const message = record(record(entry.payload)?.message);
+    const text = context?.text ?? (message?.role === "toolResult" && message.toolName === "activate_skill" && message.isError !== true
+      ? contentText(message.content) : "");
+    for (const match of text.matchAll(/<skill_content name="([^"]+)">[\s\S]*?<\/skill_content>/g)) {
+      if (allowed.has(match[1]!)) active.set(match[1]!, match[0]);
+    }
+  }
+  const retained = uncompactedEntries(snapshot).map((entry) => {
+    const context = contextEntryPayload(entry);
+    const message = record(record(entry.payload)?.message);
+    return context?.text ?? (message?.role === "toolResult" && message.toolName === "activate_skill" && message.isError !== true ? contentText(message.content) : "");
+  }).join("\n");
+  const retainedNames = new Set(Array.from(retained.matchAll(/<skill_content name="([^"]+)">[\s\S]*?<\/skill_content>/g), (match) => match[1]));
+  const bodies = [...active.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, body]) => body);
+  if (bodies.length === 0) return { text: "", hash: null };
+  const hash = createHash("sha256").update(`${snapshot.checkpointCoveredEntryId}\0${bodies.join("\n\n")}`).digest("hex");
+  const missing = [...active.entries()].sort(([a], [b]) => a.localeCompare(b))
+    .filter(([name]) => !retainedNames.has(name)).map(([, body]) => body);
+  return { hash, text: missing.length > 0 ? `Active skill instructions restored after compaction. These exact rules and staged paths remain in force:\n\n${missing.join("\n\n")}` : "" };
 }
 
 function wrapTurnContext(body: string): string {
@@ -7015,6 +7337,25 @@ const CAPABILITY_LABELS: Record<string, string> = {
   image_generation: "Image generation (create_image)",
 };
 
+/** Runtime bindings belong to the journal, never the shared system prefix. */
+function runtimeEnvironmentContext(snapshot: DurableTurnSnapshot): { text: string; hash: string | null } {
+  const runtime = durableRuntimeRequest(snapshot);
+  const workspacePath = durableWorkspacePath(snapshot, runtime?.workspacePath);
+  const text = runtime
+    ? [
+        "Runtime environment:",
+        `- Workspace root: ${workspacePath}`,
+        `- Attached inputs: ${workspacePath}/inputs`,
+        `- Final outputs: ${workspacePath}/outputs`,
+        `- Path rule: use ${workspacePath} exactly; replace any /workspace placeholder in skill instructions with ${workspacePath}`,
+        `- Permission mode: ${runtime.permissionMode}`,
+        `- Provider: ${runtime.provider.id}`,
+        `- Model: ${runtime.model ?? runtime.provider.defaultModel}`,
+      ].join("\n")
+    : "";
+  return { text, hash: text ? createHash("sha256").update(text).digest("hex") : null };
+}
+
 /**
  * The turn context a run journals before its first model call: the legacy
  * sections plus executor context (the connector catalog) and notices for
@@ -7024,7 +7365,7 @@ const CAPABILITY_LABELS: Record<string, string> = {
 export function journaledTurnContext(
   snapshot: DurableTurnSnapshot,
   executorContext = "",
-): { text: string; attachmentSkill: string | null; groundingKeys: string[]; timeAt: string | null } {
+): { text: string; attachmentSkill: string | null; groundingKeys: string[]; timeAt: string | null; runtimeHash: string | null; skillCatalogHash: string; restoredSkillsHash: string | null } {
   const runtime = durableRuntimeRequest(snapshot);
   const checkpoint = snapshot.portableCheckpoint ?? snapshot.runtimeRequest.portableCheckpoint;
   const earlier = new Set(uncompactedEntries(snapshot).flatMap((entry) => {
@@ -7036,22 +7377,29 @@ export function journaledTurnContext(
   const continuing = snapshot.runtimeRequest.continueInterruptedTurn === true;
   const phase = continuing ? continuationPhase(snapshot) : null;
   const dateContext = currentDateContext(snapshot);
+  const environment = runtimeEnvironmentContext(snapshot);
+  const catalog = skillCatalogUpdate(snapshot);
+  const restored = compactedSkillUpdate(snapshot);
   const body = [
-    dateContext,
-    requestedSkillHint(snapshot),
+    // Reusable guidance and skill templates precede this request's bindings.
     durableBuiltInToolGuidance(runtime?.builtInTools ?? []),
+    catalog.text,
+    restored.text,
+    durableImageToolSelectionPrompt(runtime?.builtInTools ?? []),
+    runtime?.modelAcceptsImages ? "" : durableVisionToolSelectionPrompt(runtime?.builtInTools ?? []),
+    selection.text,
+    dateContext,
+    environment.text,
+    requestedSkillHint(snapshot),
     runtime?.intent === "image_generation"
       ? "The user explicitly selected Create image. Call create_image to fulfill this request. Do not claim image generation is unavailable when create_image is declared for this turn."
       : "",
-    durableImageToolSelectionPrompt(runtime?.builtInTools ?? []),
-    runtime?.modelAcceptsImages ? "" : durableVisionToolSelectionPrompt(runtime?.builtInTools ?? []),
     capabilityNoticeText(snapshot),
     executorContext.trim(),
     runtime ? `Reasoning for this turn: ${runtime.reasoning}` : "",
     phase ? CONTINUATION_SYSTEM_INSTRUCTION[phase] : "",
     checkpoint ? `Portable checkpoint:\n${JSON.stringify(checkpoint)}` : "",
     grounding.text,
-    selection.text,
   ].filter(Boolean).join("\n\n");
   const text = [
     body ? wrapTurnContext(body) : "",
@@ -7062,6 +7410,9 @@ export function journaledTurnContext(
     attachmentSkill: selection.name,
     groundingKeys: grounding.keys,
     timeAt: dateContext ? new Date(snapshot.createdAt).toISOString() : null,
+    runtimeHash: environment.hash,
+    skillCatalogHash: catalog.hash,
+    restoredSkillsHash: restored.hash,
   };
 }
 
@@ -7088,15 +7439,36 @@ export function pendingContextEntries(
         attachmentSkill: turn.attachmentSkill,
         groundingKeys: turn.groundingKeys,
         timeAt: turn.timeAt,
+        runtimeHash: turn.runtimeHash,
+        skillCatalogHash: turn.skillCatalogHash,
+        restoredSkillsHash: turn.restoredSkillsHash,
       }, now)];
     }
     const updates: string[] = [];
     const extra: Record<string, JsonValue> = {};
+    const catalog = skillCatalogUpdate(snapshot);
+    if (catalog.text) {
+      updates.push(catalog.text);
+      extra.skillCatalogHash = catalog.hash;
+    }
+    const restored = compactedSkillUpdate(snapshot);
+    if (restored.text && restored.hash) {
+      updates.push(restored.text);
+      extra.restoredSkillsHash = restored.hash;
+    }
     const runtime = durableRuntimeRequest(snapshot);
     const selection = automaticDurableAttachmentSkillSelection(durableSkills(snapshot), runtime?.attachments ?? [], snapshot.steps);
     if (selection.name && !journaled.some((context) => context.attachmentSkill === selection.name)) {
       updates.push(selection.text);
       extra.attachmentSkill = selection.name;
+    }
+    const environment = runtimeEnvironmentContext(snapshot);
+    const lastRuntimeHash = [...journaled].reverse().find((context) => context.runtimeHash)?.runtimeHash;
+    // Runs journaled before runtime bindings moved out of the system prompt
+    // receive one append-only migration. Later changes append another update.
+    if (environment.text && lastRuntimeHash !== environment.hash) {
+      updates.push(environment.text);
+      extra.runtimeHash = environment.hash;
     }
     const lastTime = Math.max(...journaled.map((context) => context.timeAt ? Date.parse(context.timeAt) : Number.NaN).filter(Number.isFinite));
     if (Number.isFinite(lastTime) && now.getTime() - lastTime >= CONTEXT_TIME_REFRESH_MS) {
@@ -7137,6 +7509,7 @@ function contextEntry(
 export function modelMessages(
   snapshot: DurableTurnSnapshot,
   additionalUserContent: readonly ChatContentPart[] = [],
+  projection?: { endAtEntryId: string },
 ): {
   messages: ChatMessage[];
   stableSystemPrompt: string;
@@ -7145,11 +7518,10 @@ export function modelMessages(
   const runtime = durableRuntimeRequest(snapshot);
   const workspacePath = durableWorkspacePath(snapshot, runtime?.workspacePath);
   const skills = durableSkills(snapshot);
-  const skillInstructions = formatSkillsForSystemPrompt(skills);
   const stableSystemPrompt = [
     DURABLE_STABLE_SYSTEM_PROMPT,
     conversationProfilePrompt(runtime?.conversationKind ?? "chat"),
-    skillInstructions,
+    DURABLE_SKILL_ROUTING_PROMPT,
   ].filter(Boolean).join("\n\n");
   const builtInGuidance = durableBuiltInToolGuidance(runtime?.builtInTools ?? []);
   const intentInstruction = runtime?.intent === "image_generation"
@@ -7175,20 +7547,11 @@ export function modelMessages(
       : "";
   const checkpointContext = checkpoint ? `Portable checkpoint:\n${JSON.stringify(checkpoint)}` : "";
   const groundingContext = Object.keys(snapshot.groundingContext).length > 0
-    ? `Dynamic grounding context:\n<untrusted_grounding>${JSON.stringify(snapshot.groundingContext)}</untrusted_grounding>`
+    ? `${GROUNDING_PRECEDENCE}\n<untrusted_grounding>${JSON.stringify(snapshot.groundingContext)}</untrusted_grounding>`
     : "";
-  const runtimeEnvironment = runtime
-    ? [
-        "Runtime environment:",
-        `- Workspace root: ${workspacePath}`,
-        `- Attached inputs: ${workspacePath}/inputs`,
-        `- Final outputs: ${workspacePath}/outputs`,
-        `- Path rule: use ${workspacePath} exactly; replace any /workspace placeholder in skill instructions with ${workspacePath}`,
-        `- Permission mode: ${runtime.permissionMode}`,
-        `- Provider: ${runtime.provider.id}`,
-        `- Model: ${runtime.model ?? runtime.provider.defaultModel}`,
-      ].join("\n")
-    : "";
+  const environment = runtimeEnvironmentContext(snapshot);
+  const catalog = skillCatalogUpdate(snapshot);
+  const restored = compactedSkillUpdate(snapshot);
   const attachmentSkill = automaticDurableAttachmentSkill(skills, runtime?.attachments ?? [], snapshot.steps);
   // Provider prefix caches reuse a request only up to its first change. Text
   // that varies per turn (grounding, routed tool guidance, intent, recovery
@@ -7202,46 +7565,28 @@ export function modelMessages(
   const skillHint = requestedSkillHint(snapshot);
   const reasoningContext = runtime ? `Reasoning for this turn: ${runtime.reasoning}` : "";
   const turnContext = [
-    dateContext,
-    skillHint,
     builtInGuidance,
-    intentInstruction,
+    catalog.text,
+    restored.text,
     imageToolSelection,
     visionToolSelection,
+    attachmentSkill,
+    dateContext,
+    environment.text,
+    skillHint,
+    intentInstruction,
     reasoningContext,
     continuationInstruction,
     checkpointContext,
     groundingContext,
-    attachmentSkill,
   ].filter(Boolean).join("\n\n");
-  const journaledTurnContext = runContextEntries(snapshot).some((context) => context.scope === "turn");
-  const requestEntryIndex = snapshot.requestMessageId
-    ? uncompactedEntries(snapshot).findIndex((entry) => entry.entryId === snapshot.requestMessageId
-      && stringValue(record(record(entry.payload)?.message)?.role) === "user")
-    : -1;
-  const separateTurnContext = journaledTurnContext || requestEntryIndex >= 0;
-  const system = separateTurnContext
-    ? [stableSystemPrompt, directVision, runtimeEnvironment].filter(Boolean).join("\n\n")
-    // Without the request anchor (legacy or compacted history) keep the
-    // original single-system-message layout unchanged.
-    : [stableSystemPrompt, [
-        dateContext,
-        skillHint,
-        builtInGuidance,
-        intentInstruction,
-        imageToolSelection,
-        directVision || visionToolSelection,
-        continuationInstruction,
-        recoveryInstruction,
-        checkpointContext,
-        groundingContext,
-        runtimeEnvironment,
-        reasoningContext,
-        attachmentSkill,
-      ].filter(Boolean).join("\n\n")].filter(Boolean).join("\n\n");
+  const contexts = runContextEntries(snapshot);
+  const journaledTurnContext = contexts.some((context) => context.scope === "turn");
+  // Legacy and compacted runs use the same stable system prefix too.
+  const system = [stableSystemPrompt, directVision].filter(Boolean).join("\n\n");
   const messages: ChatMessage[] = [{ role: "system", content: system }];
   let requestMessageIndex = -1;
-  const providerToolCalls = providerToolCallReplayById(snapshot.steps);
+  const providerToolCalls = providerToolCallReplayById(snapshot.steps, snapshot.entries);
   // A tool result replays under the name its call used (use_tool for revealed
   // connector tools), which providers such as Gemini require to match.
   const callNames = new Map<string, string>();
@@ -7268,6 +7613,7 @@ export function modelMessages(
         messages.push({ role: "user", content: [{ type: "text", text: MODEL_IMAGES_INTRO }, ...images.turn] });
         turnImagesPlaced = true;
       }
+      if (projection?.endAtEntryId === entry.entryId) return { messages, stableSystemPrompt };
       continue;
     }
     const message = record(payload?.message);
@@ -7276,7 +7622,7 @@ export function modelMessages(
     if (role === "system") {
       messages.push({ role: "system", content: contentText(message?.content, workspacePath) });
     } else if (role === "user") {
-      if (!journaledTurnContext && separateTurnContext && entry.entryId === snapshot.requestMessageId) requestMessageIndex = messages.length;
+      if (!journaledTurnContext && entry.entryId === snapshot.requestMessageId) requestMessageIndex = messages.length;
       messages.push({ role: "user", content: contentText(message?.content, workspacePath) });
     } else if (role === "assistant") {
       const toolCalls = Array.isArray(message?.content)
@@ -7319,7 +7665,9 @@ export function modelMessages(
       });
     } else if (role === "toolResult") {
       const rawToolContent = contentText(message?.content, workspacePath);
-      const toolContent = boundedToolResultContext(
+      // Skill rules must stay verbatim. The request meter and compaction guard
+      // account for their full cost instead of silently deleting instructions.
+      const toolContent = message?.toolName === "activate_skill" && message.isError !== true ? rawToolContent : boundedToolResultContext(
         entry.entryId,
         rawToolContent,
         Math.max(0, toolContextBudget - toolContextCharacters),
@@ -7334,6 +7682,10 @@ export function modelMessages(
         content: toolContent,
       });
       batchImages.push(...(images.byCall.get(toolCallId) ?? []));
+    }
+    if (projection?.endAtEntryId === entry.entryId) {
+      flushBatchImages();
+      return { messages, stableSystemPrompt };
     }
   }
   flushBatchImages();
@@ -7352,6 +7704,11 @@ export function modelMessages(
         : stringValue(snapshot.runtimeRequest.input) ?? "Continue the task.",
     });
   }
+  if (!journaledTurnContext && requestMessageIndex < 0 && turnContext) {
+    // If compaction removed the request anchor, context still follows history.
+    // The runner persists it before calling the model on the normal path.
+    messages.push({ role: "user", content: wrapTurnContext(turnContext) });
+  }
   // Content without a fixed place (omission notices, explicitly inspected
   // images) goes in its own last message; earlier messages are never rewritten.
   const tail = [...images.tail, ...(turnImagesPlaced || requestMessageIndex >= 0 ? [] : images.turn)];
@@ -7367,8 +7724,12 @@ export function modelMessages(
     });
   }
   if (journaledTurnContext) {
-    // Per-call recovery text goes last so it never rewrites the cached prefix.
-    if (recoveryInstruction) messages.push({ role: "user", content: recoveryInstruction });
+    const lastRuntimeHash = [...contexts].reverse().find((context) => context.runtimeHash)?.runtimeHash;
+    const updates = [catalog.text, restored.text, environment.text && lastRuntimeHash !== environment.hash ? environment.text : ""].filter(Boolean);
+    if (updates.length > 0) {
+      // Direct callers may not have journaled the migration/update yet.
+      messages.push({ role: "user", content: wrapContextUpdate(updates.join("\n\n")) });
+    }
   } else if (requestMessageIndex >= 0) {
     if (turnContext) {
       messages.splice(requestMessageIndex + 1, 0, {
@@ -7382,9 +7743,9 @@ export function modelMessages(
         content: [{ type: "text", text: MODEL_IMAGES_INTRO }, ...images.turn],
       });
     }
-    // Per-call recovery text goes last so it never rewrites the cached prefix.
-    if (recoveryInstruction) messages.push({ role: "user", content: recoveryInstruction });
   }
+  // Recovery follows history and context even without a legacy request anchor.
+  if (recoveryInstruction) messages.push({ role: "user", content: recoveryInstruction });
   return { messages, stableSystemPrompt };
 }
 
@@ -7502,7 +7863,8 @@ function modelWindowToolContextCharacters(snapshot: DurableTurnSnapshot): number
     1,
     Math.floor(numberValue(snapshot.runtimeRequest.contextWindowTokens) ?? 128_000),
   );
-  const reservedTokens = DEFAULT_COMPACTION_SETTINGS.reserveTokens + MODEL_CONTEXT_SAFETY_TOKENS;
+  const budget = resolveContextBudget(contextWindow, 0, numberValue(snapshot.runtimeRequest.maxTokens) ?? 8_000);
+  const reservedTokens = Math.min(budget.maxOutputTokens, Math.floor(contextWindow / 2)) + budget.safetyTokens;
   const availableTokens = Math.max(1, contextWindow - reservedTokens);
   return Math.min(
     MAX_TOOL_CONTEXT_ENVELOPE_CHARS,
@@ -9180,6 +9542,7 @@ function mapSnapshot(
     version: run.version ?? 0,
     leaseOwner: owner,
     cancelledAt: dateString(run.cancelled_at),
+    browserHandoff: BrowserHandoffSchema.safeParse(run.browser_handoff).success ? BrowserHandoffSchema.parse(run.browser_handoff) : null,
     waitingStartedAt: dateString(run.waiting_started_at),
     humanWaitMs: Number(run.human_wait_ms ?? 0),
     runtimeRequest: record(run.runtime_request) ?? {},
@@ -9395,6 +9758,7 @@ interface QueuedFollowUpRow {
 }
 
 interface RunRow {
+  browser_handoff?: unknown;
   id: string;
   created_at: Date | string;
   tenant_id: string;

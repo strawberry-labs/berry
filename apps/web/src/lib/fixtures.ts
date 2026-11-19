@@ -1,4 +1,4 @@
-import type { Message, Task } from "@berry/shared";
+import type { JsonValue, Message, Task } from "@berry/shared";
 
 export const FIXED_NOW = "2026-07-10T00:00:00.000Z";
 
@@ -47,10 +47,126 @@ export function fixtureMessages(sessionId: string): Message[] {
     { ...assistant.parts[0]!, position: 3 },
   ];
   assistant.generationMs = 2_740;
+  if (sessionId !== "session_cloud") {
+    return [
+      message("msg_user_1", sessionId, "user", "Run a sandboxed task and summarize the result."),
+      assistant,
+    ];
+  }
   return [
     message("msg_user_1", sessionId, "user", "Run a sandboxed task and summarize the result."),
     assistant,
+    message("msg_user_2", sessionId, "user", "Pull October's EMEA spend from the finance workbook, reconcile it against Salesforce closed-won deals, and flag anything more than 5% off."),
+    reconciliationTurn(sessionId),
+    message("msg_user_3", sessionId, "user", DEMO_LIVE_PROMPT),
   ];
+}
+
+/** The follow-up the demo live turn answers (see demo-live-turn.ts). */
+export const DEMO_LIVE_PROMPT = "Draft the summary email to the finance team and attach the workbook.";
+
+type FixtureTool = {
+  id: string;
+  name: string;
+  title?: string;
+  args?: Record<string, JsonValue>;
+  status?: "completed" | "failed" | "denied";
+  durationMs?: number;
+  output?: string;
+  children?: Array<Record<string, JsonValue>>;
+};
+
+/**
+ * A settled turn that exercises every activity row Berry draws: reasoning,
+ * a todo list, an explore group with a routine failed probe, a connector
+ * call, a skill, a failed command and its retry, a sub-agent with its own
+ * tool calls, file writes, a saved artifact and a memory note.
+ */
+function reconciliationTurn(sessionId: string): Message {
+  const id = "msg_assistant_2";
+  const answer = [
+    "October EMEA spend reconciles to Salesforce within 5% for 135 of 142 deals. Seven are off by more than 5%, worth **€184,200** of the €2.41M total.",
+    "",
+    "| Deal | Account | Workbook | Salesforce | Off by |",
+    "| --- | --- | ---: | ---: | ---: |",
+    "| DL-20931 | Nordwind Logistik | €212,000 | €184,500 | 14.9% |",
+    "| DL-20877 | Calder & Rowe | €96,400 | €88,100 | 9.4% |",
+    "| DL-20954 | Atelier Ferrand | €41,750 | €38,900 | 7.3% |",
+    "",
+    "Four of the seven are FX timing: the workbook converted GBP at the 1 October rate while Salesforce used the close date. The other three have a discount applied in Salesforce that never reached the workbook.",
+    "",
+    "The full list, with the FX check for each deal, is in **emea-reconciliation-oct.xlsx**.",
+  ].join("\n");
+  const tools: FixtureTool[] = [
+    {
+      id: "t_todo", name: "todo_write", durationMs: 40,
+      args: { todos: [
+        { content: "Read the October EMEA workbook", status: "completed" },
+        { content: "Pull closed-won deals from Salesforce", status: "completed" },
+        { content: "Join on deal ID and compute variance", status: "completed" },
+        { content: "Check FX on flagged deals", status: "completed" },
+        { content: "Write the reconciliation workbook", status: "completed" },
+      ] },
+    },
+    { id: "t_ls", name: "ls", args: { path: "/workspace/finance" }, durationMs: 120, output: "october-emea.xlsx\nseptember-emea.xlsx\nfx-rates/\nREADME.md" },
+    { id: "t_read1", name: "read", args: { path: "/workspace/finance/october-emea.xlsx" }, durationMs: 640, output: "Sheet 'Spend': 142 rows · columns deal_id, account, amount_eur, booked_on" },
+    { id: "t_read2", name: "read", args: { path: "/workspace/finance/fx-rates/2026-10.csv" }, status: "failed", durationMs: 30, output: "ENOENT: no such file or directory" },
+    { id: "t_find", name: "find", args: { pattern: "*.csv", path: "/workspace/finance/fx-rates" }, durationMs: 90, output: "fx-rates/2026-09.csv\nfx-rates/2026-q3.csv" },
+    { id: "t_grep", name: "grep", args: { pattern: "deal_id", path: "/workspace/finance" }, durationMs: 210, output: "3 files" },
+    {
+      id: "t_sf", name: "use_tool", title: "Query closed-won opportunities",
+      args: { connector: "salesforce", tool: "soql_query", query: "SELECT Id, Deal_ID__c, Amount, CloseDate FROM Opportunity WHERE StageName = 'Closed Won' AND CloseDate = LAST_MONTH AND Region__c = 'EMEA'" },
+      durationMs: 2_310, output: "142 records",
+    },
+    { id: "t_skill", name: "activate_skill", args: { name: "spreadsheet-analysis" }, durationMs: 180, output: "Loaded spreadsheet-analysis" },
+    {
+      id: "t_py1", name: "bash", args: { command: "python reconcile.py --month 2026-10 --region EMEA" }, status: "failed", durationMs: 1_140,
+      output: "Traceback (most recent call last):\n  File \"reconcile.py\", line 3, in <module>\n    import openpyxl\nModuleNotFoundError: No module named 'openpyxl'",
+    },
+    { id: "t_pip", name: "bash", args: { command: "pip install openpyxl" }, durationMs: 4_820, output: "Successfully installed et-xmlfile-1.1.0 openpyxl-3.1.5" },
+    {
+      id: "t_py2", name: "bash", args: { command: "python reconcile.py --month 2026-10 --region EMEA" }, durationMs: 2_960,
+      output: "Matched 142/142 deals on deal_id\nWithin 5%: 135\nOver 5%: 7 (€184,200)\nWrote /workspace/outputs/emea-reconciliation-oct.xlsx",
+    },
+    {
+      id: "t_task", name: "task", durationMs: 18_400,
+      args: { description: "Check FX on the 7 flagged deals", subagent_type: "general-purpose", prompt: "For each flagged deal, compare the GBP→EUR rate on 1 October with the rate on its close date and say whether FX explains the variance." },
+      output: "FX explains 4 of 7 (DL-20931, DL-20877, DL-20902, DL-20966). The other 3 carry a Salesforce discount the workbook lacks.",
+      children: [
+        { toolCallId: "t_task_ws", name: "web_search", args: { query: "ECB euro reference rate GBP October 2026" }, status: "completed", durationMs: 1_900, output: "5 results" },
+        { toolCallId: "t_task_wf", name: "web_fetch", args: { url: "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.zip" }, status: "completed", durationMs: 3_200, output: "Fetched 31 days of rates" },
+        { toolCallId: "t_task_py", name: "bash", args: { command: "python fx_check.py flagged.csv" }, status: "completed", durationMs: 2_400, output: "4 of 7 explained by FX" },
+      ],
+    },
+    { id: "t_edit", name: "edit", args: { path: "/workspace/reconcile.py" }, durationMs: 60, output: "Added an fx_source column" },
+    { id: "t_write", name: "write", args: { path: "/workspace/outputs/emea-reconciliation-oct.xlsx" }, durationMs: 380 },
+    { id: "t_artifact", name: "persist_artifact", title: "emea-reconciliation-oct.xlsx", args: { path: "/workspace/outputs/emea-reconciliation-oct.xlsx" }, durationMs: 520, output: "Saved to the task's files" },
+    { id: "t_mem", name: "remember_memory", title: "Finance flags variances above 5%", args: { memory: "Finance flags reconciliation variances above 5%." }, durationMs: 90 },
+  ];
+  const parts: Message["parts"] = [
+    { id: `${id}_reasoning`, messageId: id, kind: "reasoning", content: "Read the workbook first, then pull the same month from Salesforce, join on deal ID and compute the variance. Anything over 5% gets an FX check, since EMEA books in GBP and EUR.", position: 0, createdAt: FIXED_NOW },
+  ];
+  for (const tool of tools) {
+    parts.push({
+      id: `${id}_${tool.id}`,
+      messageId: id,
+      kind: "tool-result",
+      content: {
+        toolCallId: tool.id,
+        name: tool.name,
+        ...(tool.title ? { title: tool.title } : {}),
+        ...(tool.args ? { arguments: tool.args } : {}),
+        status: tool.status ?? "completed",
+        ...(tool.durationMs !== undefined ? { durationMs: tool.durationMs } : {}),
+        ...(tool.output ? { output: tool.output } : {}),
+        ...(tool.children ? { children: tool.children } : {}),
+      },
+      position: parts.length,
+      createdAt: FIXED_NOW,
+    });
+  }
+  parts.push({ id: `${id}_text`, messageId: id, kind: "text", content: answer, position: parts.length, createdAt: FIXED_NOW });
+  return { ...message(id, sessionId, "assistant", ""), parts, generationMs: 74_000, inputTokens: 182_400, outputTokens: 6_120 };
 }
 
 function writingBlockFixtureMessages(sessionId: string): Message[] {

@@ -87,7 +87,6 @@ import {
 import { CONNECTORS, ConnectorsService } from "../connectors/connectors.service.ts";
 import { QueuedFollowUpService } from "../runtime/queued-follow-up.service.js";
 
-export const PROMPT_IMPROVEMENT_MODEL = "canopywave/deepseek/deepseek-v4-flash";
 
 const PROMPT_IMPROVEMENT_SYSTEM_PROMPT = `You improve a user's draft prompt for another AI assistant.
 
@@ -612,7 +611,7 @@ export class AgentApiController {
     @Inject(MemoryService) private readonly memory: MemoryService,
     @Inject(ContextAssemblyService) private readonly contextAssembly: ContextAssemblyService,
     @Inject(DurableTurnService) private readonly durableTurns: DurableTurnService,
-    @Inject(QueuedFollowUpService) private readonly queuedFollowUps: QueuedFollowUpService,
+    @Inject(QueuedFollowUpService) private readonly queuedFollowUps: QueuedFollowUpService | null,
     @Inject(ENTERPRISE_IDENTITY_REPOSITORY) private readonly identity: EnterpriseIdentityRepository,
     @Inject(CONNECTORS) private readonly connectors: ConnectorsService,
     @Inject(MANAGEMENT_SERVICE) private readonly management: ManagementService,
@@ -728,7 +727,7 @@ export class AgentApiController {
     const [initialCatalog, effective, connectorRuntime, departmentId] = await Promise.all([
       this.runtimeConfig.catalog(tenantId),
       this.organizationCapabilities.effective(tenantId, userId ?? ""),
-      userId ? this.connectors.runtime(tenantId, userId) : Promise.resolve([]),
+      userId ? this.connectors.runtime(tenantId, userId, { resolveDuringExecution: this.durableTurns.enabled }) : Promise.resolve([]),
       this.#primaryDepartmentId(tenantId, userId),
     ]);
     if (!initialCatalog) return null;
@@ -805,9 +804,9 @@ export class AgentApiController {
     const departmentId = await this.#primaryDepartmentId(tenantId, userId);
     const runtime = await this.runtimeConfig.resolve(tenantId, {
       provider: { id: "router" },
-      model: PROMPT_IMPROVEMENT_MODEL,
     });
-    const model = runtime.provider.models?.find((candidate) => candidate.id === PROMPT_IMPROVEMENT_MODEL);
+    const improvementModel = runtime.provider.defaultModel;
+    const model = runtime.provider.models?.find((candidate) => candidate.id === improvementModel);
     if (!model) {
       throw new ServiceUnavailableException({
         code: "prompt_improvement_model_unavailable",
@@ -819,7 +818,7 @@ export class AgentApiController {
       tenantId,
       mode: "chat",
       providerId: runtime.provider.id,
-      model: PROMPT_IMPROVEMENT_MODEL,
+      model: improvementModel,
       userId,
       departmentId,
     });
@@ -844,7 +843,7 @@ export class AgentApiController {
     const estimatedOutputTokens = maxOutputTokens;
     const estimatedCostMicros = budgetEstimateFromRequest({
       provider: runtime.provider,
-      model: PROMPT_IMPROVEMENT_MODEL,
+      model: improvementModel,
       estimatedInputTokens,
       estimatedOutputTokens,
     });
@@ -857,7 +856,7 @@ export class AgentApiController {
       sessionId: null,
       feature: "prompt.improve",
       provider: runtime.provider.id,
-      model: PROMPT_IMPROVEMENT_MODEL,
+      model: improvementModel,
       estimatedCostMicros,
       estimatedTokens: estimatedInputTokens + estimatedOutputTokens,
       metadata: { promptLength: request.prompt.length },
@@ -872,14 +871,14 @@ export class AgentApiController {
         apiKey: runtime.apiKey,
         appName: "Berry Prompt Improver",
       }).complete({
-        model: PROMPT_IMPROVEMENT_MODEL,
+        model: improvementModel,
         messages: [
           { role: "system", content: PROMPT_IMPROVEMENT_SYSTEM_PROMPT },
           { role: "user", content: modelInput },
         ],
         temperature: 0.2,
         maxTokens: maxOutputTokens,
-        reasoningEffort: "minimal",
+        reasoningEffort: "low",
         signal: controller.signal,
       });
     } catch (error) {
@@ -890,8 +889,8 @@ export class AgentApiController {
           userId,
           departmentId,
           provider: runtime.provider.id,
-          model: PROMPT_IMPROVEMENT_MODEL,
-          requestedModel: PROMPT_IMPROVEMENT_MODEL,
+          model: improvementModel,
+          requestedModel: improvementModel,
           promptLength: request.prompt.length,
           resultLength: 0,
           usage: estimatedPromptImprovementUsage(0, 0),
@@ -936,7 +935,7 @@ export class AgentApiController {
         cacheWriteTokens: usage.cacheWriteTokens ?? 0,
         cacheCreationTokens1h: usage.cacheCreationTokens1h ?? 0,
         cacheCreationTokens5m: usage.cacheCreationTokens5m ?? 0,
-        requestedModel: PROMPT_IMPROVEMENT_MODEL,
+        requestedModel: improvementModel,
         model: result.model,
         servedProvider: result.attribution?.servedProvider ?? runtime.provider.id,
         servedModel: result.attribution?.servedModel ?? result.model,
@@ -961,7 +960,7 @@ export class AgentApiController {
           departmentId,
           provider: usageEvent.servedProvider ?? runtime.provider.id,
           model: usageEvent.servedModel ?? result.model,
-          requestedModel: PROMPT_IMPROVEMENT_MODEL,
+          requestedModel: improvementModel,
           promptLength: request.prompt.length,
           resultLength,
           usage,
@@ -985,7 +984,7 @@ export class AgentApiController {
       throw error;
     }
     await recordResultUsage("completed", improvedPrompt.length);
-    return { prompt: improvedPrompt, model: PROMPT_IMPROVEMENT_MODEL };
+    return { prompt: improvedPrompt, model: improvementModel };
   }
 
   @Post("/images/generations")
@@ -1530,7 +1529,7 @@ export class AgentApiController {
 
   @Get("/sessions/:sessionId/follow-ups")
   async listQueuedFollowUps(@Req() request: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Query() query: unknown) {
-    if (!this.durableTurns.enabled) throw new NotFoundException("Server-owned follow-ups require the durable runner");
+    if (!this.durableTurns.enabled || !this.queuedFollowUps) throw new NotFoundException("Server-owned follow-ups require the durable runner");
     await this.ownedSession(request, sessionId);
     const parsed = FollowUpListQuerySchema.parse(query ?? {});
     return QueuedFollowUpPageSchema.parse(await this.queuedFollowUps.list(
@@ -1544,7 +1543,7 @@ export class AgentApiController {
 
   @Post("/sessions/:sessionId/follow-ups")
   async enqueueQueuedFollowUp(@Req() request: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Body() body: unknown) {
-    if (!this.durableTurns.enabled) throw new NotFoundException("Server-owned follow-ups require the durable runner");
+    if (!this.durableTurns.enabled || !this.queuedFollowUps) throw new NotFoundException("Server-owned follow-ups require the durable runner");
     const { session, task } = await this.ownedSession(request, sessionId);
     const raw = body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : {};
     const parsed = QueuedFollowUpCreateSchema.parse({
@@ -1576,7 +1575,7 @@ export class AgentApiController {
 
   @Patch("/follow-ups/:followUpId")
   async updateQueuedFollowUp(@Req() request: AuthenticatedRequest, @Param("followUpId") followUpId: string, @Body() body: unknown) {
-    if (!this.durableTurns.enabled) throw new NotFoundException("Server-owned follow-ups require the durable runner");
+    if (!this.durableTurns.enabled || !this.queuedFollowUps) throw new NotFoundException("Server-owned follow-ups require the durable runner");
     const parsed = QueuedFollowUpUpdateSchema.parse(body ?? {});
     const scope = parsed.attachments
       ? await this.queuedFollowUps.scope(tenantIdFromRequest(request), request.auth!.user.id, followUpId)
@@ -1592,7 +1591,7 @@ export class AgentApiController {
 
   @Delete("/follow-ups/:followUpId")
   async cancelQueuedFollowUp(@Req() request: AuthenticatedRequest, @Param("followUpId") followUpId: string) {
-    if (!this.durableTurns.enabled) throw new NotFoundException("Server-owned follow-ups require the durable runner");
+    if (!this.durableTurns.enabled || !this.queuedFollowUps) throw new NotFoundException("Server-owned follow-ups require the durable runner");
     return this.queuedFollowUps.cancel(tenantIdFromRequest(request), request.auth!.user.id, followUpId);
   }
 
@@ -1675,7 +1674,7 @@ export class AgentApiController {
       this.organizationCapabilities.effective(tenantId, userId),
     );
     const connectorRuntimeWork = observeAdmissionPreparation(
-      this.connectors.runtime(tenantId, userId, { taskId: task.id, sessionId }),
+      this.connectors.runtime(tenantId, userId, { taskId: task.id, sessionId, resolveDuringExecution: this.durableTurns.enabled }),
     );
     const departmentIdWork = observeAdmissionPreparation(
       this.#primaryDepartmentId(tenantId, userId),

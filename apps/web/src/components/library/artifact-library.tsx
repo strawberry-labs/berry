@@ -21,6 +21,7 @@ import { DocumentPreviewModal } from "./document-preview-modal";
 import { fileTypeLabel, formatBytes } from "./file-metadata";
 import { FileThumbnail, isImageFile } from "./file-thumbnail";
 import { toast } from "sonner";
+import { InfiniteScrollTrigger } from "../infinite-scroll-trigger";
 
 const LIBRARY_PAGE_SIZE = 50;
 const SEARCH_DEBOUNCE_MS = 220;
@@ -187,7 +188,7 @@ export function ArtifactLibrary({ client, tab, onTabChange, workspaces }: {
           })}
         </div>
       ) : null}
-      {state === "ready" && nextCursor ? <Button className="berry-library-load-more" variant="outline" disabled={loadingMore} onClick={() => void loadMore()}>{loadingMore ? "Loading…" : "Load more files"}</Button> : null}
+      <InfiniteScrollTrigger hasMore={state === "ready" && Boolean(client && nextCursor)} loading={loadingMore} error={error || null} onLoadMore={() => { setError(""); void loadMore(); }} />
       <DocumentPreviewModal file={selected} onOpenChange={(open) => { if (!open) setSelected(null); }} />
       <AlertDialog open={Boolean(pendingDelete)} onOpenChange={(open) => { if (!open && !deletingId) setPendingDelete(null); }}>
         <AlertDialogContent>

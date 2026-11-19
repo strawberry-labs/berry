@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // No DOM lib: this package must also run in React Native (Hermes).
+    "lib": ["ES2022"],
+    "types": [],
+    "noEmit": true,
+    "rootDir": "./src"
+  },
+  "include": ["src/**/*.ts"],
+  // Tests run under Vitest in Node and may use Node APIs.
+  "exclude": ["src/**/*.test.ts"]
+}

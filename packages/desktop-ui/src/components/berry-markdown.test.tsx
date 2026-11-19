@@ -22,13 +22,15 @@ describe("Markdown math", () => {
     expect(html).not.toContain("katex-error");
   });
 
-  it("uses the cheap live surface and restores full markdown after settling", () => {
+  it("renders Markdown while streaming, including an open code fence", () => {
     const live = renderToStaticMarkup(<Markdown streaming>{"# Live answer\n\n```ts\nconst value = 1;"}</Markdown>);
     expect(live).toContain('data-markdown-live="true"');
-    expect(live).toContain("# Live answer");
+    expect(live).toContain(">Live answer</h1>");
     expect(live).not.toContain("const value = 1;\n```");
-    expect(live).not.toContain("<h1");
-    expect(live).not.toContain("data-shiki-token");
+    expect(live).toContain("<h1");
+    expect(live).toContain("const value = 1;");
+    expect(live).toContain('data-highlight-status="idle"');
+    expect(live).toContain('data-streaming="true"');
 
     const settled = renderToStaticMarkup(<Markdown>{"# Settled answer"}</Markdown>);
     expect(settled).toContain("<h1");
@@ -93,7 +95,7 @@ describe("Markdown direction (H-047)", () => {
     expect(html).not.toMatch(/<(?:p|li|ul) dir=/);
   });
 
-  it("directs each line of the live surface the same way", () => {
+  it("directs streaming Markdown blocks the same way as settled blocks", () => {
     const live = renderToStaticMarkup(<Markdown streaming>{[
       "تعمل منصة Berry مع Microsoft 365 لتلخيص الملفات.",
       "",
@@ -102,13 +104,13 @@ describe("Markdown direction (H-047)", () => {
       "This English line stays left-to-right.",
     ].join("\n")}</Markdown>);
     expect(live).toMatch(/<div data-markdown-live="true" dir="rtl"/);
-    expect(live).toContain('<div data-markdown-line="">Berry Workspace');
-    expect(live).toContain('<div data-markdown-line="" dir="ltr">This English line');
+    expect(tagBefore(live, "Berry Workspace")).not.toContain('dir="ltr"');
+    expect(tagBefore(live, "This English line")).toContain('dir="ltr"');
     // Mostly English overall: the message turns left-to-right and the Arabic
     // line keeps its own direction.
     const english = renderToStaticMarkup(<Markdown streaming>{"Berry Workspace هو المكان الذي تُحفظ فيه ملفات المشروع.\n\nThis English line stays left-to-right, as written."}</Markdown>);
     expect(english).toMatch(/<div data-markdown-live="true" dir="ltr"/);
-    expect(english).toContain('<div data-markdown-line="" dir="rtl">Berry Workspace');
+    expect(tagBefore(english, "Berry Workspace")).toContain('dir="rtl"');
   });
 
   it("directs submitted prompts line by line", () => {

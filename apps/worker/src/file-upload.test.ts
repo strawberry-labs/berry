@@ -174,9 +174,17 @@ describe("upload_file transfer", () => {
     await expect(uploadFileBytes({ upload: input(), bytes, policy: open, fetch: send })).rejects.toThrow("Treat the upload as failed");
   });
 
-  it("calls a storage server error temporary", async () => {
+  it("marks a lost response as dispatched without including the signed URL", async () => {
+    const send = vi.fn<typeof fetch>().mockRejectedValue(new Error("Connection lost for " + signedUrl));
+    const failure = await uploadFileBytes({ upload: input(), bytes, policy: open, fetch: send }).catch((error: Error) => error);
+    expect(failure).toMatchObject({ toolCallPhase: "dispatched" });
+    expect((failure as Error).message).not.toContain(signedUrl);
+    expect(send).toHaveBeenCalledOnce();
+  });
+
+  it("requires checking a storage server error before another upload", async () => {
     const send = storage(new Response("<Error><Code>InternalError</Code><Message>We encountered an internal error.</Message></Error>", { status: 503 }));
-    await expect(uploadFileBytes({ upload: input(), bytes, policy: open, fetch: send })).rejects.toThrow("one retry of the same upload is reasonable");
+    await expect(uploadFileBytes({ upload: input(), bytes, policy: open, fetch: send })).rejects.toThrow("verify whether the destination stored the file before trying again");
   });
 });
 

@@ -1,5 +1,5 @@
 import { SqlScheduledTaskRepository, type ScheduledTaskSqlExecutor } from "@berry/db";
-import { DurableTurnRuntimeRequestSchema, ScheduledTaskCreateSchema, ScheduledTaskUpdateSchema, type JsonValue } from "@berry/shared";
+import { parseAdmittedRuntimeRequest, ScheduleTimezoneSchema, ScheduledTaskCreateSchema, ScheduledTaskUpdateSchema, type JsonValue } from "@berry/shared";
 import type { ChatToolDefinition } from "@berry/router-client";
 import { z } from "zod";
 import type { DurableTurnSnapshot, DurableTurnStep, DurableTurnToolExecutor, DurableToolPolicy, TurnToolResult } from "../turn-runner.ts";
@@ -34,10 +34,10 @@ export class DurableScheduledTaskToolExecutor implements DurableTurnToolExecutor
     this.repository = new SqlScheduledTaskRepository(executor);
   }
   async definitions(snapshot: DurableTurnSnapshot): Promise<readonly ChatToolDefinition[]> {
+    const runtime = parseAdmittedRuntimeRequest(snapshot.runtimeRequest);
+    const timezone = ScheduleTimezoneSchema.safeParse(runtime?.timezone);
     const inherited = await this.base.definitions?.(snapshot) ?? [];
-    const runtime = DurableTurnRuntimeRequestSchema.safeParse(snapshot.runtimeRequest);
-    const timezone = runtime.success ? runtime.data.timezone : undefined;
-    return [...inherited, ...scheduledTaskToolDefinitions(timezone)];
+    return [...inherited, ...scheduledTaskToolDefinitions(timezone.success ? timezone.data : undefined)];
   }
   modelContent(...args: Parameters<NonNullable<DurableTurnToolExecutor["modelContent"]>>) { return this.base.modelContent?.(...args) ?? Promise.resolve([]); }
   stageAssociatedInputFiles(...args: Parameters<NonNullable<DurableTurnToolExecutor["stageAssociatedInputFiles"]>>) { return this.base.stageAssociatedInputFiles?.(...args) ?? Promise.resolve([]); }
@@ -72,13 +72,13 @@ export class DurableScheduledTaskToolExecutor implements DurableTurnToolExecutor
     }
     if (name === "create_scheduled_task") {
       const input = CreateInput.parse(args);
-      const runtime = DurableTurnRuntimeRequestSchema.safeParse(snapshot.runtimeRequest);
+      const runtime = parseAdmittedRuntimeRequest(snapshot.runtimeRequest);
       const task = await this.repository.create(scope, {
         ...input, operationId: step.id, workspaceId: snapshot.workspaceId,
-        modelProviderId: input.modelProviderId ?? (runtime.success ? runtime.data.providerId : null),
-        model: input.model ?? (runtime.success ? runtime.data.model : null),
-        reasoning: input.reasoning ?? (runtime.success && ["off", "low", "medium", "high", "xhigh"].includes(runtime.data.reasoning)
-          ? runtime.data.reasoning as "off" | "low" | "medium" | "high" | "xhigh" : "off"),
+        modelProviderId: input.modelProviderId ?? runtime?.providerId ?? null,
+        model: input.model ?? runtime?.model ?? null,
+        reasoning: input.reasoning ?? (runtime && ["off", "low", "medium", "high", "xhigh"].includes(runtime.reasoning)
+          ? runtime.reasoning as "off" | "low" | "medium" | "high" | "xhigh" : "off"),
       }, snapshot.taskId);
       return result({ scheduledTask: task, url: "/settings/schedules" }, `Scheduled “${task.name}” for ${task.nextRunAt} (${task.schedule.timezone})`);
     }

@@ -3,12 +3,28 @@ import { describe, expect, it } from "vitest";
 import { OrganizationCapabilitiesService } from "./http/organization-capabilities.service.js";
 import { PersonalCapabilitiesService } from "./http/personal-capabilities.service.js";
 import { readOrganizationSkillDirectory } from "./sync-organization-skill-packages.js";
+import { googleConnectorScopes, googleToolCatalog } from "./connectors/google-tools.js";
 
 const skillsRoot = fileURLToPath(new URL("../../../deploy/skills/", import.meta.url));
-const managedSkills = ["aesg-branding", "cv-creator", "docx", "pdf", "pptx", "skill-creator", "xlsx"] as const;
+const managedSkills = [
+  "aesg-branding", "cv-creator", "docx", "gmail-mcp", "google-calendar-mcp", "google-drive-mcp", "pdf", "pptx", "skill-creator", "xlsx",
+] as const;
 
 describe("organization skill package sync source", () => {
-  it("loads and validates all seven complete managed packages", async () => {
+  it.each([
+    ["gmail-mcp", "gmail", "gmail_reply_to_thread"],
+    ["google-calendar-mcp", "google-calendar", "google_calendar_create_event"],
+    ["google-drive-mcp", "google-workspace", "drive_move_file"],
+  ] as const)("uses Berry's admitted tool names in %s", async (skill, connector, writeTool) => {
+    const { content } = await readOrganizationSkillDirectory(`${skillsRoot}${skill}`);
+    const toolNames = Array.from(content.matchAll(/`((?:google_calendar|gmail|drive|docs|sheets|slides)_[a-z_]+)`/g), ([, tool]) => tool);
+    const scopes = googleConnectorScopes(connector, "full", "search_workspace");
+    const catalog = googleToolCatalog(connector, "full", scopes).map((tool) => tool.name);
+    expect(toolNames).toContain(writeTool);
+    expect(catalog).toEqual(expect.arrayContaining(toolNames));
+  });
+
+  it("loads and validates the managed packages", async () => {
     const reviewer = new OrganizationCapabilitiesService(new PersonalCapabilitiesService());
     let packagesWithResources = 0;
 

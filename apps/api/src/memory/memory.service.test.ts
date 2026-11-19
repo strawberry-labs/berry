@@ -352,7 +352,7 @@ describe("MemoryService", () => {
       personal: [],
       personalDegraded: true,
     });
-    expect(observedSignal?.aborted).toBe(true);
+    expect(observedSignal).toMatchObject({ aborted: true, reason: controller.signal.reason });
   });
 
   it("stops waiting for a slow personal-memory search and keeps Berry's own memories", async () => {

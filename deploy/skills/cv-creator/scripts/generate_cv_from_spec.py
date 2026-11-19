@@ -164,6 +164,8 @@ def main() -> int:
                 "--skip-refresh",
                 "--orientation",
                 args.orientation,
+                "--landscape-pagination-mode",
+                "estimated",
             ],
         )
     if "pptx" in args.formats:

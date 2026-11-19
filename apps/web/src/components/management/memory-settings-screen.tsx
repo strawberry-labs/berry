@@ -5,17 +5,23 @@ import { Check, ClipboardCopy, Download, Pencil, Plus, Trash2, Upload } from "lu
 import {
   AsyncState,
   Button,
+  FormSelect,
+  InlineNotice,
   Input,
   ManagementDialog,
   ManagementPage,
   ManagementSwitch,
-  FormSelect,
+  SearchInput,
   Section,
+  SettingList,
+  SettingRow,
   StatusPill,
   Textarea,
   formatDate,
+  formatNumber,
 } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
+import { FillHeightScroller, InfiniteScrollTrigger } from "../infinite-scroll-trigger";
 
 const MEMORY_IMPORT_CONCURRENCY = 4;
 
@@ -178,7 +184,7 @@ export async function importMemoryEntries(
   return { imported, failures };
 }
 
-export function MemorySettingsScreen({ client, embedded = false }: ManagementScreenProps & { embedded?: boolean }) {
+export function MemorySettingsScreen({ client, embedded = false, lead }: ManagementScreenProps & { embedded?: boolean; lead?: React.ReactNode }) {
   const resource = useResource<MemoryResource>(
     "personal-memory",
     async () => {
@@ -312,9 +318,11 @@ export function MemorySettingsScreen({ client, embedded = false }: ManagementScr
     }
   };
 
+  const [loadMoreError, setLoadMoreError] = React.useState<string | null>(null);
   const loadMore = async () => {
     if (!client || !data.nextCursor || busy) return;
     setBusy("more");
+    setLoadMoreError(null);
     try {
       const page = await client.listMemories({
         scope: "personal",
@@ -334,7 +342,7 @@ export function MemorySettingsScreen({ client, embedded = false }: ManagementScr
         nextCursor: page.nextCursor,
       }));
     } catch (cause) {
-      setMutationError(message(cause, "Unable to load more memories"));
+      setLoadMoreError(message(cause, "Unable to load more memories"));
     } finally {
       setBusy(null);
     }
@@ -432,6 +440,9 @@ export function MemorySettingsScreen({ client, embedded = false }: ManagementScr
   );
   const groups = groupActiveMemories(filtered);
   const disabled = !data.settings.memoryEnabled;
+  const forgetTarget = confirmForget ? data.items.find((item) => item.id === confirmForget) ?? null : null;
+  const dialogOpen = importOpen || creating || Boolean(editing) || Boolean(forgetTarget) || confirmClear;
+  const errorNotice = mutationError ? <InlineNotice tone="danger">{mutationError}</InlineNotice> : null;
   const actions = <>
     <Button variant="secondary" onClick={() => void exportMemory()} disabled={!client || busy === "export"}><Download />Export</Button>
     <Button variant="secondary" onClick={openImport} disabled={!client || disabled || Boolean(busy)}><Upload />Import</Button>
@@ -444,41 +455,119 @@ export function MemorySettingsScreen({ client, embedded = false }: ManagementScr
         error={resource.error}
         onRetry={resource.retry}
       >
-        <Section>
-          <div className="grid divide-y divide-border [&>label]:flex [&>label]:items-center [&>label]:justify-between [&>label]:gap-4 [&>label]:py-3 [&>label>span]:grid [&>label>span]:gap-0.5 [&_b]:text-sm [&_small]:text-xs [&_small]:text-muted-foreground">
-            <label>
-              <span>
-                <b>Use personal memory</b>
+        {disabled ? (
+          <InlineNotice tone="warning" title="Memory is off">
+            Berry is not recalling or saving anything. Your saved entries stay here to edit, export or forget.
+          </InlineNotice>
+        ) : null}
+        {!dialogOpen ? errorNotice : null}
+
+        <Section
+          title="Saved memory"
+          description="What Berry can recall when it starts your tasks. Entries are either added by you or learned from completed tasks."
+          actions={data.items.length > 0 ? <SearchInput label="Search memory" placeholder="Search memory" value={query} onChange={setQuery} /> : undefined}
+          flush
+        >
+          {groups.length === 0 ? (
+            <div className="grid justify-items-center gap-1 px-6 py-10 text-center">
+              <strong className="text-sm font-medium text-foreground">
+                {query ? "No matching memories" : "Nothing saved yet"}
+              </strong>
+              <span className="max-w-md text-md leading-5 text-muted-foreground">
+                {query
+                  ? data.nextCursor ? "Nothing in the entries loaded so far. Clear the search and scroll the list to load older memories." : "Try a different search."
+                  : disabled ? "Turn on memory below to start saving entries." : "Add a memory yourself, import from another assistant, or let Berry learn from completed tasks."}
               </span>
+              {!query && !disabled && client ? <Button className="mt-3" variant="secondary" onClick={openCreate}><Plus />Add memory</Button> : null}
+            </div>
+          ) : (
+            <FillHeightScroller>
+            <div className="grid divide-y divide-border">
+              {groups.map((group) => (
+                <section key={group.kind} aria-labelledby={`memory-kind-${group.kind}`}>
+                  <header className="sticky top-0 z-10 flex items-center gap-2 border-b border-border bg-[var(--berry-surface-under)] px-4 py-1.5">
+                    <h3 id={`memory-kind-${group.kind}`} className="text-xs font-medium text-muted-foreground">
+                      {humanize(group.kind)}
+                    </h3>
+                    <span className="text-xs text-muted-foreground tabular-nums">{group.items.length}</span>
+                  </header>
+                  <div className="grid divide-y divide-border">
+                    {group.items.map((item) => (
+                      <article key={item.id} className="flex items-start gap-3 px-4 py-3 hover:bg-[var(--berry-hover)]">
+                        <div className="grid min-w-0 flex-1 gap-1.5">
+                          <p className="text-md leading-5 text-foreground [overflow-wrap:anywhere]">{item.content}</p>
+                          <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-muted-foreground">
+                            <StatusPill tone={item.explicit ? "info" : "neutral"}>
+                              {item.explicit ? "Added by you" : "Learned"}
+                            </StatusPill>
+                            {!item.explicit ? <span>{Math.round(item.confidence * 100)}% confidence</span> : null}
+                            <span>{item.lastUsedAt ? `Last used ${formatDate(item.lastUsedAt)}` : "Not used yet"}</span>
+                            {item.expiresAt ? <span>Expires {formatDate(item.expiresAt)}</span> : null}
+                            {item.sourceTaskId ? (
+                              <a className="text-foreground underline underline-offset-2" href={`/tasks/${encodeURIComponent(item.sourceTaskId)}`}>
+                                Source task
+                              </a>
+                            ) : null}
+                          </div>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-1">
+                          <Button variant="ghost" size="icon-sm" aria-label={`Edit ${item.content}`} disabled={!client} onClick={() => openEdit(item)}>
+                            <Pencil />
+                          </Button>
+                          <Button variant="ghost" size="icon-sm" aria-label={`Forget ${item.content}`} disabled={!client} onClick={() => { setMutationError(""); setConfirmForget(item.id); }}>
+                            <Trash2 />
+                          </Button>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              ))}
+            </div>
+            <InfiniteScrollTrigger
+              className="border-t border-border"
+              hasMore={Boolean(client && data.nextCursor)}
+              loading={busy === "more"}
+              error={loadMoreError}
+              onLoadMore={() => void loadMore()}
+            />
+            </FillHeightScroller>
+          )}
+          {data.nextCursor && query ? (
+            <p className="border-t border-border px-4 py-2 text-center text-xs text-muted-foreground">Search covers the {formatNumber(data.items.length)} entries loaded so far. Scroll the list to load older ones.</p>
+          ) : null}
+        </Section>
+
+        <Section title="Memory settings" flush>
+          <SettingList>
+            <SettingRow title="Use memory" description="Berry recalls your saved entries when it starts a task. Turning this off keeps the entries but stops recall and learning.">
               <ManagementSwitch
                 checked={data.settings.memoryEnabled}
-                disabled={busy === "settings"}
+                disabled={!client || busy === "settings"}
                 aria-label="Use personal memory"
-                onCheckedChange={(memoryEnabled) =>
-                  void updateSetting({ memoryEnabled })
-                }
+                onCheckedChange={(memoryEnabled) => void updateSetting({ memoryEnabled })}
               />
-            </label>
-            <label>
-              <span>
-                <b>Learn from completed tasks</b>
-              </span>
+            </SettingRow>
+            <SettingRow
+              title="Learn from completed tasks"
+              description={disabled
+                ? "Unavailable while memory is off."
+                : "Berry saves new entries on its own after a task finishes. When off, only entries you add are saved."}
+            >
               <ManagementSwitch
                 checked={data.settings.implicitMemoryEnabled}
-                disabled={disabled || busy === "settings"}
+                disabled={!client || disabled || busy === "settings"}
                 aria-label="Learn from completed tasks"
-                onCheckedChange={(implicitMemoryEnabled) =>
-                  void updateSetting({ implicitMemoryEnabled })
-                }
+                onCheckedChange={(implicitMemoryEnabled) => void updateSetting({ implicitMemoryEnabled })}
               />
-            </label>
-          </div>
-          {disabled ? (
-            <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-              Recall and implicit extraction are disabled. Existing entries
-              remain available to edit, export, or forget.
-            </p>
-          ) : null}
+            </SettingRow>
+            <SettingRow title="Forget everything" description="Remove every saved entry from recall. This can’t be undone from here; export first if you want a copy.">
+              <Button variant="secondary" onClick={() => { setMutationError(""); setConfirmClear(true); }} disabled={!client || data.items.length === 0}>
+                <Trash2 />
+                Forget all memory
+              </Button>
+            </SettingRow>
+          </SettingList>
         </Section>
 
         <ManagementDialog
@@ -487,7 +576,7 @@ export function MemorySettingsScreen({ client, embedded = false }: ManagementScr
             if (!open) closeImport();
           }}
           title="Import memory"
-          description="Move durable preferences and context from ChatGPT, Claude, or another assistant. Review the pasted text before importing it."
+          description="Bring preferences and context over from ChatGPT, Claude or another assistant. Review the pasted text before importing it."
           size="lg"
           footer={
             <>
@@ -508,39 +597,33 @@ export function MemorySettingsScreen({ client, embedded = false }: ManagementScr
         >
           <div className="grid gap-5">
             <section className="grid gap-2" aria-labelledby="memory-import-step-one">
-              <div className="flex items-center justify-between gap-3">
-                <div className="flex items-center gap-2">
-                  <span className="flex size-6 items-center justify-center rounded-full bg-[var(--berry-control-bg)] text-xs font-semibold text-[var(--berry-text-secondary)]">1</span>
-                  <h3 id="memory-import-step-one" className="text-sm font-medium text-foreground">Ask your current AI to export its memory</h3>
-                </div>
-                <Button variant="secondary" size="sm" onClick={() => void copyImportPrompt()}>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 id="memory-import-step-one" className="text-md font-medium text-foreground">1. Ask your current assistant to export its memory</h3>
+                <Button variant="secondary" onClick={() => void copyImportPrompt()}>
                   {promptCopied ? <Check /> : <ClipboardCopy />}
                   {promptCopied ? "Copied" : "Copy prompt"}
                 </Button>
               </div>
-              <pre className="max-h-40 overflow-y-auto whitespace-pre-wrap rounded-lg border border-[var(--berry-border)] bg-[var(--berry-surface-under)] p-3 text-xs leading-5 text-[var(--berry-text-secondary)]">
+              <pre className="max-h-40 overflow-y-auto whitespace-pre-wrap rounded-lg bg-[var(--berry-surface-under)] p-3 text-xs leading-5 text-muted-foreground">
                 {MEMORY_EXPORT_PROMPT}
               </pre>
             </section>
 
             <section className="grid gap-2" aria-labelledby="memory-import-step-two">
-              <div className="flex items-center gap-2">
-                <span className="flex size-6 items-center justify-center rounded-full bg-[var(--berry-control-bg)] text-xs font-semibold text-[var(--berry-text-secondary)]">2</span>
-                <h3 id="memory-import-step-two" className="text-sm font-medium text-foreground">Paste the exported memories</h3>
-              </div>
+              <h3 id="memory-import-step-two" className="text-md font-medium text-foreground">2. Paste what it gives you</h3>
               <Textarea
                 aria-label="Exported memories"
-                className="min-h-44 resize-y text-sm leading-5"
+                className="min-h-44 resize-y"
                 placeholder="Paste the export here"
                 value={importText}
                 onChange={(event) => setImportText(event.currentTarget.value)}
               />
-              <p className="text-xs text-[var(--berry-text-tertiary)]" aria-live="polite">
+              <p className="text-xs text-muted-foreground" aria-live="polite">
                 {importText.trim()
-                  ? `${importEntries.length} ${importEntries.length === 1 ? "memory" : "memories"} ready to import. Wording, categories and known source dates are preserved.`
-                  : "Berry imports every detected entry, with duplicates consolidated."}
+                  ? `${importEntries.length} ${importEntries.length === 1 ? "memory" : "memories"} ready to import. Wording, categories and known source dates are kept.`
+                  : "Berry imports every entry it detects and merges duplicates."}
               </p>
-              {mutationError ? <p className="text-xs text-destructive" role="alert">{mutationError}</p> : null}
+              {errorNotice}
             </section>
           </div>
         </ManagementDialog>
@@ -551,7 +634,7 @@ export function MemorySettingsScreen({ client, embedded = false }: ManagementScr
             if (!open) closeEditor();
           }}
           title={editing ? "Edit memory" : "Add a memory"}
-          description="Save only durable context you want Berry to reuse."
+          description="Save lasting context you want Berry to reuse, such as a preference or how you like work done."
           footer={
             <>
               <Button variant="secondary" onClick={closeEditor}>
@@ -565,213 +648,98 @@ export function MemorySettingsScreen({ client, embedded = false }: ManagementScr
                   busy?.startsWith("edit:")
                 }
               >
-                Save memory
+                {busy === "create" || busy?.startsWith("edit:") ? "Saving…" : "Save memory"}
               </Button>
             </>
           }
         >
-          <div className="memory-editor">
-            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">
-              Category
-              <FormSelect
-                value={kind}
-                onChange={setKind}
-                options={[
-                  { value: "profile", label: "Profile" },
-                  { value: "preference", label: "Preference" },
-                  { value: "communication_style", label: "Communication style" },
-                  { value: "accessibility", label: "Accessibility" },
-                  { value: "working_convention", label: "Working convention" },
-                  ...(!["profile", "preference", "communication_style", "accessibility", "working_convention"].includes(kind) ? [{ value: kind, label: humanize(kind) }] : []),
-                ]}
-              />
-            </label>
-            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground sm:col-span-2">
+          <div className="grid gap-4">
+            <label className="grid gap-1.5 text-xs font-medium text-foreground">
               Memory
-              <Input
+              <Textarea
+                className="min-h-24 resize-y"
                 value={content}
                 maxLength={20_000}
+                placeholder="I prefer short answers with the sources listed at the end."
                 onChange={(event) => setContent(event.currentTarget.value)}
               />
             </label>
-            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">
-              Expires
-              <Input
-                type="date"
-                value={expiresAt}
-                onChange={(event) => setExpiresAt(event.currentTarget.value)}
-              />
-            </label>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <label className="grid gap-1.5 text-xs font-medium text-foreground">
+                Category
+                <FormSelect
+                  ariaLabel="Category"
+                  value={kind}
+                  onChange={setKind}
+                  options={[
+                    { value: "profile", label: "Profile" },
+                    { value: "preference", label: "Preference" },
+                    { value: "communication_style", label: "Communication style" },
+                    { value: "accessibility", label: "Accessibility" },
+                    { value: "working_convention", label: "Working convention" },
+                    ...(!["profile", "preference", "communication_style", "accessibility", "working_convention"].includes(kind) ? [{ value: kind, label: humanize(kind) }] : []),
+                  ]}
+                />
+              </label>
+              <label className="grid gap-1.5 text-xs font-medium text-foreground">
+                Expires
+                <Input
+                  type="date"
+                  value={expiresAt}
+                  onChange={(event) => setExpiresAt(event.currentTarget.value)}
+                />
+                <span className="font-normal text-muted-foreground">Optional. Berry stops using the memory after this date.</span>
+              </label>
+            </div>
+            {errorNotice}
           </div>
         </ManagementDialog>
 
-        <Section
-          title="Saved memory"
-          description="Explicit entries are user-authored. Inferred entries were consolidated from completed tasks."
-          actions={
-            <Input
-              className="memory-search"
-              aria-label="Search memory"
-              placeholder="Search memory"
-              value={query}
-              onChange={(event) => setQuery(event.currentTarget.value)}
-            />
+        <ManagementDialog
+          open={Boolean(forgetTarget)}
+          onOpenChange={(open) => { if (!open && !busy) setConfirmForget(null); }}
+          title="Forget this memory?"
+          description="Berry will stop recalling it. This can’t be undone from here."
+          size="sm"
+          footer={
+            <>
+              <Button variant="secondary" disabled={Boolean(busy)} onClick={() => setConfirmForget(null)}>Keep</Button>
+              <Button variant="destructive" disabled={Boolean(busy)} onClick={() => { if (forgetTarget) void forget(forgetTarget.id); }}>
+                {busy?.startsWith("forget:") ? "Forgetting…" : "Forget memory"}
+              </Button>
+            </>
           }
         >
-          {mutationError ? (
-            <p
-              className="flex gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs text-muted-foreground"
-              role="alert"
-            >
-              {mutationError}
-            </p>
-          ) : null}
-          {groups.length === 0 ? (
-            <div className="memory-empty">
-              <strong>
-                {query ? "No matching memories" : "Nothing saved yet"}
-              </strong>
-              <span>
-                {query
-                  ? "Try a different search."
-                  : "Add a preference or let Berry learn after completed tasks."}
-              </span>
-            </div>
-          ) : (
-            <div className="memory-groups">
-              {groups.map((group) => (
-                <section
-                  key={group.kind}
-                  className="memory-group"
-                  aria-labelledby={`memory-kind-${group.kind}`}
-                >
-                  <header>
-                    <h3 id={`memory-kind-${group.kind}`}>
-                      {humanize(group.kind)}
-                    </h3>
-                    <span>{group.items.length}</span>
-                  </header>
-                  <div className="memory-list">
-                    {group.items.map((item) => (
-                      <article key={item.id} className="memory-row">
-                        <div className="memory-copy">
-                          <p>{item.content}</p>
-                          <div className="memory-meta">
-                            <StatusPill
-                              tone={item.explicit ? "info" : "neutral"}
-                            >
-                              {item.explicit ? "Explicit" : "Inferred"}
-                            </StatusPill>
-                            <span>
-                              {Math.round(item.confidence * 100)}% confidence
-                            </span>
-                            <span>Last used {formatDate(item.lastUsedAt)}</span>
-                            {item.expiresAt ? (
-                              <span>Expires {formatDate(item.expiresAt)}</span>
-                            ) : null}
-                            {item.sourceTaskId ? (
-                              <a
-                                href={`/tasks/${encodeURIComponent(item.sourceTaskId)}`}
-                              >
-                                Source task
-                              </a>
-                            ) : null}
-                          </div>
-                        </div>
-                        <div className="memory-actions">
-                          <Button
-                            variant="ghost"
-                            size="icon-sm"
-                            aria-label={`Edit ${item.content}`}
-                            onClick={() => openEdit(item)}
-                          >
-                            <Pencil />
-                          </Button>
-                          {confirmForget === item.id ? (
-                            <>
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                onClick={() => setConfirmForget(null)}
-                              >
-                                Keep
-                              </Button>
-                              <Button
-                                variant="destructive"
-                                size="sm"
-                                disabled={busy === `forget:${item.id}`}
-                                onClick={() => void forget(item.id)}
-                              >
-                                Forget
-                              </Button>
-                            </>
-                          ) : (
-                            <Button
-                              variant="ghost"
-                              size="icon-sm"
-                              aria-label={`Forget ${item.content}`}
-                              onClick={() => setConfirmForget(item.id)}
-                            >
-                              <Trash2 />
-                            </Button>
-                          )}
-                        </div>
-                      </article>
-                    ))}
-                  </div>
-                </section>
-              ))}
-            </div>
-          )}
-          {data.nextCursor && !query ? (
-            <Button
-              variant="outline"
-              onClick={() => void loadMore()}
-              disabled={busy === "more"}
-            >
-              Load more
-            </Button>
-          ) : null}
-          <div className="memory-clear">
-            {confirmClear ? (
-              <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/40 p-3 text-xs text-muted-foreground">
-                <strong>Forget all personal memory?</strong>
-                <span>
-                  This removes every active personal entry from recall while
-                  preserving the audit/version history.
-                </span>
-                <div className="flex flex-wrap justify-end gap-2">
-                  <Button
-                    variant="ghost"
-                    onClick={() => setConfirmClear(false)}
-                  >
-                    Cancel
-                  </Button>
-                  <Button
-                    variant="destructive"
-                    disabled={busy === "clear"}
-                    onClick={() => void clearAll()}
-                  >
-                    Forget all
-                  </Button>
-                </div>
-              </div>
-            ) : (
-              <Button
-                variant="ghost"
-                onClick={() => setConfirmClear(true)}
-                disabled={data.items.length === 0}
-              >
-                <Trash2 />
-                Clear all personal memory
-              </Button>
-            )}
+          <div className="grid gap-3">
+            <p className="line-clamp-6 rounded-lg bg-[var(--berry-surface-under)] px-3 py-2 text-md leading-5 text-foreground [overflow-wrap:anywhere]">{forgetTarget?.content}</p>
+            {errorNotice}
           </div>
-        </Section>
+        </ManagementDialog>
+
+        <ManagementDialog
+          open={confirmClear}
+          onOpenChange={(open) => { if (!open && busy !== "clear") setConfirmClear(false); }}
+          title="Forget all memory?"
+          description="Every saved entry is removed from recall, including ones not loaded on this page. Version history is kept for audit."
+          size="sm"
+          footer={
+            <>
+              <Button variant="secondary" disabled={busy === "clear"} onClick={() => setConfirmClear(false)}>Cancel</Button>
+              <Button variant="destructive" disabled={busy === "clear"} onClick={() => void clearAll()}>
+                {busy === "clear" ? "Forgetting…" : "Forget all"}
+              </Button>
+            </>
+          }
+        >
+          <div className="grid gap-3">
+            <p className="text-md leading-5 text-muted-foreground">Export first if you want a copy. The memory settings stay as they are.</p>
+            {errorNotice}
+          </div>
+        </ManagementDialog>
       </AsyncState>
   );
-  if (embedded) return <div className="grid min-w-0 gap-4"><div className="flex flex-wrap justify-end gap-2">{actions}</div>{screenContent}</div>;
-  return <ManagementPage title="Memory" description="Review the durable context Berry can recall." actions={actions}>{screenContent}</ManagementPage>;
+  if (embedded) return <div className="grid min-w-0 gap-5"><div className="flex flex-wrap items-center justify-between gap-2">{lead ?? <span />}<div className="flex flex-wrap items-center gap-2">{actions}</div></div>{screenContent}</div>;
+  return <ManagementPage width="narrow" title="Memory" description="Review and manage what Berry remembers about you." actions={actions}>{screenContent}</ManagementPage>;
 }
 
 function humanize(value: string): string {

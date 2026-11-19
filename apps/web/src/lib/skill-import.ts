@@ -1,4 +1,9 @@
-import JSZip from "jszip";
+import type JSZipType from "jszip";
+
+/** jszip is ~100 KB; load it only when a skill is actually imported or exported. */
+async function loadJSZip(): Promise<typeof JSZipType> {
+  return (await import("jszip")).default;
+}
 
 const MAX_ARCHIVE_BYTES = 5 * 1024 * 1024;
 const MAX_SKILL_BYTES = 262_144;
@@ -22,6 +27,7 @@ export async function createBrowserSkillExport(
   resourceFiles: readonly { path: string; contentBase64: string; mode?: number | undefined }[] = [],
 ): Promise<BrowserSkillExport> {
   validateContent(content);
+  const JSZip = await loadJSZip();
   const archive = new JSZip();
   archive.file("SKILL.md", content);
   for (const file of resourceFiles) {
@@ -49,6 +55,7 @@ export async function readBrowserSkillImport(file: File): Promise<BrowserSkillIm
     return { content, fileName: file.name, packageFiles: ["SKILL.md"], resourceFiles: [] };
   }
 
+  const JSZip = await loadJSZip();
   const archive = await JSZip.loadAsync(await file.arrayBuffer(), { createFolders: false });
   const entries = Object.values(archive.files);
   if (entries.length > MAX_FILES) throw new Error(`Skill packages may contain at most ${MAX_FILES} files`);

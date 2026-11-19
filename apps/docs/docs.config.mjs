@@ -25,6 +25,7 @@ export const docsNavigation = [
       { title: "Policy and Admin", source: "docs/admin/policy-admin-guide.md", output: "operate/policy-admin.html" },
       { title: "Managed Policy", source: "docs/managed-policy.md", output: "operate/managed-policy.html" },
       { title: "Sandbox", source: "docs/sandbox.md", output: "operate/sandbox.html" },
+      { title: "Mobile App", source: "docs/mobile-app.md", output: "operate/mobile-app.html" },
       { title: "Security Review", source: "docs/security-review.md", output: "operate/security-review.html" }
     ]
   },

@@ -1,99 +1,69 @@
 import * as React from "react";
-import {
-  Activity,
-  Check,
-  Copy,
-  Download,
-  Plus,
-  Save,
-  ShieldCheck,
-  Trash2,
-  Upload,
-} from "lucide-react";
-import {
-  ORGANIZATION_SKILL_PACKAGE_MAX_BYTES,
-  OrgPermissionSchema,
-  type OrgCapabilityAssignment,
-  type OrgPermission,
-  type PersonalSkillReview,
-} from "@berry/shared";
-import { readBrowserSkillImport } from "@/lib/skill-import";
+import { Plus, Save, ShieldCheck } from "lucide-react";
+import { OrgPermissionSchema, type OrgPermission } from "@berry/shared";
 import {
   AsyncState,
   Button,
-  Checkbox,
+  CellStack,
   DataTable,
   DefinitionList,
   DetailDrawer,
-  FilterSelect,
+  EmptyPanel,
   FormSelect,
+  InlineNotice,
   Input,
   ManagementDialog,
   ManagementPage,
-  ManagementSwitch,
-  MetricGrid,
-  PermissionDenied,
-  SearchInput,
-  Section,
   StatusPill,
   SuccessMessage,
-  TabBar,
-  Textarea,
-  Toolbar,
   formatDate,
   formatDateTime,
-  formatNumber,
 } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
 
-/* ------------------------------------------------------------------ helpers */
-const ALL_PERMISSIONS = OrgPermissionSchema.options as OrgPermission[];
-const PERMISSION_DOMAINS: Array<{ id: string; label: string }> = [
-  { id: "org", label: "Organization" },
-  { id: "org_settings", label: "Organization settings" },
-  { id: "members", label: "People" },
-  { id: "departments", label: "Departments" },
-  { id: "rbac", label: "Roles" },
-  { id: "acl", label: "Resource access" },
-  { id: "models", label: "Models" },
-  { id: "skills", label: "Skills" },
-  { id: "mcp", label: "MCP" },
-  { id: "feature_flags", label: "Feature access" },
-  { id: "guardrails", label: "Execution & network" },
-  { id: "usage", label: "Usage" },
-  { id: "budgets", label: "Budgets" },
-  { id: "billing", label: "Billing" },
-  { id: "reports", label: "Reports" },
-  { id: "alerts", label: "Alerts" },
-  { id: "sso", label: "SSO & SCIM" },
-  { id: "policy", label: "Managed policy" },
-  { id: "auth_policy", label: "Authentication" },
-  { id: "data_policy", label: "Data governance" },
-  { id: "service_accounts", label: "Service accounts" },
-  { id: "audit", label: "Audit" },
-];
-function humanize(value: string) {
-  return value
-    .replaceAll("_", " ")
-    .replaceAll("-", " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
+const KNOWN_PERMISSIONS = new Set<string>(OrgPermissionSchema.options);
+const PRINCIPAL_LABEL: Record<string, string> = { user: "Member", role: "Role", department: "Department" };
+const fieldLabel = "grid gap-1.5 text-xs font-medium text-muted-foreground";
+const help = "text-xs font-normal leading-4";
+const drawerHeading = "text-xs font-medium text-muted-foreground";
+
+function sentence(value: string) {
+  const text = String(value ?? "").replaceAll("_", " ").replaceAll("-", " ");
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
-function domainOf(permission: string) {
-  return permission.split(":")[0];
+/** Long opaque ids are shortened; short readable ones are shown whole. */
+function shortId(value: string) {
+  const text = String(value ?? "");
+  return text.length > 18 ? `${text.slice(0, 8)}…${text.slice(-4)}` : text;
 }
-function actionOf(permission: string) {
-  return permission.split(":")[1] ?? "read";
-}
-function copyText(value: string) {
-  void navigator.clipboard?.writeText(value).catch(() => {});
-}
-function formatPackageBytes(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+function parseKeys(value: FormDataEntryValue | null) {
+  return String(value ?? "")
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean);
 }
 
-/* -------------------------------------------------------------------- roles */
+/**
+ * This screen loads only the rules, not the member or department directory, so
+ * a principal is named by its kind with the id as the quiet second line. Role
+ * principals are stored by role name and can be shown directly.
+ */
+function PrincipalCell({ rule }: { rule: any }) {
+  if (rule.principalType === "role") return <CellStack primary={sentence(rule.principalId)} secondary="Role" />;
+  return <CellStack primary={PRINCIPAL_LABEL[rule.principalType] ?? sentence(rule.principalType)} secondary={<span className="font-mono" title={rule.principalId}>{shortId(rule.principalId)}</span>} />;
+}
+
+function PermissionCodes({ values }: { values: string[] }) {
+  if (!values.length) return <span className="text-muted-foreground">—</span>;
+  const shown = values.slice(0, 2);
+  return (
+    <span className="font-mono text-xs" title={values.join(", ")}>
+      {shown.join(", ")}
+      {values.length > shown.length ? <span className="font-sans text-muted-foreground"> +{values.length - shown.length}</span> : null}
+    </span>
+  );
+}
+
 export function AdminResourceAccessScreen({
   client,
   config,
@@ -109,271 +79,196 @@ export function AdminResourceAccessScreen({
         : config.resourceAcls.filter((x) => x.tenantId === tenantId),
     [] as any[],
   );
-  const [query, setQuery] = React.useState("");
-  const [resourceType, setResourceType] = React.useState("all");
-  const [principalType, setPrincipalType] = React.useState("all");
-  const [active, setActive] = React.useState<number | null>(null);
+  const [activeId, setActiveId] = React.useState<string | null>(null);
   const [adding, setAdding] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const [formError, setFormError] = React.useState("");
   const [message, setMessage] = React.useState("");
-  const resourceTypes = [...new Set(r.data.map((x: any) => x.resourceType))];
-  const rows = r.data.filter(
-    (x: any) =>
-      `${x.resourceId} ${x.principalId}`
-        .toLowerCase()
-        .includes(query.toLowerCase()) &&
-      (resourceType === "all" || x.resourceType === resourceType) &&
-      (principalType === "all" || x.principalType === principalType),
-  );
-  const detail = active != null ? rows[active] : null;
+  // Most recently changed rules first: that is what an administrator is checking.
+  const rows = [...r.data].sort((left: any, right: any) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
+  const activeIndex = rows.findIndex((rule: any) => rule.id === activeId);
+  const detail = activeIndex >= 0 ? rows[activeIndex] : null;
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
+    const allow = parseKeys(form.get("allow"));
+    const deny = parseKeys(form.get("deny"));
+    const unknown = [...allow, ...deny].filter((key) => !KNOWN_PERMISSIONS.has(key));
+    if (unknown.length) {
+      setFormError(`Unknown permission ${unknown.length === 1 ? "key" : "keys"}: ${unknown.join(", ")}. Keys look like acl:read; the full list is under Roles & permissions.`);
+      return;
+    }
     const input = {
       resourceType: String(form.get("resourceType")),
       resourceId: String(form.get("resourceId")),
       principalType: String(form.get("principalType")) as any,
       principalId: String(form.get("principalId")),
-      allow: String(form.get("allow"))
-        .split(",")
-        .map((v) => v.trim())
-        .filter(Boolean) as OrgPermission[],
-      deny: String(form.get("deny"))
-        .split(",")
-        .map((v) => v.trim())
-        .filter(Boolean) as OrgPermission[],
+      allow: allow as OrgPermission[],
+      deny: deny as OrgPermission[],
     };
-    const saved = await client?.upsertResourceAcl(tenantId, input);
-    r.setData([
-      saved ?? {
-        id: crypto.randomUUID(),
-        tenantId,
-        ...input,
-        updatedAt: new Date().toISOString(),
-      },
-      ...r.data,
-    ]);
-    setAdding(false);
-    setMessage("Access rule saved and recorded in the audit log.");
+    setBusy(true);
+    setFormError("");
+    try {
+      const saved = await client?.upsertResourceAcl(tenantId, input);
+      r.setData([
+        saved ?? {
+          id: crypto.randomUUID(),
+          tenantId,
+          ...input,
+          updatedAt: new Date().toISOString(),
+        },
+        ...r.data.filter((rule: any) =>
+          rule.resourceType !== input.resourceType
+          || rule.resourceId !== input.resourceId
+          || rule.principalType !== input.principalType
+          || rule.principalId !== input.principalId,
+        ),
+      ]);
+      setAdding(false);
+      setMessage("Access rule saved and recorded in the audit log.");
+    } catch (cause) {
+      setFormError(cause instanceof Error ? cause.message : "The access rule could not be saved.");
+    } finally {
+      setBusy(false);
+    }
   };
+  const addButton = canWrite ? (
+    <Button onClick={() => { setFormError(""); setAdding(true); }}>
+      <Plus aria-hidden />
+      Add rule
+    </Button>
+  ) : null;
   return (
     <ManagementPage
       title="Resource access"
-      description="Inspect and override sharing for workspaces, agents, prompts, skills, and tasks."
+      description="Exceptions to role permissions for one resource: allow or deny specific permissions for a member, role, or department."
       eyebrow="Access"
-      actions={
-        canWrite ? (
-          <Button onClick={() => setAdding(true)}>
-            <Plus data-icon="inline-start" aria-hidden />
-            Add rule
-          </Button>
-        ) : null
-      }
+      actions={addButton}
     >
-      <Toolbar>
-        <SearchInput
-          label="Search resources"
-          value={query}
-          onChange={setQuery}
-          placeholder="Search resource or principal"
-        />
-        <FilterSelect
-          label="Resource type"
-          value={resourceType}
-          onChange={setResourceType}
-          options={[
-            { value: "all", label: "All" },
-            ...resourceTypes.map((t) => ({
-              value: String(t),
-              label: humanize(String(t)),
-            })),
-          ]}
-        />
-        <FilterSelect
-          label="Principal"
-          value={principalType}
-          onChange={setPrincipalType}
-          options={[
-            { value: "all", label: "All" },
-            { value: "user", label: "User" },
-            { value: "role", label: "Role" },
-            { value: "department", label: "Department" },
-          ]}
-        />
-      </Toolbar>
       {message ? <SuccessMessage>{message}</SuccessMessage> : null}
+      <AsyncState loading={r.loading} error={r.error} onRetry={r.retry}>
+        {rows.length === 0 ? (
+          <EmptyPanel
+            icon={ShieldCheck}
+            title="No access rules"
+            description="Everyone’s access follows their role. Add a rule when one workspace, agent, or skill needs a different set of permissions."
+            action={addButton}
+          />
+        ) : (
+          <DataTable
+            label="Resource access rules"
+            columns={["Resource", "Applies to", "Allows", "Denies", "Updated"]}
+            onRowSelect={(index) => setActiveId(rows[index]?.id ?? null)}
+            activeRow={activeIndex >= 0 ? activeIndex : null}
+            rowLabel={(i) => `${sentence(rows[i].resourceType)} ${rows[i].resourceId}`}
+            rows={rows.map((x: any) => [
+              <CellStack primary={sentence(x.resourceType)} secondary={<span className="font-mono" title={x.resourceId}>{shortId(x.resourceId)}</span>} />,
+              <PrincipalCell rule={x} />,
+              <PermissionCodes values={x.allow ?? []} />,
+              <PermissionCodes values={x.deny ?? []} />,
+              formatDate(x.updatedAt),
+            ])}
+          />
+        )}
+      </AsyncState>
+      {detail ? (
+        <DetailDrawer
+          title={`${sentence(detail.resourceType)} rule`}
+          subtitle={<code>{detail.resourceId}</code>}
+          badge={<StatusPill tone="neutral">{PRINCIPAL_LABEL[detail.principalType] ?? sentence(detail.principalType)}</StatusPill>}
+          onClose={() => setActiveId(null)}
+        >
+          <DefinitionList
+            items={[
+              { term: "Resource type", detail: sentence(detail.resourceType) },
+              { term: "Resource ID", detail: <code className="break-all">{detail.resourceId}</code> },
+              {
+                term: "Applies to",
+                detail: detail.principalType === "role"
+                  ? `${sentence(detail.principalId)} role`
+                  : <>{PRINCIPAL_LABEL[detail.principalType] ?? sentence(detail.principalType)} <code className="break-all text-muted-foreground">{detail.principalId}</code></>,
+              },
+              { term: "Updated", detail: formatDateTime(detail.updatedAt) },
+            ]}
+          />
+          <h3 className={drawerHeading}>Allows</h3>
+          {detail.allow?.length ? (
+            <div className="flex flex-wrap gap-1.5">
+              {detail.allow.map((p: string) => <StatusPill key={p} tone="good">{p}</StatusPill>)}
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">Nothing beyond the role’s own permissions.</p>
+          )}
+          <h3 className={drawerHeading}>Denies</h3>
+          {detail.deny?.length ? (
+            <div className="flex flex-wrap gap-1.5">
+              {detail.deny.map((p: string) => <StatusPill key={p} tone="danger">{p}</StatusPill>)}
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">Nothing is denied by this rule.</p>
+          )}
+          <p className="text-xs leading-5 text-muted-foreground">A deny always wins over an allow. To change this rule, add a rule for the same resource and principal; it replaces this one.</p>
+        </DetailDrawer>
+      ) : null}
       <ManagementDialog
         open={adding}
-        onOpenChange={setAdding}
-        title="Add resource access rule"
-        description="Grant or deny specific permissions for a user, role, or department on one Berry resource."
+        onOpenChange={(next) => { if (!busy) setAdding(next); }}
+        title="Add access rule"
+        description="Allow or deny specific permissions on one resource for a member, role, or department. A rule for the same resource and principal replaces the existing one."
         size="lg"
         footer={
           <>
-            <Button
-              type="button"
-              variant="secondary"
-              onClick={() => setAdding(false)}
-            >
+            <Button type="button" variant="secondary" onClick={() => setAdding(false)} disabled={busy}>
               Cancel
             </Button>
-            <Button type="submit" form="create-resource-rule-form">
+            <Button type="submit" form="create-resource-rule-form" disabled={busy}>
               <Save aria-hidden />
-              Save rule
+              {busy ? "Saving…" : "Save rule"}
             </Button>
           </>
         }
       >
-        <form
-          id="create-resource-rule-form"
-          className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground"
-          onSubmit={submit}
-        >
-          <label>
+        <form id="create-resource-rule-form" className="grid gap-3 sm:grid-cols-2" onSubmit={submit}>
+          <label className={fieldLabel}>
             Resource type
-            <Input
-              name="resourceType"
-              placeholder="workspace"
-              autoFocus
-              required
-            />
+            <Input name="resourceType" placeholder="workspace" autoFocus required />
+            <small className={help}>For example workspace, agent, prompt, skill, or task.</small>
           </label>
-          <label>
+          <label className={fieldLabel}>
             Resource ID
             <Input name="resourceId" required />
+            <small className={help}>The ID shown in the resource’s own details.</small>
           </label>
-          <label>
-            Principal type
+          <label className={fieldLabel}>
+            Applies to
             <FormSelect
               name="principalType"
               defaultValue="user"
               options={[
-                { value: "user", label: "User" },
+                { value: "user", label: "Member" },
                 { value: "role", label: "Role" },
                 { value: "department", label: "Department" },
               ]}
             />
           </label>
-          <label>
-            Principal ID
+          <label className={fieldLabel}>
+            Member, role, or department ID
             <Input name="principalId" required />
+            <small className={help}>For a role, enter its name (owner, admin, or member).</small>
           </label>
-          <label>
-            Allow (comma-separated keys)
-            <Input name="allow" placeholder="acl:read" />
+          <label className={fieldLabel}>
+            Allow
+            <Input name="allow" placeholder="acl:read, skills:read" />
+            <small className={help}>Permission keys, separated by commas.</small>
           </label>
-          <label>
-            Deny (comma-separated keys)
-            <Input name="deny" />
+          <label className={fieldLabel}>
+            Deny
+            <Input name="deny" placeholder="skills:write" />
+            <small className={help}>A deny wins over any allow.</small>
           </label>
         </form>
+        {formError ? <div className="mt-3"><InlineNotice tone="danger">{formError}</InlineNotice></div> : null}
       </ManagementDialog>
-      <div className={detail ? "min-w-0" : undefined}>
-        <AsyncState
-          loading={r.loading}
-          error={r.error}
-          onRetry={r.retry}
-          empty={rows.length === 0}
-        >
-          <DataTable
-            label="Resource access rules"
-            columns={["Resource", "Principal", "Allowed", "Denied", "Updated"]}
-            onRowSelect={setActive}
-            activeRow={active}
-            rowLabel={(i) => `${rows[i].resourceType} ${rows[i].resourceId}`}
-            rows={rows.map((x: any) => [
-              <span className="grid min-w-0 gap-0.5 [&_b]:truncate [&_b]:text-sm [&_small]:text-xs [&_small]:text-muted-foreground">
-                <b>{x.resourceId}</b>
-                <small>{humanize(x.resourceType)}</small>
-              </span>,
-              <span className="grid min-w-0 gap-0.5 [&_b]:truncate [&_b]:text-sm [&_small]:text-xs [&_small]:text-muted-foreground">
-                <b>{x.principalId}</b>
-                <small>{humanize(x.principalType)}</small>
-              </span>,
-              x.allow.length ? (
-                <span className="flex flex-wrap gap-1.5">
-                  {x.allow.map((p: string) => (
-                    <StatusPill key={p} tone="good">
-                      {p}
-                    </StatusPill>
-                  ))}
-                </span>
-              ) : (
-                "—"
-              ),
-              x.deny.length ? (
-                <span className="flex flex-wrap gap-1.5">
-                  {x.deny.map((p: string) => (
-                    <StatusPill key={p} tone="danger">
-                      {p}
-                    </StatusPill>
-                  ))}
-                </span>
-              ) : (
-                "—"
-              ),
-              formatDate(x.updatedAt),
-            ])}
-          />
-        </AsyncState>
-        {detail ? (
-          <DetailDrawer
-            title={detail.resourceId}
-            subtitle={humanize(detail.resourceType)}
-            badge={
-              <StatusPill tone="info">
-                {humanize(detail.principalType)}
-              </StatusPill>
-            }
-            onClose={() => setActive(null)}
-          >
-            <DefinitionList
-              items={[
-                {
-                  term: "Resource",
-                  detail: `${humanize(detail.resourceType)} · ${detail.resourceId}`,
-                },
-                {
-                  term: "Principal",
-                  detail: `${humanize(detail.principalType)} · ${detail.principalId}`,
-                },
-                { term: "Updated", detail: formatDateTime(detail.updatedAt) },
-              ]}
-            />
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              Effective permissions
-            </h3>
-            <div className="flex flex-wrap gap-1.5">
-              {detail.allow.length ? (
-                detail.allow.map((p: string) => (
-                  <StatusPill key={p} tone="good">
-                    {p}
-                  </StatusPill>
-                ))
-              ) : (
-                <span className="text-xs text-muted-foreground">
-                  No explicit grants
-                </span>
-              )}
-            </div>
-            {detail.deny.length ? (
-              <>
-                <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                  Denied
-                </h3>
-                <div className="flex flex-wrap gap-1.5">
-                  {detail.deny.map((p: string) => (
-                    <StatusPill key={p} tone="danger">
-                      {p}
-                    </StatusPill>
-                  ))}
-                </div>
-              </>
-            ) : null}
-          </DetailDrawer>
-        ) : null}
-      </div>
     </ManagementPage>
   );
 }
-
-/* --------------------------------------------------------------- providers */

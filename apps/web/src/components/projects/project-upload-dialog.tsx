@@ -152,8 +152,8 @@ export function ProjectUploadDialog({ open, workspace, onOpenChange, onUpload }:
                   <span className="min-w-0 flex-1">
                     <strong className="block truncate text-xs font-medium">{item.file.name}</strong>
                     {item.state === "uploading" ? <Progress className="mt-1.5 h-1" value={item.progress * 100} aria-label={`${item.file.name} upload progress`} /> : null}
-                    {item.state === "complete" ? <span className="block text-[11px] text-[var(--berry-text-tertiary)]">Added to Library</span> : null}
-                    {item.state === "error" ? <span className="block text-[11px] text-destructive">{item.error}</span> : null}
+                    {item.state === "complete" ? <span className="block text-xs text-[var(--berry-text-tertiary)]">Added to Library</span> : null}
+                    {item.state === "error" ? <span className="block text-xs text-destructive">{item.error}</span> : null}
                   </span>
                 </div>
               ))}

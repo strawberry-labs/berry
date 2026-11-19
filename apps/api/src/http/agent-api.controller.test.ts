@@ -2,7 +2,7 @@ import "reflect-metadata";
 import { ConflictException, UnauthorizedException, type INestApplication } from "@nestjs/common";
 import { Test } from "@nestjs/testing";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
-import type { AgentStreamEvent } from "@berry/shared";
+import { DurableTurnRuntimeRequestSchema, type AgentStreamEvent } from "@berry/shared";
 import type { McpServerSpec, SessionHost, StartTurnOptions } from "@berry/local-agent";
 import request from "supertest";
 import { firstValueFrom, take } from "rxjs";
@@ -21,9 +21,14 @@ import { DurableTurnService, type DurableTurnAdmission, type DurableTurnAdmissio
 import { ContextAssemblyService } from "../memory/context-assembly.service.ts";
 import { InMemoryEnterpriseIdentityRepository, type EnterpriseIdentityRepository } from "../identity/identity.repository.ts";
 import { apiRuntimeMetrics } from "../runtime/runtime-metrics.ts";
-import { AgentApiController, durableAdmissionPreparationTimeoutMs, durableCapabilityPreparationTimeoutMs, durableTaskReconciliationStatus, networkPolicyWithApprovedMcpDomains, normalizeImprovedPrompt, preservePromptSkillTokens, PROMPT_IMPROVEMENT_MODEL, promptImprovementModelInput, promptImprovementSkills, turnAdmissionFingerprint } from "./agent-api.controller.ts";
+import { AgentApiController, durableAdmissionPreparationTimeoutMs, durableCapabilityPreparationTimeoutMs, durableTaskReconciliationStatus, networkPolicyWithApprovedMcpDomains, normalizeImprovedPrompt, preservePromptSkillTokens, promptImprovementModelInput, promptImprovementSkills, turnAdmissionFingerprint } from "./agent-api.controller.ts";
 import { SupportViewController } from "./support-view.controller.ts";
+import { ScheduledTaskDispatcher } from "../schedules/scheduled-task-dispatcher.ts";
+import type { ScheduledTasksService } from "../schedules/scheduled-tasks.service.ts";
+import { SupportWorkspaceController } from "./support-workspace.controller.ts";
 import { MANAGEMENT_SERVICE, ManagementService } from "../management/management.service.ts";
+
+const PROMPT_IMPROVEMENT_MODEL = "inference-net/deepseek-v4.1-flash-1017";
 
 describe("AgentApiController", () => {
   let app: INestApplication | null = null;
@@ -47,11 +52,50 @@ describe("AgentApiController", () => {
     }
   });
 
+  it.each(["chat", "automation"])("admits native browser controls and owner credentials through the ordinary %s path", async (kind) => {
+    const runtimeConfig = new CloudRuntimeConfigService({
+      ...chatRuntimeEnv(), BERRYCRAWL_API_KEY: "browser-fixture-secret",
+      BERRY_CLOUD_MCP_SERVERS_JSON: JSON.stringify([{
+        id: "berrycrawl", name: "BerryCrawl", transport: "streamable-http",
+        url: "https://api.berrycrawl.com/api/v1/mcp", credentialEnv: "BERRYCRAWL_API_KEY",
+      }]),
+    });
+    const admit = vi.fn(async (input: DurableTurnAdmission) => ({ runId: "browser-turn", sessionId: input.sessionId }));
+    app = await createApp(fakeSessionHost(), {
+      runtimeConfig, durableTurns: { enabled: true, replayAdmission: async () => null, admit },
+    });
+    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader())
+      .send({ workspaceId: "workspace_cloud", title: "Browser report", permissionMode: "full-access" }).expect(201);
+    const input = "Open the browser, inspect the report, and summarize it";
+    if (kind === "automation") {
+      const claim = { id: "00000000-0000-7000-8000-000000000911", userId: "user_1", sessionId: created.body.session.id, workspaceId: "workspace_cloud", email: "test@example.test", name: "Test User", input: { prompt: input, timezone: "Asia/Dubai", reasoning: "off" } };
+      const repo = { enqueueDue: vi.fn().mockResolvedValue(1), claimPending: vi.fn().mockResolvedValue([claim]), authorizeClaim: vi.fn().mockResolvedValue(true), admitted: vi.fn(), failed: vi.fn() };
+      const schedules = { enabled: true, tenantId: SELF_HOST_TENANT_ID, repository: async (fn: (repository: typeof repo) => Promise<unknown>) => fn(repo) };
+      await new ScheduledTaskDispatcher(schedules as unknown as ScheduledTasksService, app.get(AgentApiController), runtimeConfig).tick();
+      expect(repo.failed).not.toHaveBeenCalled();
+      expect(repo.admitted).toHaveBeenCalledWith(SELF_HOST_TENANT_ID, claim.id, expect.any(String), "browser-turn");
+    } else {
+      await request(app.getHttpServer()).post(`/v1/sessions/${created.body.session.id}/turns`).set(authHeader())
+        .send({ input, workspacePath: "/workspace" }).expect(201);
+    }
+    expect(admit).toHaveBeenCalledOnce();
+    const admitted = admit.mock.calls[0]![0];
+    expect(admitted).toMatchObject({ userId: "user_1", input, runtimeRequest: { permissionMode: "full-access" } });
+    const browser = DurableTurnRuntimeRequestSchema.parse(admitted.runtimeRequest).mcpServers[0]!;
+    expect(browser.cachedTools).toHaveLength(22);
+    expect(browser.defaultTools).toEqual(expect.arrayContaining(["berrycrawl_browser_open", "berrycrawl_browser_snapshot", "berrycrawl_browser_click", "berrycrawl_browser_close"]));
+    expect(browser.nonReplayableTools).toContain("berrycrawl_browser_click");
+    expect(browser.allowedTools).not.toContain("berrycrawl_browser_run_task");
+    expect(browser.credentialRef).toBe("env:BERRYCRAWL_API_KEY");
+    expect(JSON.stringify(admitted.runtimeRequest)).not.toContain("browser-fixture-secret");
+  });
+
   it("wires support-view delegation in the production module", async () => {
     app = await createApp(fakeSessionHost());
 
     const supportView = app.get(SupportViewController) as unknown as { agentApi?: unknown };
     expect(supportView.agentApi).toBeInstanceOf(AgentApiController);
+    expect(app.get(SupportWorkspaceController)).toBeInstanceOf(SupportWorkspaceController);
   });
 
   afterEach(async () => {
@@ -136,7 +180,7 @@ describe("AgentApiController", () => {
     }, "2026-08-13T10:00:00.000Z")).toBe("cancelled");
   });
 
-  it("improves prompts with the fixed low-cost model and records measured usage", async () => {
+  it("improves prompts with the deployment default and records measured usage", async () => {
     const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify({
       id: "completion_prompt_improve",
       model: PROMPT_IMPROVEMENT_MODEL,
@@ -163,7 +207,7 @@ describe("AgentApiController", () => {
     expect(fetchImpl).toHaveBeenCalledOnce();
     const upstreamRequest = fetchImpl.mock.calls[0]![1]!;
     const upstreamBody = JSON.parse(String(upstreamRequest.body)) as Record<string, unknown>;
-    expect(upstreamBody).toMatchObject({ model: PROMPT_IMPROVEMENT_MODEL, stream: false, temperature: 0.2 });
+    expect(upstreamBody).toMatchObject({ model: PROMPT_IMPROVEMENT_MODEL, stream: false, temperature: 0.2, reasoning: { effort: "low" } });
     expect(upstreamBody).not.toHaveProperty("tools");
     expect(upstreamBody.messages).toEqual([
       expect.objectContaining({ role: "system", content: expect.stringContaining("Return only the improved prompt") }),
@@ -216,7 +260,7 @@ describe("AgentApiController", () => {
       ));
 
     const upstream = JSON.parse(String(fetchImpl.mock.calls[0]![1]!.body)) as Record<string, unknown>;
-    expect(upstream).toMatchObject({ reasoning: { effort: "minimal" }, max_tokens: 1_024 });
+    expect(upstream).toMatchObject({ reasoning: { effort: "low" }, max_tokens: 1_024 });
     expect(JSON.stringify(upstream.messages)).toContain("$research");
   });
 
@@ -1465,6 +1509,71 @@ describe("AgentApiController", () => {
     expect(startTurn).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { durable: false, change: "disabled" },
+    { durable: true, change: "disabled" },
+    { durable: false, change: "removed" },
+    { durable: true, change: "removed" },
+  ])("replaces a $change saved model before a turn and persists the replacement (durable: $durable)", async ({ durable, change }) => {
+    const oldModel = "kimi-retired";
+    const replacement = "task-default";
+    const repository = new InMemoryModelGovernanceRepository(false);
+    const governance = new ModelGovernanceService(repository);
+    await governance.upsertDefault({ tenantId: SELF_HOST_TENANT_ID, mode: "chat", providerId: "router", model: replacement });
+    const runtimeConfig = new CloudRuntimeConfigService({
+      ...chatRuntimeEnv(),
+      BERRY_ROUTER_DEFAULT_MODEL: replacement,
+      BERRY_ROUTER_MODELS_JSON: JSON.stringify([{ id: oldModel }, { id: replacement }]),
+    });
+    const startTurn = vi.fn((_input: StartTurnOptions) => ({ turnId: "fallback-turn" }));
+    const admit = vi.fn(async (input: DurableTurnAdmission) => ({ runId: "fallback-run", sessionId: input.sessionId }));
+    app = await createApp(fakeSessionHost({ startTurn }), {
+      runtimeConfig, modelGovernance: governance,
+      ...(durable ? { durableTurns: { enabled: true, replayAdmission: async () => null, admit } } : {}),
+    });
+    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({
+      workspaceId: "workspace_cloud", title: "Existing Kimi task", modelProviderId: "router", model: oldModel,
+    }).expect(201);
+    const sessionId = created.body.session.id;
+    expect(created.body.session.model).toBe(oldModel);
+
+    if (change === "disabled") {
+      await governance.upsertPolicy({ tenantId: SELF_HOST_TENANT_ID, providerId: "router", model: oldModel, status: "blocked" });
+    } else {
+      runtimeConfig.config.provider!.models = [{ id: replacement }];
+    }
+    // Reproduce both the stale saved session and the stale browser override.
+    await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/turns`).set(authHeader()).send({
+      input: "Continue the existing conversation", workspacePath: "/workspace", provider: { id: "router" }, model: oldModel,
+    }).expect(201);
+    const first = durable ? admit.mock.calls[0]?.[0].runtimeRequest : startTurn.mock.calls[0]?.[0];
+    expect(first).toMatchObject({ model: replacement });
+    await request(app.getHttpServer()).get(`/v1/sessions/${sessionId}`).set(authHeader()).expect(200).expect(({ body }) => {
+      expect(body).toMatchObject({ modelProviderId: "router", model: replacement });
+    });
+    await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/turns`).set(authHeader())
+      .send({ input: "Another message", workspacePath: "/workspace" }).expect(201);
+    const next = durable ? admit.mock.calls[1]?.[0].runtimeRequest : startTurn.mock.calls[1]?.[0];
+    expect(next).toMatchObject({ model: replacement });
+    if (change === "disabled") {
+      expect(await governance.listModels(SELF_HOST_TENANT_ID, { includeBlocked: true }))
+        .toContainEqual(expect.objectContaining({ model: oldModel, status: "blocked" }));
+    }
+  });
+
+  it("replaces a stale browser model when creating a new task", async () => {
+    const runtimeConfig = chatRuntimeConfig();
+    const governance = new ModelGovernanceService(new InMemoryModelGovernanceRepository(false));
+    await governance.upsertPolicy({ tenantId: SELF_HOST_TENANT_ID, providerId: "router", model: "kimi-retired", status: "blocked" });
+    app = await createApp(fakeSessionHost(), { runtimeConfig, modelGovernance: governance });
+
+    await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({
+      workspaceId: "workspace_cloud", title: "New task", modelProviderId: "router", model: "kimi-retired",
+    }).expect(201).expect(({ body }) => {
+      expect(body.session).toMatchObject({ modelProviderId: "router", model: "chat-model" });
+    });
+  });
+
   it("blocks disallowed models before budget reservation and model work", async () => {
     const startTurn = vi.fn(() => ({ turnId: "turn_never" }));
     const repository = new InMemoryModelGovernanceRepository(false);
@@ -2364,14 +2473,14 @@ function promptImprovementRuntimeConfig(): CloudRuntimeConfigService {
     BERRY_ROUTER_DEFAULT_MODEL: PROMPT_IMPROVEMENT_MODEL,
     BERRY_ROUTER_MODELS_JSON: JSON.stringify([{
       id: PROMPT_IMPROVEMENT_MODEL,
-      name: "DeepSeek V4 Flash",
-      contextWindow: 1_000_000,
+      name: "DeepSeek V4.1 Flash",
+      contextWindow: 1_024_000,
       maxOutputTokens: 384_000,
       capabilities: {
         tools: true,
         reasoning: true,
         json: true,
-        cost: { input: 0.14, output: 0.28, cacheRead: 0.03 },
+        cost: { input: 0.3, output: 1.2, cacheRead: 0.006 },
       },
     }]),
   });

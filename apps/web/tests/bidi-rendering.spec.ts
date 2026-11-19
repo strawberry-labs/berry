@@ -119,6 +119,44 @@ test("a streaming mixed Arabic/English answer reads right to left (H-047)", asyn
   }
 });
 
+test("a wide chat table opens in a scrollable modal", async ({ page, browserName }) => {
+  servedOnlyInChromium(browserName);
+  await page.setViewportSize({ width: 1600, height: 900 });
+  const columns = Array.from({ length: 24 }, (_, index) => `Column ${index + 1}`);
+  const row = (cells: string[]) => `| ${cells.join(" | ")} |`;
+  const markdown = [
+    row(columns),
+    row(columns.map(() => "---")),
+    ...Array.from({ length: 50 }, (_, index) => row(columns.map((column) => `Row ${index + 1}, ${column}`))),
+  ].join("\n");
+  await page.route("**/v1/sessions/*/messages*", async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    const assistant = body.messages.find((message: { role: string }) => message.role === "assistant");
+    assistant.parts[0].content = markdown;
+    await route.fulfill({ response, json: body });
+  });
+  await page.goto(`/tasks/${settledTask}`);
+  const trigger = page.getByRole("button", { name: "Expand table" });
+  await trigger.click();
+  const dialog = page.getByRole("dialog", { name: "Expanded table" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("cell", { name: "Row 50, Column 24", exact: true })).toBeAttached();
+  const scroll = await dialog.getByRole("region", { name: "Table contents" }).evaluate((element) => {
+    element.scrollTo(element.scrollWidth, element.scrollHeight);
+    return { x: element.scrollLeft, y: element.scrollTop };
+  });
+  expect(scroll.x).toBeGreaterThan(0);
+  expect(scroll.y).toBeGreaterThan(0);
+  await expect(page.locator('[data-slot="dialog-overlay"]')).toHaveCSS("backdrop-filter", /blur/);
+  await dialog.getByRole("button", { name: "Close" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(trigger).toBeFocused();
+  await trigger.click();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+});
+
 test("a directed prompt keeps its line clamp and per-line alignment (H-047)", async ({ page }) => {
   // Same structure as DirectedText inside CollapsibleSubmittedPrompt: block
   // lines inside a -webkit-line-clamp box (no whitespace between the spans).

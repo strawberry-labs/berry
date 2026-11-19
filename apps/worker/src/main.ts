@@ -149,12 +149,13 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
   });
   const compactor = new DurableSessionCompactor(
     new SqlSessionCompactionRepository(executor),
-    createCheckpointGenerator(env),
+    null,
     {
       leaseOwner: `${hostname()}:${process.pid}:${randomUUID()}:compactor`,
       leaseSeconds: durableConfig.runLeaseSeconds,
-      fallbackProvider: env.BERRY_COMPACTION_PROVIDER ?? "deterministic",
-      fallbackModel: env.BERRY_COMPACTION_MODEL ?? "checkpoint-v2",
+      generatorForModel: (selection) => createCheckpointGenerator(env, selection),
+      fallbackProvider: env.BERRY_ROUTER_PROVIDER_ID?.trim() || "router",
+      fallbackModel: env.BERRY_ROUTER_DEFAULT_MODEL?.trim() || "inference-net/deepseek-v4.1-flash-1017",
     },
   );
   const personalMemory = createPersonalMemoryProviderFromEnv(env);

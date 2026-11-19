@@ -7,18 +7,27 @@ import { PgSqlExecutor } from "./db/pg-executor.js";
 import { OrganizationCapabilitiesService } from "./http/organization-capabilities.service.js";
 import { PersonalCapabilitiesService } from "./http/personal-capabilities.service.js";
 
-const AESG_SKILLS = ["aesg-branding", "cv-creator", "docx", "pdf", "pptx", "skill-creator", "xlsx"] as const;
+const GOOGLE_MCP_SKILLS = ["gmail-mcp", "google-calendar-mcp", "google-drive-mcp"] as const;
+const AESG_SKILLS = ["aesg-branding", "cv-creator", "docx", ...GOOGLE_MCP_SKILLS, "pdf", "pptx", "skill-creator", "xlsx"] as const;
 
 export async function syncOrganizationSkillPackages(env: NodeJS.ProcessEnv = process.env, argv: readonly string[] = process.argv.slice(2)): Promise<void> {
   const databaseUrl = env.BERRY_DATABASE_URL ?? env.DATABASE_URL;
   if (!databaseUrl) throw new Error("BERRY_DATABASE_URL or DATABASE_URL is required");
   const root = resolve(argument(argv, "--root") ?? "/organization-skill-import");
   const tenantId = argument(argv, "--tenant") ?? env.AESG_TENANT_ID ?? "00000000-0000-7000-8000-000000000001";
+  const selectedSkills = argv.flatMap((value, index) => {
+    if (value !== "--skill") return [];
+    const skill = argv[index + 1];
+    if (!skill || skill.startsWith("--")) throw new Error("--skill requires a value");
+    if (!AESG_SKILLS.some((id) => id === skill)) throw new Error(`Unknown managed skill: ${skill}`);
+    return [skill];
+  });
+  const skillIds = selectedSkills.length ? AESG_SKILLS.filter((id) => selectedSkills.includes(id)) : AESG_SKILLS;
   const executor = PgSqlExecutor.fromConnectionString(databaseUrl);
   try {
     const reviewer = new OrganizationCapabilitiesService(new PersonalCapabilitiesService(undefined, env));
     const prepared: Array<{ capabilityId: typeof AESG_SKILLS[number]; skill: Awaited<ReturnType<typeof readOrganizationSkillDirectory>>; review: Awaited<ReturnType<OrganizationCapabilitiesService["reviewSkill"]>> }> = [];
-    for (const capabilityId of AESG_SKILLS) {
+    for (const capabilityId of skillIds) {
       const packageRoot = join(root, capabilityId);
       const skill = await readOrganizationSkillDirectory(packageRoot);
       const review = await reviewer.reviewSkill({ ...skill, source: "upload" });
@@ -31,13 +40,14 @@ export async function syncOrganizationSkillPackages(env: NodeJS.ProcessEnv = pro
       const results = [];
       for (const { capabilityId, skill, review } of prepared) {
         const current = (await organizations.list(tenantId)).find((item) => item.kind === "skill" && item.capabilityId === capabilityId);
+        const connectorSkill = GOOGLE_MCP_SKILLS.some((id) => id === capabilityId);
         const saved = await organizations.upsert(tenantId, {
           kind: "skill",
           capabilityId,
           name: current?.name ?? review.name,
           description: review.description,
-          assignment: current?.assignment ?? "required",
-          allowUserDisable: current?.allowUserDisable ?? false,
+          assignment: current?.assignment ?? (connectorSkill ? "default-on" : "required"),
+          allowUserDisable: current?.allowUserDisable ?? connectorSkill,
           contentHash: review.hash,
           config: { content: skill.content, packageStorageVersion: 1 },
           resourceFiles: skill.resourceFiles,

@@ -1,3 +1,6 @@
+import { BrowserHandoffController } from "../browser/browser-handoff.controller.js";
+import { BrowserHandoffService } from "../browser/browser-handoff.service.js";
+import { CloudDatabaseService } from "../db/cloud-database.service.js";
 import { ScheduledTasksController } from "../schedules/scheduled-tasks.controller.ts";
 import { ScheduledTasksService } from "../schedules/scheduled-tasks.service.ts";
 import { ScheduledTaskDispatcher } from "../schedules/scheduled-task-dispatcher.ts";
@@ -42,6 +45,13 @@ import { SetupModule } from "../setup/setup.module.ts";
 import type { SetupService } from "../setup/setup.service.ts";
 import { QueuedFollowUpService } from "../runtime/queued-follow-up.service.js";
 import { SupportViewController } from "./support-view.controller.ts";
+import { SupportWorkspaceController } from "./support-workspace.controller.ts";
+import { AllowanceController } from "../budget/allowance.controller.ts";
+import { UsageController } from "../usage/usage.controller.ts";
+import { MobileController, MobileDeviceAdminController } from "../mobile/mobile.controller.ts";
+import { MOBILE_PAIRING_CONFIG, MobilePairingService, mobilePairingConfigFromEnv, type MobilePairingConfig } from "../mobile/mobile-pairing.service.ts";
+import { InMemoryMobilePairingStore, MOBILE_PAIRING_STORE, type MobilePairingStore } from "../mobile/mobile-pairing.store.ts";
+import { InMemoryMobileRateLimiter, MOBILE_RATE_LIMITER, type MobileRateLimiter } from "../mobile/mobile-rate-limiter.ts";
 
 export type AgentApiModuleOptions = {
   sessionHost: { useValue: SessionHost } | Pick<FactoryProvider<SessionHost>, "inject" | "useFactory">;
@@ -63,6 +73,12 @@ export type AgentApiModuleOptions = {
   durableContextEnabled?: boolean;
   connectors?: { useValue: ConnectorsService };
   setup?: { useValue: SetupService };
+  mobile?: {
+    store?: MobilePairingStore;
+    rateLimiter?: MobileRateLimiter;
+    config?: MobilePairingConfig;
+    env?: NodeJS.ProcessEnv;
+  };
 };
 
 @Module({})
@@ -80,6 +96,16 @@ export class AgentApiModule {
         ? { provide: MOBILE_DEVICE_REGISTRY, useValue: options.mobileDevices.useValue }
         : { provide: MOBILE_DEVICE_REGISTRY, inject: options.mobileDevices.inject ?? [], useFactory: options.mobileDevices.useFactory }
       : { provide: MOBILE_DEVICE_REGISTRY, useClass: InMemoryMobileDeviceRegistry };
+    const setupService = options.setup?.useValue;
+    const mobileConfig = options.mobile?.config ?? mobilePairingConfigFromEnv(
+      options.mobile?.env ?? process.env,
+      setupService
+        ? async () => {
+          const { organization } = await setupService.status();
+          return { applicationName: organization.applicationName, logoUrl: organization.logoUrl ?? null, accentColor: organization.accentColor ?? null };
+        }
+        : undefined,
+    );
     const sandboxWorkspaceProvider: Provider<SandboxWorkspaceService> = options.sandboxWorkspace
       ? { provide: SANDBOX_WORKSPACE_SERVICE, useValue: options.sandboxWorkspace.useValue }
       : { provide: SANDBOX_WORKSPACE_SERVICE, useFactory: () => new SandboxWorkspaceService({ provider: new FixtureSandboxProvider() }) };
@@ -100,14 +126,27 @@ export class AgentApiModule {
         ...(durableContextEnabled ? [MemoryModule] : []),
         SessionHostModule.register(options.sessionHost),
       ],
-      controllers: [ScheduledTasksController, MemberSkillsController, AgentApiController, SupportViewController, PersonalCapabilitiesController, OrganizationCapabilitiesController, ConnectorsController, OrganizationConnectorsController],
+      controllers: [BrowserHandoffController, ScheduledTasksController, MemberSkillsController, AgentApiController, SupportViewController, SupportWorkspaceController, PersonalCapabilitiesController, OrganizationCapabilitiesController, ConnectorsController, OrganizationConnectorsController, MobileController, MobileDeviceAdminController],
       providers: [
         // SupportViewController delegates member-scoped operations through the
         // existing API surface. Register the controller as a provider as well
         // so that delegation is available in the production module.
         AgentApiController,
+        BrowserHandoffController,
+        ...(durableContextEnabled ? [{ provide: BrowserHandoffService, inject: [CloudDatabaseService], useFactory: (database: CloudDatabaseService) => new BrowserHandoffService(database) }] : []),
+        SupportViewController,
+        ScheduledTasksController,
+        PersonalCapabilitiesController,
+        OrganizationCapabilitiesController,
+        MemberSkillsController,
+        AllowanceController,
+        UsageController,
         storeProvider,
         mobileDeviceProvider,
+        { provide: MOBILE_PAIRING_STORE, useValue: options.mobile?.store ?? new InMemoryMobilePairingStore() },
+        { provide: MOBILE_RATE_LIMITER, useValue: options.mobile?.rateLimiter ?? new InMemoryMobileRateLimiter() },
+        { provide: MOBILE_PAIRING_CONFIG, useValue: mobileConfig },
+        MobilePairingService,
         sandboxWorkspaceProvider,
         {
           provide: CONNECTORS,
@@ -120,7 +159,9 @@ export class AgentApiModule {
         options.organizationCapabilities ? { provide: ORGANIZATION_CAPABILITIES, useValue: options.organizationCapabilities.useValue } : { provide: ORGANIZATION_CAPABILITIES, inject: [PERSONAL_CAPABILITIES], useFactory: (personal: PersonalCapabilitiesService) => new OrganizationCapabilitiesService(personal) },
         { provide: DURABLE_TURN_RUNNER_ENABLED, useValue: options.durableRunnerEnabled ?? false },
         TurnCancellationPublisher,
-        QueuedFollowUpService,
+        durableContextEnabled
+          ? QueuedFollowUpService
+          : { provide: QueuedFollowUpService, useValue: null },
         ScheduledTasksService,
         ...(options.durableRunnerEnabled ? [ScheduledTaskDispatcher] : []),
         ...(durableContextEnabled

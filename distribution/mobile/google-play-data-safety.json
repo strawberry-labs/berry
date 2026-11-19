@@ -5,8 +5,9 @@
   "usersCanRequestDeletion": true,
   "dataTypes": [],
   "notes": [
-    "Berry mobile transmits task, chat, approval, session, and optional push-token data only to the endpoint configured by the user.",
-    "Direct custom/LAN endpoint mode sends chat prompts and responses only to that configured endpoint and disables push notifications.",
+    "Berry mobile sends task, message, attachment, approval and session data only to the Berry server the person paired it with by scanning a QR code from their signed-in web session. The app developer receives none of it.",
+    "Accounts are created and deleted by the person's organization on its Berry server; the app has no account creation. Signing out or revoking a phone deletes that phone's session on the server.",
+    "Camera, photos and files are used only for scanning the sign-in code and for attachments the person chooses. Push notifications are not used in this version.",
     "The app does not sell data, serve ads, or track users across apps or websites."
   ]
 }

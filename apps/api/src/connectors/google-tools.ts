@@ -3,6 +3,7 @@ import type { McpCachedTool } from "@berry/local-agent";
 import type { ConnectorWorkspaceAccessMode } from "@berry/shared";
 
 export type GoogleConnectorKey = "google-workspace" | "gmail" | "google-calendar";
+export const DEFAULT_GOOGLE_CONNECTOR_ACCESS_LEVEL = "full";
 export type GoogleAccessLevel = "read" | "full";
 
 const SCOPE = {
@@ -72,11 +73,11 @@ function tool(
   access: GoogleAccessLevel,
   scopes: ScopeRequirement,
   run: ToolDefinition["run"],
-  options: { destructive?: boolean; idempotent?: boolean; openWorld?: boolean; approvalRequired?: boolean } = {},
+  options: { destructive?: boolean; idempotent?: boolean; openWorld?: boolean } = {},
 ): ToolDefinition {
   return {
     name, description, inputSchema, access, scopes, run,
-    approvalRequired: options.approvalRequired ?? access === "full",
+    approvalRequired: access === "full",
     annotations: {
       readOnlyHint: access === "read",
       destructiveHint: options.destructive ?? false,
@@ -125,7 +126,6 @@ const workspaceTools: ToolDefinition[] = [
   }, { openWorld: true }),
   tool("drive_move_file", "Move a Drive file between folders.", object({ fileId: string("File ID."), addParentId: string("Destination folder ID."), removeParentIds: stringArray("Parent IDs to remove.", 20) }, ["fileId", "addParentId"]), "full", { all: [SCOPE.driveFile] }, async (token, input) => updateDriveMetadata(token, input, {}, optionalString(input.addParentId), optionalStringArray(input.removeParentIds)), { idempotent: true }),
   tool("drive_rename_file", "Rename a Drive file.", object({ fileId: string("File ID."), name: string("New name.") }, ["fileId", "name"]), "full", { all: [SCOPE.driveFile] }, (token, input) => updateDriveMetadata(token, input, { name: requiredString(input.name, "name") }), { idempotent: true }),
-  tool("drive_trash_file", "Move a Drive file to trash. This is reversible.", object({ fileId: string("File ID.") }, ["fileId"]), "full", { all: [SCOPE.driveFile] }, (token, input) => updateDriveMetadata(token, input, { trashed: true }), { destructive: true, idempotent: true }),
   tool("drive_restore_file", "Restore a Drive file from trash.", object({ fileId: string("File ID.") }, ["fileId"]), "full", { all: [SCOPE.driveFile] }, (token, input) => updateDriveMetadata(token, input, { trashed: false }), { idempotent: true }),
 
   tool("docs_read_document", "Read all tabs and structural content in a Google Doc.", object({ documentId: string("Document ID.") }, ["documentId"]), "read", driveReadScopes,
@@ -146,7 +146,6 @@ const workspaceTools: ToolDefinition[] = [
   tool("sheets_create_spreadsheet", "Create a spreadsheet with optional sheet titles.", object({ title: string("Spreadsheet title."), sheetTitles: stringArray("Optional initial sheet titles.", 20) }, ["title"]), "full", { any: [SCOPE.driveFile, SCOPE.sheets] }, (token, input) => googleJson(token, sheetsUrl("spreadsheets"), { method: "POST", body: jsonBody({ properties: { title: requiredString(input.title, "title") }, ...(optionalStringArray(input.sheetTitles)?.length ? { sheets: optionalStringArray(input.sheetTitles)!.map((title) => ({ properties: { title } })) } : {}) }) }), { openWorld: true }),
   tool("sheets_update_values", "Replace values in a bounded A1 range.", valuesWriteSchema(false), "full", { any: [SCOPE.driveFile, SCOPE.sheets] }, (token, input) => googleJson(token, sheetsUrl(`spreadsheets/${encodeURIComponent(requiredString(input.spreadsheetId, "spreadsheetId"))}/values/${encodeURIComponent(requiredString(input.range, "range"))}`, { valueInputOption: optionalString(input.valueInputOption) ?? "USER_ENTERED" }), { method: "PUT", body: jsonBody({ range: requiredString(input.range, "range"), majorDimension: optionalString(input.majorDimension) ?? "ROWS", values: boundedValues(input.values) }) }), { idempotent: true }),
   tool("sheets_append_values", "Append rows after a table in a bounded A1 range.", valuesWriteSchema(false), "full", { any: [SCOPE.driveFile, SCOPE.sheets] }, (token, input) => googleJson(token, sheetsUrl(`spreadsheets/${encodeURIComponent(requiredString(input.spreadsheetId, "spreadsheetId"))}/values/${encodeURIComponent(requiredString(input.range, "range"))}:append`, { valueInputOption: optionalString(input.valueInputOption) ?? "USER_ENTERED", insertDataOption: "INSERT_ROWS" }), { method: "POST", body: jsonBody({ range: requiredString(input.range, "range"), majorDimension: optionalString(input.majorDimension) ?? "ROWS", values: boundedValues(input.values) }) }), { idempotent: false }),
-  tool("sheets_clear_values", "Clear values in a bounded A1 range.", object({ spreadsheetId: string("Spreadsheet ID."), range: string("A1 range.") }, ["spreadsheetId", "range"]), "full", { any: [SCOPE.driveFile, SCOPE.sheets] }, (token, input) => googleJson(token, sheetsUrl(`spreadsheets/${encodeURIComponent(requiredString(input.spreadsheetId, "spreadsheetId"))}/values/${encodeURIComponent(requiredString(input.range, "range"))}:clear`), { method: "POST", body: "{}" }), { destructive: true, idempotent: true }),
   tool("sheets_add_sheet", "Add a sheet tab.", object({ spreadsheetId: string("Spreadsheet ID."), title: string("New sheet title."), rowCount: integer("Initial rows.", 1, 100_000), columnCount: integer("Initial columns.", 1, 1_000) }, ["spreadsheetId", "title"]), "full", { any: [SCOPE.driveFile, SCOPE.sheets] }, (token, input) => sheetsBatch(token, input, [{ addSheet: { properties: { title: requiredString(input.title, "title"), gridProperties: { rowCount: boundedInteger(input.rowCount, 1000, 1, 100_000), columnCount: boundedInteger(input.columnCount, 26, 1, 1_000) } } } }]), { openWorld: true }),
   tool("sheets_format_range", "Apply basic bold, italic, background, and number formatting to a grid range.", gridRangeSchema({ bold: boolean("Bold text."), italic: boolean("Italic text."), backgroundColorHex: string("Six-digit hex RGB."), numberPattern: string("Optional number-format pattern.") }), "full", { any: [SCOPE.driveFile, SCOPE.sheets] }, formatSheetRange, { idempotent: true }),
   tool("sheets_insert_dimension", "Insert rows or columns before a bounded index.", object({ spreadsheetId: string("Spreadsheet ID."), sheetId: integer("Numeric sheet ID.", 0, 2_147_483_647), dimension: string("ROWS or COLUMNS.", { enum: ["ROWS", "COLUMNS"] }), startIndex: integer("Zero-based start index.", 0, 1_000_000), count: integer("Number to insert.", 1, 1_000) }, ["spreadsheetId", "sheetId", "dimension", "startIndex", "count"]), "full", { any: [SCOPE.driveFile, SCOPE.sheets] }, (token, input) => sheetsBatch(token, input, [{ insertDimension: { range: { sheetId: boundedInteger(input.sheetId, 0, 0, 2_147_483_647), dimension: requiredEnum(input.dimension, ["ROWS", "COLUMNS"], "dimension"), startIndex: boundedInteger(input.startIndex, 0, 0, 1_000_000), endIndex: boundedInteger(input.startIndex, 0, 0, 1_000_000) + boundedInteger(input.count, 1, 1, 1_000) }, inheritFromBefore: false } }]), { idempotent: false }),
@@ -158,7 +157,6 @@ const workspaceTools: ToolDefinition[] = [
   tool("slides_add_text", "Add a text box to a slide.", object({ presentationId: string("Presentation ID."), pageObjectId: string("Target slide object ID."), text: string("Text."), x: number("X position in points."), y: number("Y position in points."), width: number("Width in points."), height: number("Height in points.") }, ["presentationId", "pageObjectId", "text"]), "full", { any: [SCOPE.driveFile, SCOPE.slides] }, addSlideText, { openWorld: true }),
   tool("slides_replace_text", "Replace all matching text in a presentation.", object({ presentationId: string("Presentation ID."), find: string("Text to find."), replace: string("Replacement."), matchCase: boolean("Match case."), pageObjectIds: stringArray("Optional slides to limit replacement.", 100) }, ["presentationId", "find", "replace"]), "full", { any: [SCOPE.driveFile, SCOPE.slides] }, (token, input) => slidesBatch(token, input, [{ replaceAllText: { containsText: { text: requiredString(input.find, "find"), matchCase: optionalBoolean(input.matchCase) ?? true }, replaceText: stringValue(input.replace), ...(optionalStringArray(input.pageObjectIds)?.length ? { pageObjectIds: optionalStringArray(input.pageObjectIds) } : {}) } }]), { idempotent: true }),
   tool("slides_add_image", "Add an image from a public HTTPS URL. Google requires PNG, JPEG, or GIF under 50 MB and 25 MP.", object({ presentationId: string("Presentation ID."), pageObjectId: string("Target slide object ID."), imageUrl: string("Public HTTPS image URL."), x: number("X points."), y: number("Y points."), width: number("Width points."), height: number("Height points.") }, ["presentationId", "pageObjectId", "imageUrl"]), "full", { any: [SCOPE.driveFile, SCOPE.slides] }, addSlideImage, { openWorld: true }),
-  tool("slides_delete_object", "Delete a slide element or slide.", object({ presentationId: string("Presentation ID."), objectId: string("Object ID.") }, ["presentationId", "objectId"]), "full", { any: [SCOPE.driveFile, SCOPE.slides] }, (token, input) => slidesBatch(token, input, [{ deleteObject: { objectId: requiredString(input.objectId, "objectId") } }]), { destructive: true, idempotent: true }),
 
   tool("forms_get_form", "Read a Google Form and its questions.", object({ formId: string("Form ID.") }, ["formId"]), "read", driveReadScopes, (token, input) => googleJson(token, formsUrl(`forms/${encodeURIComponent(requiredString(input.formId, "formId"))}`))),
   tool("forms_list_responses", "List form responses with an optional timestamp filter.", object({ formId: string("Form ID."), filter: string("Only timestamp > or >= filters are supported."), pageSize: integer("Maximum responses.", 1, 500), pageToken: string("Continuation token.") }, ["formId"]), "read", { any: [SCOPE.driveFile, SCOPE.formsResponses] }, (token, input) => googleJson(token, formsUrl(`forms/${encodeURIComponent(requiredString(input.formId, "formId"))}/responses`, { filter: optionalString(input.filter), pageSize: boundedInteger(input.pageSize, 100, 1, 500), pageToken: optionalString(input.pageToken) }))),
@@ -167,7 +165,6 @@ const workspaceTools: ToolDefinition[] = [
   tool("forms_add_question", "Add a text, paragraph, choice, checkbox, dropdown, scale, date, or time question.", formQuestionSchema(false), "full", { any: [SCOPE.driveFile, SCOPE.formsBody] }, addFormQuestion, { openWorld: true }),
   tool("forms_update_question", "Replace an existing question item.", formQuestionSchema(true), "full", { any: [SCOPE.driveFile, SCOPE.formsBody] }, updateFormQuestion, { idempotent: true }),
   tool("forms_move_item", "Move a form item to a new zero-based index.", object({ formId: string("Form ID."), originalIndex: integer("Current index.", 0, 10_000), newIndex: integer("New index.", 0, 10_000), revisionId: string("Optional required revision ID.") }, ["formId", "originalIndex", "newIndex"]), "full", { any: [SCOPE.driveFile, SCOPE.formsBody] }, (token, input) => formsBatch(token, input, [{ moveItem: { originalLocation: { index: boundedInteger(input.originalIndex, 0, 0, 10_000) }, newLocation: { index: boundedInteger(input.newIndex, 0, 0, 10_000) } } }]), { idempotent: true }),
-  tool("forms_delete_item", "Delete a form item by zero-based index.", object({ formId: string("Form ID."), index: integer("Item index.", 0, 10_000), revisionId: string("Optional required revision ID.") }, ["formId", "index"]), "full", { any: [SCOPE.driveFile, SCOPE.formsBody] }, (token, input) => formsBatch(token, input, [{ deleteItem: { location: { index: boundedInteger(input.index, 0, 0, 10_000) } } }]), { destructive: true, idempotent: true }),
   tool("forms_set_publish_state", "Publish, unpublish, open, or close a form.", object({ formId: string("Form ID."), isPublished: boolean("Whether the form is published."), isAcceptingResponses: boolean("Whether responses are accepted.") }, ["formId", "isPublished", "isAcceptingResponses"]), "full", { any: [SCOPE.driveFile, SCOPE.formsBody] }, setFormPublishState, { destructive: true, idempotent: true, openWorld: true }),
 ];
 
@@ -185,8 +182,8 @@ const gmailTools: ToolDefinition[] = [
   tool("gmail_list_labels", "List Gmail labels.", object({}), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token) => googleJson(token, gmailUrl("users/me/labels"))),
   tool("gmail_list_drafts", "List Gmail drafts.", gmailSearchSchema("drafts"), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl("users/me/drafts", gmailSearchQuery(input)))),
   tool("gmail_get_draft", "Get one Gmail draft.", object({ draftId: string("Draft ID."), format: string("Message format.", { enum: ["full", "metadata", "minimal", "raw"] }) }, ["draftId"]), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl(`users/me/drafts/${encodeURIComponent(requiredString(input.draftId, "draftId"))}`, { format: optionalString(input.format) ?? "full" }))),
-  tool("gmail_create_draft", "Create a reviewable Gmail draft. This does not send it.", mailSchema(), "full", { all: [SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl("users/me/drafts"), { method: "POST", body: jsonBody({ message: compact({ raw: encodeMail(input), threadId: optionalString(input.threadId) }) }) }), { openWorld: true, approvalRequired: false }),
-  tool("gmail_update_draft", "Replace the content of a Gmail draft.", mailSchema({ draftId: string("Draft ID.") }, ["draftId"]), "full", { all: [SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl(`users/me/drafts/${encodeURIComponent(requiredString(input.draftId, "draftId"))}`), { method: "PUT", body: jsonBody({ id: requiredString(input.draftId, "draftId"), message: compact({ raw: encodeMail(input), threadId: optionalString(input.threadId) }) }) }), { idempotent: true, openWorld: true, approvalRequired: false }),
+  tool("gmail_create_draft", "Create a reviewable Gmail draft. This does not send it.", mailSchema(), "full", { all: [SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl("users/me/drafts"), { method: "POST", body: jsonBody({ message: compact({ raw: encodeMail(input), threadId: optionalString(input.threadId) }) }) }), { openWorld: true }),
+  tool("gmail_update_draft", "Replace the content of a Gmail draft.", mailSchema({ draftId: string("Draft ID.") }, ["draftId"]), "full", { all: [SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl(`users/me/drafts/${encodeURIComponent(requiredString(input.draftId, "draftId"))}`), { method: "PUT", body: jsonBody({ id: requiredString(input.draftId, "draftId"), message: compact({ raw: encodeMail(input), threadId: optionalString(input.threadId) }) }) }), { idempotent: true, openWorld: true }),
   tool("gmail_send_draft", "Send an existing Gmail draft.", object({ draftId: string("Draft ID.") }, ["draftId"]), "full", { all: [SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl("users/me/drafts/send"), { method: "POST", body: jsonBody({ id: requiredString(input.draftId, "draftId") }) }), { destructive: true, openWorld: true }),
   tool("gmail_send_message", "Send an email from the connected Gmail account.", mailSchema(), "full", { all: [SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl("users/me/messages/send"), { method: "POST", body: jsonBody(compact({ raw: encodeMail(input), threadId: optionalString(input.threadId) })) }), { destructive: true, openWorld: true }),
   tool("gmail_reply_to_thread", "Send a correctly threaded reply. Supply the parent Message-ID and References headers from the thread.", mailSchema({ threadId: string("Thread ID."), inReplyTo: string("Parent Message-ID header."), references: string("References header."), subject: string("Matching subject.") }, ["threadId", "inReplyTo", "references"]), "full", { all: [SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl("users/me/messages/send"), { method: "POST", body: jsonBody({ raw: encodeMail(input), threadId: requiredString(input.threadId, "threadId") }) }), { destructive: true, openWorld: true }),
@@ -194,7 +191,6 @@ const gmailTools: ToolDefinition[] = [
   tool("gmail_remove_labels", "Remove labels from a message or thread.", gmailLabelsSchema(false), "full", { all: [SCOPE.gmailModify] }, (token, input) => modifyGmailLabels(token, { ...input, remove: true }), { idempotent: true }),
   tool("gmail_mark_read", "Mark a message or thread read.", gmailTargetSchema(), "full", { all: [SCOPE.gmailModify] }, (token, input) => modifyGmailLabels(token, { ...input, labelIds: ["UNREAD"], remove: true }), { idempotent: true }),
   tool("gmail_mark_unread", "Mark a message or thread unread.", gmailTargetSchema(), "full", { all: [SCOPE.gmailModify] }, (token, input) => modifyGmailLabels(token, { ...input, labelIds: ["UNREAD"], remove: false }), { idempotent: true }),
-  tool("gmail_trash_message", "Move a Gmail message to trash.", object({ messageId: string("Message ID.") }, ["messageId"]), "full", { all: [SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl(`users/me/messages/${encodeURIComponent(requiredString(input.messageId, "messageId"))}/trash`), { method: "POST", body: "{}" }), { destructive: true, idempotent: true }),
   tool("gmail_untrash_message", "Restore a Gmail message from trash.", object({ messageId: string("Message ID.") }, ["messageId"]), "full", { all: [SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl(`users/me/messages/${encodeURIComponent(requiredString(input.messageId, "messageId"))}/untrash`), { method: "POST", body: "{}" }), { idempotent: true }),
 ];
 
@@ -207,7 +203,6 @@ const calendarTools: ToolDefinition[] = [
   tool("google_calendar_create_event", "Create a Calendar event with explicit invitation-email behavior.", calendarEventSchema(false), "full", { all: [SCOPE.calendarEvents] }, createCalendarEvent, { openWorld: true }),
   tool("google_calendar_update_event", "Update a Calendar event by reading and safely replacing the current resource.", calendarEventSchema(true), "full", { all: [SCOPE.calendarEvents] }, updateCalendarEvent, { openWorld: true }),
   tool("google_calendar_respond_to_event", "Accept, decline, or tentatively accept an invitation.", object({ calendarId: string("Calendar ID."), eventId: string("Event ID."), responseStatus: string("Response.", { enum: ["accepted", "declined", "tentative"] }), sendUpdates: string("Invitation email behavior.", { enum: ["all", "externalOnly", "none"] }) }, ["eventId", "responseStatus"]), "full", { all: [SCOPE.calendarEvents] }, respondToEvent, { openWorld: true }),
-  tool("google_calendar_delete_event", "Delete an event and explicitly choose invitation-email behavior.", object({ calendarId: string("Calendar ID."), eventId: string("Event ID."), sendUpdates: string("Invitation email behavior.", { enum: ["all", "externalOnly", "none"] }) }, ["eventId"]), "full", { all: [SCOPE.calendarEvents] }, (token, input) => googleJson(token, calendarUrl(`calendars/${encodeURIComponent(optionalString(input.calendarId) ?? "primary")}/events/${encodeURIComponent(requiredString(input.eventId, "eventId"))}`, { sendUpdates: optionalString(input.sendUpdates) ?? "none" }), { method: "DELETE" }), { destructive: true, idempotent: true, openWorld: true }),
 ];
 
 const toolsByConnector: Record<GoogleConnectorKey, ToolDefinition[]> = { "google-workspace": workspaceTools, gmail: gmailTools, "google-calendar": calendarTools };
@@ -292,7 +287,23 @@ async function googleFetch(token: string, url: string, init: RequestInit = {}): 
   }
   return last!;
 }
-function googleError(status: number, text: string): Error { let message = `HTTP ${status}`; try { const parsed = JSON.parse(text) as { error?: { message?: string; status?: string } }; message = parsed.error?.message ?? parsed.error?.status ?? message; } catch { /* redacted fallback */ } return new Error(`Google API ${status}: ${message.slice(0, 500)}`); }
+class GoogleApiError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(`Google API ${status}: ${message.slice(0, 500)}`);
+  }
+}
+
+export class GoogleCalendarInsertRejected extends Error {}
+
+function googleError(status: number, text: string): GoogleApiError {
+  let message = `HTTP ${status}`;
+  try {
+    const parsed = JSON.parse(text) as { error?: { message?: string; status?: string } };
+    const detail = parsed?.error?.message ?? parsed?.error?.status;
+    if (typeof detail === "string") message = detail;
+  } catch { /* redacted fallback */ }
+  return new GoogleApiError(status, message);
+}
 
 async function searchDriveFiles(token: string, input: Record<string, unknown>): Promise<unknown> {
   const driveId = optionalString(input.driveId);
@@ -624,10 +635,62 @@ function calendarListEventsSchema(): Record<string, unknown> { return object({ c
 function listCalendarEvents(token: string, input: Record<string, unknown>) { const singleEvents = optionalBoolean(input.singleEvents) ?? true; const orderBy = optionalString(input.orderBy) ?? (singleEvents ? "startTime" : "updated"); if (orderBy === "startTime" && !singleEvents) throw new Error("startTime ordering requires singleEvents=true"); return googleJson(token, calendarUrl(`calendars/${encodeURIComponent(optionalString(input.calendarId) ?? "primary")}/events`, { q: optionalString(input.query), timeMin: optionalString(input.timeMin), timeMax: optionalString(input.timeMax), maxResults: boundedInteger(input.maxResults, 100, 1, 2500), pageToken: optionalString(input.pageToken), singleEvents, orderBy })); }
 function freeBusySchema(): Record<string, unknown> { return object({ timeMin: string("RFC3339 start."), timeMax: string("RFC3339 end."), timeZone: string("IANA time zone."), calendarIds: stringArray("Calendar IDs or attendee emails, maximum 50.", 50) }, ["timeMin", "timeMax", "calendarIds"]); }
 function queryFreeBusy(token: string, input: Record<string, unknown>) { const ids = requiredStringArray(input.calendarIds, "calendarIds"); if (ids.length > 50) throw new Error("Free/busy supports at most 50 calendars per query"); return googleJson(token, calendarUrl("freeBusy"), { method: "POST", body: jsonBody(compact({ timeMin: requiredDate(input.timeMin, "timeMin").toISOString(), timeMax: requiredDate(input.timeMax, "timeMax").toISOString(), timeZone: optionalString(input.timeZone), groupExpansionMax: 100, calendarExpansionMax: 50, items: ids.map((id) => ({ id })) })) }); }
-async function suggestCalendarTimes(token: string, input: Record<string, unknown>): Promise<unknown> { const response = await queryFreeBusy(token, input) as Record<string, unknown>; const calendars = record(response.calendars) ?? {}; const busy = Object.values(calendars).flatMap((calendar) => Array.isArray(record(calendar)?.busy) ? record(calendar)!.busy as unknown[] : []).flatMap((slot) => { const item = record(slot); if (!item) return []; const start = Date.parse(String(item.start)); const end = Date.parse(String(item.end)); return Number.isFinite(start) && Number.isFinite(end) ? [{ start, end }] : []; }).sort((a, b) => a.start - b.start); const min = requiredDate(input.timeMin, "timeMin").getTime(); const max = requiredDate(input.timeMax, "timeMax").getTime(); const duration = boundedInteger(input.durationMinutes, 30, 5, 480) * 60_000; const step = boundedInteger(input.intervalMinutes, 15, 5, 120) * 60_000; const suggestions: Array<{ start: string; end: string }> = []; for (let start = min; start + duration <= max && suggestions.length < 20; start += step) { if (!busy.some((slot) => start < slot.end && start + duration > slot.start)) suggestions.push({ start: new Date(start).toISOString(), end: new Date(start + duration).toISOString() }); } return { suggestions, busySource: response }; }
+async function suggestCalendarTimes(token: string, input: Record<string, unknown>): Promise<unknown> {
+  const response = await queryFreeBusy(token, input) as Record<string, unknown>;
+  const calendars = record(response.calendars) ?? {};
+  const groups = record(response.groups) ?? {};
+  const requested = requiredStringArray(input.calendarIds, "calendarIds");
+  const hasAvailability = (id: string) => {
+    const calendar = record(calendars[id]);
+    return Array.isArray(calendar?.busy) && !(Array.isArray(calendar.errors) && calendar.errors.length > 0);
+  };
+  // An incomplete calendar or group result leaves its availability unknown.
+  const unavailableCalendarIds = requested.filter((id) => {
+    const group = record(groups[id]);
+    if (!group) return !hasAvailability(id);
+    const members = optionalStringArray(group.calendars);
+    return !members?.length || (Array.isArray(group.errors) && group.errors.length > 0) || !members.every(hasAvailability);
+  });
+  if (unavailableCalendarIds.length > 0) return { suggestions: [], unavailableCalendarIds, busySource: response };
+  const busy = Object.values(calendars).flatMap((calendar) => {
+    const slots = record(calendar)?.busy;
+    return Array.isArray(slots) ? slots.flatMap((slot: unknown) => {
+      const start = Date.parse(String(record(slot)?.start));
+      const end = Date.parse(String(record(slot)?.end));
+      return Number.isFinite(start) && Number.isFinite(end) ? [{ start, end }] : [];
+    }) : [];
+  }).sort((a, b) => a.start - b.start);
+  const min = requiredDate(input.timeMin, "timeMin").getTime();
+  const max = requiredDate(input.timeMax, "timeMax").getTime();
+  const duration = boundedInteger(input.durationMinutes, 30, 5, 480) * 60_000;
+  const step = boundedInteger(input.intervalMinutes, 15, 5, 120) * 60_000;
+  const suggestions: Array<{ start: string; end: string }> = [];
+  for (let start = min; start + duration <= max && suggestions.length < 20; start += step) {
+    if (!busy.some((slot) => start < slot.end && start + duration > slot.start)) {
+      suggestions.push({ start: new Date(start).toISOString(), end: new Date(start + duration).toISOString() });
+    }
+  }
+  return { suggestions, busySource: response };
+}
 function calendarEventSchema(update: boolean): Record<string, unknown> { return object({ calendarId: string("Calendar ID, normally primary."), ...(update ? { eventId: string("Event ID.") } : { idempotencyKey: string("Stable idempotency key for retries.") }), summary: string("Event title."), description: string("Description."), location: string("Location."), start: string("RFC3339 date-time."), end: string("RFC3339 date-time."), timeZone: string("IANA time zone."), attendees: stringArray("Attendee emails.", 200), sendUpdates: string("Invitation email behavior.", { enum: ["all", "externalOnly", "none"] }), createMeet: boolean("Create Google Meet conference."), recurrence: stringArray("RFC5545 recurrence rules.", 20) }, [update ? "eventId" : "idempotencyKey", "summary", "start", "end"]); }
 function eventResource(input: Record<string, unknown>): Record<string, unknown> { const start = requiredDate(input.start, "start"); const end = requiredDate(input.end, "end"); if (end <= start) throw new Error("Event end must be after start"); const meet = input.createMeet === true ? { createRequest: { requestId: randomUUID(), conferenceSolutionKey: { type: "hangoutsMeet" } } } : undefined; return compact({ summary: requiredString(input.summary, "summary"), description: optionalString(input.description), location: optionalString(input.location), start: compact({ dateTime: start.toISOString(), timeZone: optionalString(input.timeZone) }), end: compact({ dateTime: end.toISOString(), timeZone: optionalString(input.timeZone) }), attendees: optionalStringArray(input.attendees)?.map((email) => ({ email })), recurrence: optionalStringArray(input.recurrence), conferenceData: meet }); }
-function createCalendarEvent(token: string, input: Record<string, unknown>) { const event = eventResource(input); const id = calendarEventId(requiredString(input.idempotencyKey, "idempotencyKey")); return googleJson(token, calendarUrl(`calendars/${encodeURIComponent(optionalString(input.calendarId) ?? "primary")}/events`, { sendUpdates: optionalString(input.sendUpdates) ?? "none", conferenceDataVersion: input.createMeet === true ? 1 : undefined }), { method: "POST", body: jsonBody({ id, ...event }) }); }
+async function createCalendarEvent(token: string, input: Record<string, unknown>) {
+  const event = eventResource(input);
+  const id = createHash("sha256").update(requiredString(input.idempotencyKey, "idempotencyKey")).digest("hex");
+  const url = calendarUrl(`calendars/${encodeURIComponent(optionalString(input.calendarId) ?? "primary")}/events`, {
+    sendUpdates: optionalString(input.sendUpdates) ?? "none",
+    conferenceDataVersion: input.createMeet === true ? 1 : undefined,
+  });
+  try {
+    return await googleJson(token, url, { method: "POST", body: jsonBody({ id, ...event }) });
+  } catch (error) {
+    // A 400 from this single insert request confirms that Calendar rejected the event.
+    if (error instanceof GoogleApiError && error.status === 400) {
+      throw new GoogleCalendarInsertRejected(error.message, { cause: error });
+    }
+    throw error;
+  }
+}
 async function updateCalendarEvent(token: string, input: Record<string, unknown>): Promise<unknown> { const calendarId = optionalString(input.calendarId) ?? "primary"; const eventId = requiredString(input.eventId, "eventId"); const current = await googleJson(token, calendarUrl(`calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`)) as Record<string, unknown>; if (current.recurringEventId && optionalStringArray(input.recurrence)?.length) throw new Error("Changing recurrence on one occurrence is not supported"); const updated = { ...current, ...eventResource(input), id: current.id, etag: current.etag }; return googleJson(token, calendarUrl(`calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`, { sendUpdates: optionalString(input.sendUpdates) ?? "none", conferenceDataVersion: input.createMeet === true || current.conferenceData ? 1 : undefined }), { method: "PUT", ...(typeof current.etag === "string" ? { headers: { "if-match": current.etag } } : {}), body: jsonBody(updated) }); }
 async function respondToEvent(token: string, input: Record<string, unknown>, context: ToolContext): Promise<unknown> { const calendarId = optionalString(input.calendarId) ?? "primary"; const eventId = requiredString(input.eventId, "eventId"); const event = await googleJson(token, calendarUrl(`calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`)) as Record<string, unknown>; const attendees = Array.isArray(event.attendees) ? event.attendees.map((value) => ({ ...requiredObject(value, "attendee") })) : []; const attendee = attendees.find((value) => value.self === true || (context.accountEmail && value.email === context.accountEmail)); if (!attendee) throw new Error("The connected account is not an attendee on this event"); attendee.responseStatus = requiredEnum(input.responseStatus, ["accepted", "declined", "tentative"], "responseStatus"); return googleJson(token, calendarUrl(`calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`, { sendUpdates: optionalString(input.sendUpdates) ?? "none" }), { method: "PUT", ...(typeof event.etag === "string" ? { headers: { "if-match": event.etag } } : {}), body: jsonBody({ ...event, attendees }) }); }
 
@@ -682,5 +745,4 @@ function requiredDate(value: unknown, name: string): Date { const date = new Dat
 function safeHeader(value: string): string { return value.replace(/[\r\n]+/g, " ").trim(); }
 function safeHeaderList(values: string[]): string { return values.map(safeHeader).join(", "); }
 function googleObjectId(prefix: string): string { return `${prefix}_${randomUUID().replace(/-/g, "")}`.slice(0, 50); }
-function calendarEventId(value: string): string { const normalized = Buffer.from(value).toString("hex").toLowerCase(); return `berry${normalized}`.slice(0, 128).padEnd(10, "0"); }
 function hexColor(value: string): Record<string, number> { const match = /^#?([0-9a-f]{6})$/i.exec(value); if (!match) throw new Error("backgroundColorHex must be six hexadecimal digits"); const hex = match[1]!; return { red: parseInt(hex.slice(0, 2), 16) / 255, green: parseInt(hex.slice(2, 4), 16) / 255, blue: parseInt(hex.slice(4, 6), 16) / 255 }; }

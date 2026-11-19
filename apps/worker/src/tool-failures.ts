@@ -1,3 +1,4 @@
+import { McpConnectionError, McpToolError } from "@berry/local-agent/mcp";
 import { classifyProviderFailure } from "./provider-retry.js";
 import { ToolArgumentError } from "./tool-arguments.js";
 
@@ -40,6 +41,8 @@ export interface ToolFailure {
   status?: number;
   code?: string;
   action: string;
+  blockedConnectorId?: string;
+  reconnect?: { connectorId: string; grantId: string };
 }
 
 const DETERMINISTIC = new Set<ToolFailureCategory>([
@@ -78,18 +81,49 @@ export function toolFailureAction(category: ToolFailureCategory): string {
   return ACTIONS[category];
 }
 
+/** A verified connector response rejected a write before applying it. */
+export class McpWriteValidationError extends Error {
+  constructor(message: string, readonly status: number, options?: ErrorOptions) {
+    super(message, options);
+  }
+}
+
 /**
  * Classifies one tool failure. `changesState` is false for read-only tools:
  * a failed read never needs an outcome check, while a failed change-making call
  * that may have reached its target has an unknown outcome.
  */
 export function classifyToolFailure(error: unknown, options: { changesState: boolean; timedOut?: boolean }): ToolFailure {
+  if (error instanceof McpWriteValidationError) {
+    return {
+      category: "invalid_input",
+      deterministic: true,
+      outcome: "not_applied",
+      outcomeVersion: TOOL_FAILURE_OUTCOME_VERSION,
+      status: error.status,
+      action: ACTIONS.invalid_input,
+    };
+  }
+  if (error instanceof McpConnectionError) return mcpConnectionFailure(error, options.changesState);
   const transport = classifyProviderFailure(error);
   const details = structuredFailureDetails(error);
   const status = details.status ?? transport.status ?? httpStatusCode(error);
   const code = details.code ?? transport.code;
   // Codes such as invalid_token or SCRAPE_PROXY_UNAVAILABLE carry the class on their own.
   const message = [errorText(error), details.text, code].filter(Boolean).join(" ");
+  if (error instanceof McpToolError && status !== 403 && (status === 401 || CREDENTIALS_PATTERN.test(message))) {
+    // An authentication-looking application result can follow a write. It
+    // neither proves pre-dispatch rejection nor authorizes a sign-in prompt.
+    return {
+      category: options.changesState ? "unknown_outcome" : "transient",
+      deterministic: false,
+      outcome: options.changesState ? "unknown" : "not_applied",
+      outcomeVersion: TOOL_FAILURE_OUTCOME_VERSION,
+      action: options.changesState ? ACTIONS.unknown_outcome : "The tool reported an authentication failure. Report the service interruption or use an independent tool.",
+      ...(status !== undefined ? { status } : {}),
+      ...(code ? { code } : {}),
+    };
+  }
   const rateLimited = status === 429 || transport.category === "rate_limit" || /RATE_LIMIT/i.test(code ?? "");
   // A command that ran reported in its own output, which says nothing
   // trustworthy about what an earlier part of it changed.
@@ -147,11 +181,34 @@ export function classifyToolFailure(error: unknown, options: { changesState: boo
   };
 }
 
+function mcpConnectionFailure(error: McpConnectionError, changesState: boolean): ToolFailure {
+  const { connectorId, grantId, status, exhausted } = error.details;
+  const reconnect = error.kind === "reauth_required" && connectorId && grantId ? { connectorId, grantId } : undefined;
+  const unknown = changesState && !error.beforeDispatch;
+  const configuration = error.kind === "configuration" || error.kind === "permission";
+  const blocked = reconnect || (exhausted && error.beforeDispatch);
+  return {
+    category: unknown ? "unknown_outcome" : configuration ? "configuration" : reconnect ? "credentials" : "transient",
+    code: `mcp_${error.kind}`,
+    ...(status !== undefined ? { status } : {}),
+    deterministic: Boolean(configuration || blocked || (exhausted && !changesState)),
+    outcome: unknown ? "unknown" : "not_applied",
+    outcomeVersion: TOOL_FAILURE_OUTCOME_VERSION,
+    action: unknown ? ACTIONS.unknown_outcome : reconnect
+      ? "Direct the connection owner to Reconnect in this task. Continue with other authorized connectors where possible."
+      : configuration ? error.message
+      : "Berry finished connection recovery for this call. Report the interruption and continue with other authorized tools where possible.",
+    ...(blocked && connectorId ? { blockedConnectorId: connectorId } : {}),
+    ...(reconnect ? { reconnect } : {}),
+  };
+}
+
 /** Reads a stored failure classification back from a failed step's output. */
 export function storedToolFailure(output: unknown): ToolFailure | null {
   const failure = record(record(output)?.failure);
   const category = failure?.category;
   if (typeof category !== "string" || !(category in ACTIONS)) return null;
+  const reconnect = record(failure?.reconnect);
   return {
     category: category as ToolFailureCategory,
     deterministic: failure?.deterministic === true,
@@ -160,6 +217,9 @@ export function storedToolFailure(output: unknown): ToolFailure | null {
     ...(typeof failure?.status === "number" ? { status: failure.status } : {}),
     ...(typeof failure?.code === "string" ? { code: failure.code } : {}),
     action: typeof failure?.action === "string" ? failure.action : ACTIONS[category as ToolFailureCategory],
+    ...(typeof failure?.blockedConnectorId === "string" ? { blockedConnectorId: failure.blockedConnectorId } : {}),
+    ...(typeof reconnect?.connectorId === "string" && typeof reconnect.grantId === "string"
+      ? { reconnect: { connectorId: reconnect.connectorId, grantId: reconnect.grantId } } : {}),
   };
 }
 

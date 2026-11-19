@@ -34,6 +34,9 @@ from cv_template_common import (  # noqa: E402
     section_text,
     slugify,
 )
+from v3.word_layout import (
+    verdana_path, experience_tab_dxa, PROJECT_BEFORE_DXA, PROJECT_AFTER_DXA,
+)
 from text_normalization import repair_text_artifacts  # noqa: E402
 
 DEFAULT_EXTRACTED_ROOT = ROOT / "output" / "extracted"
@@ -61,7 +64,6 @@ LANDSCAPE_SIDEBAR_FIRST_PAGE_REFLOW_DXA = 0
 # break and every project card a breathing gap.  The page packer must reserve
 # those exact gaps or it will place content that Word subsequently pushes.
 LANDSCAPE_SIDEBAR_SECTION_GAP_DXA = 120
-LANDSCAPE_PROJECT_CARD_GAP_DXA = 120
 # These must match the explicit landscape project-cell margins in the DOCX
 # builder. Measure against the narrower right lane so the packer never puts a
 # card on a page that Word will later overflow.
@@ -1240,18 +1242,6 @@ def portrait_layout_metrics() -> PortraitLayoutMetrics:
             if child.tag == f"{W}p"
         )
 
-        project_paragraphs = document.xpath(
-            './/w:p[contains(string(.), "{{ project.description }}")]',
-            namespaces=WORD_NS,
-        )
-        project_spacing = (
-            project_paragraphs[0].find(f"{W}pPr/{W}spacing")
-            if project_paragraphs
-            else None
-        )
-        paragraph_after = _word_int(
-            project_spacing, "after", fallback.paragraph_after_dxa
-        )
         heading_paragraphs = document.xpath(
             './/w:p[contains(string(.), "SELECTED PROJECTS")]',
             namespaces=WORD_NS,
@@ -1272,7 +1262,7 @@ def portrait_layout_metrics() -> PortraitLayoutMetrics:
             project_width_dxa=project_width,
             line_height_dxa=line_height,
             project_body_line_height_dxa=project_body_line_height,
-            paragraph_after_dxa=paragraph_after,
+            paragraph_after_dxa=fallback.paragraph_after_dxa,
             section_heading_before_dxa=_word_int(
                 heading_spacing, "before", fallback.section_heading_before_dxa
             ),
@@ -1389,15 +1379,6 @@ def landscape_layout_metrics() -> LandscapeLayoutMetrics:
             if child.tag == f"{W}p"
         )
 
-        project_paragraphs = document.xpath(
-            './/w:p[contains(string(.), "{{ project.description }}")]',
-            namespaces=WORD_NS,
-        )
-        project_spacing = (
-            project_paragraphs[0].find(f"{W}pPr/{W}spacing")
-            if project_paragraphs
-            else None
-        )
         heading_paragraphs = document.xpath(
             './/w:p[contains(string(.), "SELECTED PROJECTS")]',
             namespaces=WORD_NS,
@@ -1418,9 +1399,7 @@ def landscape_layout_metrics() -> LandscapeLayoutMetrics:
             project_width_dxa=project_width,
             continuation_project_width_dxa=continuation_project_width,
             line_height_dxa=line_height,
-            paragraph_after_dxa=_word_int(
-                project_spacing, "after", fallback.paragraph_after_dxa
-            ),
+            paragraph_after_dxa=fallback.paragraph_after_dxa,
             section_heading_before_dxa=_word_int(
                 heading_spacing, "before", fallback.section_heading_before_dxa
             ),
@@ -1434,20 +1413,7 @@ def landscape_layout_metrics() -> LandscapeLayoutMetrics:
 
 @lru_cache(maxsize=2)
 def portrait_measurement_font(bold: bool = False) -> ImageFont.ImageFont:
-    name = "Verdana Bold.ttf" if bold else "Verdana.ttf"
-    candidates = (
-        Path("/System/Library/Fonts/Supplemental") / name,
-        Path("/Library/Fonts") / name,
-        Path("C:/Windows/Fonts") / ("verdanab.ttf" if bold else "verdana.ttf"),
-        Path("/usr/share/fonts/truetype/msttcorefonts") / name,
-        Path("/usr/share/fonts/truetype/dejavu")
-        / ("DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"),
-    )
-    size = 9 * FONT_MEASURE_SCALE
-    for candidate in candidates:
-        if candidate.exists():
-            return ImageFont.truetype(str(candidate), size=size)
-    return ImageFont.load_default()
+    return ImageFont.truetype(str(verdana_path(bold)), size=9 * FONT_MEASURE_SCALE)
 
 
 def wrapped_line_count(
@@ -1494,42 +1460,18 @@ def portrait_project_height_dxa(
 ) -> int:
     metrics = metrics or portrait_layout_metrics()
     width = metrics.project_width_dxa - metrics.cell_horizontal_padding_dxa
-    # Portrait Version 1 renders separate name, client and date paragraphs.
-    # Measuring the old combined title/date field (or the now-hidden role)
-    # underestimates a card and lets Word split it in the narrow first-page
-    # project cell.
     line_height = metrics.project_body_line_height_dxa
-    height = (
-        wrapped_line_count([(collapse(project.get("name")), True)], width)
-        * line_height
-        + metrics.paragraph_after_dxa
-    )
-    client = collapse(project.get("client_line"))
-    if client:
-        height += (
-            wrapped_line_count([(client, False)], width) * line_height
-            + metrics.paragraph_after_dxa
-        )
+    height = wrapped_line_count([(collapse(project.get("name")), True)], width) * line_height
+    # The client paragraph is retained even for an undisclosed client.
+    client = collapse(project.get("client_line")) or "Confidential"
+    height += wrapped_line_count([(client, False)], width) * line_height
     duration = collapse(project.get("duration_line"))
     if duration:
-        height += (
-            wrapped_line_count([(duration, False)], width) * line_height
-            + metrics.paragraph_after_dxa
-        )
-    # The portrait templates render the complete description paragraph. The
-    # placement model must measure that same rendered text; using the shorter
-    # teaser made the estimate smaller than the rendered card and let Word
-    # push a project off the first page after packing had accepted it.
+        height += wrapped_line_count([(duration, False)], width) * line_height
     description = collapse(project.get("description") or project.get("description_teaser"))
-    height += (
-        wrapped_line_count([(description, False)], width) * line_height
-        + metrics.paragraph_after_dxa
-    )
-    # Allow a small fixed tolerance for Word's run metrics and table layout.
-    # The previous full-line buffer per card was leaving unused project space
-    # on portrait page one. Borderline cards still belong in the full-width
-    # continuation, not as split narrow-column content.
-    return height + 60
+    height += wrapped_line_count([(description, False)], width) * line_height
+    # The narrative owns both gaps; the final structural paragraph is 1 twip.
+    return height + PROJECT_BEFORE_DXA + PROJECT_AFTER_DXA + 1 + 60
 
 
 def portrait_experience_height_dxa(
@@ -1540,10 +1482,13 @@ def portrait_experience_height_dxa(
     width = metrics.project_width_dxa - metrics.cell_horizontal_padding_dxa
     regular = portrait_measurement_font(False)
     height = 0
+    shared_tab = max((
+        experience_tab_dxa(regular.getlength(
+            f"{collapse(item.get('prefix')).strip()}\u00a0"
+        ) / FONT_MEASURE_SCALE) for item in experience
+    ), default=0)
+    body_width = max(metrics.line_height_dxa, width - shared_tab)
     for item in experience:
-        prefix = f"{collapse(item.get('prefix')).strip()}\u00a0"
-        prefix_points = regular.getlength(prefix) / FONT_MEASURE_SCALE
-        body_width = max(metrics.line_height_dxa, width - math.ceil(prefix_points * 20))
         height += (
             wrapped_line_count([(collapse(item.get("body")), False)], body_width)
             * metrics.line_height_dxa
@@ -1878,18 +1823,9 @@ def landscape_project_height_dxa(
         metrics=metrics,
         description_field=description_field,
     )
-    # The reserved line before the description is a carriage return inside
-    # the description paragraph, not a separate paragraph.  It therefore
-    # contributes a line height but no additional paragraph-after spacing.
-    # Only the description paragraph has the template's 6pt after-spacing.
-    # Title, client, and duration paragraphs have no direct or inherited
-    # after-spacing, so charging each one here rejects cards that Word can
-    # safely render in the remaining page-one row.
     return (
         sum(line_counts.values()) * metrics.line_height_dxa
-        + metrics.paragraph_after_dxa
-        + LANDSCAPE_PROJECT_CARD_GAP_DXA
-        + 1
+        + PROJECT_BEFORE_DXA + PROJECT_AFTER_DXA + 1
     )
 
 
@@ -1918,7 +1854,6 @@ def landscape_project_line_counts(
             reserve_blank_line=True,
         ),
         "duration": lines(str(project.get("duration_line") or "")),
-        "description_spacer": 1,
         "description": lines(
             str(project.get(description_field) or ""),
             reserve_blank_line=True,
@@ -2491,11 +2426,13 @@ def preprocess_cv(
         project["description_short"] = sentence_limit(description, 420)
         project["description_teaser"] = sentence_limit(description, 320)
     qualifications = qualification_items(cv)
-    key_expertise = key_expertise_items(cv)
-    if not key_expertise:
-        key_expertise = inferred_key_expertise(cv, projects)
-    if not key_expertise and qualifications:
-        key_expertise = qualifications[:4]
+    key_expertise = []
+    if cv.get("omit_key_expertise") is not True:
+        key_expertise = key_expertise_items(cv)
+        if not key_expertise:
+            key_expertise = inferred_key_expertise(cv, projects)
+        if not key_expertise and qualifications:
+            key_expertise = qualifications[:4]
     experience = split_experience_items(experience_items(cv))
     memberships = membership_items(cv)
     overview_text = overview(cv)

@@ -1,6 +1,6 @@
 import * as React from "react";
 import { Bell, BellRing, Languages, MonitorCog, Volume2 } from "lucide-react";
-import { FormSelect, ManagementPage, ManagementSwitch, Section } from "./management-primitives";
+import { FormSelect, ManagementPage, ManagementSwitch, Section, SettingList, SettingRow } from "./management-primitives";
 import { applyDocumentTheme, DEFAULT_BERRY_THEME, normalizeThemePreference } from "@/lib/theme";
 import { useLocalSetting } from "./management-context";
 import {
@@ -17,6 +17,7 @@ export function GeneralSettingsScreen() {
   const [browserNotifications, setBrowserNotifications] = useLocalSetting(BROWSER_NOTIFICATIONS_KEY, "on");
   const [soundAlerts, setSoundAlerts] = useLocalSetting(SOUND_ALERTS_KEY, "on");
   const [permission, setPermission] = React.useState<BrowserPermissionState>("unsupported");
+  const [languageName, setLanguageName] = React.useState("System default");
 
   React.useEffect(() => {
     applyDocumentTheme(normalizeThemePreference(theme));
@@ -24,6 +25,12 @@ export function GeneralSettingsScreen() {
   React.useEffect(() => {
     document.documentElement.lang = navigator.language.split("-")[0] || "en";
     setPermission(notificationPermission());
+    try {
+      const name = new Intl.DisplayNames([navigator.language], { type: "language" }).of(navigator.language);
+      if (name) setLanguageName(name);
+    } catch {
+      // Keep the generic label when the browser cannot name its own locale.
+    }
   }, []);
 
   const toggleBrowserNotifications = async (checked: boolean) => {
@@ -36,30 +43,28 @@ export function GeneralSettingsScreen() {
     if (checked) void unlockCompletionSound();
   };
 
-  return <ManagementPage title="General" description="Choose how Berry looks and how it gets your attention.">
-    <Section title="Appearance"><div className="grid divide-y divide-border">
-      <SettingRow icon={MonitorCog} title="Theme" description="Use Berry’s light, dark, or system appearance."><div className="w-40"><FormSelect ariaLabel="Theme" value={theme} onChange={setTheme} options={[{ value: "system", label: "System" }, { value: "dark", label: "Dark" }, { value: "light", label: "Light" }]} /></div></SettingRow>
-      <SettingRow icon={Languages} title="Language" description="Berry follows your browser and operating system."><span className="text-sm text-muted-foreground">System default</span></SettingRow>
-    </div></Section>
-    <Section title="Communication preferences"><div className="grid divide-y divide-border">
-      <SettingRow icon={browserNotifications === "on" ? BellRing : Bell} title="Browser notifications" description={permissionText(permission, browserNotifications === "on")}>
-        <ManagementSwitch checked={browserNotifications === "on" && permission === "granted"} onCheckedChange={(checked) => void toggleBrowserNotifications(checked)} aria-label="Browser notifications" />
-      </SettingRow>
-      <SettingRow icon={Volume2} title="Sound alert" description="Play one sound when a task completes while you are away.">
-        <ManagementSwitch checked={soundAlerts === "on"} onCheckedChange={toggleSoundAlerts} aria-label="Sound alert" />
-      </SettingRow>
-    </div></Section>
+  return <ManagementPage width="narrow" title="General" description="Choose how Berry looks and how it gets your attention.">
+    <Section title="Appearance" flush>
+      <SettingList>
+        <SettingRow icon={MonitorCog} title="Theme" description="Follow your system setting, or always use light or dark.">
+          <div className="w-40"><FormSelect ariaLabel="Theme" value={theme} onChange={setTheme} options={[{ value: "system", label: "System" }, { value: "dark", label: "Dark" }, { value: "light", label: "Light" }]} /></div>
+        </SettingRow>
+        <SettingRow icon={Languages} title="Language" description="Berry uses your browser’s language.">
+          <span className="text-md text-muted-foreground">{languageName}</span>
+        </SettingRow>
+      </SettingList>
+    </Section>
+    <Section title="Notifications" flush>
+      <SettingList>
+        <SettingRow icon={browserNotifications === "on" ? BellRing : Bell} title="Browser notifications" description={permissionText(permission, browserNotifications === "on")}>
+          <ManagementSwitch checked={browserNotifications === "on" && permission === "granted"} onCheckedChange={(checked) => void toggleBrowserNotifications(checked)} aria-label="Browser notifications" />
+        </SettingRow>
+        <SettingRow icon={Volume2} title="Completion sound" description="Play a sound when a task finishes while you are in another tab.">
+          <ManagementSwitch checked={soundAlerts === "on"} onCheckedChange={toggleSoundAlerts} aria-label="Completion sound" />
+        </SettingRow>
+      </SettingList>
+    </Section>
   </ManagementPage>;
-}
-
-function SettingRow({ icon: Icon, title, description, children }: { icon: typeof Bell; title: string; description: string; children: React.ReactNode }) {
-  return <div className="flex items-center justify-between gap-4 py-3 first:pt-0 last:pb-0">
-    <span className="flex min-w-0 items-start gap-3">
-      <span className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg border border-border bg-muted/35 text-muted-foreground"><Icon className="size-4" aria-hidden /></span>
-      <span className="grid gap-0.5"><b className="text-sm font-medium text-foreground">{title}</b><small className="text-xs leading-5 text-muted-foreground">{description}</small></span>
-    </span>
-    <span className="shrink-0">{children}</span>
-  </div>;
 }
 
 function permissionText(permission: BrowserPermissionState, enabled: boolean): string {

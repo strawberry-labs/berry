@@ -70,6 +70,9 @@ import { PostgresUsageRepository } from "./usage/usage.repository.ts";
 import { createUsageEventVerifierFromEnv } from "./usage/usage.signing.ts";
 import { deploymentRuntimeDescription } from "./deployment-mode.ts";
 import { createBerryAuthRuntime, type BerryAuthRuntime } from "./auth/auth-runtime.ts";
+import { PostgresMobileDeviceRegistry } from "./http/mobile-devices.ts";
+import { PostgresMobilePairingStore } from "./mobile/mobile-pairing.store.ts";
+import { createMobileRateLimiterFromEnv } from "./mobile/mobile-rate-limiter.ts";
 import type { AuthenticatedRequest } from "./auth/auth.guard.ts";
 import { PublicAuth } from "./auth/auth.decorators.ts";
 import { ConnectorsService } from "./connectors/connectors.service.ts";
@@ -396,6 +399,12 @@ export function createApiMainModule(env: NodeJS.ProcessEnv = process.env): Dynam
         auth: { useValue: auth },
         connectors: { useValue: connectors },
         setup: { useValue: setup },
+        mobileDevices: { useValue: new PostgresMobileDeviceRegistry(database) },
+        mobile: {
+          store: new PostgresMobilePairingStore(database),
+          rateLimiter: createMobileRateLimiterFromEnv(env),
+          env,
+        },
       }),
     ],
     controllers: [HealthController, ArtifactController],

@@ -4,6 +4,7 @@ import {
   decodeBase64Url,
   executeGoogleTool,
   GOOGLE_DRIVE_IMPORT_TIMEOUT_MS,
+  GoogleCalendarInsertRejected,
   googleConnectorScopes,
   googleToolCatalog,
   googleToolsRequiringApproval,
@@ -12,6 +13,17 @@ import {
 
 const GMAIL_MODIFY = "https://www.googleapis.com/auth/gmail.modify";
 const GMAIL_READ = "https://www.googleapis.com/auth/gmail.readonly";
+
+const CALENDAR_EVENT = {
+  summary: "Interview meeting",
+  idempotencyKey: "interview-new-date",
+  start: "2026-11-19T17:30:00+04:00",
+  end: "2026-11-19T18:30:00+04:00",
+  timeZone: "Asia/Dubai",
+  attendees: ["guest@example.com"],
+  createMeet: true,
+  sendUpdates: "all",
+};
 
 describe("Google connector tool policy", () => {
   afterEach(() => {
@@ -55,12 +67,12 @@ describe("Google connector tool policy", () => {
     expect(readFile?.inputSchema.required).toEqual(["fileId"]);
   });
 
-  it("requires approval for native writes in every task mode except reviewable Gmail drafts", () => {
+  it("requires approval for native writes, including Gmail drafts", () => {
     const gmail = googleToolsRequiringApproval("gmail", "full", [GMAIL_MODIFY]);
     expect(gmail).toContain("gmail_send_message");
     expect(gmail).toContain("gmail_apply_labels");
-    expect(gmail).not.toContain("gmail_create_draft");
-    expect(gmail).not.toContain("gmail_update_draft");
+    expect(gmail).toContain("gmail_create_draft");
+    expect(gmail).toContain("gmail_update_draft");
 
     const calendar = googleToolsRequiringApproval("google-calendar", "full", [
       "https://www.googleapis.com/auth/calendar.events",
@@ -69,7 +81,82 @@ describe("Google connector tool policy", () => {
     ]);
     expect(calendar).toContain("google_calendar_create_event");
     expect(calendar).toContain("google_calendar_respond_to_event");
-    expect(calendar).toContain("google_calendar_delete_event");
+  });
+
+  it("sends the same valid Calendar event ID when reusing an idempotency key", async () => {
+    const fetchMock = vi.fn(async (_url: string, _request: RequestInit) => Response.json({ status: "confirmed" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const scopes = googleConnectorScopes("google-calendar", "full");
+
+    await executeGoogleTool("google-calendar", "full", "google_calendar_create_event", "token", CALENDAR_EVENT, null, scopes);
+    await executeGoogleTool("google-calendar", "full", "google_calendar_create_event", "token", CALENDAR_EVENT, null, scopes);
+
+    const [first, second] = fetchMock.mock.calls;
+    const body = JSON.parse(String(first![1].body));
+    expect(body.id).toMatch(/^[0-9a-v]{5,1024}$/);
+    expect(JSON.parse(String(second![1].body)).id).toBe(body.id);
+    expect(body.attendees).toEqual([{ email: "guest@example.com" }]);
+    expect(new URL(first![0]).searchParams.get("sendUpdates")).toBe("all");
+    expect(new URL(first![0]).searchParams.get("conferenceDataVersion")).toBe("1");
+  });
+
+  it.each([400, 503])("keeps the provider's Calendar insert error and distinguishes HTTP %d", async (status) => {
+    const error = status === 400 ? "Invalid resource id value." : "Service unavailable.";
+    const fetchMock = vi.fn(async () => Response.json({ error: { message: error } }, { status }));
+    vi.stubGlobal("fetch", fetchMock);
+    const scopes = googleConnectorScopes("google-calendar", "full");
+    const outcome = await executeGoogleTool("google-calendar", "full", "google_calendar_create_event", "token", CALENDAR_EVENT, null, scopes)
+      .catch((failure: unknown) => failure);
+
+    expect(outcome).toMatchObject({ message: `Google API ${status}: ${error}` });
+    expect(outcome instanceof GoogleCalendarInsertRejected).toBe(status === 400);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("withholds a common time if a requested calendar has unknown availability", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ calendars: {
+      primary: { busy: [] },
+      "guest@example.com": { errors: [{ reason: "notFound" }] },
+    } })));
+    const scopes = googleConnectorScopes("google-calendar", "read");
+    await expect(executeGoogleTool("google-calendar", "read", "google_calendar_suggest_times", "token", {
+      timeMin: CALENDAR_EVENT.start,
+      timeMax: CALENDAR_EVENT.end,
+      calendarIds: ["primary", ...CALENDAR_EVENT.attendees, "missing@example.com"],
+      durationMinutes: 60,
+    }, null, scopes)).resolves.toMatchObject({
+      suggestions: [], unavailableCalendarIds: ["guest@example.com", "missing@example.com"],
+    });
+  });
+
+  it.each([
+    {
+      connector: "google-workspace",
+      writes: ["drive_create_folder", "docs_insert_text", "sheets_update_values", "slides_add_slide", "forms_update_question"],
+      deletions: ["drive_trash_file", "sheets_clear_values", "slides_delete_object", "forms_delete_item"],
+    },
+    {
+      connector: "gmail",
+      writes: ["gmail_create_draft", "gmail_send_message", "gmail_remove_labels"],
+      deletions: ["gmail_trash_message"],
+    },
+    {
+      connector: "google-calendar",
+      writes: ["google_calendar_create_event", "google_calendar_update_event", "google_calendar_respond_to_event"],
+      deletions: ["google_calendar_delete_event"],
+    },
+  ] as const)("allows $connector writes and denies deletion tools", async ({ connector, writes, deletions }) => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const scopes = googleConnectorScopes(connector, "full");
+    const tools = googleToolCatalog(connector, "full", scopes).map((tool) => tool.name);
+    expect(tools).toEqual(expect.arrayContaining([...writes]));
+    for (const name of deletions) {
+      expect(tools).not.toContain(name);
+      await expect(executeGoogleTool(connector, "full", name, "access-token", {}, null, scopes))
+        .rejects.toThrow("not authorized");
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("sends Gmail label removals in removeLabelIds, never addLabelIds", async () => {

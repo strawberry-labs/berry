@@ -258,11 +258,13 @@ FROM (SELECT * FROM recorded UNION ALL SELECT * FROM live) totals
         cursor: query.cursor,
         limit: query.limit + 1,
       }, "desc");
-      const rows = await executor.query<UsageEventRow>(
-        `SELECT * FROM usage_events ${eventQuery.where} ORDER BY ts DESC,id DESC${eventQuery.limitClause}`,
+      // The pg date parser loses sub-millisecond precision. Keep it in the cursor.
+      const rows = await executor.query<UsageEventRow & { cursor_ts: string }>(
+        `SELECT *, to_char(ts AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_ts
+         FROM usage_events ${eventQuery.where} ORDER BY ts DESC,id DESC${eventQuery.limitClause}`,
         eventQuery.params,
       );
-      return requestPageFromOrderedEvents(rows.map(usageEventFromRow), query.limit);
+      return requestPageFromOrderedEvents(rows.map(usageEventFromRow), query.limit, rows[query.limit - 1]?.cursor_ts);
     });
   }
 
@@ -503,13 +505,22 @@ function queryFilter(query: UsageAnalyticsQuery): UsageEventFilter {
   };
 }
 
+function projectMonthEndSpend(query: Pick<UsageAnalyticsQuery, "from" | "to">, spend: bigint, now = new Date()): string | null {
+  const start = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
+  const end = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
+  const to = Date.parse(query.to);
+  // Forecast only from a month-to-date sample of at least one full day.
+  if (Date.parse(query.from) !== start || to >= end) return null;
+  const elapsedMs = Math.min(to, now.getTime()) - start;
+  if (elapsedMs < 86_400_000) return null;
+  const elapsed = BigInt(elapsedMs);
+  return ((spend * BigInt(end - start) + elapsed / 2n) / elapsed).toString();
+}
+
 function analyticsFromEvents(tenantId: string, query: UsageAnalyticsQuery, events: CloudUsageEventRecord[]): UsageAnalytics {
   const totalCost = events.reduce((sum, event) => sum + BigInt(event.costBilledMicros), 0n);
   const successes = events.filter((event) => isSuccess(event.status)).length;
   const tokens = events.reduce((sum, event) => sum + event.tokensIn + event.tokensOut, 0);
-  const elapsedDays = Math.max(1, (new Date(query.to).getTime() - new Date(query.from).getTime()) / 86_400_000);
-  const monthDays = new Date(new Date(query.to).getUTCFullYear(), new Date(query.to).getUTCMonth() + 1, 0).getUTCDate();
-  const projection = totalCost * BigInt(Math.max(1, Math.round(monthDays / elapsedDays)));
   const latencies = events.flatMap((event) => event.latencyMs === null ? [] : [event.latencyMs]).sort((a, b) => a - b);
   const ttfts = events.flatMap((event) => event.ttftMs === null ? [] : [event.ttftMs]).sort((a, b) => a - b);
   const sandboxMinutes = events.reduce((sum, event) => sum + sandboxMinutesFor(event.sandboxUsage), 0);
@@ -520,7 +531,7 @@ function analyticsFromEvents(tenantId: string, query: UsageAnalyticsQuery, event
       inputTokens: events.reduce((sum, event) => sum + event.tokensIn, 0),
       outputTokens: events.reduce((sum, event) => sum + event.tokensOut, 0),
       successRate: events.length ? successes / events.length : null,
-      projectedMonthEndMicros: events.length ? projection.toString() : null,
+      projectedMonthEndMicros: events.length ? projectMonthEndSpend(query, totalCost) : null,
     },
     series: usageSeries(events, query),
     breakdowns: {
@@ -649,7 +660,7 @@ async function postgresAnalytics(
       FROM aggregated
     )
     SELECT * FROM ranked
-    WHERE dimension_rank <= 100
+    WHERE dimension_rank <= 100 OR dimension = 'member'
     ORDER BY dimension, dimension_rank
   `, filter.params);
 
@@ -657,14 +668,7 @@ async function postgresAnalytics(
   const requestCount = numberFromDb(totals?.requests);
   const inputTokens = numberFromDb(totals?.input_tokens);
   const outputTokens = numberFromDb(totals?.output_tokens);
-  const elapsedDays = Math.max(
-    1,
-    (new Date(query.to).getTime() - new Date(query.from).getTime()) / 86_400_000,
-  );
-  const to = new Date(query.to);
-  const monthDays = new Date(Date.UTC(to.getUTCFullYear(), to.getUTCMonth() + 1, 0)).getUTCDate();
   const totalCost = BigInt(totals?.billed_cost_micros ?? "0");
-  const projection = totalCost * BigInt(Math.max(1, Math.round(monthDays / elapsedDays)));
   const series = seriesRows.map((row) => ({
     ts: iso(row.bucket),
     billedCostMicros: String(row.billed_cost_micros),
@@ -733,7 +737,7 @@ async function postgresAnalytics(
       inputTokens,
       outputTokens,
       successRate: requestCount ? numberFromDb(totals?.successes) / requestCount : null,
-      projectedMonthEndMicros: requestCount ? projection.toString() : null,
+      projectedMonthEndMicros: requestCount ? projectMonthEndSpend(query, totalCost) : null,
     },
     series,
     breakdowns,
@@ -883,14 +887,14 @@ function requestPageFromEvents(events: CloudUsageEventRecord[], query: UsageAnal
   return requestPageFromOrderedEvents(sorted.slice(start, start + query.limit + 1), query.limit);
 }
 
-function requestPageFromOrderedEvents(events: CloudUsageEventRecord[], limit: number): UsageRequestPage {
+function requestPageFromOrderedEvents(events: CloudUsageEventRecord[], limit: number, cursorTs?: string): UsageRequestPage {
   const hasMore = events.length > limit;
   const pageEvents = events.slice(0, limit);
   const last = pageEvents.at(-1);
   return UsageRequestPageSchema.parse({
     items: pageEvents.map(requestSummaryFromEvent),
     hasMore,
-    nextCursor: hasMore && last ? requestCursor(last) : null,
+    nextCursor: hasMore && last ? requestCursor(last, cursorTs) : null,
   });
 }
 
@@ -936,15 +940,17 @@ function requestDetailFromEvent(event: CloudUsageEventRecord): UsageRequestDetai
   return UsageRequestDetailSchema.parse({ ...requestSummaryFromEvent(event), taskId: event.taskId, sessionId: event.sessionId, sandboxId: event.sandboxId, reservationId: typeof metadata.reservationId === "string" ? metadata.reservationId : null, safeMetadata });
 }
 
-function requestCursor(event: CloudUsageEventRecord): string { return `${event.ts}|${event.id}`; }
+function requestCursor(event: CloudUsageEventRecord, ts = event.ts): string { return `${ts}|${event.id}`; }
 function parseRequestCursor(cursor: string | undefined): { ts: string; id: string } | null {
   if (!cursor) return null;
   const separator = cursor.lastIndexOf("|");
   if (separator <= 0) return null;
   const ts = cursor.slice(0, separator);
   const id = cursor.slice(separator + 1);
-  if (Number.isNaN(new Date(ts).getTime()) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) return null;
-  return { ts: new Date(ts).toISOString(), id };
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime()) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) return null;
+  const submilliseconds = /\.\d{3}(\d{1,3})Z$/.exec(ts)?.[1] ?? "";
+  return { ts: date.toISOString().replace(/Z$/, `${submilliseconds}Z`), id };
 }
 function redactRequestId(value: string): string { return value.length <= 12 ? value : `${value.slice(0, 6)}…${value.slice(-4)}`; }
 function isSuccess(status: string): boolean { return ["completed", "success", "succeeded"].includes(status); }
@@ -1101,7 +1107,7 @@ type UsageEventRow = {
   id: string;
   tenant_id: string;
   request_id: string;
-  source: "api" | "router" | "sandbox" | "fixture";
+  source: CloudUsageEventRecord["source"];
   user_id: string | null;
   department_id: string | null;
   workspace_id: string | null;
