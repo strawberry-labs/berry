@@ -174,6 +174,9 @@ if [ "$berry_configure_roles" = true ]; then
 fi
 
 worker_scale_reconciled=false
+# A terminating worker drains its current durable phase. Allow the longest configured
+# provider call (30 minutes) to finish and save its receipt before Docker kills it.
+worker_stop_timeout=2100
 berry_non_monitoring_restart_services=""
 for service in $berry_restart_services; do
   case "$service" in
@@ -185,7 +188,7 @@ if [ "$berry_compose_changed" = true ]; then
   # Wait only for long-running services. Compose reports a successful one-shot
   # container such as minio-init as an error under `up --wait`, and following
   # API dependencies here would also run migrations and role setup twice.
-  compose up -d --no-deps --no-build --pull never --remove-orphans --wait --wait-timeout 120 $worker_scale_args $berry_runtime_services
+  compose up -d --no-deps --no-build --pull never --remove-orphans --timeout "$worker_stop_timeout" --wait --wait-timeout 120 $worker_scale_args $berry_runtime_services
   worker_scale_reconciled=true
   if [ "$berry_initialize_minio" = true ]; then
     compose run --rm --no-deps minio-init
@@ -194,7 +197,7 @@ elif [ -n "$berry_non_monitoring_restart_services" ]; then
   echo "Restarting affected services:$berry_restart_services"
   case " $berry_non_monitoring_restart_services " in
     *" worker "*|*" worker-foreground "*)
-      compose up -d --no-build --pull never --no-deps --wait --wait-timeout 120 $worker_scale_args $berry_non_monitoring_restart_services
+      compose up -d --no-build --pull never --no-deps --timeout "$worker_stop_timeout" --wait --wait-timeout 120 $worker_scale_args $berry_non_monitoring_restart_services
       worker_scale_reconciled=true
       ;;
     *)
