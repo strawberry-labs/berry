@@ -11,7 +11,9 @@ export interface ScheduledTaskSqlExecutor {
   transaction?<T>(callback: (executor: ScheduledTaskSqlExecutor) => Promise<T>): Promise<T>;
 }
 export type ScheduledTaskScope = { tenantId: string; userId: string };
+export type ScheduledMailActivityGate = { kind: "gmail_since_checkpoint"; connectorId: string; checkpointTool: string; overlapSeconds?: number; deliveryDelaySeconds?: number };
 export type ScheduledRunClaim = {
+  activityGate?: ScheduledMailActivityGate | null;
   id: string; userId: string; sessionId: string; workspaceId: string; email: string; name: string;
   input: { prompt: string; timezone: string; reasoning: ScheduledTask["reasoning"] };
 };
@@ -124,7 +126,8 @@ export class SqlScheduledTaskRepository {
       if (rescheduled && schedule.kind === "once" && new Date(schedule.runAt) <= now) throw new Error("Choose a future time before restarting a one-time task");
       const next = state === "active" ? (rescheduled ? nextTaskScheduleRun(schedule, now) : prior.next_run_at) : null;
       const [row] = await sql.query<ScheduleRow>(`UPDATE scheduled_tasks SET name=$4,prompt=$5,schedule=$6::jsonb,state=$7,next_run_at=$8,
-        model_provider_id=$9,model=$10,reasoning=$11,last_error=NULL,updated_at=now()
+        model_provider_id=$9,model=$10,reasoning=$11,last_error=NULL,updated_at=now(),
+        activity_gate=CASE WHEN prompt IS DISTINCT FROM $5 THEN NULL ELSE activity_gate END
         WHERE tenant_id=$1::uuid AND user_id=$2::uuid AND id=$3::uuid RETURNING *`,
         [scope.tenantId, scope.userId, id, input.name ?? prior.name, input.prompt ?? prior.prompt, JSON.stringify(schedule), state, next,
           input.modelProviderId === undefined ? prior.model_provider_id : input.modelProviderId,
@@ -231,7 +234,7 @@ export class SqlScheduledTaskRepository {
         FROM turn_runs t WHERE r.tenant_id=$1::uuid AND t.tenant_id=r.tenant_id AND t.request_id='model_' || r.id::text
           AND r.state IN ('pending','dispatching') AND t.session_id=r.session_id
           AND t.task_id=r.task_id AND t.user_id=(SELECT user_id FROM scheduled_tasks s WHERE s.tenant_id=r.tenant_id AND s.id=r.schedule_id)`, [tenantId]);
-      const rows = await sql.query<{ id: string; user_id: string; session_id: string; workspace_id: string; email: string; name: string; input: ScheduledRunClaim["input"] }>(`WITH claims AS (
+      const rows = await sql.query<{ id: string; user_id: string; session_id: string; workspace_id: string; email: string; name: string; input: ScheduledRunClaim["input"]; activity_gate: ScheduledMailActivityGate | null }>(`WITH claims AS (
         SELECT r.id FROM scheduled_task_runs r JOIN scheduled_tasks s ON s.tenant_id=r.tenant_id AND s.id=r.schedule_id
         WHERE r.tenant_id=$1::uuid AND r.state IN ('pending','dispatching') AND r.retry_at<=now()
           AND (r.lease_expires_at IS NULL OR r.lease_expires_at<=now())
@@ -239,9 +242,10 @@ export class SqlScheduledTaskRepository {
       ), claimed AS (
         UPDATE scheduled_task_runs r SET state='dispatching',attempts=attempts+1,lease_owner=$2,lease_expires_at=now()+interval '5 minutes'
         FROM claims WHERE r.id=claims.id AND r.tenant_id=$1::uuid RETURNING r.*
-      ) SELECT r.id,s.user_id,r.session_id,s.workspace_id,u.email,u.name,r.input FROM claimed r
+      ) SELECT r.id,s.user_id,r.session_id,s.workspace_id,u.email,u.name,r.input,
+        CASE WHEN r.trigger='scheduled' AND r.input->>'prompt'=s.prompt THEN s.activity_gate END AS activity_gate FROM claimed r
         JOIN scheduled_tasks s ON s.tenant_id=r.tenant_id AND s.id=r.schedule_id JOIN users u ON u.id=s.user_id`, [tenantId, owner]);
-      return rows.map((row) => ({ id: row.id, userId: row.user_id, sessionId: row.session_id, workspaceId: row.workspace_id, email: row.email, name: row.name, input: row.input }));
+      return rows.map((row) => ({ id: row.id, userId: row.user_id, sessionId: row.session_id, workspaceId: row.workspace_id, email: row.email, name: row.name, input: row.input, activityGate: row.activity_gate }));
     });
   }
 
@@ -251,6 +255,20 @@ export class SqlScheduledTaskRepository {
         JOIN scheduled_tasks s ON s.tenant_id=r.tenant_id AND s.id=r.schedule_id
         WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid AND r.state='dispatching' AND r.lease_owner=$3 AND r.lease_expires_at>now()`, [tenantId, id, owner]);
       return Boolean(row && await this.activeOwner(sql, { tenantId, userId: row.user_id }, row.workspace_id));
+    });
+  }
+
+  async skipIdle(tenantId: string, id: string, owner: string): Promise<void> {
+    await this.scoped(tenantId, async (sql) => {
+      await sql.execute(`WITH skipped AS (
+        UPDATE scheduled_task_runs r SET state='skipped', finished_at=now(), lease_expires_at=NULL, lease_owner=NULL,
+          error='No new mail or pending work'
+        WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid AND r.trigger='scheduled' AND r.state='dispatching'
+          AND r.lease_owner=$3 AND r.lease_expires_at>now() AND r.turn_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM turn_runs t WHERE t.tenant_id=r.tenant_id AND t.session_id=r.session_id)
+        RETURNING r.task_id)
+        UPDATE tasks SET status='completed', unread_at=NULL, updated_at=now() WHERE tenant_id=$1::uuid
+          AND status='queued' AND id IN (SELECT task_id FROM skipped)`, [tenantId, id, owner]);
     });
   }
 

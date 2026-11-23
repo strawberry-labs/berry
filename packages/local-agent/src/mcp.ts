@@ -1,5 +1,6 @@
 import type { AgentTool, AgentToolResult } from "@berry/harness";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -204,6 +205,26 @@ interface ConnectedServer {
   /** When tools/list last completed on this connection (epoch ms). */
   listedAt: number;
 }
+
+const operationContext = new AsyncLocalStorage<string>();
+export function withMcpOperation<T>(operationId: string, action: () => Promise<T>): Promise<T> {
+  return operationContext.run(operationId, action);
+}
+
+function wireJson(value: unknown): string {
+  if (Array.isArray(value)) return "[" + value.map(wireJson).join(",") + "]";
+  if (value && typeof value === "object") return "{" + Object.entries(value)
+    .filter(([, item]) => item !== undefined).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+    .map(([key, item]) => JSON.stringify(key) + ":" + wireJson(item)).join(",") + "}";
+  return JSON.stringify(value) ?? "null";
+}
+
+const operationReceipt = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("unknown"), operationId: z.string().uuid(), supportedTools: z.array(z.string()).max(1024).optional() }),
+  z.object({ status: z.literal("applied"), operationId: z.string().uuid(), tool: z.string(), argumentsHash: z.string(), result: z.unknown() }),
+  z.object({ status: z.literal("rejected"), operationId: z.string().uuid(), tool: z.string(), argumentsHash: z.string(),
+    httpStatus: z.number().int().min(400).max(499), code: z.string().regex(/^[a-z][a-z0-9_]{1,80}$/) }),
+]);
 
 const mcpRequestSignal = new AsyncLocalStorage<AbortSignal | undefined>();
 
@@ -714,7 +735,8 @@ export class McpToolSource {
     const requestOptions = { ...(signal ? { signal } : {}), ...(browserCall ? { timeout: 150_000 } : {}) };
     let result: Awaited<ReturnType<Client["callTool"]>>;
     try {
-      result = await client.callTool({ name, arguments: args }, undefined, requestOptions);
+      const operationId = operationContext.getStore();
+      result = await client.callTool({ name, arguments: args, ...(operationId ? { _meta: { "berry.dev/operation-id": operationId } } : {}) }, undefined, requestOptions);
     } catch (error) {
       if (error instanceof McpConnectionError) throw error;
       // Only a refusal from the HTTP transport proves the tool did not run.
@@ -738,6 +760,39 @@ export class McpToolSource {
       const allowed = spec.allowedTools ? new Set(spec.allowedTools) : null;
       const cached = (live?.cachedTools ?? spec.cachedTools ?? []).filter((tool) => !allowed || allowed.has(tool.name));
       return cached.map((tool) => cachedTool(spec, tool, (name, args, signal) => this.#executeTool(spec, name, args, signal, false)));
+    });
+  }
+
+  async readOperationReceipt(serverId: string, toolName: string, operationId: string, args: unknown, signal: AbortSignal) {
+    const spec = this.#options.servers.find((entry) => entry.id === serverId && entry.trusted && entry.enabled && entry.transport !== "stdio");
+    if (!spec || !z.string().uuid().safeParse(operationId).success) return;
+    const uri = `berry-receipt://operations/${operationId}`;
+    return this.#withConnection(spec, signal, true, async (server) => {
+      const tool = server.cachedTools.find((entry) => `mcp__${sanitizeName(spec.name)}__${sanitizeName(entry.name)}` === toolName);
+      if (!tool || !server.client.getServerCapabilities()?.resources) return;
+      const reply = await server.client.readResource({ uri }, { signal, timeout: 8_000 });
+      const item = reply.contents[0];
+      if (reply.contents.length !== 1 || item?.uri !== uri || !("text" in item) || typeof item.text !== "string" || item.text.length > 1_048_576) return;
+      const parsed = operationReceipt.safeParse(JSON.parse(item.text));
+      if (!parsed.success || parsed.data.operationId !== operationId) return;
+      const receipt = parsed.data;
+      if (receipt.status === "unknown") return !receipt.supportedTools || receipt.supportedTools.includes(tool.name)
+        ? { status: "pending" as const } : undefined;
+      const expected = createHash("sha256").update(wireJson(args)).digest("hex");
+      if (receipt.tool !== tool.name || receipt.argumentsHash !== expected) return;
+      if (receipt.status === "applied" && receipt.result === undefined) return;
+      return receipt;
+    });
+  }
+
+  async executeReviewedRead(serverId: string, wireName: string, args: Record<string, unknown>, signal: AbortSignal) {
+    const spec = this.#options.servers.find((entry) => entry.id === serverId && entry.enabled && entry.trusted);
+    const reviewed = spec?.cachedTools?.find((tool) => tool.name === wireName && tool.annotations?.readOnlyHint === true && !tool.annotations.destructiveHint);
+    if (!spec || !reviewed) throw new Error("The configured read tool has not been reviewed");
+    return this.#withConnection(spec, signal, true, async (server) => {
+      const live = server.cachedTools.find((tool) => tool.name === wireName);
+      if (!live || !sameReviewedToolDefinition(reviewed, live)) throw new Error("The configured read tool changed");
+      return this.#call(server.client, wireName, args, signal, spec);
     });
   }
 

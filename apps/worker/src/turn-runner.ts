@@ -557,6 +557,8 @@ export interface DurableSkillPackageStageOptions {
 }
 
 export interface DurableTurnToolExecutor {
+  operationReceipt?(snapshot: DurableTurnSnapshot, step: DurableTurnStep, signal: AbortSignal): Promise<
+    { status: "applied"; result: TurnToolResult } | { status: "rejected"; httpStatus: number; code: string } | { status: "pending" } | undefined>;
   definitions?(snapshot: DurableTurnSnapshot): Promise<readonly ChatToolDefinition[]>;
   /** Text this executor adds to a run's turn context, journaled once per run. */
   turnContext?(snapshot: DurableTurnSnapshot): Promise<string>;
@@ -634,8 +636,7 @@ const OUTPUT_REPETITION_CHECK_INTERVAL = 128;
 const MODEL_CONTEXT_SAFETY_TOKENS = CONTEXT_SAFETY_TOKENS;
 const DEFAULT_NO_PROGRESS_WARNING_THRESHOLD = 3;
 const DEFAULT_NO_PROGRESS_HARD_THRESHOLD = 5;
-const DEFAULT_CUMULATIVE_TOOL_TIME_MS = 30 * 60_000;
-const DEFAULT_ACTIVE_COMPUTE_MS = 2 * 60 * 60_000;
+const DEFAULT_STALLED_MODEL_ITERATIONS = 40;
 const DEFAULT_ABORT_CLEANUP_TIMEOUT_MS = 2_000;
 const TOOL_CONTEXT_CHARACTERS_PER_TOKEN = 4;
 const MAX_TOOL_CONTEXT_ENVELOPE_CHARS = 4 * 1024 * 1024;
@@ -697,8 +698,9 @@ export class DurableTurnRunner {
       snapshotIntervalSeconds?: number;
       contextWindowTokens?: number;
       maxModelAttempts?: number;
-      maxModelIterations?: number;
-      maxTurnDurationMs?: number;
+      maxModelIterations?: number | undefined;
+      maxStalledModelIterations?: number | undefined;
+      maxTurnDurationMs?: number | undefined;
       modelPreparationTimeoutMs?: number;
       modelIdleTimeoutMs?: number;
       modelMaxDurationMs?: number;
@@ -706,8 +708,8 @@ export class DurableTurnRunner {
       toolMaxDurationMs?: number;
       toolClassLimits?: Partial<Record<"read" | "command" | "connector" | "image" | "default", ToolExecutionLimit>>;
       maxParallelToolCalls?: number;
-      maxCumulativeToolTimeMs?: number;
-      maxActiveComputeMs?: number;
+      maxCumulativeToolTimeMs?: number | undefined;
+      maxActiveComputeMs?: number | undefined;
       noProgressWarningThreshold?: number;
       noProgressHardThreshold?: number;
       maxToolRepairAttempts?: number;
@@ -848,6 +850,52 @@ export class DurableTurnRunner {
     }
   }
 
+  private async checkOperationReceipt(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnRunState | undefined> {
+    if (!isMcpToolStep(step) || !this.tools.operationReceipt) return;
+    const receipt = await this.tools.operationReceipt(snapshot, step, AbortSignal.timeout(12_000)).catch(() => undefined);
+    if (!receipt) return;
+    if (receipt.status === "pending") {
+      const attempt = typeof step.input.receiptChecks === "number" ? step.input.receiptChecks : 0;
+      const delay = [5_000, 20_000, 60_000][attempt];
+      if (!delay) return;
+      await this.repository.commit(snapshot, {
+        expectedState: "executing_tool", nextState: "executing_tool",
+        steps: [{ ...step, state: "running", input: { ...step.input, receiptChecks: attempt + 1 } }],
+        outbox: [{ eventType: "turn.execute", dedupeKey: `${snapshot.id}:receipt:${step.id}:${attempt + 1}`,
+          payload: { tenantId: snapshot.tenantId, runId: snapshot.id, reason: "continue" },
+          availableAt: new Date(Date.now() + delay).toISOString() }],
+        nextAction: "Check the connector for the saved update",
+      });
+      return "executing_tool";
+    }
+    const applied = receipt.status === "applied";
+    const result = journalSafeToolResult(receipt.status === "applied" ? receipt.result : {
+      summary: `The connector rejected the update (${receipt.code}). Check its current state before trying a corrected update.`,
+      output: { failure: { category: "rejected", outcome: "not_applied", code: receipt.code, httpStatus: receipt.httpStatus } },
+    });
+    const entryId = randomUUID(), toolCallId = toolCallIdForStep(step), toolName = toolNameForStep(step);
+    const remaining = snapshot.steps.some((other) => other.id !== step.id && isRunnableToolStep(other));
+    const nextState = remaining ? "executing_tool" : "calling_model";
+    const iteration = modelIteration(snapshot.steps) + 1;
+    const state = applied ? "completed" as const : "failed" as const;
+    const summary = result.summary.slice(0, 2000);
+    await this.commitAndWake(snapshot, {
+      expectedState: "executing_tool", nextState, nextAction: "Continue from the verified connector result",
+      steps: [{ ...step, state, output: result.output, error: applied ? null : summary, outcomeCertainty: "known",
+        sessionEntryId: entryId, resultFingerprint: resultFingerprintForToolResult(snapshot, result) },
+        ...(!remaining ? [{ id: randomUUID(), sequence: nextStepSequence(snapshot.steps), type: "model.call", state: "pending" as const,
+          input: { iteration }, retryClass: "idempotent_with_key" as const, idempotencyKey: `${snapshot.id}:model:${iteration}` }] : [])],
+      events: [{ kind: "tool.end", toolCallId, status: state, summary }],
+      toolResultMessage: { id: entryId, toolCallId, name: toolName, input: (step.input.arguments ?? {}) as JsonValue,
+        status: state, output: result.output, summary },
+      entries: [{ entryId, entryType: "message", stepId: step.id, payload: { type: "message", id: entryId,
+        parentId: snapshot.entries.at(-1)?.entryId ?? null, timestamp: new Date().toISOString(),
+        message: { role: "toolResult", toolCallId, toolName, isError: !applied, timestamp: Date.now(),
+          content: [{ type: "text", text: applied ? durableToolResultText(result.output) : summary }] } } }],
+    });
+    return nextState;
+  }
+
   private async transitionAmbiguousToolToRecovery(
     snapshot: DurableTurnSnapshot,
     reason: string,
@@ -979,24 +1027,28 @@ export class DurableTurnRunner {
       });
       return "finalizing";
     }
-    const maxModelIterations = Math.max(1, this.options.maxModelIterations ?? 200);
-    if (modelIteration(snapshot.steps) > maxModelIterations) {
+    const maxModelIterations = this.options.maxModelIterations;
+    if (maxModelIterations !== undefined && modelIteration(snapshot.steps) > maxModelIterations) {
       throw new DurableTurnTerminalError(
         `The task exceeded the ${maxModelIterations}-step model safety limit. Click the Continue/Play button in the bottom-right corner if you want Berry to continue from the latest saved progress.`,
       );
     }
-    const maxTurnDurationMs = Math.max(60_000, this.options.maxTurnDurationMs ?? 2 * 60 * 60 * 1_000);
+    const stallWindow = this.options.maxStalledModelIterations ?? maxModelIterations ?? DEFAULT_STALLED_MODEL_ITERATIONS;
+    if (modelIteration(snapshot.steps) > stallWindow && modelStepsWithoutProgress(snapshot) > stallWindow) {
+      throw new DurableTurnTerminalError(`Berry stopped after ${stallWindow} model steps without a new, confirmed tool result. The completed work is saved.`);
+    }
+    const maxTurnDurationMs = this.options.maxTurnDurationMs;
     const waitingMs = (snapshot.humanWaitMs ?? 0)
       + (snapshot.waitingStartedAt && snapshot.state === "waiting"
         ? Math.max(0, Date.now() - Date.parse(snapshot.waitingStartedAt))
         : 0);
-    if (Date.now() - Date.parse(snapshot.createdAt) - waitingMs > maxTurnDurationMs) {
+    if (maxTurnDurationMs !== undefined && Date.now() - Date.parse(snapshot.createdAt) - waitingMs > maxTurnDurationMs) {
       const durationMinutes = Math.round(maxTurnDurationMs / 60_000);
       throw new DurableTurnTerminalError(
         `The task exceeded the ${durationMinutes}-minute execution safety limit. Berry stopped it to prevent an abandoned or looping task from blocking other work.`,
       );
     }
-    if (progressState(snapshot).cumulativeActiveComputeMs >= Math.max(60_000, this.options.maxActiveComputeMs ?? DEFAULT_ACTIVE_COMPUTE_MS)) {
+    if (this.options.maxActiveComputeMs !== undefined && progressState(snapshot).cumulativeActiveComputeMs >= this.options.maxActiveComputeMs) {
       throw new DurableTurnTerminalError(
         "The task exceeded its active-compute budget. Berry stopped it before starting another model request.",
       );
@@ -1796,8 +1848,8 @@ export class DurableTurnRunner {
     const toolCallId = stringValue(step.input.toolCallId) ?? step.id;
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     const progress = progressState(snapshot);
-    const cumulativeToolBudget = Math.max(60_000, this.options.maxCumulativeToolTimeMs ?? DEFAULT_CUMULATIVE_TOOL_TIME_MS);
-    if (progress.cumulativeToolMs >= cumulativeToolBudget) {
+    const cumulativeToolBudget = this.options.maxCumulativeToolTimeMs;
+    if (cumulativeToolBudget !== undefined && progress.cumulativeToolMs >= cumulativeToolBudget) {
       return this.stopToolUse(snapshot, step, toolTimeBudgetGuard(cumulativeToolBudget));
     }
     const priorRepairAttempts = matchingToolFailureCount(snapshot, step);
@@ -1929,6 +1981,8 @@ export class DurableTurnRunner {
     // Neither is run again on its own.
     const interrupted = step.state === "running" && (step.retryClass === "non_idempotent_manual" || isMcpToolStep(step)) && !argumentError;
     if (interrupted && holdsForReview(step)) {
+      const recovered = await this.checkOperationReceipt(snapshot, step);
+      if (recovered) return recovered;
       await this.repository.commit(snapshot, {
         expectedState: "executing_tool",
         nextState: "recovery_required",
@@ -2174,6 +2228,8 @@ export class DurableTurnRunner {
             });
     } catch (error) {
       if (error instanceof DurableToolTimeoutError && holdsForReview(step)) {
+        const recovered = await this.checkOperationReceipt(snapshot, step);
+        if (recovered) return recovered;
         await this.transitionAmbiguousToolToRecovery(snapshot, error.message, {
           timedOut: true,
           outcomeCertainty: "unknown",
@@ -2219,6 +2275,10 @@ export class DurableTurnRunner {
       // unknown (an unrecognised error) is shown to the model; the next call
       // of the tool is held instead (uncertainEarlierCalls). Sandbox tools are
       // never held: the model sees what happened and continues.
+      if (failure.outcome === "unknown" && holdsForReview(step)) {
+        const recovered = await this.checkOperationReceipt(snapshot, step);
+        if (recovered) return recovered;
+      }
       if (failure.category === "unknown_outcome" && holdsForReview(step)) {
         await this.transitionAmbiguousToolToRecovery(snapshot, message, {
           outcomeCertainty: "unknown",
@@ -2447,8 +2507,8 @@ export class DurableTurnRunner {
     steps: readonly DurableTurnStep[],
   ): Promise<TurnRunState> {
     const currentProgress = progressState(snapshot);
-    const cumulativeToolBudget = Math.max(60_000, this.options.maxCumulativeToolTimeMs ?? DEFAULT_CUMULATIVE_TOOL_TIME_MS);
-    if (currentProgress.cumulativeToolMs >= cumulativeToolBudget) {
+    const cumulativeToolBudget = this.options.maxCumulativeToolTimeMs;
+    if (cumulativeToolBudget !== undefined && currentProgress.cumulativeToolMs >= cumulativeToolBudget) {
       return this.stopToolUse(snapshot, steps[0]!, toolTimeBudgetGuard(cumulativeToolBudget));
     }
     for (const step of steps) {
@@ -5544,6 +5604,26 @@ function formatCount(value: number): string {
 
 function modelIteration(steps: readonly DurableTurnStep[]): number {
   return steps.filter((step) => step.type === "model.call").length;
+}
+
+// Count from durable evidence so restarting the worker cannot renew a stalled run.
+function modelStepsWithoutProgress(snapshot: DurableTurnSnapshot): number {
+  const observed = new Set<string>();
+  let count = 0;
+  for (const step of snapshot.steps) {
+    if (step.type === "model.call") { count++; continue; }
+    if (!isToolStep(step) || step.state !== "completed" || step.error || !step.resultFingerprint
+        || step.outcomeCertainty === "unknown" || declaredPolling(step)) continue;
+    const name = toolNameForStep(step);
+    if (["tool_search", "search_tools", "activate_skill", "ask_user_question", "compose_message"].includes(name)) continue;
+    const output = record(step.output);
+    if (output?.error || output?.isError === true || output?.success === false || output?.suppressed === true) continue;
+    const receipt = `${name}:${step.resultFingerprint}`;
+    if (observed.has(receipt)) continue;
+    observed.add(receipt);
+    count = 0;
+  }
+  return count;
 }
 
 function repeatedToolFailure(snapshot: DurableTurnSnapshot, step: DurableTurnStep): string | null {

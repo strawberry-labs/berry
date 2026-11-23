@@ -5837,4 +5837,5 @@ export const cloudMigrations = [
     id: 75, name: "browser_human_handoff_v1",
     sql: "ALTER TABLE turn_runs ADD COLUMN IF NOT EXISTS browser_handoff jsonb",
   },
+  { id: 76, name: "scheduled_activity_gate_v1", sql: "ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS activity_gate jsonb" },
 ] as const;

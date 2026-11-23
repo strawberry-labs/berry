@@ -2906,6 +2906,22 @@ describe("durable turn runner", () => {
     expect(repository.mutations.filter((mutation) => mutation.toolResultMessages)).toHaveLength(1);
   });
 
+  it.each(["applied", "rejected", "pending"] as const)("reads a %s receipt after a worker interruption without dispatching the write", async (status) => {
+    const tool = toolStep("running", "non_idempotent_manual", false);
+    tool.type = "tool.mcp__tracker__save";
+    tool.input.toolName = "mcp__tracker__save";
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    const execute = vi.fn();
+    const runner = new DurableTurnRunner(repository, unusedModel(), { execute, operationReceipt: async () =>
+      status === "applied" ? { status, result: { output: { recordId: "confirmed" }, summary: "Saved" } }
+      : status === "rejected" ? { status, httpStatus: 409, code: "version_changed" } : { status } });
+    const result = await runner.execute({ tenantId, runId, reason: "lease-recovery" });
+    expect(execute).not.toHaveBeenCalled();
+    expect(result.state).toBe(status === "pending" ? "executing_tool" : "calling_model");
+    expect(repository.current.steps.find((s) => s.id === tool.id)?.state).toBe(status === "applied" ? "completed" : status === "rejected" ? "failed" : "running");
+    if (status === "pending") expect(repository.outbox.at(-1)?.availableAt).toBeTruthy();
+  });
+
   it("moves an ambiguous running non-idempotent tool to recovery_required", async () => {
     const tool = toolStep("running", "non_idempotent_manual", false);
     const current = snapshot("executing_tool", [admittedStep(), tool]);
@@ -5393,7 +5409,21 @@ describe("durable turn runner", () => {
     expect(repository.current.error).not.toContain("prevent an agent loop");
   });
 
-  it("defaults the model iteration safety limit to 200 steps", async () => {
+  it("finishes productive work beyond 200 calls and ten hours", async () => {
+    const steps = Array.from({ length: 210 }, (_, i) => [
+      { ...modelStep("completed", i * 2 + 1), input: { iteration: i + 1 } },
+      { ...readOnlyToolStep("read", i * 2 + 2, "/record/" + i, "completed"), output: { record: i }, resultFingerprint: "record-" + i },
+    ]).flat();
+    const current = snapshot("calling_model", [admittedStep(), ...steps, modelStep("pending", 421)]);
+    current.createdAt = new Date(Date.now() - 11 * 3600_000).toISOString();
+    const repository = new FakeTurnRepository(current);
+    const call = vi.fn().mockResolvedValue({ text: "Finished", inputTokens: 1, outputTokens: 1, toolCalls: [] });
+    const runner = new DurableTurnRunner(repository, { call }, noTools());
+    expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("finalizing");
+    expect(call).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops a turn that consumes model calls without confirmed tool progress", async () => {
     const steps = Array.from({ length: 201 }, (_, index) => ({
       ...modelStep(index === 200 ? "pending" : "completed", index + 1),
       id: randomUUID(),
@@ -5411,7 +5441,7 @@ describe("durable turn runner", () => {
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
       .resolves.toMatchObject({ state: "failed" });
     expect(modelCalls).toBe(0);
-    expect(repository.current.error).toContain("200-step model safety limit");
+    expect(repository.current.error).toContain("without a new, confirmed tool result");
   });
 
   it("allows the 79th and 80th model steps but denies the 81st before the provider call", async () => {
@@ -7781,7 +7811,7 @@ describe("durable turn runner", () => {
 
 class FakeTurnRepository implements DurableTurnRepository {
   events: AgentStreamEvent[] = [];
-  outbox: Array<{ eventType: string; dedupeKey: string }> = [];
+  outbox: Array<{ eventType: string; dedupeKey: string; availableAt?: string }> = [];
   mutations: DurableTurnMutation[] = [];
   budgetDecision: BudgetReservationDecision = { allowed: true, reason: null };
   lastBudgetEstimate = "0";

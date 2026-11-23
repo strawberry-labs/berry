@@ -224,14 +224,11 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
           positiveInteger(env.BERRY_MODEL_MAX_DURATION_MS) ?? 900_000,
           1_800_000,
         ),
-        maxModelIterations: Math.min(
-          positiveInteger(env.BERRY_MAX_MODEL_ITERATIONS) ?? 200,
-          200,
-        ),
-        maxTurnDurationMs: Math.min(
-          positiveInteger(env.BERRY_MAX_TURN_DURATION_MS) ?? 7_200_000,
-          21_600_000,
-        ),
+        maxStalledModelIterations: positiveInteger(env.BERRY_MAX_STALLED_MODEL_ITERATIONS),
+        maxModelIterations: positiveInteger(env.BERRY_MAX_MODEL_ITERATIONS),
+        maxTurnDurationMs: positiveInteger(env.BERRY_MAX_TURN_DURATION_MS),
+        maxActiveComputeMs: positiveInteger(env.BERRY_MAX_ACTIVE_COMPUTE_MS),
+        maxCumulativeToolTimeMs: positiveInteger(env.BERRY_MAX_CUMULATIVE_TOOL_TIME_MS),
         modelPreparationTimeoutMs: Math.min(
           positiveInteger(env.BERRY_MODEL_PREPARATION_TIMEOUT_MS) ?? 120_000,
           300_000,
