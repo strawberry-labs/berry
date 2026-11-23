@@ -17,6 +17,16 @@ describe("schedule form timezone handling", () => {
       expect(localScheduleDate(scheduleDateToIso(local, "America/New_York"), "America/New_York")).toBe(local);
     }
   });
+  it("round-trips weekday and weekend hours, including off and once daily", () => {
+    for (const weekendHours of ["0", "12", "24"]) {
+      const draft = { ...scheduleDraft(), preset: "hours" as const, time: "05:40", untilHour: "19", weekdayHours: "2", weekendHours };
+      const schedule = draftSchedule(draft);
+      const restored = scheduleDraft({ schedule } as Parameters<typeof scheduleDraft>[0]);
+      expect(restored).toMatchObject({ preset: "hours", time: "05:40", untilHour: "19", weekdayHours: "2", weekendHours });
+      expect(draftSchedule(restored)).toEqual(schedule);
+    }
+    expect(() => draftSchedule({ ...scheduleDraft(), preset: "hours", weekdayHours: "0", weekendHours: "0" })).toThrow("Enable");
+  });
   it("produces five-field cron for common repeat options", () => {
     const draft = { ...scheduleDraft(), timezone: "Asia/Dubai", time: "09:15", day: "2" };
     expect(draftSchedule({ ...draft, preset: "weekdays" })).toEqual({ kind: "cron", expression: "15 9 * * 1-5", timezone: "Asia/Dubai" });

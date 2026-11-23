@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { CalendarClock, Pause, Pencil, Play, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
-import { ScheduledTaskCreateSchema, type ScheduledTask, type ScheduledTaskRun } from "@berry/shared";
+import { nextTaskScheduleRun, ScheduledTaskCreateSchema, type ScheduledTask, type ScheduledTaskRun } from "@berry/shared";
 import {
   AsyncState,
   Button,
@@ -27,6 +27,11 @@ import { TimezoneSelect } from "../management/timezone-select";
 import { actionErrorMessage } from "@/lib/action-error";
 import { describeTaskSchedule, draftSchedule, scheduleDraft, type ScheduledTaskDraft, type SchedulePreset } from "@/lib/scheduled-task-form";
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "./field";
+
+const cadenceOptions = [{ value: "0", label: "Off" }, ...Array.from({ length: 24 }, (_, index) => {
+  const hours = index + 1;
+  return { value: String(hours), label: hours === 24 ? "Once daily" : hours === 1 ? "Every hour" : `Every ${hours} hours` };
+})];
 
 function formatAt(value: string | null, timezone: string, fallback = "No upcoming run"): string {
   return value ? new Intl.DateTimeFormat(undefined, { timeZone: timezone, month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(new Date(value)) : fallback;
@@ -86,7 +91,7 @@ export function ScheduledTasksScreen({ client, tenantId, userId, supportView, wo
       if (editing === "new") await client.createScheduledTask(parsed);
       else {
         const original = scheduleDraft(editing);
-        const changed = (["preset", "time", "day", "expression", "timezone", "runAt", "minutes"] as const).some((key) => draft[key] !== original[key]);
+        const changed = (["preset", "time", "day", "expression", "timezone", "runAt", "minutes", "untilHour", "weekdayHours", "weekendHours"] as const).some((key) => draft[key] !== original[key]);
         await client.updateScheduledTask(editing.id, { name: parsed.name, prompt: parsed.prompt,
           ...(changed ? { schedule: parsed.schedule, ...(editing.state === "paused" ? { state: "paused" as const } : {}) } : {}),
         }, operationId);
@@ -110,6 +115,20 @@ export function ScheduledTasksScreen({ client, tenantId, userId, supportView, wo
     finally { inFlight.current = false; setBusy(null); }
   }
   const mode: "repeat" | "once" | "delay" = draft.preset === "once" || draft.preset === "delay" ? draft.preset : "repeat";
+  const nextRuns = React.useMemo(() => {
+    if (!editing || (draft.preset !== "hours" && draft.preset !== "custom")) return [];
+    try {
+      const schedule = draftSchedule(draft);
+      if (schedule.kind !== "cron") return [];
+      const runs: string[] = [];
+      let from = new Date();
+      for (let i = 0; i < 3; i++) {
+        from = nextTaskScheduleRun(schedule, from);
+        runs.push(formatAt(from.toISOString(), schedule.timezone));
+      }
+      return runs;
+    } catch { return []; }
+  }, [editing, draft]);
   const rows = React.useMemo(() => [...(schedules.data ?? [])].sort((left, right) =>
     taskStatus(left).rank - taskStatus(right).rank
     || (left.nextRunAt ?? "9999").localeCompare(right.nextRunAt ?? "9999")
@@ -192,15 +211,21 @@ export function ScheduledTasksScreen({ client, tenantId, userId, supportView, wo
         {editing === "new" ? <Field><FieldLabel>Project</FieldLabel><FormSelect value={draft.workspaceId || "general"} onChange={(value) => change("workspaceId", value === "general" ? "" : value)} disabled={saving} ariaLabel="Project" options={[{ value: "general", label: "General tasks" }, ...workspaces.filter((workspace) => workspace.workspaceKind === "project").map((workspace) => ({ value: workspace.id, label: workspace.name }))]} /><FieldDescription>Where each run’s chat is created. This can’t be changed later.</FieldDescription></Field> : null}
         <Field><FieldLabel>When</FieldLabel><div><SegmentedControl label="Schedule type" value={mode} onChange={(value) => { if (!saving && value !== mode) change("preset", value === "repeat" ? "weekdays" : value); }} options={[{ value: "repeat", label: "Repeat" }, { value: "once", label: "Once" }, { value: "delay", label: "After a delay" }]} /></div></Field>
         {mode === "repeat" ? <div className="grid gap-4 sm:grid-cols-2">
-          <Field><FieldLabel>Repeat</FieldLabel><FormSelect value={draft.preset} disabled={saving} ariaLabel="Repeat frequency" onChange={(value) => change("preset", value as SchedulePreset)} options={[{ value: "daily", label: "Every day" }, { value: "weekdays", label: "Weekdays" }, { value: "weekly", label: "Every week" }, { value: "monthly", label: "Every month" }, { value: "custom", label: "Custom (cron)" }]} /></Field>
-          {draft.preset !== "custom" ? <Field><FieldLabel htmlFor="schedule-time">Time</FieldLabel><Input id="schedule-time" type="time" required value={draft.time} disabled={saving} onChange={(event) => change("time", event.target.value)} /></Field> : null}
+          <Field><FieldLabel>Repeat</FieldLabel><FormSelect value={draft.preset} disabled={saving} ariaLabel="Repeat frequency" onChange={(value) => change("preset", value as SchedulePreset)} options={[{ value: "daily", label: "Every day" }, { value: "weekdays", label: "Weekdays" }, { value: "weekly", label: "Every week" }, { value: "monthly", label: "Every month" }, { value: "hours", label: "Working hours" }, { value: "custom", label: "Custom (cron)" }]} /></Field>
+          {draft.preset !== "custom" ? <Field><FieldLabel htmlFor="schedule-time">{draft.preset === "hours" ? "First check" : "Time"}</FieldLabel><Input id="schedule-time" type="time" required value={draft.time} disabled={saving} onChange={(event) => change("time", event.target.value)} /></Field> : null}
+          {draft.preset === "hours" ? <>
+            <Field><FieldLabel>Stop before</FieldLabel><FormSelect ariaLabel="Stop before" disabled={saving} value={draft.untilHour} onChange={(v) => change("untilHour", v)} options={Array.from({ length: 24 }, (_, i) => ({ value: String(i + 1), label: i === 23 ? "Midnight (24:00)" : String(i + 1).padStart(2, "0") + ":00" }))} /></Field>
+            <Field><FieldLabel>Monday–Friday</FieldLabel><FormSelect ariaLabel="Weekday frequency" disabled={saving} value={draft.weekdayHours} onChange={(v) => change("weekdayHours", v)} options={cadenceOptions} /></Field>
+            <Field><FieldLabel>Saturday–Sunday</FieldLabel><FormSelect ariaLabel="Weekend frequency" disabled={saving} value={draft.weekendHours} onChange={(v) => change("weekendHours", v)} options={cadenceOptions} /></Field>
+          </> : null}
           {draft.preset === "weekly" ? <Field><FieldLabel>Day</FieldLabel><FormSelect value={draft.day} disabled={saving} ariaLabel="Day of the week" onChange={(value) => change("day", value)} options={["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"].map((label, index) => ({ value: String(index), label }))} /></Field> : null}
           {draft.preset === "monthly" ? <Field><FieldLabel htmlFor="schedule-day">Day of the month</FieldLabel><Input id="schedule-day" type="number" min={1} max={31} required value={draft.day} disabled={saving} onChange={(event) => change("day", event.target.value)} /><FieldDescription>Months without this day are skipped.</FieldDescription></Field> : null}
         </div> : null}
-        {draft.preset === "custom" ? <Field><FieldLabel htmlFor="schedule-cron">Cron expression</FieldLabel><Input id="schedule-cron" className="font-mono" value={draft.expression} required disabled={saving} placeholder="0 9 * * 1-5" onChange={(event) => change("expression", event.target.value)} /><FieldDescription>Minute, hour, day of month, month, day of week. For example, 0 9 * * 1-5 runs on weekdays at 09:00.</FieldDescription></Field> : null}
+        {draft.preset === "custom" ? <Field><FieldLabel htmlFor="schedule-cron">Cron expression</FieldLabel><Textarea id="schedule-cron" rows={3} className="font-mono" value={draft.expression} required disabled={saving} placeholder="0 9 * * 1-5" onChange={(event) => change("expression", event.target.value)} /><FieldDescription>Enter one five-field cron rule per line. A match on any line starts one run.</FieldDescription></Field> : null}
         {draft.preset === "once" ? <Field><FieldLabel htmlFor="schedule-date">Date and time</FieldLabel><Input id="schedule-date" type="datetime-local" required value={draft.runAt} disabled={saving} onChange={(event) => change("runAt", event.target.value)} /></Field> : null}
         {draft.preset === "delay" ? <Field><FieldLabel htmlFor="schedule-delay">Minutes from now</FieldLabel><Input id="schedule-delay" type="number" min={1} max={525600} required value={draft.minutes} disabled={saving} onChange={(event) => change("minutes", event.target.value)} /><FieldDescription>The delay starts when you save.</FieldDescription></Field> : null}
         <Field><FieldLabel>Timezone</FieldLabel><TimezoneSelect ariaLabel="Timezone" value={draft.timezone} disabled={saving} onChange={(timezone) => change("timezone", timezone)} /><FieldDescription>Times follow this timezone, including its daylight saving changes.</FieldDescription></Field>
+        {nextRuns.length > 0 ? <FieldDescription>Next checks · {nextRuns.join(" · ")}</FieldDescription> : null}
         {formError ? <InlineNotice tone="danger">{formError}</InlineNotice> : null}
         <FieldDescription>Runs use your current tool access and count against your allowance. If the previous run is still going, the next one is skipped.</FieldDescription>
       </FieldGroup></form>

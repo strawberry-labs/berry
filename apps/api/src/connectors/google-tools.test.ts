@@ -67,6 +67,49 @@ describe("Google connector tool policy", () => {
     expect(readFile?.inputSchema.required).toEqual(["fileId"]);
   });
 
+  it("batches selected Gmail headers, preserves received time and reports a missing ID", async () => {
+    const fetcher = vi.fn(async (url: string) => {
+      const u = new URL(url);
+      expect(u.searchParams.get("format")).toBe("metadata");
+      expect(u.searchParams.get("fields")).toBe("id,threadId,internalDate,payload(headers)");
+      expect(u.searchParams.getAll("metadataHeaders")).toEqual(["From"]);
+      if (u.pathname.endsWith("/missing")) return Response.json({ error: { message: "Not found" } }, { status: 404 });
+      return Response.json({ id: "m", threadId: "t", internalDate: "123", payload: { headers: [
+        { name: "FROM", value: "sender" }, { name: "Unrequested", value: "unused" },
+      ] } });
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const read = () => executeGoogleTool("gmail", "read", "gmail_get_messages_metadata", "token", { messageIds: ["m", "missing", "m"], metadataHeaders: ["From"] }, null, [GMAIL_READ]);
+    expect(await read()).toEqual({ messages: [{ id: "m", threadId: "t", internalDate: "123", headers: [{ name: "FROM", value: "sender" }] },
+      { id: "missing", error: { status: 404, message: expect.any(String) } }] });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({}, { status: 401 })));
+    await expect(read()).rejects.toThrow("401");
+  });
+
+  it("returns compact decoded parts, complete forwards and link targets without file bytes", async () => {
+    const body = "a🔎b\n> forwarded exactly";
+    const html = '<a href="https://example.com/f">file</a>';
+    const enc = (s: string) => Buffer.from(s).toString("base64url");
+    const file = "private-binary-sentinel";
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.includes("/attachments/")) return Response.json({ data: enc(html), size: Buffer.byteLength(html) });
+      return Response.json({ id: "m", threadId: "t", internalDate: "123", payload: { partId: "", mimeType: "multipart/mixed", parts: [
+        { partId: "0", mimeType: "text/plain", body: { data: enc(body), size: Buffer.byteLength(body) } },
+        { partId: "1", mimeType: "text/html", body: { attachmentId: "external", size: Buffer.byteLength(html) } },
+        { partId: "2", mimeType: "application/pdf", filename: "document.pdf", body: { data: enc(file) } },
+      ] } });
+    }));
+    const read = (args: Record<string, unknown>) => executeGoogleTool("gmail", "read", "gmail_read_message", "token", { messageId: "m", ...args }, null, [GMAIL_READ]);
+    const overview = await read({ limit: 2 });
+    expect(overview).toMatchObject({ id: "m", body: { text: "a🔎", nextOffset: 3 }, inventory: { total: 4 } });
+    expect(JSON.stringify(overview)).not.toContain(enc(file));
+    expect(await read({ view: "text", partId: "0", offset: 3 })).toMatchObject({ body: { text: "b\n> forwarded exactly", nextOffset: null } });
+    expect(await read({ view: "text", partId: "1" })).toMatchObject({ body: { text: html } });
+    expect(await read({ view: "parts", offset: 3 })).toMatchObject({ parts: [{ partId: "2", filename: "document.pdf" }], nextOffset: null });
+    await expect(read({ view: "text", partId: "2" })).rejects.toThrow("gmail_get_attachment");
+  });
+
   it("requires approval for native writes, including Gmail drafts", () => {
     const gmail = googleToolsRequiringApproval("gmail", "full", [GMAIL_MODIFY]);
     expect(gmail).toContain("gmail_send_message");
@@ -602,7 +645,11 @@ describe("Gmail attachment import", () => {
     expect(artifactImporter).toHaveBeenCalledWith(expect.objectContaining({ name: "attachment-0.txt", contentType: "text/plain" }));
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
-    await expect(run({ messageId: "message-1", partId: "" }, artifactImporter)).rejects.toThrow("partId or attachmentId is required");
+    await expect(run({ messageId: "message-1" }, artifactImporter)).rejects.toThrow("partId or attachmentId is required");
+    await expect(run({ messageId: "message-1", partId: "" }, artifactImporter)).rejects.toThrow("is a container");
+    fetchMock.mockResolvedValueOnce(json({ ...message(), payload: { partId: "", mimeType: "text/plain", body: { size: 5, data: "aGVsbG8" } } }));
+    await run({ messageId: "message-1", partId: "" }, artifactImporter);
+    expect(imported!.toString()).toBe("hello");
     fetchMock.mockReset().mockResolvedValueOnce(json({ ...message(), payload: { ...message().payload, partId: "9" } }));
     await expect(run({ messageId: "message-1", partId: "9" }, artifactImporter)).rejects.toThrow("is a container, not an attachment");
   });
