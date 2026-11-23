@@ -4,6 +4,7 @@ import {
   McpToolSource,
   McpConnectionError,
   McpToolError,
+  withMcpOperation,
   isOfficialBerryCrawlServer,
   mcpServerSpecsFromJson,
   type McpServerSpec,
@@ -318,6 +319,19 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     return boundaries.length ? Math.max(...boundaries) : undefined;
   }
 
+  async operationReceipt(snapshot: DurableTurnSnapshot, step: DurableTurnStep, signal: AbortSignal) {
+    const name = stringValue(step.input.toolName) ?? step.type.slice(5);
+    if (!name.startsWith("mcp__")) return;
+    const context = await this.#context(snapshot);
+    const server = this.#serverForTool(name, context.servers);
+    if (!server || !this.#visibleToolNames(snapshot, context).has(name)) return;
+    const receipt = await context.source.readOperationReceipt(server.id, name, step.id, record(step.input.arguments) ?? {}, signal);
+    if (receipt?.status === "applied") return { status: "applied" as const, result: {
+      output: { content: JSON.stringify(receipt.result) }, summary: "The connector confirmed the saved update.",
+    } };
+    return receipt;
+  }
+
   async execute(
     snapshot: DurableTurnSnapshot,
     step: DurableTurnStep,
@@ -364,7 +378,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     const executeTool = () => signal || reportProgress
       ? tool.execute(callId, (record(step.input.arguments) ?? {}) as never, signal, reportProgress)
       : tool.execute(callId, (record(step.input.arguments) ?? {}) as never);
-    const result = resumed
+    const result = await withMcpOperation(step.id, async () => resumed
       ? { content: [], details: resumed.details }
       : isStoredMcpCredentialRef(server.id, server.credentialKey)
         ? await this.#runManagedMcp(snapshot, server, () => context.source.executeTool(
@@ -375,7 +389,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
         ))
         : usesNativeGoogleOAuth(server, snapshot.userId)
           ? await this.#runManagedMcp(snapshot, server, executeTool, toolName)
-          : await executeTool();
+          : await executeTool());
     const fullText = result.content.flatMap((part) =>
       part.type === "text" && typeof part.text === "string" ? [part.text] : []
     ).join("\n");

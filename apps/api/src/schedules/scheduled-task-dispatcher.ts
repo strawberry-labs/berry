@@ -4,6 +4,8 @@ import type { ScheduledRunClaim } from "@berry/db";
 import type { AuthenticatedRequest } from "../auth/auth.guard.ts";
 import { AgentApiController } from "../http/agent-api.controller.ts";
 import { CloudRuntimeConfigService } from "../runtime/cloud-runtime-config.ts";
+import { ScheduledConnectionRequired } from "../connectors/scheduled-mail-activity.ts";
+import { CONNECTORS, type ConnectorsService } from "../connectors/connectors.service.ts";
 import { ScheduledTasksService } from "./scheduled-tasks.service.ts";
 
 /** Replica-safe wakeups reuse the exact model, connector, memory, and budget admission path of interactive turns. */
@@ -17,6 +19,7 @@ export class ScheduledTaskDispatcher implements OnApplicationBootstrap, OnModule
     @Inject(ScheduledTasksService) private readonly schedules: ScheduledTasksService,
     @Inject(AgentApiController) private readonly agent: AgentApiController,
     @Inject(CloudRuntimeConfigService) private readonly runtime: CloudRuntimeConfigService,
+    @Inject(CONNECTORS) private readonly connectors?: ConnectorsService,
   ) {}
   onApplicationBootstrap(): void {
     if (!this.schedules.enabled) return;
@@ -49,6 +52,17 @@ export class ScheduledTaskDispatcher implements OnApplicationBootstrap, OnModule
         await this.schedules.repository((repo) => repo.failed(tenantId, claim.id, owner, "Workspace or active membership is unavailable", false));
         return;
       }
+      if (claim.activityGate?.kind === "gmail_since_checkpoint" && this.connectors) {
+        const idle = await this.connectors.isScheduledMailboxIdle(tenantId, claim.userId, claim.activityGate).catch((error: unknown) => {
+          if (error instanceof ScheduledConnectionRequired) throw error;
+          return false;
+        });
+        if (idle) {
+          await this.schedules.repository((repo) => repo.skipIdle(tenantId, claim.id, owner));
+          return;
+        }
+        if (!await this.schedules.repository((repo) => repo.authorizeClaim(tenantId, claim.id, owner))) return;
+      }
       const request = {
         headers: {},
         auth: { session: { id: claim.id, userId: claim.userId }, user: { id: claim.userId, email: claim.email, name: claim.name } },
@@ -61,6 +75,10 @@ export class ScheduledTaskDispatcher implements OnApplicationBootstrap, OnModule
     } catch (error) {
       // Store only safe, actionable errors. Provider and database exceptions can
       // contain credentials or request payloads and must never reach run history.
+      if (error instanceof ScheduledConnectionRequired) {
+        await this.schedules.repository((repo) => repo.failed(tenantId, claim.id, owner, error.message, false));
+        return;
+      }
       const http = error instanceof HttpException ? error : null;
       const message = http && http.getStatus() < 500 ? http.message : "Could not start this run. The server will retry transient failures.";
       await this.schedules.repository((repo) => repo.failed(tenantId, claim.id, owner, message, !http || http.getStatus() >= 500 || http.getStatus() === 429));

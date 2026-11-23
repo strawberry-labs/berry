@@ -1,3 +1,4 @@
+import { idleMailboxSince, ScheduledConnectionRequired } from "./scheduled-mail-activity.ts";
 import { mcpOAuthStartError } from "./mcp-oauth-error.ts";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
@@ -13,7 +14,7 @@ import {
   type McpOAuthState,
   type McpServerSpec,
 } from "@berry/local-agent";
-import { McpConnectionError, type McpResolvedCredential } from "@berry/local-agent/mcp";
+import { McpConnectionError, McpToolSource, type McpResolvedCredential } from "@berry/local-agent/mcp";
 import {
   ConnectorSecretEnvelopeSchema,
   ConnectorSchema,
@@ -830,10 +831,11 @@ export class ConnectorsService {
     }
   }
 
-  async runtime(tenantId: string, userId: string, context: { taskId?: string; sessionId?: string; resolveDuringExecution?: boolean } = {}): Promise<McpServerSpec[]> {
+  async runtime(tenantId: string, userId: string, context: { taskId?: string; sessionId?: string; resolveDuringExecution?: boolean; onlyConnectorId?: string } = {}): Promise<McpServerSpec[]> {
     const rows = await this.database.withTenant(tenantId, (db) => db.query<ConnectorRow>("SELECT * FROM organization_connectors WHERE enabled=true AND publication_status='published' AND approval_status='approved' ORDER BY kind, name"));
     const servers: McpServerSpec[] = [];
     for (const row of rows) {
+      if (context.onlyConnectorId && row.id !== context.onlyConnectorId) continue;
       if (isGoogleKey(row.connector_key)) {
         const connection = await this.#connection(tenantId, row.id, userId);
         if (!connection || (connection.status !== "connected" && connection.status !== "reauth_required")) continue;
@@ -905,6 +907,35 @@ export class ConnectorsService {
       });
     }
     return servers;
+  }
+
+  async isScheduledMailboxIdle(tenantId: string, userId: string, gate: { connectorId: string; checkpointTool: string; overlapSeconds?: number; deliveryDelaySeconds?: number }): Promise<boolean> {
+    const servers = await this.runtime(tenantId, userId, { onlyConnectorId: gate.connectorId });
+    const server = servers.find((entry) => entry.id === gate.connectorId && entry.transport !== "stdio");
+    if (!server) {
+      const row = await this.#row(tenantId, gate.connectorId);
+      if (row.enabled && row.auth_strategy === "personal" && row.auth_type !== "none") {
+        const connection = await this.#connection(tenantId, row.id, userId);
+        if (!connection || ["revoked", "reauth_required"].includes(connection.status)) throw new ScheduledConnectionRequired("The checkpoint connector needs to be connected for this account.");
+      }
+      return false;
+    }
+    const source = new McpToolSource({ servers: [server], connectTimeoutMs: 8_000 });
+    try {
+      const response = await source.executeReviewedRead(server.id, gate.checkpointTool, {}, AbortSignal.timeout(15_000));
+      const envelope = requiredObject(response.details?.structuredContent, "checkpoint response");
+      const row = await this.#row(tenantId, BUILT_INS.gmail.id);
+      if (!row.enabled || row.publication_status !== "published" || row.approval_status !== "approved") return false;
+      const connection = await this.#connection(tenantId, row.id, userId);
+      if (!connection || ["revoked", "reauth_required"].includes(connection.status)) throw new ScheduledConnectionRequired("Gmail needs to be connected for this account.");
+      if (connection.status !== "connected") return false;
+      return await idleMailboxSince(envelope.result, connection.account_email, async (args) => {
+        const token = await this.#googleAccessToken(tenantId, row, connection);
+        return executeGoogleTool("gmail", "read", "gmail_search_messages", token, args, connection.account_email, connection.granted_scopes ?? []);
+      }, gate);
+    } finally {
+      await source.close();
+    }
   }
 
   async handleGoogleMcp(
