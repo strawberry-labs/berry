@@ -92,7 +92,15 @@ if [[ "$ssm_status" != "Online" ]]; then
   exit 1
 fi
 
-parameters="$(jq -cn --arg domain "$domain" --arg commit "$commit" '{commands: [
+rds_endpoint="$(jq -r '.[0].Outputs[] | select(.OutputKey == "DatabaseEndpoint") | .OutputValue' <<<"$matches")"
+rds_secret="$(jq -r '.[0].Outputs[] | select(.OutputKey == "DatabaseSecretArn") | .OutputValue' <<<"$matches")"
+rds_database="$(jq -r '.[0].Outputs[] | select(.OutputKey == "DatabaseName") | .OutputValue' <<<"$matches")"
+if [[ -n "$rds_secret" && ( -z "$rds_database" || -z "$rds_endpoint" ) ]]; then
+  echo "The domain-matched stack is missing its managed database identity." >&2
+  exit 1
+fi
+parameters="$(jq -cn --arg domain "$domain" --arg commit "$commit" --arg region "$region" \
+  --arg endpoint "$rds_endpoint" --arg secret "$rds_secret" --arg database "$rds_database" '{commands: [
   "set -eu",
   "test -d /opt/berry/.git",
   "test -f /opt/berry/deploy/.env.production",
@@ -106,7 +114,9 @@ parameters="$(jq -cn --arg domain "$domain" --arg commit "$commit" '{commands: [
   "trap \"rm -f -- $launcher\" EXIT INT TERM",
   ("git -c safe.directory=/opt/berry show " + (($commit + ":deploy/server-deploy.sh") | @sh) + " > \"$launcher\""),
   "chmod 700 \"$launcher\"",
-  ("BERRY_DEPLOY_REPO_DIR=/opt/berry BERRY_DEPLOY_EXPECTED_DOMAIN=" + ($domain | @sh) + " \"$launcher\" " + ($commit | @sh))
+  ("BERRY_DEPLOY_RDS_ENDPOINT=" + ($endpoint | @sh) + " BERRY_DEPLOY_RDS_SECRET=" + ($secret | @sh)
+   + " BERRY_DEPLOY_RDS_DATABASE=" + ($database | @sh) + " BERRY_AWS_REGION=" + ($region | @sh)
+   + " BERRY_DEPLOY_REPO_DIR=/opt/berry BERRY_DEPLOY_EXPECTED_DOMAIN=" + ($domain | @sh) + " \"$launcher\" " + ($commit | @sh))
 ]}')"
 
 command_id="$(aws ssm send-command \
