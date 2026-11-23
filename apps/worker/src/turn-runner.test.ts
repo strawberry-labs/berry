@@ -5423,6 +5423,21 @@ describe("durable turn runner", () => {
     expect(call).toHaveBeenCalledTimes(1);
   });
 
+  it("counts distinct committed writes with identical acknowledgements, including historical results without fingerprints", async () => {
+    const steps = Array.from({ length: 55 }, (_, i) => {
+      const write = toolStep("completed", "non_idempotent_manual", false);
+      write.sequence = i * 2 + 2;
+      write.input.arguments = { path: "/record/" + i, content: "done" };
+      write.output = { ok: true };
+      return [modelStep("completed", i * 2 + 1), write];
+    }).flat();
+    const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), ...steps, modelStep("pending", 111)]));
+    const call = vi.fn().mockResolvedValue({ text: "Done", inputTokens: 1, outputTokens: 1, toolCalls: [] });
+    const runner = new DurableTurnRunner(repository, { call }, noTools());
+    expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("finalizing");
+    expect(call).toHaveBeenCalledOnce();
+  });
+
   it("stops a turn that consumes model calls without confirmed tool progress", async () => {
     const steps = Array.from({ length: 201 }, (_, index) => ({
       ...modelStep(index === 200 ? "pending" : "completed", index + 1),

@@ -5612,13 +5612,18 @@ function modelStepsWithoutProgress(snapshot: DurableTurnSnapshot): number {
   let count = 0;
   for (const step of snapshot.steps) {
     if (step.type === "model.call") { count++; continue; }
-    if (!isToolStep(step) || step.state !== "completed" || step.error || !step.resultFingerprint
-        || step.outcomeCertainty === "unknown" || declaredPolling(step)) continue;
+    if (!isToolStep(step) || step.state !== "completed" || step.error || step.outcomeCertainty === "unknown") continue;
     const name = toolNameForStep(step);
     if (["tool_search", "search_tools", "activate_skill", "ask_user_question", "compose_message"].includes(name)) continue;
     const output = record(step.output);
     if (output?.error || output?.isError === true || output?.success === false || output?.suppressed === true) continue;
-    const receipt = `${name}:${step.resultFingerprint}`;
+    const fingerprint = resultFingerprintForStep(snapshot, step);
+    if (!fingerprint) continue;
+    // Distinct writes can return the same acknowledgement. Repeated reads or polls
+    // count again only when their observed result changes to a previously unseen value.
+    const identity = step.retryClass !== "read_only" && repeatPolicyForStep(step) === "block_after_success"
+      ? toolRepeatSignature(step) : name;
+    const receipt = `${identity}:${fingerprint}`;
     if (observed.has(receipt)) continue;
     observed.add(receipt);
     count = 0;
