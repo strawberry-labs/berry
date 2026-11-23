@@ -164,13 +164,21 @@ if [ "$berry_prometheus_changed" = true ]; then
   compose pull alertmanager prometheus
 fi
 
+database_job() {
+  if [ "$storage_mode" = "aws" ] && [ -n "${BERRY_DEPLOY_RDS_SECRET:-}" ]; then
+    python3 deploy/aws/run-database-job.py "$env_file" "$1"
+  else
+    compose run --rm --no-deps "$1"
+  fi
+}
+
 if [ "$berry_run_migrations" = true ]; then
   echo "Running database migrations..."
-  compose run --rm --no-deps db-migrate
+  database_job db-migrate
 fi
 if [ "$berry_configure_roles" = true ]; then
   echo "Configuring least-privilege database roles..."
-  compose run --rm --no-deps postgres-roles
+  database_job postgres-roles
 fi
 
 worker_scale_reconciled=false
