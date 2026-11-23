@@ -1,3 +1,4 @@
+import { Cron } from "croner";
 import { z } from "zod";
 
 export const ScheduleTimezoneSchema = z.string().trim().min(1).max(100).refine((timezone) => {
@@ -10,6 +11,25 @@ export const TaskScheduleSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("once"), runAt: z.string().datetime({ offset: true }), timezone: ScheduleTimezoneSchema }).strict(),
 ]);
 export type TaskSchedule = z.infer<typeof TaskScheduleSchema>;
+
+/** Each line is an independent five-field cron rule in the same timezone. */
+export function nextTaskScheduleRun(schedule: TaskSchedule, from: Date): Date {
+  if (schedule.kind === "once") return new Date(schedule.runAt);
+  const rules = schedule.expression.trim().split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  let next: Date | null = null;
+  for (const rule of rules) {
+    if (rule.split(/\s+/).length !== 5) {
+      throw new Error("Use five-field cron on each line: minute hour day-of-month month day-of-week");
+    }
+    const cron = new Cron(rule, { timezone: schedule.timezone, paused: true });
+    try {
+      const date = cron.nextRun(from);
+      if (date && (!next || date < next)) next = date;
+    } finally { cron.stop(); }
+  }
+  if (!next) throw new Error("This cron schedule has no future run");
+  return next;
+}
 
 export const TaskScheduleInputSchema = z.union([
   TaskScheduleSchema,

@@ -1,8 +1,10 @@
 # Automations
 
 Automations opens from the sidebar directly below Library. Users can create daily,
-weekday, weekly, monthly, custom cron, one-time, or relative-delay tasks. Each run
+weekday, weekly, monthly, working-hours, custom cron, one-time, or relative-delay tasks. Each run
 creates its own chat in the selected project. Run history links to those chats.
+
+Working hours lets you choose a first check, a closing hour, and separate intervals for Monday–Friday and Saturday–Sunday. Either group can be off. An open editor previews the next three checks in the selected timezone. A custom recurring schedule accepts one five-field cron rule per line. Matching rules share one run history and one overlap check.
 
 The agent has `create_scheduled_task`, `list_scheduled_tasks`,
 `update_scheduled_task`, and `delete_scheduled_task` in every durable chat,

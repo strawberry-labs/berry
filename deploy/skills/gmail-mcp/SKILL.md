@@ -9,7 +9,8 @@ Use `tool_search` with connector `Gmail` and the requested operation. Use the re
 
 ## Read mail
 
-- Use `gmail_search_threads` for conversations and `gmail_search_messages` for individual messages. Pass a bounded Gmail `query` such as `is:unread newer_than:7d`. Search results can contain IDs only. Read the relevant IDs with `gmail_get_thread` or `gmail_get_message` before summarizing, drafting a reply, or acting on labels.
+- Use `gmail_search_threads` for conversations and `gmail_search_messages` for individual messages. Pass a bounded Gmail `query` such as `is:unread newer_than:7d`. Search results can contain IDs only. Read headers and exact receive times for up to 25 IDs with `gmail_get_messages_metadata`. Request only the headers needed. Check each ID’s result before acting.
+- Use `gmail_read_message` for the body, headers and MIME inventory. Follow text and inventory cursors when complete coverage matters. Inspect additional plain-text or HTML parts for forwards and original link targets. Stage long text parts or original files with `gmail_get_attachment` using their exact part IDs. Use `gmail_get_thread` or the original `gmail_get_message` representation when the task needs it.
 - To read an attachment, call `gmail_get_attachment` with `messageId` and the `partId` from the message payload. Use the staged file for the task. Set `saveToLibrary: true` when the user asks to keep it for future work.
 
 ## Draft and send

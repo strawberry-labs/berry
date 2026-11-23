@@ -11,7 +11,7 @@ const TOOL_NAMES = new Set(["create_scheduled_task", "list_scheduled_tasks", "up
 const scheduleProperties = {
   kind: { type: "string", enum: ["cron", "once", "delay"] },
   timezone: { type: "string", description: "IANA timezone, e.g. Asia/Dubai. Interpret cron in this timezone; never convert it to UTC." },
-  expression: { type: "string", description: "Five-field cron for recurring work, e.g. 0 9 * * 1-5 for weekdays at 09:00. Only for kind=cron." },
+  expression: { type: "string", description: "One five-field cron rule per line. The schedule runs once whenever any rule matches. Combine different weekday and weekend hours using separate lines in one schedule. Only for kind=cron." },
   runAt: { type: "string", description: "Future ISO timestamp with an explicit UTC offset for kind=once." },
   minutes: { type: "integer", minimum: 1, maximum: 525600, description: "Delay from the real server clock for kind=delay. For 'in 20 minutes' use 20; never calculate a clock time yourself." },
 };

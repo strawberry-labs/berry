@@ -172,10 +172,22 @@ const gmailTools: ToolDefinition[] = [
   tool("gmail_search_threads", "Search Gmail threads using Gmail API search syntax.", gmailSearchSchema("threads"), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl("users/me/threads", gmailSearchQuery(input)))),
   tool("gmail_search_messages", "Search individual Gmail messages using Gmail API search syntax.", gmailSearchSchema("messages"), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl("users/me/messages", gmailSearchQuery(input)))),
   tool("gmail_get_thread", "Get a Gmail thread and its messages.", gmailGetSchema("threadId"), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl(`users/me/threads/${encodeURIComponent(requiredString(input.threadId, "threadId"))}`, gmailGetQuery(input)))),
-  tool("gmail_get_message", "Get one Gmail message.", gmailGetSchema("messageId", true), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl(`users/me/messages/${encodeURIComponent(requiredString(input.messageId, "messageId"))}`, gmailGetQuery(input)))),
+  tool("gmail_get_messages_metadata", "Read IDs, receive times and selected headers for up to 25 messages in one call. Use after gmail_search_messages. Each requested ID has its own result or error.", object({
+    messageIds: { ...stringArray("Gmail message IDs from this account.", 25), minItems: 1 },
+    metadataHeaders: stringArray("Header names. Defaults to From, To, Subject, Date, Reply-To and Message-ID.", 32),
+  }, ["messageIds"]), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, getGmailMetadataBatch),
+  tool("gmail_read_message", "Read a Gmail message as decoded text with its headers and MIME part inventory. Quoted and forwarded text stays intact. Choose an explicit text/HTML part for alternate representations and links. For long parts or files, use gmail_get_attachment to stage their complete bytes.", object({
+    messageId: string("Gmail message ID."),
+    view: string("overview (default): headers, first inventory page and preferred body. parts: page through the inventory. text: a decoded text part.", { enum: ["overview", "parts", "text"] }),
+    partId: string("Exact MIME part ID for text, including the empty string for the root. Defaults to an unnamed plain-text body, then HTML."),
+    metadataHeaders: stringArray("Root header names for the overview. Request Authentication-Results when needed. A single asterisk requests every original root header.", 32),
+    offset: integer("UTF-16 offset for text or entry offset for parts. Follow nextOffset.", 0, 100_000_000),
+    limit: integer("Text characters (default 3000, maximum 8000) or inventory entries (default 25, maximum 50).", 1, 8000),
+  }, ["messageId"]), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, readGmailMessage),
+  tool("gmail_get_message", "Get the original Gmail API representation. Prefer gmail_read_message for readable content and gmail_get_messages_metadata for headers.", gmailGetSchema("messageId", true), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl(`users/me/messages/${encodeURIComponent(requiredString(input.messageId, "messageId"))}`, gmailGetQuery(input)))),
   tool("gmail_get_attachment", "Download one Gmail attachment as a file for use in the current task. Berry decodes it and stages the original file in the task sandbox; the result gives its sandbox path, media type, size and SHA-256. File bytes are never placed directly in model context. Identify the attachment by messageId plus the partId shown for it by gmail_get_message (attachment IDs can change between reads), or by its attachmentId. By default the file is temporary and is not added to the Berry Library. Set saveToLibrary=true only when the user explicitly asks to keep it or clearly intends to reuse it in future tasks.", object({
     messageId: string("Message ID."),
-    partId: string("MIME part ID of the attachment in the message payload, for example 1 or 2.1. Preferred over attachmentId."),
+    partId: string("Exact MIME part ID, e.g. 1, 2.1, or the empty string for a root file or text body. Preferred over attachmentId."),
     attachmentId: string("Attachment ID from the message payload. Used when partId is not supplied."),
     saveToLibrary: boolean("Save the file to the Berry Library and queue searchable extraction. Defaults to false. Use true only for clear durable user intent, never only because the current task needs the file."),
   }, ["messageId"]), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, getGmailAttachment),
@@ -260,14 +272,14 @@ function calendarUrl(path: string, query: Record<string, QueryValue> = {}) { ret
 type QueryValue = string | number | boolean | string[] | undefined;
 function apiUrl(base: string, path: string, query: Record<string, QueryValue>): string { const url = new URL(path, base); for (const [key, value] of Object.entries(query)) { if (value === undefined) continue; for (const item of Array.isArray(value) ? value : [value]) url.searchParams.append(key, String(item)); } return url.toString(); }
 
-async function googleJson(token: string, url: string, init: RequestInit = {}): Promise<unknown> {
+async function googleJson(token: string, url: string, init: RequestInit = {}, outputLimit = GOOGLE_TOOL_OUTPUT_LIMIT_BYTES): Promise<unknown> {
   const response = await googleFetch(token, url, init);
   if (response.status === 204) return { ok: true };
   const text = await readBoundedText(
     response,
-    response.ok ? GOOGLE_TOOL_OUTPUT_LIMIT_BYTES : GOOGLE_ERROR_BODY_LIMIT_BYTES,
+    response.ok ? outputLimit : GOOGLE_ERROR_BODY_LIMIT_BYTES,
     response.ok
-      ? "Google API response exceeds Berry's 10 MB tool-output limit"
+      ? (outputLimit === GOOGLE_TOOL_OUTPUT_LIMIT_BYTES ? "Google API response exceeds Berry's 10 MB tool-output limit" : "Gmail message exceeds the supported size")
       : "Google API error response exceeds Berry's 1 MB limit",
   );
   if (!response.ok) throw googleError(response.status, text);
@@ -501,7 +513,119 @@ function gmailTargetSchema(): Record<string, unknown> { return object({ targetTy
 function gmailLabelsSchema(apply: boolean): Record<string, unknown> { return object({ ...gmailTargetSchema().properties as Record<string, unknown>, labelIds: stringArray(`${apply ? "Apply" : "Remove"} these label IDs.`, 100) }, ["targetType", "id", "labelIds"]); }
 function modifyGmailLabels(token: string, input: Record<string, unknown>) { const target = requiredEnum(input.targetType, ["message", "thread"], "targetType"); const labels = requiredStringArray(input.labelIds, "labelIds").slice(0, 100); const remove = input.remove === true || input.targetAction === "remove" || false; const method = target === "message" ? "messages" : "threads"; return googleJson(token, gmailUrl(`users/me/${method}/${encodeURIComponent(requiredString(input.id, "id"))}/modify`), { method: "POST", body: jsonBody({ addLabelIds: remove ? [] : labels, removeLabelIds: remove ? labels : [] }) }); }
 
-type GmailPart = { partId: string; filename: string; mimeType: string; attachmentId: string | null; size: number | null; data: string | null };
+type GmailPart = {
+  partId: string; filename: string; mimeType: string; attachmentId: string | null;
+  size: number | null; data: string | null; contentType: string; disposition: string | null; contentId: string | null;
+};
+
+const DEFAULT_GMAIL_HEADERS = ["From", "To", "Subject", "Date", "Reply-To", "Message-ID"];
+
+function gmailHeaderSelection(value: unknown, allowAll = false): string[] {
+  if (value === undefined) return DEFAULT_GMAIL_HEADERS;
+  if (allowAll && Array.isArray(value) && value.length === 1 && value[0] === "*") return ["*"];
+  if (!Array.isArray(value) || value.length > 32 || value.some((h) => typeof h !== "string" || !/^[a-z0-9-]{1,100}$/i.test(h))) {
+    throw new Error("Request up to 32 header names");
+  }
+  return [...new Set(value as string[])];
+}
+
+function gmailHeaders(payload: Record<string, unknown> | null): Array<{ name: string; value: string }> {
+  if (!Array.isArray(payload?.headers)) return [];
+  return payload.headers.flatMap((item: unknown) => {
+    const h = record(item);
+    return typeof h?.name === "string" && typeof h.value === "string" ? [{ name: h.name, value: h.value }] : [];
+  });
+}
+
+function gmailMessageSummary(message: Record<string, unknown>, names: string[]) {
+  const wanted = new Set(names.map((name) => name.toLowerCase()));
+  return { id: message.id, threadId: message.threadId, internalDate: message.internalDate,
+    headers: gmailHeaders(record(message.payload)).filter((h) => wanted.has("*") || wanted.has(h.name.toLowerCase())) };
+}
+
+async function getGmailMetadataBatch(token: string, input: Record<string, unknown>) {
+  const requested = requiredStringArray(input.messageIds, "messageIds");
+  if (requested.length > 25) throw new Error("Request up to 25 message IDs");
+  const ids = [...new Set(requested)];
+  const headers = gmailHeaderSelection(input.metadataHeaders);
+  const messages = [];
+  for (let index = 0; index < ids.length; index += 4) {
+    const group = await Promise.all(ids.slice(index, index + 4).map(async (id) => {
+      try {
+        const message = record(await googleJson(token, gmailUrl(`users/me/messages/${encodeURIComponent(id)}`, {
+          format: "metadata", metadataHeaders: headers, fields: headers.length ? "id,threadId,internalDate,payload(headers)" : "id,threadId,internalDate",
+        })));
+        if (!message || message.id !== id) throw new Error("Gmail returned an unexpected message identity");
+        return gmailMessageSummary(message, headers);
+      } catch (error) {
+        if (!(error instanceof GoogleApiError) || error.status === 401 || error.status === 403) throw error;
+        return { id, error: { status: error.status, message: error.message } };
+      }
+    }));
+    messages.push(...group);
+  }
+  return { messages };
+}
+
+async function getGmailPayload(token: string, messageId: string) {
+  const result = await googleJson(token, gmailUrl(`users/me/messages/${encodeURIComponent(messageId)}`, {
+    format: "full", fields: "id,threadId,internalDate,payload",
+  }), {}, GMAIL_ATTACHMENT_RESPONSE_LIMIT_BYTES);
+  return requiredObject(result, "Gmail message");
+}
+
+function gmailPartList(parts: GmailPart[], offset: number, limit: number) {
+  const page = parts.slice(offset, offset + limit).map((p) => compact({
+    partId: p.partId, mimeType: p.mimeType, filename: p.filename || undefined, size: p.size,
+    disposition: p.disposition ?? undefined, contentId: p.contentId ?? undefined,
+    charset: gmailCharset(p.contentType), downloadable: !/^multipart\//i.test(p.mimeType) && (p.attachmentId !== null || p.data !== null || p.size === 0),
+  }));
+  return { parts: page, total: parts.length, nextOffset: offset + page.length < parts.length ? offset + page.length : null };
+}
+
+function gmailCharset(contentType: string): string | undefined {
+  return /(?:^|;)\s*charset\s*=\s*(?:"([^"]+)"|([^;\s]+))/i.exec(contentType)?.slice(1).find(Boolean);
+}
+
+async function gmailTextPage(token: string, messageId: string, part: GmailPart, offset: number, limit: number) {
+  if (!/^text\//i.test(part.mimeType)) throw new Error("This MIME part is a file. Use gmail_get_attachment with its partId.");
+  let data = part.data;
+  if (part.attachmentId && !data) {
+    const body = record(await googleJson(token, gmailAttachmentUrl(messageId, part.attachmentId), {}, GMAIL_ATTACHMENT_RESPONSE_LIMIT_BYTES));
+    data = typeof body?.data === "string" ? body.data : null;
+  }
+  if (data === null && part.size !== 0) throw new Error("Gmail returned no text for this part");
+  const bytes = decodeBase64Url(data ?? "");
+  if (part.size !== null && bytes.length !== part.size) throw new Error("Incomplete Gmail text part");
+  const charset = gmailCharset(part.contentType) ?? "utf-8";
+  let text: string;
+  try { text = new TextDecoder(charset, { fatal: true }).decode(bytes); }
+  catch { throw new Error("Cannot decode this text part with its declared charset. Read its original bytes with gmail_get_attachment."); }
+  let start = Math.min(offset, text.length);
+  if (start > 0 && /[\uDC00-\uDFFF]/.test(text.charAt(start))) start--;
+  let end = Math.min(start + limit, text.length);
+  if (end < text.length && /[\uDC00-\uDFFF]/.test(text.charAt(end))) end++;
+  return { partId: part.partId, mimeType: part.mimeType, charset, text: text.slice(start, end), offset: start,
+    totalCharacters: text.length, nextOffset: end < text.length ? end : null };
+}
+
+async function readGmailMessage(token: string, input: Record<string, unknown>) {
+  const messageId = requiredString(input.messageId, "messageId");
+  const view = requiredEnum(input.view ?? "overview", ["overview", "parts", "text"], "view");
+  const offset = boundedInteger(input.offset, 0, 0, 100_000_000);
+  const limit = view === "parts" ? boundedInteger(input.limit, 25, 1, 50) : boundedInteger(input.limit, 3_000, 1, 8_000);
+  const selectedHeaders = gmailHeaderSelection(input.metadataHeaders, true);
+  const message = await getGmailPayload(token, messageId);
+  if (message.id !== messageId || !record(message.payload)) throw new Error("Gmail returned no matching message payload");
+  const parts = gmailParts(record(message.payload), true);
+  if (view === "parts") return { id: messageId, ...gmailPartList(parts, offset, limit) };
+  const part = input.partId !== undefined ? parts.find((p) => p.partId === input.partId)
+    : ["text/plain", "text/html"].map((type) => parts.find((p) => p.mimeType.toLowerCase() === type && !p.filename && !/^attachment\b/i.test(p.disposition ?? ""))).find(Boolean);
+  if (input.partId !== undefined && !part) throw new Error("Unknown Gmail MIME part ID");
+  const body = part ? await gmailTextPage(token, messageId, part, offset, limit) : null;
+  if (view === "text") return { id: messageId, body };
+  return { ...gmailMessageSummary(message, selectedHeaders), inventory: gmailPartList(parts, 0, 25), body };
+}
 
 /**
  * Imports one attachment as a Berry file: the model gets its path, size and
@@ -511,12 +635,12 @@ type GmailPart = { partId: string; filename: string; mimeType: string; attachmen
  */
 async function getGmailAttachment(token: string, input: Record<string, unknown>, context: ToolContext): Promise<unknown> {
   const messageId = requiredString(input.messageId, "messageId");
-  const partId = optionalString(input.partId);
+  const partId = typeof input.partId === "string" ? input.partId : undefined;
   const requestedAttachmentId = optionalString(input.attachmentId);
   if (partId === undefined && requestedAttachmentId === undefined) throw new Error("partId or attachmentId is required");
   // Outside a task there is no file storage; keep Gmail's own response.
   if (!context.artifactImporter && partId === undefined) return googleJson(token, gmailAttachmentUrl(messageId, requestedAttachmentId!));
-  const message = record(await googleJson(token, gmailUrl(`users/me/messages/${encodeURIComponent(messageId)}`, { format: "full", fields: "id,threadId,internalDate,payload" }))) ?? {};
+  const message = await getGmailPayload(token, messageId);
   const parts = gmailParts(record(message.payload));
   let part = partId !== undefined ? parts.find((candidate) => candidate.partId === partId) : parts.find((candidate) => candidate.attachmentId === requestedAttachmentId);
   if (partId !== undefined && !part) throw new Error(`Gmail message ${messageId} has no MIME part ${partId}`);
@@ -588,10 +712,16 @@ async function getGmailAttachment(token: string, input: Record<string, unknown>,
   });
 }
 function gmailAttachmentUrl(messageId: string, attachmentId: string): string { return gmailUrl(`users/me/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(attachmentId)}`); }
-function gmailParts(payload: Record<string, unknown> | null): GmailPart[] {
+function gmailParts(payload: Record<string, unknown> | null, requireComplete = false): GmailPart[] {
   const parts: GmailPart[] = [];
   const visit = (part: Record<string, unknown> | null, depth: number): void => {
-    if (!part || depth > 32 || parts.length >= 1_000) return;
+    if (!part) return;
+    if (depth > 32 || parts.length >= 1_000) {
+      if (requireComplete) throw new Error("Gmail MIME inventory exceeds the compact viewer limit. Use gmail_get_message for the original.");
+      return;
+    }
+    const headers = gmailHeaders(part);
+    const header = (name: string) => headers.find((h) => h.name.toLowerCase() === name)?.value;
     const body = record(part.body) ?? {};
     parts.push({
       partId: typeof part.partId === "string" ? part.partId : "",
@@ -600,6 +730,7 @@ function gmailParts(payload: Record<string, unknown> | null): GmailPart[] {
       attachmentId: optionalString(body.attachmentId) ?? null,
       size: typeof body.size === "number" && Number.isSafeInteger(body.size) && body.size >= 0 ? body.size : null,
       data: typeof body.data === "string" ? body.data : null,
+      contentType: header("content-type") ?? "", disposition: header("content-disposition") ?? null, contentId: header("content-id") ?? null,
     });
     if (Array.isArray(part.parts)) for (const child of part.parts) visit(record(child), depth + 1);
   };
