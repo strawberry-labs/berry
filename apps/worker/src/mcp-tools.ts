@@ -34,7 +34,7 @@ import {
 } from "./turn-runner.js";
 import { emitWorkerOperationalEvent } from "./operational-telemetry.js";
 import { resolveMcpCredential } from "./mcp-credentials.js";
-import { McpWriteValidationError, storedToolFailure } from "./tool-failures.js";
+import { McpWriteValidationError, storedToolFailure, temporaryMcpBlockExpired } from "./tool-failures.js";
 import {
   READ_TOOL_RESULT, S3ToolResultStore, TOOL_RESULT_INLINE_CHARACTERS,
   readStoredToolResult, readToolResultDefinition,
@@ -403,7 +403,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     const result = await withMcpOperation(step.id, async () => resumed
       ? { content: [], details: resumed.details }
       : managed || usesNativeGoogleOAuth(server, snapshot.userId)
-        ? await this.#runManagedMcp(snapshot, server, executeTool, managed ? undefined : toolName)
+        ? await this.#runManagedMcp(snapshot, server, executeTool, managed ? undefined : toolName, step.retryClass === "read_only")
         : await executeTool());
     const fullText = result.content.flatMap((part) =>
       part.type === "text" && typeof part.text === "string" ? [part.text] : []
@@ -606,8 +606,11 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     return context;
   }
 
-  async #runManagedMcp<T>(snapshot: DurableTurnSnapshot, server: McpServerSpec, run: () => Promise<T>, toolName?: string): Promise<T> {
-    const blocked = snapshot.steps.map((step) => storedToolFailure(step.output)).find((failure) => failure?.blockedConnectorId === server.id);
+  async #runManagedMcp<T>(snapshot: DurableTurnSnapshot, server: McpServerSpec, run: () => Promise<T>, toolName?: string, safeRead = false): Promise<T> {
+    const blocked = snapshot.steps.flatMap(step => {
+      const failure = storedToolFailure(step.output);
+      return failure?.blockedConnectorId === server.id && !(safeRead && temporaryMcpBlockExpired(failure, step.completedAt)) ? [failure] : [];
+    })[0];
     if (blocked) throw new McpConnectionError(blocked.reconnect ? "reauth_required" : "temporary", true, {
       connectorId: server.id, exhausted: true, ...(blocked.reconnect ? { grantId: blocked.reconnect.grantId } : {}),
     });
