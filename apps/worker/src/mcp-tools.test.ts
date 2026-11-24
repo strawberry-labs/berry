@@ -43,6 +43,9 @@ describe("durable MCP tool exposure", () => {
     };
 
     try {
+      await executor.definitions(snapshot);
+      expect(executor.unlistedTool(snapshot, name)).toBe(false);
+      expect(executor.unlistedTool(snapshot, name + "_invented")).toBe(true);
       expect(executor.policy(snapshot, name, "full-access")?.requiresApproval).toBe(native);
       if (native) {
         await expect(executor.requiredWriteApproval(snapshot, step)).resolves.toMatchObject({

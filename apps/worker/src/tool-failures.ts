@@ -9,6 +9,8 @@ import { ToolArgumentError } from "./tool-arguments.js";
  * taken effect. Transport detection reuses the shared provider classifier.
  */
 export type ToolFailureCategory =
+  /** The connector returned an authenticated receipt confirming it declined the operation. */
+  | "rejected"
   /** The arguments are wrong for this tool: schema, path policy, unsupported operation. */
   | "invalid_input"
   /** The named file, record, page or source does not exist or cannot be reached. */
@@ -50,6 +52,7 @@ const DETERMINISTIC = new Set<ToolFailureCategory>([
 ]);
 
 const ACTIONS: Record<ToolFailureCategory, string> = {
+  rejected: "Read the current state and correct the request before trying again.",
   invalid_input: "The arguments are not valid for this tool. Correct them before calling again; the same call fails the same way.",
   missing_resource: "Check the exact path, ID or URL first (list, search or read what exists). If it is right, the source is unavailable: use another source or tell the user. The same call fails the same way.",
   configuration: "This needs a configuration or administrator change (admission, connector review, proxy or network settings). Tell the user what is blocked; retrying will not help.",

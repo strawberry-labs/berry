@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   ScheduledTaskCreateSchema, ScheduledTaskSchema, ScheduledTaskUpdateSchema, ScheduledTaskRunSchema,
-  type ScheduledTask, type ScheduledTaskCreate, type ScheduledTaskUpdate, type ScheduledTaskRun,
+  type ScheduledTask, type ScheduledTaskCreate, type ScheduledTaskUpdate, type ScheduledTaskRun, type ToolCompletionRule,
 } from "@berry/shared";
 import { normalizeTaskSchedule, nextTaskScheduleRun } from "./task-schedule.ts";
 
@@ -11,13 +11,14 @@ export interface ScheduledTaskSqlExecutor {
   transaction?<T>(callback: (executor: ScheduledTaskSqlExecutor) => Promise<T>): Promise<T>;
 }
 export type ScheduledTaskScope = { tenantId: string; userId: string };
-export type ScheduledMailActivityGate = { kind: "gmail_since_checkpoint"; connectorId: string; checkpointTool: string; overlapSeconds?: number; deliveryDelaySeconds?: number };
+export type ScheduledMailActivityGate = { kind: "gmail_since_checkpoint"; connectorId: string; checkpointTool: string; overlapSeconds?: number; deliveryDelaySeconds?: number; completionRule?: ToolCompletionRule };
 export type ScheduledRunClaim = {
   activityGate?: ScheduledMailActivityGate | null;
   id: string; userId: string; sessionId: string; workspaceId: string; email: string; name: string;
-  input: { prompt: string; timezone: string; reasoning: ScheduledTask["reasoning"] };
+  input: { prompt: string; timezone: string; reasoning: ScheduledTask["reasoning"]; completionRule?: ToolCompletionRule };
 };
 type ScheduleRow = {
+  activity_gate?: ScheduledMailActivityGate | null;
   id: string; tenant_id: string; user_id: string; workspace_id: string; source_task_id: string | null;
   name: string; prompt: string; schedule: ScheduledTask["schedule"]; state: ScheduledTask["state"];
   next_run_at: Date | string | null; last_run_at: Date | string | null; last_error: string | null;
@@ -163,17 +164,21 @@ export class SqlScheduledTaskRepository {
     });
   }
 
-  private async busy(sql: ScheduledTaskSqlExecutor, tenantId: string, id: string): Promise<boolean> {
-    const [row] = await sql.query<{ busy: boolean }>(`SELECT EXISTS (
-      SELECT 1 FROM scheduled_task_runs r LEFT JOIN turn_runs t ON t.tenant_id=r.tenant_id AND t.id=r.turn_id
+  private async busyReason(sql: ScheduledTaskSqlExecutor, tenantId: string, id: string): Promise<string | null> {
+    const [row] = await sql.query<{ reason: string }>(`SELECT CASE
+        WHEN t.state='waiting' AND t.waiting_reason='approval' THEN 'Previous run is waiting for approval'
+        WHEN t.state='waiting' THEN 'Previous run is waiting for user input'
+        ELSE 'Previous run is still in progress' END AS reason
+      FROM scheduled_task_runs r LEFT JOIN turn_runs t ON t.tenant_id=r.tenant_id AND t.id=r.turn_id
       WHERE r.tenant_id=$1::uuid AND r.schedule_id=$2::uuid
         AND (r.state IN ('pending','dispatching') OR (r.state='admitted' AND t.state NOT IN (${TERMINAL_STATES})))
-    ) AS busy`, [tenantId, id]);
-    return row?.busy === true;
+      ORDER BY r.scheduled_at DESC LIMIT 1`, [tenantId, id]);
+    return row?.reason ?? null;
   }
 
   private async enqueue(sql: ScheduledTaskSqlExecutor, row: ScheduleRow, at: Date, trigger: "scheduled" | "manual", key: string, skipReason: string | null = null): Promise<ScheduledTaskRun> {
-    const input = { prompt: row.prompt, timezone: row.schedule.timezone, reasoning: row.reasoning };
+    const input = { prompt: row.prompt, timezone: row.schedule.timezone, reasoning: row.reasoning,
+      ...(row.activity_gate?.completionRule ? { completionRule: row.activity_gate.completionRule } : {}) };
     const id = randomUUID();
     const [run] = await sql.query<RunRow>(`INSERT INTO scheduled_task_runs (id,tenant_id,schedule_id,scheduled_at,trigger,occurrence_key,state,input,error,finished_at)
       VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5,$6,$7,$8::jsonb,$9,CASE WHEN $9::text IS NULL THEN NULL ELSE now() END)
@@ -200,7 +205,7 @@ export class SqlScheduledTaskRepository {
     return this.scoped(scope.tenantId, (sql) => this.operation(sql, scope, operationId, "run", { id }, async () => {
       const row = await this.owned(sql, scope, id);
       if (!await this.activeOwner(sql, scope, row.workspace_id)) throw new Error("Workspace or active membership not found");
-      if (await this.busy(sql, scope.tenantId, id)) throw new Error("This scheduled task already has a run in progress");
+      if (await this.busyReason(sql, scope.tenantId, id)) throw new Error("This scheduled task already has a run in progress");
       return this.enqueue(sql, row, await this.clock(sql), "manual", `manual:${operationId}`);
     }));
   }
@@ -218,7 +223,7 @@ export class SqlScheduledTaskRepository {
         }
         const next = row.schedule.kind === "once" ? null : nextTaskScheduleRun(row.schedule, now);
         const at = new Date(row.next_run_at!);
-        const skip = await this.busy(sql, tenantId, row.id) ? "Previous run is still in progress" : null;
+        const skip = await this.busyReason(sql, tenantId, row.id);
         await this.enqueue(sql, row, at, "scheduled", `scheduled:${at.toISOString()}`, skip);
         // Coalesce downtime to one due run; never replay an unbounded backlog.
         await sql.execute("UPDATE scheduled_tasks SET next_run_at=$3,state=$4,updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid", [tenantId, row.id, next, next ? "active" : "completed"]);

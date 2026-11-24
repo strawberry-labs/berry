@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { ScheduledRunClaim } from "@berry/db";
 import type { AuthenticatedRequest } from "../auth/auth.guard.ts";
 import { AgentApiController } from "../http/agent-api.controller.ts";
+import { DurableTurnService } from "../runtime/durable-turn.service.ts";
 import { CloudRuntimeConfigService } from "../runtime/cloud-runtime-config.ts";
 import { ScheduledConnectionRequired } from "../connectors/scheduled-mail-activity.ts";
 import { CONNECTORS, type ConnectorsService } from "../connectors/connectors.service.ts";
@@ -20,7 +21,10 @@ export class ScheduledTaskDispatcher implements OnApplicationBootstrap, OnModule
     @Inject(AgentApiController) private readonly agent: AgentApiController,
     @Inject(CloudRuntimeConfigService) private readonly runtime: CloudRuntimeConfigService,
     @Inject(CONNECTORS) private readonly connectors?: ConnectorsService,
+    @Inject(DurableTurnService) private readonly turns?: DurableTurnService,
   ) {}
+  private nextApprovalCheck = 0;
+
   onApplicationBootstrap(): void {
     if (!this.schedules.enabled) return;
     this.timer = setInterval(() => { void this.tick(); }, 10_000);
@@ -39,6 +43,10 @@ export class ScheduledTaskDispatcher implements OnApplicationBootstrap, OnModule
   }
   private async dispatch(): Promise<void> {
     const tenantId = this.schedules.tenantId;
+    if (this.turns && Date.now() >= this.nextApprovalCheck) {
+      this.nextApprovalCheck = Date.now() + 60_000;
+      await this.turns.reconcileScheduledApprovals(tenantId).catch(() => this.logger.error("Could not reconcile scheduled approvals"));
+    }
     await this.schedules.repository((repo) => repo.enqueueDue(tenantId));
     const owner = randomUUID();
     const claims = await this.schedules.repository((repo) => repo.claimPending(tenantId, owner));
@@ -65,6 +73,7 @@ export class ScheduledTaskDispatcher implements OnApplicationBootstrap, OnModule
       }
       const request = {
         headers: {},
+        ...(claim.input.completionRule ? { scheduledCompletionRule: claim.input.completionRule } : {}),
         auth: { session: { id: claim.id, userId: claim.userId }, user: { id: claim.userId, email: claim.email, name: claim.name } },
       } as AuthenticatedRequest;
       const response = await this.agent.startTurn(request, claim.sessionId, {

@@ -9,6 +9,8 @@ import {
 import { BerryAuthService, type BerryAuthSession } from "./auth-runtime.ts";
 
 export type AuthenticatedRequest = IncomingMessage & {
+  /** Set internally by the scheduler after reading the stored configuration. */
+  scheduledCompletionRule?: import("@berry/shared").ToolCompletionRule;
   auth?: BerryAuthSession;
   user?: BerryAuthSession["user"];
 };

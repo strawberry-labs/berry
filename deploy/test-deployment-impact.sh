@@ -24,6 +24,16 @@ assert_not_contains() {
   esac
 }
 
+berry_impact_add_file "packages/db/src/scheduled-tasks.ts"
+berry_impact_add_file "packages/shared/src/durable-context.ts"
+assert_contains "$berry_image_services" api "scheduler services"
+assert_contains "$berry_restart_services" worker-foreground "scheduler services"
+assert_not_contains "$berry_image_services" web "scheduler services"
+assert_not_contains "$berry_image_services" mem0 "scheduler services"
+test "$berry_run_migrations" = false
+test "$berry_configure_roles" = false
+
+berry_impact_reset
 berry_impact_add_file "apps/web/src/routes/index.tsx"
 assert_contains "$berry_image_services" web "web image services"
 assert_contains "$berry_restart_services" web "web restart services"

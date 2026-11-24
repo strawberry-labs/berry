@@ -2020,6 +2020,7 @@ export class AgentApiController {
         });
         const runtimeRequest = DurableTurnRuntimeRequestSchema.parse({
           capabilityVersion: 1,
+          ...(httpRequest.scheduledCompletionRule ? { completionRule: httpRequest.scheduledCompletionRule } : {}),
           ...(request.timezone ? { timezone: request.timezone } : {}),
           admissionFingerprint: operationFingerprint,
           ...(request.intent ? { intent: request.intent } : {}),

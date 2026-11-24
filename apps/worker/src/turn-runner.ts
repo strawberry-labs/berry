@@ -24,6 +24,7 @@ import {
 } from "@berry/local-agent";
 import {
   AgentStreamEventSchema,
+  ToolCompletionRuleSchema,
   classifyProviderFailure,
   DURABLE_BASE_BUILT_IN_TOOLS,
   parseAdmittedRuntimeRequest,
@@ -573,6 +574,8 @@ export interface DurableTurnToolExecutor {
     detail?: string;
     writePreview: ApprovalWritePreview;
   } | undefined>;
+  /** Confirms a name is absent from the connector catalog admitted for this task. */
+  unlistedTool?(snapshot: DurableTurnSnapshot, toolName: string): boolean;
   /** Input schema of a tool the model reaches without a declared definition (a connector tool behind use_tool). */
   argumentSchema?(snapshot: DurableTurnSnapshot, toolName: string): unknown;
   /**
@@ -871,7 +874,8 @@ export class DurableTurnRunner {
     const applied = receipt.status === "applied";
     const result = journalSafeToolResult(receipt.status === "applied" ? receipt.result : {
       summary: `The connector rejected the update (${receipt.code}). Check its current state before trying a corrected update.`,
-      output: { failure: { category: "rejected", outcome: "not_applied", code: receipt.code, httpStatus: receipt.httpStatus } },
+      output: { failure: { category: "rejected", outcome: "not_applied", outcomeVersion: TOOL_FAILURE_OUTCOME_VERSION,
+        deterministic: false, code: receipt.code, status: receipt.httpStatus, httpStatus: receipt.httpStatus, action: toolFailureAction("rejected") } },
     });
     const entryId = randomUUID(), toolCallId = toolCallIdForStep(step), toolName = toolNameForStep(step);
     const remaining = snapshot.steps.some((other) => other.id !== step.id && isRunnableToolStep(other));
@@ -1034,7 +1038,7 @@ export class DurableTurnRunner {
       );
     }
     const stallWindow = this.options.maxStalledModelIterations ?? maxModelIterations ?? DEFAULT_STALLED_MODEL_ITERATIONS;
-    if (modelIteration(snapshot.steps) > stallWindow && modelStepsWithoutProgress(snapshot) > stallWindow) {
+    if (modelIteration(snapshot.steps) > stallWindow && confirmedModelProgress(snapshot).stepsSinceResult > stallWindow) {
       throw new DurableTurnTerminalError(`Berry stopped after ${stallWindow} model steps without a new, confirmed tool result. The completed work is saved.`);
     }
     const maxTurnDurationMs = this.options.maxTurnDurationMs;
@@ -1053,8 +1057,32 @@ export class DurableTurnRunner {
         "The task exceeded its active-compute budget. Berry stopped it before starting another model request.",
       );
     }
-    const maxModelAttempts = Math.max(1, this.options.maxModelAttempts ?? 3);
+    const normalAttempts = Math.max(1, this.options.maxModelAttempts ?? 3);
+    const resumingTimeout = typeof step.input.timeoutResumeSequence === "number";
+    const maxModelAttempts = normalAttempts + (resumingTimeout ? 1 : 0);
+    if (resumingTimeout && step.attempt === normalAttempts && typeof step.input.timeoutResumeAt === "string"
+      && Date.parse(step.input.timeoutResumeAt) > Date.now()) {
+      await this.repository.release(snapshot);
+      return "calling_model";
+    }
     if (step.attempt >= maxModelAttempts) {
+      const cause = record(record(step.output)?.providerDiagnostics)?.failureCause;
+      if (!resumingTimeout && (cause === "idle_timeout" || cause === "max_duration")) {
+        const { lastResultSequence } = confirmedModelProgress(snapshot);
+        if (lastResultSequence !== null && !snapshot.steps.some((prior) => prior.type === "model.call"
+          && prior.input.timeoutResumeSequence === lastResultSequence)) {
+          const availableAt = new Date(Date.now() + 60_000).toISOString();
+          // A delayed retry uses the same journal and cannot redispatch completed tools.
+          await this.repository.commit(snapshot, {
+            expectedState: "calling_model", nextState: "calling_model",
+            steps: [{ ...step, state: "pending", input: { ...step.input, timeoutResumeAt: availableAt, timeoutResumeSequence: lastResultSequence } }],
+            outbox: [{ eventType: "turn.execute", dedupeKey: `${snapshot.id}:timeout-resume:${step.id}:${lastResultSequence}`,
+              payload: { tenantId: snapshot.tenantId, runId: snapshot.id, reason: "continue" }, availableAt }],
+            nextAction: "Resume the model request from the last confirmed work after a short delay",
+          });
+          return "calling_model";
+        }
+      }
       throw new DurableTurnTerminalError(
         modelRetryExhaustedMessage(snapshot, step, this.options.modelIdleTimeoutMs ?? 240_000),
       );
@@ -1177,6 +1205,7 @@ export class DurableTurnRunner {
           `${budget.reason ?? "The budget reservation for this turn is no longer active."} Berry stopped before calling the model again; your work so far is saved. Continue the task or send a new message to start a fresh budgeted turn.`,
         );
       }
+      if (unconfirmedToolOperation(snapshot)) throw new DurableTurnTerminalError("The spend limit was reached with unconfirmed connector work. Confirmed work is saved.");
       await this.finishForBudget(snapshot, budget.reason ?? "Your spend limit has been reached.");
       return "completed";
     }
@@ -1623,6 +1652,9 @@ export class DurableTurnRunner {
       if (requiresAdmittedBash(call.name) && !declaredSchemas.has(call.name)) {
         return notRunMessage(call.name, "This tool was not admitted for this turn");
       }
+      if (this.tools.unlistedTool?.(snapshot, call.name)) {
+        return notRunMessage(call.name, "This connector tool is unavailable. Use tool_search and copy an available tool name.");
+      }
       return toolArgumentError(call, declaredSchemas, (name) => this.tools.argumentSchema?.(snapshot, name));
     });
     let argumentErrors = checkArguments();
@@ -1864,6 +1896,14 @@ export class DurableTurnRunner {
     const uncertain = step.state === "pending" && holdsForReview(step)
       ? uncertainEarlierCalls(snapshot, step)
       : [];
+    // Older workers saved verified rejections without an outcome schema version.
+    // Recheck the original operation with the connector before releasing a corrected call.
+    for (const entry of [...uncertain]) {
+      const failure = record(record(entry.previous.output)?.failure);
+      if (entry.previous.outcomeCertainty !== "known" || failure?.category !== "rejected" || failure.outcome !== "not_applied") continue;
+      const receipt = await this.tools.operationReceipt?.(snapshot, entry.previous, AbortSignal.timeout(12_000)).catch(() => undefined);
+      if (receipt?.status === "rejected") uncertain.splice(uncertain.indexOf(entry), 1);
+    }
     const latestUncertain = uncertain[0];
     if (latestUncertain) {
       await this.transitionAmbiguousToolToRecovery(snapshot, [
@@ -3286,6 +3326,23 @@ export class DurableTurnRunner {
   }
 
   private async finalize(snapshot: DurableTurnSnapshot): Promise<TurnRunState> {
+    const open = unconfirmedToolOperation(snapshot);
+    if (open) {
+      if (snapshot.steps.some((step) => step.type === "model.call"
+        && (step.input.completionRetryFor === open.sequence || step.input.wrapUp))) {
+        throw new DurableTurnTerminalError("Partial completion. The connector has not confirmed all the work that started. Confirmed work is saved.");
+      }
+      const iteration = modelIteration(snapshot.steps) + 1;
+      await this.commitAndWake(snapshot, {
+        expectedState: "finalizing", nextState: "calling_model",
+        steps: [{ id: randomUUID(), type: "model.call", state: "pending", sequence: nextStepSequence(snapshot.steps),
+          input: { iteration, completionRetryFor: open.sequence, completionReminder:
+            `The connector has not confirmed completion for work started by ${open.startTool}. Check its saved state and obtain the matching ${open.finishTool} receipt when safe. Preserve confirmed results and report any blocker.` },
+          retryClass: "idempotent_with_key", idempotencyKey: `${snapshot.id}:model:${iteration}` }],
+        nextAction: "Verify the outstanding connector work before finishing",
+      });
+      return "calling_model";
+    }
     let finalizedArtifacts: readonly TurnToolResult[];
     try {
       finalizedArtifacts = await this.withHeartbeat(
@@ -5606,9 +5663,70 @@ function modelIteration(steps: readonly DurableTurnStep[]): number {
   return steps.filter((step) => step.type === "model.call").length;
 }
 
+/** Match successful connector receipts by business object identity, never by assistant text. */
+function unconfirmedToolOperation(snapshot: DurableTurnSnapshot): { sequence: number; startTool: string; finishTool: string } | undefined {
+  if (!snapshot.runtimeRequest.completionRule) return;
+  const parsed = ToolCompletionRuleSchema.safeParse(snapshot.runtimeRequest.completionRule);
+  if (!parsed.success) throw new DurableTurnTerminalError("The automation completion rule is invalid.");
+  const rule = parsed.data;
+  const open = new Map<string, number>();
+  const atPath = (value: unknown, path: readonly string[]): unknown => path.reduce<unknown>((v, key) =>
+    v && typeof v === "object" && Object.hasOwn(v, key) ? (v as Record<string, unknown>)[key] : undefined, value);
+  const timestamp = (value: unknown): number | undefined => {
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T/.test(value)) return;
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  };
+  let target: number | undefined;
+  let covered: number | undefined;
+  let coverageSequence: number | undefined;
+  let unverifiedStart: number | undefined;
+  for (const step of snapshot.steps) {
+    const name = toolNameForStep(step);
+    if (name !== rule.startTool && name !== rule.finishTool && name !== rule.coverage?.checkpointTool) continue;
+    const output = record(step.output);
+    const confirmed = step.state === "completed" && !step.error && step.outcomeCertainty !== "unknown"
+      && output?.isError !== true && output?.suppressed !== true;
+    if (!confirmed) {
+      if (name === rule.startTool) unverifiedStart ??= step.sequence;
+      continue;
+    }
+    let result = record(record(record(output?.details)?.structuredContent)?.result);
+    if (!result && typeof output?.content === "string") {
+      try { result = record(JSON.parse(output.content)); } catch { /* A text reply cannot confirm an object ID. */ }
+    }
+    if (rule.coverage && (name === rule.coverage.checkpointTool || name === rule.finishTool)) {
+      const checkpoint = name === rule.coverage.checkpointTool;
+      if (checkpoint && target === undefined && atPath(result, rule.coverage.readyPath) === rule.coverage.readyValue) {
+        target = timestamp(atPath(result, rule.coverage.targetPath));
+        coverageSequence = step.sequence;
+      }
+      const until = timestamp(atPath(result, checkpoint ? rule.coverage.checkpointPath : rule.coverage.finishedPath));
+      if (until !== undefined && (covered === undefined || until > covered)) {
+        covered = until;
+        coverageSequence = step.sequence;
+      }
+      if (checkpoint) continue;
+    }
+    const id = result?.[rule.idField];
+    if (typeof id !== "string" || !id) {
+      if (name === rule.startTool) open.set("unverified-step:" + step.id, step.sequence);
+      continue;
+    }
+    if (name === rule.startTool) {
+      unverifiedStart = undefined;
+      if (!open.has(id)) open.set(id, step.sequence);
+    } else open.delete(id);
+  }
+  const shortOfTarget = target !== undefined && (covered === undefined || covered < target);
+  const sequence = open.values().next().value ?? unverifiedStart ?? (shortOfTarget ? coverageSequence : undefined);
+  return sequence === undefined ? undefined : { sequence, startTool: rule.startTool, finishTool: rule.finishTool };
+}
+
 // Count from durable evidence so restarting the worker cannot renew a stalled run.
-function modelStepsWithoutProgress(snapshot: DurableTurnSnapshot): number {
+function confirmedModelProgress(snapshot: DurableTurnSnapshot): { stepsSinceResult: number; lastResultSequence: number | null } {
   const observed = new Set<string>();
+  let lastResultSequence: number | null = null;
   let count = 0;
   for (const step of snapshot.steps) {
     if (step.type === "model.call") { count++; continue; }
@@ -5626,9 +5744,10 @@ function modelStepsWithoutProgress(snapshot: DurableTurnSnapshot): number {
     const receipt = `${identity}:${fingerprint}`;
     if (observed.has(receipt)) continue;
     observed.add(receipt);
+    lastResultSequence = step.sequence;
     count = 0;
   }
-  return count;
+  return { stepsSinceResult: count, lastResultSequence };
 }
 
 function repeatedToolFailure(snapshot: DurableTurnSnapshot, step: DurableTurnStep): string | null {
@@ -7831,6 +7950,8 @@ export function modelMessages(
   }
   // Recovery follows history and context even without a legacy request anchor.
   if (recoveryInstruction) messages.push({ role: "user", content: recoveryInstruction });
+  const completionReminder = latestStep(snapshot.steps, "model.call")?.input.completionReminder;
+  if (typeof completionReminder === "string") messages.push({ role: "user", content: completionReminder });
   return { messages, stableSystemPrompt };
 }
 

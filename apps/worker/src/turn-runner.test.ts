@@ -2920,6 +2920,17 @@ describe("durable turn runner", () => {
     expect(result.state).toBe(status === "pending" ? "executing_tool" : "calling_model");
     expect(repository.current.steps.find((s) => s.id === tool.id)?.state).toBe(status === "applied" ? "completed" : status === "rejected" ? "failed" : "running");
     if (status === "pending") expect(repository.outbox.at(-1)?.availableAt).toBeTruthy();
+    if (status === "rejected") {
+      const failed = repository.current.steps.find((s) => s.id === tool.id)!;
+      expect(failed.output).toMatchObject({ failure: { category: "rejected", outcome: "not_applied", outcomeVersion: TOOL_FAILURE_OUTCOME_VERSION } });
+      const corrected = { ...tool, id: "corrected", sequence: failed.sequence + 2, state: "pending" as const,
+        input: { ...tool.input, toolCallId: "corrected", arguments: { version: 2 } } };
+      const resumed = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), failed, corrected]));
+      const apply = vi.fn(async () => ({ output: { saved: true }, summary: "Saved" }));
+      const retry = new DurableTurnRunner(resumed, unusedModel(), { execute: apply });
+      await expect(retry.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ state: "calling_model" });
+      expect(apply).toHaveBeenCalledTimes(1);
+    }
   });
 
   it("moves an ambiguous running non-idempotent tool to recovery_required", async () => {
@@ -3794,6 +3805,36 @@ describe("durable turn runner", () => {
     });
   });
 
+  it("checks matching connector receipts and the original cutoff before closing a scheduled run", async () => {
+    const startTool = "mcp__Connector__start", finishTool = "mcp__Connector__finish", checkpointTool = "mcp__Connector__checkpoint";
+    const rule = { startTool, finishTool, idField: "id", coverage: { checkpointTool, targetPath: ["plan", "end"],
+      checkpointPath: ["through"], finishedPath: ["through"], readyPath: ["plan", "status"], readyValue: "ready" } };
+    function saved(tool: string, sequence: number, result: Record<string, string | Record<string, string>>): DurableTurnStep {
+      return { ...toolStep("completed", "read_only", false), id: "receipt-" + sequence, sequence, type: "tool." + tool,
+        input: { toolName: tool }, output: { content: JSON.stringify(result) }, outcomeCertainty: "known" };
+    }
+    const target = "2026-11-24T08:00:00Z", partial = "2026-11-24T07:00:00Z";
+    const receipts = [admittedStep(), saved(checkpointTool, 1, { through: partial, plan: { status: "ready", end: target } }),
+      saved(startTool, 2, { id: "A" }), saved(finishTool, 3, { id: "B", through: target })];
+    const current = snapshot("finalizing", receipts);
+    current.runtimeRequest.completionRule = rule;
+    const repo = new FakeTurnRepository(current);
+    const runner = new DurableTurnRunner(repo, unusedModel(), { execute: vi.fn() });
+    await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ state: "calling_model" });
+    expect(repo.current.steps.at(-1)?.input.completionRetryFor).toBe(2);
+    repo.current.state = "finalizing";
+    await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ state: "failed" });
+    const short = snapshot("finalizing", [receipts[0]!, receipts[1]!, receipts[2]!, saved(finishTool, 3, { id: "A", through: partial })]);
+    short.runtimeRequest.completionRule = rule;
+    const shortRepo = new FakeTurnRepository(short);
+    const shortRunner = new DurableTurnRunner(shortRepo, unusedModel(), { execute: vi.fn() });
+    await expect(shortRunner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ state: "calling_model" });
+    const complete = snapshot("finalizing", [receipts[0]!, receipts[1]!, receipts[2]!, saved(finishTool, 3, { id: "A", through: target })]);
+    complete.runtimeRequest.completionRule = rule;
+    await expect(new DurableTurnRunner(new FakeTurnRepository(complete), unusedModel(), { execute: vi.fn() })
+      .execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ state: "completed" });
+  });
+
   describe("partial publication after the answer (H-014)", () => {
     const job = () => ({ tenantId, runId, reason: "continue" as const });
     const receipt: TurnToolResult = {
@@ -4125,18 +4166,26 @@ describe("durable turn runner", () => {
           await vi.advanceTimersByTimeAsync(240_000);
           await settled;
         }
+        await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ state: "calling_model" });
+        expect(repository.outbox.at(-1)?.availableAt).toBeTruthy();
+        await runner.execute({ tenantId, runId, reason: "continue" });
+        expect(modelCalls).toBe(3);
+        await vi.advanceTimersByTimeAsync(60_000);
+        const resumed = expect(runner.execute({ tenantId, runId, reason: "continue" })).rejects.toBeInstanceOf(DurableToolTimeoutError);
+        await vi.advanceTimersByTimeAsync(240_000);
+        await resumed;
         const final = await runner.execute({ tenantId, runId, reason: "continue" });
 
-        expect(modelCalls).toBe(3);
+        expect(modelCalls).toBe(4);
         expect(tools.execute).not.toHaveBeenCalled();
         const attempts = repository.events.filter((event) => event.kind === "provider.attempt");
         expect(attempts.map((event) => [event.kind === "provider.attempt" && event.category, event.kind === "provider.attempt" && event.retryDecision]))
-          .toEqual([["timeout", "retry"], ["timeout", "retry"], ["timeout", "terminal"]]);
+          .toEqual([["timeout", "retry"], ["timeout", "retry"], ["timeout", "terminal"], ["timeout", "terminal"]]);
         const diagnostics = (repository.current.steps.find((step) => step.type === "model.call")?.output as { providerDiagnostics?: { failureCause?: string; attemptCauses?: Array<{ cause: string }> } }).providerDiagnostics;
         expect(diagnostics?.failureCause).toBe("idle_timeout");
-        expect(diagnostics?.attemptCauses?.map((entry) => entry.cause)).toEqual(["idle_timeout", "idle_timeout", "idle_timeout"]);
+        expect(diagnostics?.attemptCauses?.map((entry) => entry.cause)).toEqual(["idle_timeout", "idle_timeout", "idle_timeout", "idle_timeout"]);
         expect(final.state).toBe("failed");
-        expect(repository.current.error).toContain("Model request failed after 3 attempts: the model stopped sending output, and Berry ended each of 3 attempts after 240 seconds without progress (idle timeout).");
+        expect(repository.current.error).toContain("Model request failed after 4 attempts: the model stopped sending output, and Berry ended each of 4 attempts after 240 seconds without progress (idle timeout).");
         expect(repository.current.error).toContain("Work saved before the failure is kept: hero.png.");
         expect(repository.current.error).toContain("Use Continue to resume from what is already saved.");
       } finally {
