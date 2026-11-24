@@ -197,8 +197,8 @@ export function unparsedToolArguments(value: unknown, schema?: unknown): string 
 
 /**
  * Definite violations of a JSON schema: wrong types, missing required fields
- * and values outside an enum, with nested objects and array items. Keywords
- * it does not know (oneOf, $ref, patterns, lengths) are not judged, and null
+ * and values outside an enum, with nested objects, tagged object variants, and
+ * undeclared fields in closed objects. Unresolved keywords are left to the tool. Null
  * for an optional field counts as absent, so a valid call is never refused.
  */
 export function schemaArgumentProblems(schema: unknown, value: unknown, limit = 5): string[] {
@@ -217,6 +217,14 @@ export function schemaArgumentProblems(schema: unknown, value: unknown, limit = 
     }
     const object = plainObject(item);
     if (object) {
+      if (!rule.$ref) {
+        const variant = taggedObjectVariant(rule.oneOf ?? rule.anyOf, object);
+        if (variant?.branch) visit(variant.branch, item, path, depth + 1);
+        else if (variant) {
+          const allowed = [...new Set(variant.allowed)].slice(0, 12).map((tag) => JSON.stringify(tag)).join(", ");
+          problems.push(`${field(join(path, variant.key))} must select one of ${allowed}`);
+        }
+      }
       const properties = plainObject(rule.properties) ?? {};
       const required = Array.isArray(rule.required) ? rule.required.filter((name): name is string => typeof name === "string") : [];
       for (const name of required) {
@@ -225,8 +233,15 @@ export function schemaArgumentProblems(schema: unknown, value: unknown, limit = 
         problems.push(`${field(join(path, name))} is required but missing (sent ${sent.length > 0 ? `fields: ${sent.join(", ")}` : "no fields"})`);
       }
       for (const [name, child] of Object.entries(object)) {
-        if (properties[name] === undefined || (child === null && !required.includes(name))) continue;
-        visit(properties[name], child, join(path, name), depth + 1);
+        if (problems.length >= limit) break;
+        if (!Object.hasOwn(properties, name)) {
+          // Pattern-based and referenced schemas can permit additional keys.
+          if (rule.additionalProperties === false && !rule.patternProperties && !rule.$ref) {
+            problems.push(`${field(join(path, name))} is not a declared field; remove it`);
+          }
+          continue;
+        }
+        if (child !== null || required.includes(name)) visit(properties[name], child, join(path, name), depth + 1);
       }
     } else if (Array.isArray(item) && plainObject(rule.items)) {
       item.forEach((element, index) => visit(rule.items, element, `${path}[${index}]`, depth + 1));
@@ -234,6 +249,25 @@ export function schemaArgumentProblems(schema: unknown, value: unknown, limit = 
   };
   visit(schema, value, "", 0);
   return problems;
+}
+
+/** A shared required literal selects an object variant without guessing about overlapping schemas. */
+function taggedObjectVariant(choices: unknown, item: Record<string, unknown>): { branch?: unknown; key: string; allowed: string[] } | undefined {
+  if (!Array.isArray(choices) || choices.length < 2) return;
+  const branches = choices.map(plainObject);
+  const first = branches[0];
+  if (!Array.isArray(first?.required)) return;
+  for (const key of first.required) {
+    if (typeof key !== "string") continue;
+    const tags = branches.map((branch) => {
+      if (branch?.$ref || !Array.isArray(branch?.required) || !branch.required.includes(key)) return;
+      const property = plainObject(plainObject(branch.properties)?.[key]);
+      return property?.$ref ? undefined : property?.const;
+    });
+    if (!tags.every((tag): tag is string => typeof tag === "string")) continue;
+    const matches = branches.filter((_, index) => tags[index] === item[key]);
+    if (matches.length <= 1) return { key, allowed: tags, branch: matches[0] };
+  }
 }
 
 /** The result text for a call that was not run. */

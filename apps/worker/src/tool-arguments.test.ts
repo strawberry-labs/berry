@@ -48,6 +48,28 @@ describe("tool argument checks (H-011)", () => {
     expect(unparsedToolArguments({ raw: "hello" }, { type: "object", properties: { raw: { type: "string" } } })).toBeNull();
   });
 
+  it("reports the exact wrong field in a selected connector action", () => {
+    const variants = [
+      { type: "object", required: ["action", "document"], properties: {
+        action: { const: "save" },
+        document: { type: "object", required: ["title"], properties: { title: { type: "string" } }, additionalProperties: false },
+      }, additionalProperties: false },
+      { type: "object", required: ["action", "reason"], properties: {
+        action: { const: "defer" }, reason: { type: "string" },
+      }, additionalProperties: false },
+    ];
+    for (const schema of [{ oneOf: variants }, { anyOf: variants }]) {
+      expect(schemaArgumentProblems(schema, { action: "save", document: { title: "Draft", unrelated: "private text" } }))
+        .toEqual(['"document.unrelated" is not a declared field; remove it']);
+      expect(schemaArgumentProblems(schema, { action: "save", document: {} })[0]).toContain('"document.title" is required');
+      expect(schemaArgumentProblems(schema, { document: {} })).toEqual(['"action" must select one of "save", "defer"']);
+      expect(schemaArgumentProblems(schema, { action: "defer", reason: "waiting" })).toEqual([]);
+    }
+    expect(schemaArgumentProblems({ oneOf: [variants[0], { type: "object" }] }, { action: "other", custom: true })).toEqual([]);
+    expect(schemaArgumentProblems({ oneOf: [variants[0], { $ref: "#/$defs/other" }] }, { action: "other" })).toEqual([]);
+    expect(schemaArgumentProblems({ additionalProperties: false, patternProperties: { "^x-": {} } }, { "x-ok": 1 })).toEqual([]);
+  });
+
   it("names the field and why for schema violations, and never refuses a valid call", () => {
     const schema = {
       type: "object",
