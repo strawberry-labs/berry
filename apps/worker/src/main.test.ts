@@ -1,5 +1,16 @@
-import { describe, expect, it } from "vitest";
+import type { LookupAddress } from "node:dns";
+import { describe, expect, it, vi } from "vitest";
 import { foregroundQueueShardIndexFromEnv, resolveForegroundQueueShardIndex, workerProcessConfigFromEnv } from "./main.js";
+
+const { lookupAll } = vi.hoisted(() => ({ lookupAll: vi.fn<() => Promise<LookupAddress[]>>() }));
+vi.mock("node:dns/promises", async (original) => ({
+  ...await original<typeof import("node:dns/promises")>(),
+  lookup: lookupAll,
+}));
+vi.mock("node:os", async (original) => ({
+  ...await original<typeof import("node:os")>(),
+  networkInterfaces: () => ({ eth0: [{ address: "192.0.2.2", internal: false }] }),
+}));
 
 describe("workerProcessConfigFromEnv", () => {
   it("uses the isolated production foreground capacity", () => {
@@ -83,6 +94,38 @@ describe("workerProcessConfigFromEnv", () => {
       BERRY_WORKER_ROLE: "foreground",
       BERRY_FOREGROUND_QUEUE_SHARD_COUNT: "0",
     })).toThrow("BERRY_FOREGROUND_QUEUE_SHARD_COUNT must be an integer between 1 and 128");
+  });
+
+  it("waits for all peers and its own address before taking a shard", async () => {
+    vi.useFakeTimers();
+    const record = (address: string) => ({ address, family: 4 });
+    const dns = lookupAll
+      .mockRejectedValueOnce(new Error("DNS service starting"))
+      .mockResolvedValueOnce([record("192.0.2.1")])
+      .mockResolvedValueOnce([record("192.0.2.1"), record("192.0.2.3")])
+      .mockResolvedValueOnce([record("192.0.2.2"), record("192.0.2.1")]);
+    try {
+      const assigned = resolveForegroundQueueShardIndex({}, 2);
+      await vi.advanceTimersByTimeAsync(3000);
+      await expect(assigned).resolves.toBe(1);
+      expect(dns).toHaveBeenCalledTimes(4);
+    } finally {
+      dns.mockReset();
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves an unresolved shard unassigned after the startup wait", async () => {
+    vi.useFakeTimers();
+    const dns = lookupAll.mockResolvedValue([{ address: "192.0.2.2", family: 4 }]);
+    try {
+      const refused = expect(resolveForegroundQueueShardIndex({}, 2)).rejects.toThrow("complete set of 2 replicas");
+      await vi.advanceTimersByTimeAsync(60_000);
+      await refused;
+    } finally {
+      dns.mockReset();
+      vi.useRealTimers();
+    }
   });
 
   it("resolves an explicit shard without requiring a DNS lookup", async () => {
