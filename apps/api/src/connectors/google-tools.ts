@@ -175,6 +175,8 @@ const gmailTools: ToolDefinition[] = [
     windowStart: string("Inclusive ISO 8601 timestamp with timezone.", { format: "date-time" }),
     windowEnd: string("Exclusive ISO 8601 timestamp with timezone.", { format: "date-time" }),
     pageToken: string("Continuation token from the previous page."),
+    knownMessageBatches: { type: "array", items: object({ ids: stringArray("Previously recorded message IDs.", 100), sha256: string("SHA-256 of the JSON array of IDs.") }, ["ids", "sha256"]), description: "Optional exact receipt batches from a prior processing step. Copy each ids and sha256 pair unchanged. Matching messages count toward coverage and are omitted from the remaining work." },
+    coveredThrough: string("Optional previous checkpoint, used to count messages before it in this window.", { format: "date-time" }),
     maxResults: integer("Maximum Gmail results per page. Defaults to 100.", 1, 100),
   }, ["windowStart", "windowEnd"]), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, listGmailMessagesInWindow),
   tool("gmail_get_thread", "Get a Gmail thread and its messages.", gmailGetSchema("threadId"), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl(`users/me/threads/${encodeURIComponent(requiredString(input.threadId, "threadId"))}`, gmailGetQuery(input)))),
@@ -591,6 +593,19 @@ async function listGmailMessagesInWindow(token: string, input: Record<string, un
   const start = timestamp("windowStart");
   const end = timestamp("windowEnd");
   if (end <= start) throw new Error("windowEnd must be later than windowStart");
+  const coveredThrough = input.coveredThrough === undefined ? start : timestamp("coveredThrough");
+  const known = new Set<string>();
+  const batches = input.knownMessageBatches ?? [];
+  if (!Array.isArray(batches)) throw new Error("knownMessageBatches must be an array");
+  for (const entry of batches) {
+    const batch = record(entry);
+    const ids = batch?.ids;
+    if (!Array.isArray(ids) || ids.length > 100 || ids.some(id => typeof id !== "string" || !id || id.length > 512)
+        || createHash("sha256").update(JSON.stringify(ids)).digest("hex") !== batch?.sha256) {
+      throw new Error("Invalid known message batch. Copy its IDs and checksum together from the saved receipt.");
+    }
+    for (const id of ids) known.add(id);
+  }
   const pageToken = optionalString(input.pageToken);
   const result = requiredObject(await googleJson(token, gmailUrl("users/me/messages", {
     q: `after:${Math.floor(start / 1000) - 1} before:${Math.ceil(end / 1000) + 1}`,
@@ -617,8 +632,12 @@ async function listGmailMessagesInWindow(token: string, input: Record<string, un
       if (received >= start && received < end) messages.push({ id: String(message.id), receivedAt: new Date(received).toISOString() });
     }
   }
+  const remaining = messages.filter(message => !known.has(message.id));
   return { windowStart: new Date(start).toISOString(), windowEnd: new Date(end).toISOString(),
-    listedCount: listed.length, uniqueCount: ids.length, inWindowCount: messages.length, messages, nextPageToken };
+    listedCount: listed.length, uniqueCount: ids.length, inWindowCount: messages.length,
+    knownInWindowCount: messages.length - remaining.length, remainingCount: remaining.length,
+    overlapCount: messages.filter(message => Date.parse(message.receivedAt) < coveredThrough).length,
+    messages: remaining, nextPageToken };
 }
 
 async function getGmailPayload(token: string, messageId: string) {

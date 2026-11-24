@@ -106,6 +106,11 @@ describe("Google connector tool policy", () => {
     const bounds = { windowStart: "2026-11-23T08:48:30.747+04:00", windowEnd: new Date(end).toISOString(), pageToken: "prior" };
     await expect(read(bounds)).resolves.toMatchObject({ listedCount: 5, uniqueCount: 4, inWindowCount: 2, nextPageToken: "next",
       messages: [{ id: "first", receivedAt: new Date(start).toISOString() }, { id: "last", receivedAt: new Date(end - 1).toISOString() }] });
+    const ids = ["first", "outside"];
+    const sha256 = createHash("sha256").update(JSON.stringify(ids)).digest("hex");
+    await expect(read({ ...bounds, coveredThrough: new Date(start + 1).toISOString(), knownMessageBatches: [{ ids, sha256 }] }))
+      .resolves.toMatchObject({ inWindowCount: 2, knownInWindowCount: 1, remainingCount: 1, overlapCount: 1, messages: [{ id: "last" }] });
+    await expect(read({ ...bounds, knownMessageBatches: [{ ids: ["last"], sha256 }] })).rejects.toThrow("checksum");
     await expect(read({ ...bounds, windowStart: "2026-11-23T04:48:30" })).rejects.toThrow("timezone");
     await expect(executeGoogleTool("gmail", "read", "gmail_search_messages", "token", { query: "after=1790000000 before=1790100000" }, null, [GMAIL_READ])).rejects.toThrow("colon");
     vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(Response.json({ messages: [{ id: "m" }] })).mockResolvedValueOnce(Response.json({ id: "m" })));
