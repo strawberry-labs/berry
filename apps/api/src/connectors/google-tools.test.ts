@@ -125,6 +125,22 @@ describe("Google connector tool policy", () => {
     await expect(read()).rejects.toThrow("Incomplete Gmail text part");
   });
 
+  it.each(["Windows-1252", "iso-8859-1"])("reads normalized Gmail text carrying the original %s charset", async (charset) => {
+    const body = "Résumé — reçu";
+    const message = (bytes: Buffer, size: number) => Response.json({ id: "m", payload: {
+      partId: "", mimeType: "text/plain", headers: [{ name: "Content-Type", value: `text/plain; charset=${charset}` }],
+      body: { data: bytes.toString("base64url"), size },
+    } });
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce(message(Buffer.from(body), body.length))
+      .mockResolvedValueOnce(message(Buffer.from([0x63, 0x61, 0x66, 0xe9]), 4))
+      .mockResolvedValueOnce(message(Buffer.from([0x63, 0x61, 0x66, 0xff]), 3)));
+    const read = () => executeGoogleTool("gmail", "read", "gmail_read_message", "token", { messageId: "m" }, null, [GMAIL_READ]);
+    await expect(read()).resolves.toMatchObject({ body: { text: body, charset: "utf-8" } });
+    await expect(read()).resolves.toMatchObject({ body: { text: "café", charset } });
+    await expect(read()).rejects.toThrow("Incomplete Gmail text part");
+  });
+
   it("returns compact decoded parts, complete forwards and link targets without file bytes", async () => {
     const body = "a🔎b\n> forwarded exactly";
     const html = '<a href="https://example.com/f">file</a>';
