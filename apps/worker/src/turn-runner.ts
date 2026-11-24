@@ -886,7 +886,7 @@ export class DurableTurnRunner {
     await this.commitAndWake(snapshot, {
       expectedState: "executing_tool", nextState, nextAction: "Continue from the verified connector result",
       steps: [{ ...step, state, output: result.output, error: applied ? null : summary, outcomeCertainty: "known",
-        sessionEntryId: entryId, resultFingerprint: resultFingerprintForToolResult(snapshot, result) },
+        sessionEntryId: entryId, resultFingerprint: resultFingerprintForToolResult(snapshot, step, result) },
         ...(!remaining ? [{ id: randomUUID(), sequence: nextStepSequence(snapshot.steps), type: "model.call", state: "pending" as const,
           input: { iteration }, retryClass: "idempotent_with_key" as const, idempotencyKey: `${snapshot.id}:model:${iteration}` }] : [])],
       events: [{ kind: "tool.end", toolCallId, status: state, summary }],
@@ -2428,7 +2428,7 @@ export class DurableTurnRunner {
     }
     result = journalSafeToolResult(result);
     const toolDurationMs = Math.max(0, Date.now() - toolStartedAt);
-    const resultFingerprint = resultFingerprintForToolResult(snapshot, result);
+    const resultFingerprint = resultFingerprintForToolResult(snapshot, step, result);
     const progressAssessment = assessToolProgress(snapshot, step, resultFingerprint);
     const updatedProgress = nextProgress(snapshot, {
       kind: progressAssessment.kind,
@@ -2716,7 +2716,7 @@ export class DurableTurnRunner {
         ? "Duplicate tool call suppressed because the same tool and input was already scheduled in this tool batch."
         : assessment.policy === "block_after_success"
           ? "Duplicate tool call suppressed because this external operation already completed successfully once."
-          : "Duplicate tool call suppressed because this tool and input already completed successfully with no new result.";
+          : ["Duplicate tool call suppressed because this tool and input already completed successfully with no new result.", repeatedReadGuidance(assessment)].join(" ");
       const summary = refusal ? UNCHANGED_RETRY_REFUSED : "Duplicate tool call suppressed.";
       batchProgress = nextProgress({ ...snapshot, progress: batchProgress }, {
         kind: "result_repeated",
@@ -2784,7 +2784,7 @@ export class DurableTurnRunner {
       const batchToolMs = index === 0 ? Math.max(0, Date.now() - startedAt) : 0;
       if (outcome.status === "fulfilled") {
         const result = journalSafeToolResult(outcome.value);
-        const resultFingerprint = resultFingerprintForToolResult(snapshot, result);
+        const resultFingerprint = resultFingerprintForToolResult(snapshot, step, result);
         const assessmentSnapshot: DurableTurnSnapshot = {
           ...snapshot,
           progress: batchProgress,
@@ -3012,7 +3012,7 @@ export class DurableTurnRunner {
           "Duplicate tool call suppressed.",
           "This exact tool and input already completed twice with the same result.",
           "Running it again would not provide new information.",
-          "Choose different arguments, use a different tool, continue using the existing result, or explain the blocker. Do not repeat this call.",
+          repeatedReadGuidance(assessment),
         ].join("\n\n");
     const progress = nextProgress(snapshot, {
       kind: "result_repeated",
@@ -5746,11 +5746,12 @@ function unconfirmedToolOperation(snapshot: DurableTurnSnapshot): { sequence: nu
 }
 
 // Count from durable evidence so restarting the worker cannot renew a stalled run.
-function confirmedModelProgress(snapshot: DurableTurnSnapshot): { stepsSinceResult: number; lastResultSequence: number | null } {
+function confirmedModelProgress(snapshot: DurableTurnSnapshot, beforeSequence = Infinity): { stepsSinceResult: number; lastResultSequence: number | null } {
   const observed = new Set<string>();
   let lastResultSequence: number | null = null;
   let count = 0;
   for (const step of snapshot.steps) {
+    if (step.sequence >= beforeSequence) continue;
     if (step.type === "model.call") { count++; continue; }
     if (!isToolStep(step) || step.state !== "completed" || step.error || step.outcomeCertainty === "unknown") continue;
     const name = toolNameForStep(step);
@@ -6213,6 +6214,7 @@ interface ToolRepeatAssessment {
   priorCompletedCount: number;
   consecutiveSameResultCount: number;
   priorSuppressionCount: number;
+  savedReadId?: string;
   decision: "allow" | "allow_with_warning" | "suppress" | "terminate";
 }
 
@@ -6281,14 +6283,32 @@ function repeatPolicyForStep(step: DurableTurnStep): ToolRepeatPolicy {
   return "block_after_success";
 }
 
+function archivedReadObservation(step: DurableTurnStep, value: unknown): { tool: string; sha256: string } | undefined {
+  if (step.retryClass !== "read_only" || !isMcpToolStep(step)) return;
+  const output = record(value);
+  if (!output || output.hasImages || output.artifacts || output.stagingStatus) return;
+  const sha256 = record(output.storedResult)?.sha256;
+  if (typeof sha256 === "string" && /^[a-f0-9]{64}$/.test(sha256)) return { tool: toolNameForStep(step), sha256 };
+}
+
 function resultFingerprintForStep(snapshot: DurableTurnSnapshot, step: DurableTurnStep): string | null {
+  // Historical archives include a step-specific storage ID in otherwise identical output.
+  const observation = archivedReadObservation(step, step.output);
+  if (observation) return progressFingerprint(snapshot.id, observation);
   if (step.resultFingerprint) return step.resultFingerprint;
   if (step.output === null || step.output === undefined) return null;
   return progressFingerprint(snapshot.id, step.output);
 }
 
-function resultFingerprintForToolResult(snapshot: DurableTurnSnapshot, result: TurnToolResult): string {
-  return progressFingerprint(snapshot.id, result.progress?.fingerprintBasis ?? result.output);
+function resultFingerprintForToolResult(snapshot: DurableTurnSnapshot, step: DurableTurnStep, result: TurnToolResult): string {
+  return progressFingerprint(snapshot.id, result.progress?.fingerprintBasis ?? archivedReadObservation(step, result.output) ?? result.output);
+}
+
+function repeatedReadGuidance(assessment: ToolRepeatAssessment): string {
+  return [
+    ...(assessment.savedReadId ? [`Read the saved result with read_tool_result and result_id=${assessment.savedReadId}.`] : []),
+    "Use the existing result for this item. If it is incomplete, request the next offset, cursor or missing field. Then continue the remaining work.",
+  ].join(" ");
 }
 
 function assessRepeatedToolCall(
@@ -6338,8 +6358,13 @@ function assessRepeatedToolCall(
   // polling, not a loop. The no-progress budget still bounds it (H-030).
   const polling = policy === "compare_result" && completed.length > 0
     && reportsPendingJobState(completed.at(-1)!.output);
-  const decision = suppressions.length > 0
-    ? "terminate"
+  const lastSuppression = suppressions.at(-1);
+  const observationalRead = policy === "compare_result" && step.retryClass === "read_only" && isMcpToolStep(step);
+  const independentProgress = lastSuppression && observationalRead
+    && (confirmedModelProgress(snapshot, step.sequence).lastResultSequence ?? -1) > lastSuppression.sequence;
+  const savedReadId = observationalRead && lastFingerprint ? record(record(completed.at(-1)?.output)?.storedResult)?.id : undefined;
+  const decision = lastSuppression
+    ? independentProgress ? "suppress" : "terminate"
     : policy === "block_after_success" && completed.length > 0
       ? "suppress"
       : polling
@@ -6355,6 +6380,7 @@ function assessRepeatedToolCall(
     priorCompletedCount: completed.length,
     consecutiveSameResultCount,
     priorSuppressionCount: suppressions.length,
+    ...(typeof savedReadId === "string" && /^[a-f0-9]{64}$/.test(savedReadId) ? { savedReadId } : {}),
     decision,
   };
 }

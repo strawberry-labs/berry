@@ -5634,6 +5634,41 @@ describe("durable turn runner", () => {
       .toMatchObject({ state: "failed", error: "duplicate_tool_call_loop" });
   });
 
+  it("reuses an archived connector read while other work progresses, and stops when only the same data repeats", async () => {
+    const name = "mcp__Records__get_record";
+    const read = (sequence: number, key: string): DurableTurnStep => ({
+      ...toolStep("pending", "read_only", false), sequence, type: `tool.${name}`,
+      input: { toolName: name, toolCallId: randomUUID(), arguments: { key }, repeatPolicy: "compare_result" },
+    });
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), read(1, "a")]));
+    const execute = vi.fn(async (_snapshot: DurableTurnSnapshot, step: DurableTurnStep) => {
+      const id = step.sequence.toString(16).padStart(64, "0");
+      const sha256 = (step.input.arguments as { key: string }).key.repeat(64);
+      return { output: { content: `Saved result ${id}`, storedResult: { id, sha256, characters: 24000 } }, summary: "Read record" };
+    });
+    const runner = new DurableTurnRunner(repository, unusedModel(), { execute });
+    const advance = () => runner.execute({ tenantId, runId, reason: "continue" });
+    const next = async (sequence: number, key: string) => {
+      queueToolForExecution(repository, read(sequence, key));
+      await advance();
+    };
+    await advance();
+    await next(3, "a");
+    // Simulate a snapshot persisted by a worker which included the storage ID in its fingerprint.
+    repository.current.steps.find((step) => step.sequence === 3)!.resultFingerprint = "legacy-reference-specific-hash";
+    await next(5, "a");
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(repository.mutations.at(-1)?.toolResultMessage?.output)).toContain("3".padStart(64, "0"));
+    await next(7, "b");
+    await next(9, "a");
+    expect(finalAnswerRequested(repository)).toBe(false);
+    expect(repository.current.steps.find((step) => step.sequence === 9)?.error).toBe("duplicate_tool_call_suppressed");
+    await next(11, "b"); // Its saved reference changed, but its contents did not.
+    await next(13, "a");
+    expect(execute).toHaveBeenCalledTimes(4);
+    expect(repository.current.progress?.budgetReason).toBe("duplicate_tool_call_loop");
+  });
+
   describe("asynchronous job polling (task 917)", () => {
     const poll = (sequence: number): DurableTurnStep => ({
       ...toolStep("pending", "read_only", false),
