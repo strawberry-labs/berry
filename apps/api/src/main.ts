@@ -416,7 +416,8 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
   const app = await NestFactory.create<NestExpressApplication>(createApiMainModule(env), { cors: corsConfig(env), bodyParser: false });
   app.useBodyParser("json", { limit: env.BERRY_API_JSON_BODY_LIMIT ?? "40mb" });
   app.useBodyParser("urlencoded", { limit: env.BERRY_API_JSON_BODY_LIMIT ?? "40mb", extended: true });
-  app.enableShutdownHooks();
+  // The API runs as container PID 1. Exit after all hooks drain even if an idle client keeps the event loop open.
+  app.enableShutdownHooks([], { useProcessExit: true });
   const database = app.get(CloudDatabaseService);
   if (env.BERRY_RUN_MIGRATIONS !== "false") await database.migrate();
   const port = Number(env.PORT ?? env.BERRY_API_PORT ?? 3000);
