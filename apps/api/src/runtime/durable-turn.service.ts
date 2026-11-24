@@ -1105,7 +1105,7 @@ ORDER BY a.created_at ASC
           ORDER BY a.created_at LIMIT 20 FOR UPDATE OF a,r SKIP LOCKED`, [tenantId]);
         for (const wait of waits) {
           await tx.execute(`UPDATE approvals SET status='expired',expired_at=now(),decided_at=now(),closed_at=now(),
-            closure_reason=$3,updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid AND status='pending'`,
+            closure_reason=$3 WHERE tenant_id=$1::uuid AND id=$2::uuid AND status='pending'`,
             [tenantId, wait.id, wait.unavailable ? "tool_unavailable" : "approval_expired"]);
           if (!wait.unavailable) {
             await expireWaitTransaction(tx, tenantId, {

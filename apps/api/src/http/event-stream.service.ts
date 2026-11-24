@@ -1,6 +1,6 @@
-import { Inject, Injectable } from "@nestjs/common";
+import { Inject, Injectable, type OnModuleDestroy } from "@nestjs/common";
 import { AgentStreamEventSchema, HostPushEventSchema, normalizeTaskForWeb, type AgentStreamEvent, type HostPushEvent, type Task } from "@berry/shared";
-import { Observable, Subject } from "rxjs";
+import { Observable, ReplaySubject, Subject, takeUntil } from "rxjs";
 import { createHash } from "node:crypto";
 import { DurableTurnService, parseEventCursor } from "../runtime/durable-turn.service.js";
 
@@ -15,7 +15,8 @@ export const LEGACY_EVENT_TTL_MS = 15 * 60 * 1_000;
 export const LEGACY_EVENT_GLOBAL_ENTRY_CAP = 32_768;
 
 @Injectable()
-export class ApiEventStreamService {
+export class ApiEventStreamService implements OnModuleDestroy {
+  readonly #shutdown = new ReplaySubject<void>(1);
   readonly #subjects = new Map<string, Subject<MessageEvent<AgentStreamEvent>>>();
   readonly #taskSubjects = new Map<string, Subject<MessageEvent<HostPushEvent>>>();
   // Replay state keeps only fixed-size identity metadata. The full event is
@@ -28,6 +29,12 @@ export class ApiEventStreamService {
 
   constructor(@Inject(DurableTurnService) private readonly durableTurns?: DurableTurnService) {}
 
+  onModuleDestroy(): void {
+    // End HTTP subscriptions before Nest waits for open connections. Durable runs and cursors live in the database.
+    this.#shutdown.next();
+    this.#shutdown.complete();
+  }
+
   publish(sessionId: string, event: AgentStreamEvent): AgentStreamEvent {
     const parsed = AgentStreamEventSchema.parse(event);
     this.#cleanupLegacyState();
@@ -39,7 +46,7 @@ export class ApiEventStreamService {
   }
 
   stream(sessionId: string, replay: AgentStreamEvent[] = [], lastEventId?: string | null, replayRunKey?: string | null): Observable<MessageEvent<AgentStreamEvent>> {
-    return new Observable((subscriber) => {
+    return new Observable<MessageEvent<AgentStreamEvent>>((subscriber) => {
       this.#cleanupLegacyState();
       const subject = this.#subject(sessionId);
       const afterSequence = parseLegacyEventId(lastEventId);
@@ -65,7 +72,7 @@ export class ApiEventStreamService {
         if (subject.observed === false) this.#subjects.delete(sessionId);
         this.#cleanupLegacyState();
       };
-    });
+    }).pipe(takeUntil(this.#shutdown));
   }
 
   async streamDurable(
@@ -81,7 +88,7 @@ export class ApiEventStreamService {
     const normalizedCursor = parseEventCursor(cursor) ? cursor : null;
     const connectedAt = normalizedCursor ? undefined : new Date();
     let initial = await durableTurns.eventsAfter(tenantId, sessionId, normalizedCursor, 500, connectedAt);
-    return new Observable((subscriber) => {
+    return new Observable<MessageEvent<AgentStreamEvent>>((subscriber) => {
       let closed = false;
       let lastCursor = normalizedCursor;
       let pollDelay = DURABLE_EVENT_POLL_MS;
@@ -135,7 +142,7 @@ export class ApiEventStreamService {
         closed = true;
         if (timer) clearTimeout(timer);
       };
-    });
+    }).pipe(takeUntil(this.#shutdown));
   }
 
   publishTask(task: Task): HostPushEvent {
@@ -145,7 +152,7 @@ export class ApiEventStreamService {
   }
 
   taskStream(taskId: string): Observable<MessageEvent<HostPushEvent>> {
-    return new Observable((subscriber) => {
+    return new Observable<MessageEvent<HostPushEvent>>((subscriber) => {
       let subject = this.#taskSubjects.get(taskId);
       if (!subject) {
         subject = new Subject<MessageEvent<HostPushEvent>>();
@@ -156,7 +163,7 @@ export class ApiEventStreamService {
         subscription.unsubscribe();
         if (subject?.observed === false) this.#taskSubjects.delete(taskId);
       };
-    });
+    }).pipe(takeUntil(this.#shutdown));
   }
 
   #subject(sessionId: string): Subject<MessageEvent<AgentStreamEvent>> {
