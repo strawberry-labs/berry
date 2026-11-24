@@ -1141,7 +1141,8 @@ export class DurableTurnRunner {
       definitions,
       additionalUserContent,
     );
-    if (this.options.compactor && shouldCompactSnapshot(snapshot, this.options, activeContextTokens)) {
+    const timeoutCheckpoint = this.options.compactor && needsCheckpointAfterSilentTimeouts(snapshot, step);
+    if (this.options.compactor && (timeoutCheckpoint || shouldCompactSnapshot(snapshot, this.options, activeContextTokens))) {
       if (completedCompactionForCurrentTail(snapshot)) {
         throw new DurableTurnTerminalError(
           `Context remains above the safe model limit after compaction (${activeContextTokens} estimated tokens).`,
@@ -1162,7 +1163,8 @@ export class DurableTurnRunner {
             type: "session.compact",
             state: "pending",
             input: {
-              reason: "token-threshold",
+              reason: timeoutCheckpoint ? "repeated-silent-timeout" : "token-threshold",
+              ...(timeoutCheckpoint ? { timedOutModelStepId: step.id } : {}),
               contextTailEntryId: compactionTailEntryId(snapshot),
               estimatedUncompactedTokens: estimateUncompactedTokens(snapshot),
             },
@@ -1173,7 +1175,9 @@ export class DurableTurnRunner {
         events: [{
           kind: "session.note",
           note: "compacting",
-          detail: "Context auto-compacting",
+          detail: timeoutCheckpoint
+            ? "The model timed out twice without returning output. Berry is shortening the conversation before resuming from saved work."
+            : "Context auto-compacting",
         }],
         nextAction: "Create a portable checkpoint before the next model request",
       });
@@ -1218,7 +1222,7 @@ export class DurableTurnRunner {
         ...step,
         state: "running",
         incrementAttempt: true,
-        output: { streamMessageId: messageId },
+        output: { ...(record(step.output) ?? {}), streamMessageId: messageId },
         startedAt: new Date(modelStartedAt).toISOString(),
       }],
       progress: {
@@ -1240,6 +1244,7 @@ export class DurableTurnRunner {
     const providerAttempts: ProviderAttemptReport[] = [];
     const attemptLayer = runnerAttemptLayer(step);
     let result: TurnModelResult;
+    let emittedOutput = false;
     try {
       result = await this.withHeartbeat(snapshot, async ({ signal, reportProgress, abort }) => {
         const permissionMode = stringValue(snapshot.runtimeRequest.permissionMode) ?? "ask";
@@ -1258,6 +1263,7 @@ export class DurableTurnRunner {
               if (report) report.retryDecision = decision;
             },
             emitDelta: async (delta, channel) => {
+              if (delta.length > 0) emittedOutput = true;
               reportProgress();
               try {
                 repetitionGuard.observe(delta, channel);
@@ -1310,7 +1316,8 @@ export class DurableTurnRunner {
       const priorCauses = record(record(step.output)?.providerDiagnostics)?.attemptCauses;
       diagnostics.attemptCauses = [
         ...(Array.isArray(priorCauses) ? priorCauses : []),
-        { cause: diagnostics.failureCause ?? null, latencyMs: diagnostics.latencyMs ?? null },
+        { cause: diagnostics.failureCause ?? null, latencyMs: diagnostics.latencyMs ?? null,
+          ...(error instanceof DurableToolTimeoutError ? { emittedOutput } : {}) },
       ].slice(-10);
       const failedModelProgress = reconcileModelCallProgress(
         modelProgress,
@@ -6520,6 +6527,20 @@ function stableToolFamily(name: string): string {
   if (["persist_artifact", "create_image", "inspect_images"].includes(normalized)) return "artifact";
   if (normalized === "activate_skill") return "skill";
   return "extension";
+}
+
+function needsCheckpointAfterSilentTimeouts(snapshot: DurableTurnSnapshot, step: DurableTurnStep): boolean {
+  if (step.attempt < 2) return false;
+  const attempts = record(record(step.output)?.providerDiagnostics)?.attemptCauses;
+  if (!Array.isArray(attempts) || attempts.length < 2 || !attempts.slice(-2).every((value) => {
+    const attempt = record(value);
+    return attempt?.emittedOutput === false && (attempt.cause === "idle_timeout" || attempt.cause === "max_duration");
+  })) return false;
+  if (completedCompactionForCurrentTail(snapshot) || snapshot.steps.some((prior) =>
+    prior.type === "session.compact" && prior.input.timedOutModelStepId === step.id)) return false;
+  const journal = uncompactedEntries(snapshot).filter((entry) => entry.entryType === "message");
+  return journal.length > 1 && estimateEntriesTokens(journal) > DEFAULT_COMPACTION_SETTINGS.keepRecentTokens
+    && confirmedModelProgress(snapshot, step.sequence).lastResultSequence !== null;
 }
 
 function shouldCompactSnapshot(

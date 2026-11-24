@@ -4193,6 +4193,65 @@ describe("durable turn runner", () => {
       } satisfies DurableTurnModel;
     }
 
+    it("shortens a long conversation once after two silent timeouts and resumes the same model step", async () => {
+      vi.useFakeTimers();
+      try {
+        const model = modelStep("pending", 2);
+        const current = snapshot("calling_model", [admittedStep(), savedImage, model]);
+        current.runtimeRequest.contextWindowTokens = 1_040_000;
+        current.entries.push(...Array.from({ length: 4 }, () => ({
+          ...current.entries[0]!, entryId: randomUUID(),
+          payload: { type: "message", message: { role: "user", content: "older evidence ".repeat(5000) } },
+        })));
+        const repository = new ReleasingTurnRepository(current);
+        const call = vi.fn(async (_snapshot: DurableTurnSnapshot, _step: DurableTurnStep, context: Parameters<DurableTurnModel["call"]>[2]) => {
+          if (call.mock.calls.length < 3) {
+            await new Promise<void>((_resolve, reject) => context.signal!.addEventListener("abort", () => reject(new Error("stream ended"))));
+          }
+          return { text: "Done", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+        });
+        const compact = vi.fn(async () => ({ sessionId: current.sessionId, summary: "Saved progress", tokensBefore: 60000, tokensAfter: 120 }));
+        const tools = { execute: vi.fn() };
+        const runner = new DurableTurnRunner(repository, { call }, tools, { modelIdleTimeoutMs: 20, compactor: { compactSession: compact } });
+        const advance = () => runner.execute({ tenantId, runId, reason: "continue" });
+        for (let i = 0; i < 2; i++) {
+          const failed = expect(advance()).rejects.toBeInstanceOf(DurableToolTimeoutError);
+          await vi.advanceTimersByTimeAsync(20);
+          await failed;
+        }
+        expect((await advance()).state).toBe("compacting");
+        expect(repository.current.steps.find(step => step.type === "session.compact")?.input).toMatchObject({
+          reason: "repeated-silent-timeout", timedOutModelStepId: model.id,
+        });
+        expect((await advance()).state).toBe("calling_model");
+        expect((await advance()).state).toBe("finalizing");
+        expect(compact).toHaveBeenCalledOnce();
+        expect(call).toHaveBeenCalledTimes(3);
+        expect(repository.current.steps.filter(step => step.type === "model.call")).toHaveLength(1);
+        expect(repository.current.steps.find(step => step.id === model.id)?.attempt).toBe(3);
+        expect(tools.execute).not.toHaveBeenCalled();
+      } finally { vi.useRealTimers(); }
+    });
+
+    it.each([true, undefined])("continues ordinary retries when earlier timeouts produced output or lack that evidence (%s)", async (emittedOutput) => {
+      const pending = modelStep("pending", 2);
+      const current = snapshot("calling_model", [admittedStep(), savedImage, {
+        ...pending, attempt: 2, output: { providerDiagnostics: { attemptCauses: [
+          { cause: "max_duration", ...(emittedOutput === undefined ? {} : { emittedOutput }) },
+          { cause: "idle_timeout", emittedOutput: false },
+        ] } },
+      }]);
+      current.runtimeRequest.contextWindowTokens = 1_040_000;
+      current.entries.push({ ...current.entries[0]!, entryId: randomUUID(),
+        payload: { type: "message", message: { role: "user", content: "prior evidence ".repeat(12000) } } });
+      const compact = vi.fn();
+      const call = vi.fn(async () => ({ text: "Done", inputTokens: 1, outputTokens: 1, toolCalls: [] }));
+      const repository = new FakeTurnRepository(current);
+      const runner = new DurableTurnRunner(repository, { call }, noTools(), { compactor: { compactSession: compact } });
+      expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("finalizing");
+      expect(compact).not.toHaveBeenCalled();
+    });
+
     it("keeps the idle-timeout cause through retry exhaustion and names the saved work", async () => {
       vi.useFakeTimers();
       try {
