@@ -1071,6 +1071,76 @@ ORDER BY a.created_at ASC
     });
   }
 
+  /** Release scheduled waits that can no longer receive a meaningful approval. */
+  async reconcileScheduledApprovals(tenantId: string): Promise<void> {
+    if (!this.enabled) return;
+    await this.database.withTenant(tenantId, async (executor) => {
+      const work = async (tx: SqlExecutor) => {
+        const waits = await tx.query<{
+          id: string; run_id: string; session_id: string; task_id: string; step_id: string;
+          tool_call_id: string | null; tool_name: string; sandbox_id: string | null; unavailable: boolean;
+        }>(`
+          SELECT a.id,r.id AS run_id,r.session_id,r.task_id,s.id AS step_id,a.tool_call_id,
+            s.input->>'toolName' AS tool_name,r.sandbox_id,check_tool.unavailable
+          FROM approvals a
+          JOIN turn_runs r ON r.tenant_id=a.tenant_id AND r.id=a.run_id
+          JOIN turn_steps s ON s.tenant_id=r.tenant_id AND s.run_id=r.id AND s.id=a.step_id
+          CROSS JOIN LATERAL (SELECT EXISTS (
+            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(r.runtime_request->'mcpServers')='array'
+              THEN r.runtime_request->'mcpServers' ELSE '[]'::jsonb END) server
+            CROSS JOIN LATERAL (SELECT 'mcp__'||regexp_replace(server->>'name','[^a-zA-Z0-9_-]','_','g')||'__' AS prefix) names
+            WHERE a.kind='mcp' AND s.attempt=0 AND s.state='waiting'
+              AND server->>'enabled'='true' AND server->>'trusted'='true'
+              AND server->>'trustReadOnlyAnnotations'='true'
+              AND server->>'credentialRef'=('connector:'||(server->>'id')||':'||r.user_id::text)
+              AND starts_with(s.input->>'toolName',names.prefix)
+              AND jsonb_typeof(server->'cachedTools')='array' AND server->'cachedTools'<>'[]'::jsonb
+              AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(server->'cachedTools')='array'
+                THEN server->'cachedTools' ELSE '[]'::jsonb END) t
+                WHERE names.prefix||regexp_replace(t->>'name','[^a-zA-Z0-9_-]','_','g')=s.input->>'toolName')
+          ) AS unavailable) check_tool
+          WHERE a.tenant_id=$1::uuid AND a.status='pending' AND r.state='waiting' AND r.waiting_reason='approval'
+            AND EXISTS (SELECT 1 FROM scheduled_task_runs job WHERE job.tenant_id=r.tenant_id AND job.turn_id=r.id AND job.trigger='scheduled')
+            AND (check_tool.unavailable OR a.expires_at<=now())
+          ORDER BY a.created_at LIMIT 20 FOR UPDATE OF a,r SKIP LOCKED`, [tenantId]);
+        for (const wait of waits) {
+          await tx.execute(`UPDATE approvals SET status='expired',expired_at=now(),decided_at=now(),closed_at=now(),
+            closure_reason=$3,updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid AND status='pending'`,
+            [tenantId, wait.id, wait.unavailable ? "tool_unavailable" : "approval_expired"]);
+          if (!wait.unavailable) {
+            await expireWaitTransaction(tx, tenantId, {
+              runId: wait.run_id, sessionId: wait.session_id, taskId: wait.task_id, sandboxId: wait.sandbox_id,
+              stepId: wait.step_id, toolCallId: wait.tool_call_id, closureReason: "approval_expired",
+              summary: "This approval expired before a decision was recorded.",
+              event: { kind: "approval.expired", approvalId: wait.id },
+            });
+            continue;
+          }
+          // This name was absent from the immutable built-in catalog. Deliver a
+          // local refusal to the model. The requested external call never runs.
+          const reason = wait.tool_name + " was not run: this tool is unavailable. Use tool_search and copy an available tool name.";
+          await tx.execute(`UPDATE turn_steps SET state='pending',input=input||jsonb_build_object('argumentError',$4::text),
+              updated_at=now() WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid AND state='waiting'`,
+            [tenantId, wait.run_id, wait.step_id, reason]);
+          await tx.execute(`UPDATE turn_runs SET state='executing_tool',waiting_reason=NULL,next_action='Continue with the available connector tools',
+              human_wait_ms=human_wait_ms+COALESCE(GREATEST(0,FLOOR(EXTRACT(EPOCH FROM (now()-waiting_started_at))*1000)::bigint),0),
+              waiting_started_at=NULL,lease_owner=NULL,lease_expires_at=NULL,version=version+1,updated_at=now()
+              WHERE tenant_id=$1::uuid AND id=$2::uuid AND state='waiting'`, [tenantId, wait.run_id]);
+          await tx.execute("UPDATE tasks SET status='running',updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid",
+            [tenantId, wait.task_id]);
+          await appendDurableEvents(tx, tenantId, wait.run_id, wait.session_id, [
+            { kind: "approval.expired", approvalId: wait.id },
+            { kind: "tool.update", toolCallId: wait.tool_call_id ?? wait.step_id, detail: reason },
+          ]);
+          await tx.execute(`INSERT INTO runtime_outbox (tenant_id,event_type,aggregate_id,dedupe_key,payload)
+            VALUES ($1::uuid,'turn.resume',$2,$3,$4::jsonb) ON CONFLICT (tenant_id,dedupe_key) DO NOTHING`,
+            [tenantId, wait.run_id, wait.run_id + ":unlisted:" + wait.id, JSON.stringify({ tenantId, runId: wait.run_id, reason: "approval-resolved" })]);
+        }
+      };
+      return executor.transaction ? executor.transaction(work) : work(executor);
+    });
+  }
+
   async decideApproval(
     tenantId: string,
     userId: string,

@@ -636,7 +636,24 @@ export type DurableVisionCapability = z.infer<typeof DurableVisionCapabilitySche
 export const TurnIntentSchema = z.enum(["image_generation"]);
 export type TurnIntent = z.infer<typeof TurnIntentSchema>;
 
+/** An automation can require each opened operation to have a matching completion receipt. */
+export const ToolCompletionRuleSchema = z.object({
+  startTool: z.string().regex(/^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+$/).max(220),
+  finishTool: z.string().regex(/^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+$/).max(220),
+  idField: z.string().regex(/^[A-Za-z][A-Za-z0-9_]*$/).max(64),
+  coverage: z.object({
+    checkpointTool: z.string().regex(/^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+$/).max(220),
+    targetPath: z.array(z.string().min(1).max(64)).min(1).max(6),
+    checkpointPath: z.array(z.string().min(1).max(64)).min(1).max(6),
+    finishedPath: z.array(z.string().min(1).max(64)).min(1).max(6),
+    readyPath: z.array(z.string().min(1).max(64)).min(1).max(6),
+    readyValue: z.string().min(1).max(64),
+  }).strict().optional(),
+}).strict().refine(rule => rule.startTool !== rule.finishTool);
+export type ToolCompletionRule = z.infer<typeof ToolCompletionRuleSchema>;
+
 export const DurableTurnRuntimeRequestSchema = z.object({
+  completionRule: ToolCompletionRuleSchema.optional(),
   capabilityVersion: z.literal(1),
   requestId: z.string().min(1).optional(),
   admissionFingerprint: z.string().regex(/^[a-f0-9]{64}$/).optional(),

@@ -58,6 +58,14 @@ describe("scheduled task dispatcher", () => {
       { operationId: claim.id, input: claim.input.prompt, workspaceId: claim.workspaceId, workspacePath: "/workspace", reasoning: "high", timezone: "Asia/Dubai" });
     expect(repo.admitted).toHaveBeenCalledWith("tenant", claim.id, expect.any(String), "turn");
   });
+  it("passes the saved completion rule to the worker through trusted run admission", async () => {
+    const { claim, repo, agent, dispatcher } = fixture();
+    const completionRule = { startTool: "mcp__Tracker__start_job", finishTool: "mcp__Tracker__finish_job", idField: "id" };
+    repo.claimPending.mockResolvedValue([{ ...claim, input: { ...claim.input, completionRule } }]);
+    await dispatcher.tick();
+    expect(agent.startTurn).toHaveBeenCalledWith(expect.objectContaining({ scheduledCompletionRule: completionRule }), claim.sessionId,
+      expect.objectContaining({ operationId: claim.id }));
+  });
   it("does not start work for a revoked owner", async () => {
     const { repo, agent, dispatcher } = fixture(); repo.authorizeClaim.mockResolvedValue(false);
     await dispatcher.tick(); expect(agent.startTurn).not.toHaveBeenCalled();

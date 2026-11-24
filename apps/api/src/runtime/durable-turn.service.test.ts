@@ -1155,6 +1155,24 @@ describe("DurableTurnService", () => {
     )).toHaveLength(2);
   });
 
+  it("resumes an unavailable scheduled tool as a local refusal without granting approval", async () => {
+    const statements: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { statements.push({ sql, params }); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("check_tool.unavailable")) return [{ id: stepId, run_id: runId, session_id: sessionId,
+          task_id: taskId, step_id: stepId, tool_call_id: null, tool_name: "mcp__Test__unlisted", sandbox_id: null, unavailable: true }] as T[];
+        if (sql.includes("MAX(sequence)")) return [{ value: 1 }] as T[];
+        return [] as T[];
+      },
+    };
+    await new DurableTurnService(new CloudDatabaseService(executor), true).reconcileScheduledApprovals(tenantId);
+    expect(statements.some(x => x.sql.includes("status='expired'") && x.params.includes("tool_unavailable"))).toBe(true);
+    expect(statements.some(x => x.sql.includes("argumentError") && x.params.some(p => String(p).includes("was not run")))).toBe(true);
+    expect(statements.some(x => x.sql.includes("'turn.resume'"))).toBe(true);
+    expect(statements.some(x => x.sql.includes("status='approved'"))).toBe(false);
+  });
+
   it("resolves an approval and projects task running state in one transaction", async () => {
     const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
     const executor: SqlExecutor = {

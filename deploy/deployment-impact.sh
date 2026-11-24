@@ -65,6 +65,10 @@ berry_impact_add_file() {
     apps/api/*)
       berry_mark_service api
       ;;
+    packages/db/src/scheduled-tasks.ts)
+      # Scheduler queries use the existing tables and service roles.
+      berry_mark_service api
+      ;;
     packages/db/*)
       berry_mark_service api
       berry_run_migrations=true
@@ -84,6 +88,11 @@ berry_impact_add_file() {
       berry_mark_service api
       berry_mark_worker_pools
       berry_mark_service mem0
+      ;;
+    packages/shared/src/durable-context.ts)
+      # Runtime admission and execution consume this server-side contract.
+      berry_mark_service api
+      berry_mark_worker_pools
       ;;
     packages/shared/*)
       berry_mark_service api

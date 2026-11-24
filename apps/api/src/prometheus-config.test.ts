@@ -78,10 +78,11 @@ describe("Compose Prometheus configuration", () => {
     expect(cloudFormation).toContain("Resource: !Ref AlertTopic");
   });
 
-  it("quarantines structured compaction from the organization chat default", () => {
-    const compose = readFileSync(new URL("compose.yaml", deployRoot), "utf8");
-    expect(compose).toContain(
-      "BERRY_COMPACTION_MODEL: ${BERRY_COMPACTION_MODEL:-canopywave/moonshotai/kimi-k2.6}",
-    );
+  it("supplies the router fallback for workers that compact long conversations", () => {
+    const compose = parse(readFileSync(new URL("compose.yaml", deployRoot), "utf8"));
+    const environment = compose.services.worker.environment;
+    expect(environment.BERRY_ROUTER_DEFAULT_MODEL).toBe("${BERRY_ROUTER_DEFAULT_MODEL:-inference-net/deepseek-v4.1-flash-1017}");
+    expect(environment).not.toHaveProperty("BERRY_COMPACTION_MODEL");
+    expect(compose.services["worker-foreground"].extends.service).toBe("worker");
   });
 });
