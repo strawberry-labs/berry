@@ -641,19 +641,23 @@ function gmailCharset(contentType: string): string | undefined {
   return /(?:^|;)\s*charset\s*=\s*(?:"([^"]+)"|([^;\s]+))/i.exec(contentType)?.slice(1).find(Boolean);
 }
 
-// Gmail sometimes reports the decoded character count as the size of a text
-// body. Only accept that alternative for complete, strictly decodable body
-// text. Files and short or otherwise inconsistent payloads still fail closed.
-function gmailPartSizeMatches(bytes: Buffer, declared: number | null, part?: GmailPart) {
-  if (declared === null || bytes.byteLength === declared) return true;
-  if (!part || bytes.byteLength < declared || !/^text\//i.test(part.mimeType)
-      || part.filename || /^attachment\b/i.test(part.disposition ?? "")) return false;
-  try {
-    const text = new TextDecoder(gmailCharset(part.contentType) ?? "utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
-    return text.length === declared;
-  } catch {
-    return false;
+// Gmail can return normalized UTF-8 text with the original MIME charset and
+// a character count. Accept that representation only when strict decoding
+// reproduces the reported length. Files must still match their byte count.
+function gmailCharsetForSize(bytes: Buffer, declared: number | null, part?: GmailPart): string | null {
+  const charset = gmailCharset(part?.contentType ?? "") ?? "utf-8";
+  if (declared === null || bytes.byteLength === declared) return charset;
+  if (!part || bytes.byteLength < declared || !/^text\/(plain|html)$/i.test(part.mimeType)
+      || part.filename || /^attachment\b/i.test(part.disposition ?? "")) return null;
+  for (const candidate of new Set([charset, "utf-8"])) {
+    try {
+      const text = new TextDecoder(candidate, { fatal: true, ignoreBOM: true }).decode(bytes);
+      if (text.length === declared) return candidate;
+    } catch {
+      // The normalized representation can be valid even when the MIME label is stale.
+    }
   }
+  return null;
 }
 
 async function gmailTextPage(token: string, messageId: string, part: GmailPart, offset: number, limit: number) {
@@ -665,8 +669,8 @@ async function gmailTextPage(token: string, messageId: string, part: GmailPart, 
   }
   if (data === null && part.size !== 0) throw new Error("Gmail returned no text for this part");
   const bytes = decodeBase64Url(data ?? "");
-  if (!gmailPartSizeMatches(bytes, part.size, part)) throw new Error("Incomplete Gmail text part");
-  const charset = gmailCharset(part.contentType) ?? "utf-8";
+  const charset = gmailCharsetForSize(bytes, part.size, part);
+  if (!charset) throw new Error("Incomplete Gmail text part");
   let text: string;
   try { text = new TextDecoder(charset, { fatal: true }).decode(bytes); }
   catch { throw new Error("Cannot decode this text part with its declared charset. Read its original bytes with gmail_get_attachment."); }
@@ -745,7 +749,7 @@ async function getGmailAttachment(token: string, input: Record<string, unknown>,
   const bytes = decodeBase64Url(encoded);
   if (bytes.byteLength > GMAIL_ATTACHMENT_LIMIT_BYTES) throw new Error("Gmail attachment exceeds Berry's 50 MB limit");
   for (const declaredSize of [partSize, responseSize]) {
-    if (!gmailPartSizeMatches(bytes, declaredSize, part)) {
+    if (!gmailCharsetForSize(bytes, declaredSize, part)) {
       throw new Error(`Gmail attachment data is incomplete: expected ${declaredSize} bytes, decoded ${bytes.byteLength}`);
     }
   }
