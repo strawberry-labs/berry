@@ -206,6 +206,13 @@ function mcpConnectionFailure(error: McpConnectionError, changesState: boolean):
   };
 }
 
+// A temporary service outage is no longer evidence that an independent read will fail
+// after the connector's recovery window. Authentication and ambiguous writes keep their holds.
+export function temporaryMcpBlockExpired(failure: ToolFailure, completedAt?: string | null): boolean {
+  return failure.category === "transient" && failure.code === "mcp_temporary"
+    && !!completedAt && Date.now() - Date.parse(completedAt) >= 120_000;
+}
+
 /** Reads a stored failure classification back from a failed step's output. */
 export function storedToolFailure(output: unknown): ToolFailure | null {
   const failure = record(record(output)?.failure);

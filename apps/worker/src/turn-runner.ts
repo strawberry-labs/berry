@@ -96,7 +96,7 @@ import {
   operationalDuration,
   persistWorkerOperationalEvent,
 } from "./operational-telemetry.js";
-import { classifyToolFailure, storedToolFailure, TOOL_FAILURE_OUTCOME_VERSION, toolFailureAction, type ToolFailure } from "./tool-failures.js";
+import { classifyToolFailure, storedToolFailure, temporaryMcpBlockExpired, TOOL_FAILURE_OUTCOME_VERSION, toolFailureAction, type ToolFailure } from "./tool-failures.js";
 import {
   PROVIDER_CREDIT_EXHAUSTED_MESSAGE,
   raiseProviderCreditAlert,
@@ -1842,6 +1842,12 @@ export class DurableTurnRunner {
     const runnableSteps = snapshot.steps
       .filter(isRunnableToolStep)
       .sort((left, right) => left.sequence - right.sequence);
+    const deferredUntil = runnableSteps[0]?.input.connectorReadRetryAt;
+    if (typeof deferredUntil === "string" && Date.parse(deferredUntil) > Date.now()) {
+      await this.commitAndWake(snapshot, { expectedState: "executing_tool", nextState: "executing_tool",
+        nextAction: "Waiting to reconnect for the pending read" }, deferredUntil);
+      return "executing_tool";
+    }
     if (runnableSteps.length > 1 && runnableSteps.some((step) => toolNameForStep(step).startsWith("mcp__"))) {
       // A worker resumed on another process has no connector catalog yet.
       // Resolve it once before evaluating authoritative read-only policies.
@@ -1852,6 +1858,8 @@ export class DurableTurnRunner {
     }
     const parallelPrefix: DurableTurnStep[] = [];
     for (const candidate of runnableSteps) {
+      const retryAt = candidate.input.connectorReadRetryAt;
+      if (typeof retryAt === "string" && Date.parse(retryAt) > Date.now()) break;
       if (!isParallelReadOnlyToolStep(candidate, this.tools.supportsConcurrency?.(snapshot, candidate) === true)) break;
       parallelPrefix.push(candidate);
     }
@@ -2308,6 +2316,12 @@ export class DurableTurnRunner {
             changesState: toolMayChangeState(step),
             timedOut,
           });
+      const deferred = deferredMcpRead(step, failure);
+      if (deferred) {
+        await this.commitAndWake(snapshot, { expectedState: "executing_tool", nextState: "executing_tool",
+          steps: [deferred], nextAction: "Waiting to reconnect for the pending read" }, deferred.input.connectorReadRetryAt);
+        return "executing_tool";
+      }
       // A change outside the sandbox that the target may have applied before
       // the connection dropped or it answered with a server error is never
       // repeated automatically. Like a timeout, it waits for an explicit
@@ -2861,6 +2875,11 @@ export class DurableTurnRunner {
         : undefined;
       const message = (outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)).slice(0, 4_000).replace(/\u0000/g, "\uFFFD");
       const failure = classifyToolFailure(outcome.reason, { changesState: false, timedOut: outcome.reason instanceof DurableToolTimeoutError });
+      const deferred = deferredMcpRead(step, failure);
+      if (deferred) {
+        mutations.push(deferred);
+        continue;
+      }
       const repeatGuardAssessment = repeatAssessments.get(step.id)!;
       mutations.push({
         ...step,
@@ -2924,7 +2943,8 @@ export class DurableTurnRunner {
 
     const iteration = modelIteration(snapshot.steps) + 1;
     const settledIds = new Set(mutations.map((mutation) => mutation.id));
-    const remaining = snapshot.steps.some((candidate) => isRunnableToolStep(candidate) && !settledIds.has(candidate.id));
+    const retryAt = mutations.find(mutation => mutation.state === "pending")?.input?.connectorReadRetryAt;
+    const remaining = typeof retryAt === "string" || snapshot.steps.some((candidate) => isRunnableToolStep(candidate) && !settledIds.has(candidate.id));
     const nextState = remaining ? "executing_tool" : "calling_model";
     // Repeated reads that change nothing end tool use, not the task (H-004).
     const wrapUp = hardNoProgress && !remaining ? noProgressReason(batchProgress.consecutiveNoProgress) : null;
@@ -2962,7 +2982,7 @@ export class DurableTurnRunner {
       ...(sandbox ? {
         outbox: [scheduledSandboxSnapshot(snapshot, this.options.snapshotIntervalSeconds ?? 900)],
       } : {}),
-    });
+    }, typeof retryAt === "string" ? retryAt : undefined);
     return nextState;
   }
 
@@ -3685,6 +3705,7 @@ export class DurableTurnRunner {
   private async commitAndWake(
     snapshot: DurableTurnSnapshot,
     mutation: DurableTurnMutation,
+    availableAt?: string,
   ): Promise<void> {
     const terminal = TERMINAL_STATES.has(mutation.nextState);
     const outbox = terminal
@@ -3693,7 +3714,8 @@ export class DurableTurnRunner {
           ...(mutation.outbox ?? []),
           {
             eventType: "turn.execute" as const,
-            dedupeKey: `${snapshot.id}:wake:${snapshot.version + 1}:${mutation.nextState}`,
+            dedupeKey: availableAt ? `${snapshot.id}:connector-read:${availableAt}` : `${snapshot.id}:wake:${snapshot.version + 1}:${mutation.nextState}`,
+            ...(availableAt ? { availableAt } : {}),
             payload: {
               tenantId: snapshot.tenantId,
               runId: snapshot.id,
@@ -5905,6 +5927,7 @@ function unchangedFailedRetry(snapshot: DurableTurnSnapshot, step: DurableTurnSt
   if (!previous || previous.state !== "failed") return null;
   const failure = storedToolFailure(previous.output);
   if (!failure) return null;
+  if (step.retryClass === "read_only" && temporaryMcpBlockExpired(failure, previous.completedAt)) return null;
   if (isMcpToolStep(step) && !(failure.code?.startsWith("mcp_") && failure.deterministic)) return null;
   const stored = record(record(previous.output)?.failure);
   const previousError = stringValue(stored?.previousError)
@@ -6759,6 +6782,18 @@ function toolCallIdForStep(step: DurableTurnStep): string {
 
 function toolNameForStep(step: DurableTurnStep): string {
   return stringValue(step.input.toolName) ?? step.type.slice(5);
+}
+
+// The SDK has already attempted an immediate reconnect. Resume safe reads from
+// the durable queue so an outage costs no model calls and occupies no worker.
+function deferredMcpRead(step: DurableTurnStep, failure: ToolFailure) {
+  if (!isMcpToolStep(step) || step.retryClass !== "read_only" || step.input.requiresApproval === true
+      || failure.category !== "transient" || failure.code !== "mcp_temporary" || failure.outcome !== "not_applied") return;
+  const count = typeof step.input.connectorReadRetries === "number" ? step.input.connectorReadRetries : 0;
+  const delay = [15_000, 60_000, 120_000][count];
+  if (!delay) return;
+  return { ...step, state: "pending" as const, deadlineAt: null, idleDeadlineAt: null,
+    input: { ...step.input, connectorReadRetries: count + 1, connectorReadRetryAt: new Date(Date.now() + delay).toISOString() } };
 }
 
 function isRunnableToolStep(step: DurableTurnStep): boolean {

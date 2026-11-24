@@ -4011,6 +4011,47 @@ describe("durable turn runner", () => {
     });
   });
 
+  it.each([false, true])("resumes a temporarily unavailable connector read without repeating completed work (parallel=%s)", async (parallel) => {
+    const name = "mcp__Records__list";
+    const item = { ...toolStep("pending", "read_only", false), type: "tool." + name,
+      input: { toolName: name, toolCallId: "records", arguments: {}, requiresApproval: false } };
+    const sibling = readOnlyToolStep("read", 2, "/workspace/independent.txt");
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), item, ...(parallel ? [sibling] : [])]));
+    const hits: string[] = [];
+    const execute = async (_snapshot: DurableTurnSnapshot, step: DurableTurnStep) => {
+      hits.push(step.id);
+      if (step.id === item.id && hits.filter(id => id === item.id).length === 1)
+        throw new McpConnectionError("temporary", true, { connectorId: "records", exhausted: true });
+      return { output: { ok: true }, summary: "Read" };
+    };
+    const wake = () => new DurableTurnRunner(repository, unusedModel(), { execute, supportsConcurrency: () => true })
+      .execute({ tenantId, runId, reason: "continue" });
+    await expect(wake()).resolves.toMatchObject({ state: "executing_tool" });
+    const pending = repository.current.steps.find(step => step.id === item.id)!;
+    expect(pending).toMatchObject({ state: "pending", input: { connectorReadRetries: 1 } });
+    expect(repository.outbox.at(-1)?.availableAt).toBe(pending.input.connectorReadRetryAt);
+    const attempts = hits.length;
+    await expect(wake()).resolves.toMatchObject({ state: "executing_tool" });
+    expect(hits).toHaveLength(attempts);
+    pending.input.connectorReadRetryAt = new Date(Date.now() - 1).toISOString();
+    await expect(wake()).resolves.toMatchObject({ state: "calling_model" });
+    expect(hits.filter(id => id === item.id)).toHaveLength(2);
+    expect(hits.filter(id => id === sibling.id)).toHaveLength(parallel ? 1 : 0);
+  });
+
+  it("returns the outage to the model once the durable read retries are exhausted", async () => {
+    const name = "mcp__Records__list";
+    const item = { ...toolStep("pending", "read_only", false), type: "tool." + name,
+      input: { toolName: name, toolCallId: "records", arguments: {}, connectorReadRetries: 3, requiresApproval: false } };
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), item]));
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => { throw new McpConnectionError("temporary", true, { connectorId: "records", exhausted: true }); },
+    });
+    await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ state: "calling_model" });
+    expect(repository.current.steps.find(step => step.id === item.id)?.state).toBe("failed");
+    expect(repository.outbox.some(entry => entry.availableAt)).toBe(false);
+  });
+
   describe("parallel read deadline (H-078)", () => {
     const job = () => ({ tenantId, runId, reason: "continue" as const });
     const fastAndSlow = () => {
