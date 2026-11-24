@@ -293,7 +293,10 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     const servers = this.#turnContexts.get(mcpContextKey(snapshot))?.servers ?? (runtime ? runtime.mcpServers : this.#allowedServers(snapshot));
     const server = servers.find((server) => server.enabled && server.trusted && isOfficialBerryCrawlServer(server)
       && toolName.startsWith(`mcp__${sanitizeName(server.name)}__berrycrawl_browser_`));
-    if (!server) return undefined;
+    if (!server) {
+      const connector = servers.find(candidate => toolName.startsWith(`mcp__${sanitizeName(candidate.name)}__`));
+      return connector ? lastWriteBeforeReviewedRead(snapshot, step, connector)?.sequence : undefined;
+    }
     const prefix = `mcp__${sanitizeName(server.name)}__berrycrawl_browser_`;
     const action = toolName.slice(prefix.length);
     const session = stringValue(record(step.input.arguments)?.session_id);
@@ -332,7 +335,8 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     const context = await this.#context(snapshot);
     const server = this.#serverForTool(name, context.servers);
     if (!server || !this.#visibleToolNames(snapshot, context).has(name)) return;
-    const receipt = await context.source.readOperationReceipt(server.id, name, step.id, record(step.input.arguments) ?? {}, signal);
+    const closeUnapplied = step.state === "running" && typeof step.input.receiptChecks === "number" && step.input.receiptChecks >= 3;
+    const receipt = await context.source.readOperationReceipt(server.id, name, step.id, record(step.input.arguments) ?? {}, signal, closeUnapplied);
     if (receipt?.status === "applied") return { status: "applied" as const, result: {
       output: { content: JSON.stringify(receipt.result) }, summary: "The connector confirmed the saved update.",
     } };
@@ -382,21 +386,25 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     // Repeating an import whose file was not staged retries staging of the
     // Berry file already held instead of downloading it again (H-068).
     const resumed = this.base.stageAssociatedInputFiles ? resumableConnectorImport(snapshot, step, toolName) : null;
-    const executeTool = () => signal || reportProgress
-      ? tool.execute(callId, (record(step.input.arguments) ?? {}) as never, signal, reportProgress)
-      : tool.execute(callId, (record(step.input.arguments) ?? {}) as never);
+    const managed = isStoredMcpCredentialRef(server.id, server.credentialKey);
+    const refreshedRead = lastWriteBeforeReviewedRead(snapshot, step, server);
+    const args = record(step.input.arguments) ?? {};
+    const executeTool = () => {
+      if (refreshedRead) {
+        return context.source.executeReviewedRead(server.id, refreshedRead.wireName, args, mcpStepSignal(step, signal) ?? AbortSignal.timeout(60_000));
+      }
+      if (managed) {
+        // A durable step ID alone gives the remote service no idempotency guarantee.
+        return context.source.executeTool(server.id, toolName, args, mcpStepSignal(step, signal),
+          step.retryClass === "read_only" || step.retryClass === "idempotent");
+      }
+      return signal || reportProgress ? tool.execute(callId, args as never, signal, reportProgress) : tool.execute(callId, args as never);
+    };
     const result = await withMcpOperation(step.id, async () => resumed
       ? { content: [], details: resumed.details }
-      : isStoredMcpCredentialRef(server.id, server.credentialKey)
-        ? await this.#runManagedMcp(snapshot, server, () => context.source.executeTool(
-          server.id, toolName, record(step.input.arguments) ?? {}, mcpStepSignal(step, signal),
-          // A durable step ID alone gives the remote service no idempotency
-          // guarantee. Custom OAuth MCP tool annotations are untrusted.
-          step.retryClass === "read_only" || step.retryClass === "idempotent",
-        ))
-        : usesNativeGoogleOAuth(server, snapshot.userId)
-          ? await this.#runManagedMcp(snapshot, server, executeTool, toolName)
-          : await executeTool());
+      : managed || usesNativeGoogleOAuth(server, snapshot.userId)
+        ? await this.#runManagedMcp(snapshot, server, executeTool, managed ? undefined : toolName)
+        : await executeTool());
     const fullText = result.content.flatMap((part) =>
       part.type === "text" && typeof part.text === "string" ? [part.text] : []
     ).join("\n");
@@ -808,6 +816,28 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   #serverForTool(toolName: string, candidates: readonly McpServerSpec[]): McpServerSpec | undefined {
     return candidates.find((server) => toolName.startsWith(`mcp__${sanitizeName(server.name)}__`));
   }
+}
+
+// A connector write invalidates earlier observations on that connector. Only a
+// read from the admitted catalog gets a fresh observation; its live definition
+// is checked before dispatch. A write never gains another attempt this way.
+function lastWriteBeforeReviewedRead(snapshot: DurableTurnSnapshot, step: DurableTurnStep,
+  server: McpServerSpec | NonNullable<ReturnType<typeof parseAdmittedRuntimeRequest>>["mcpServers"][number]) {
+  if (!server.enabled || !server.trusted || isOfficialBerryCrawlServer(server)) return;
+  const prefix = `mcp__${sanitizeName(server.name)}__`;
+  const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
+  const reviewed = server.cachedTools?.find(tool => prefix + sanitizeName(tool.name) === toolName);
+  if (reviewed?.annotations?.readOnlyHint !== true || reviewed.annotations.destructiveHint
+      || server.nonReplayableTools?.includes(reviewed.name)) return;
+  const writes = new Set(server.cachedTools?.filter(tool => tool.annotations?.readOnlyHint === false)
+    .map(tool => prefix + sanitizeName(tool.name)));
+  let sequence = -1;
+  for (const earlier of snapshot.steps) {
+    if (earlier.state !== "completed" || earlier.sequence >= step.sequence || earlier.sequence <= sequence) continue;
+    const name = stringValue(earlier.input.toolName) ?? earlier.type.slice(5);
+    if (writes.has(name)) sequence = earlier.sequence;
+  }
+  if (sequence >= 0) return { sequence, wireName: reviewed.name };
 }
 
 const BROWSER_STATE_ACTIONS = new Set(["navigate", "click", "type", "press", "scroll", "act"]);

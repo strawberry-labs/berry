@@ -75,6 +75,37 @@ function recoveringConnection() {
 describe("OAuth MCP recovery through the pinned Streamable HTTP client", () => {
   beforeEach(() => { remote.request.mockReset(); });
 
+  it("closes only a reviewed missing receipt after polling and never reruns the original write", async () => {
+    const close = { name: "berry_close_unapplied_operation", description: "Close an unapplied operation",
+      inputSchema: { type: "object", properties: {} }, annotations: { idempotentHint: true, readOnlyHint: false } };
+    const id = "2689aa95-2d3d-4d80-b13c-652c812451da";
+    const toolCalls: string[] = [];
+    remote.request.mockImplementation(async request => {
+      if (request.method !== "POST") return new Response(null, { status: 405 });
+      const body = await request.json() as Rpc;
+      if (body.method === "initialize") return rpc(body.id, { protocolVersion: "2025-03-26", capabilities: { tools: {}, resources: {} }, serverInfo: { name: "test", version: "1" } });
+      if (body.method === "tools/list") return rpc(body.id, { tools: [deletion, close] });
+      if (body.method === "resources/read") return rpc(body.id, { contents: [{ uri: body.params.uri,
+        text: JSON.stringify({ status: "unknown", operationId: id, supportedTools: [deletion.name], closeUnappliedTool: close.name }) }] });
+      if (body.method === "tools/call") {
+        toolCalls.push(String(body.params.name));
+        return rpc(body.id, { content: [{ type: "text", text: JSON.stringify({ ...(body.params.arguments as object),
+          status: "rejected", code: "operation_closed_before_commit", httpStatus: 409 }) }] });
+      }
+      return new Response(null, { status: 202 });
+    });
+    for (const reviewed of [false, true]) {
+      const source = new McpToolSource({ servers: [{ ...spec, cachedTools: reviewed ? [deletion, close] : [deletion] }] });
+      try {
+        const check = (final: boolean) => source.readOperationReceipt(spec.id, "mcp__Connect__remove_record", id, { id: "42" }, AbortSignal.timeout(5000), final);
+        expect(source.listTools().some(tool => tool.name.endsWith(close.name))).toBe(false);
+        await expect(check(false)).resolves.toEqual({ status: "pending" });
+        await expect(check(true)).resolves.toMatchObject({ status: reviewed ? "rejected" : "pending" });
+      } finally { await source.close(); }
+    }
+    expect(toolCalls).toEqual([close.name]);
+  });
+
   it("refreshes a verified HTTP 401 before executing an identical permitted write once", async () => {
     const writes = vi.fn();
     const { initialize, requests } = mockMcpServer(({ token, arguments: args }) => {

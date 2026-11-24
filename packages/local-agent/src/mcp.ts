@@ -220,7 +220,7 @@ function wireJson(value: unknown): string {
 }
 
 const operationReceipt = z.discriminatedUnion("status", [
-  z.object({ status: z.literal("unknown"), operationId: z.string().uuid(), supportedTools: z.array(z.string()).max(1024).optional() }),
+  z.object({ status: z.literal("unknown"), operationId: z.string().uuid(), supportedTools: z.array(z.string()).max(1024).optional(), closeUnappliedTool: z.string().optional() }),
   z.object({ status: z.literal("applied"), operationId: z.string().uuid(), tool: z.string(), argumentsHash: z.string(), result: z.unknown() }),
   z.object({ status: z.literal("rejected"), operationId: z.string().uuid(), tool: z.string(), argumentsHash: z.string(),
     httpStatus: z.number().int().min(400).max(499), code: z.string().regex(/^[a-z][a-z0-9_]{1,80}$/) }),
@@ -758,12 +758,12 @@ export class McpToolSource {
       if (!spec.enabled || !spec.trusted) return [];
       const live = this.#servers.get(spec.id);
       const allowed = spec.allowedTools ? new Set(spec.allowedTools) : null;
-      const cached = (live?.cachedTools ?? spec.cachedTools ?? []).filter((tool) => !allowed || allowed.has(tool.name));
+      const cached = (live?.cachedTools ?? spec.cachedTools ?? []).filter((tool) => tool.name !== "berry_close_unapplied_operation" && (!allowed || allowed.has(tool.name)));
       return cached.map((tool) => cachedTool(spec, tool, (name, args, signal) => this.#executeTool(spec, name, args, signal, false)));
     });
   }
 
-  async readOperationReceipt(serverId: string, toolName: string, operationId: string, args: unknown, signal: AbortSignal) {
+  async readOperationReceipt(serverId: string, toolName: string, operationId: string, args: unknown, signal: AbortSignal, closeUnapplied = false) {
     const spec = this.#options.servers.find((entry) => entry.id === serverId && entry.trusted && entry.enabled && entry.transport !== "stdio");
     if (!spec || !z.string().uuid().safeParse(operationId).success) return;
     const uri = `berry-receipt://operations/${operationId}`;
@@ -775,10 +775,30 @@ export class McpToolSource {
       if (reply.contents.length !== 1 || item?.uri !== uri || !("text" in item) || typeof item.text !== "string" || item.text.length > 1_048_576) return;
       const parsed = operationReceipt.safeParse(JSON.parse(item.text));
       if (!parsed.success || parsed.data.operationId !== operationId) return;
-      const receipt = parsed.data;
-      if (receipt.status === "unknown") return !receipt.supportedTools || receipt.supportedTools.includes(tool.name)
-        ? { status: "pending" as const } : undefined;
+      let receipt = parsed.data;
       const expected = createHash("sha256").update(wireJson(args)).digest("hex");
+      if (receipt.status === "unknown") {
+        if (receipt.supportedTools && !receipt.supportedTools.includes(tool.name)) return;
+        const closeName = receipt.closeUnappliedTool;
+        const reviewed = spec.cachedTools?.find(entry => entry.name === closeName);
+        const live = server.cachedTools.find(entry => entry.name === closeName);
+        if (!closeUnapplied || closeName !== "berry_close_unapplied_operation" || !receipt.supportedTools?.includes(tool.name)
+            || spec.approvalRequiredTools?.includes(closeName)
+            || (spec.allowedTools && !spec.allowedTools.includes(closeName))
+            || !reviewed || !live || !sameReviewedToolDefinition(reviewed, live)
+            || reviewed.annotations?.idempotentHint !== true || reviewed.annotations?.readOnlyHint !== false) {
+          return { status: "pending" as const };
+        }
+        const closed = await server.client.callTool({ name: closeName, arguments: {
+          operationId, tool: tool.name, argumentsHash: expected,
+        } }, undefined, { signal, timeout: 8_000 });
+        const content = closed.content;
+        if (closed.isError || !Array.isArray(content) || content.length !== 1 || content[0]?.type !== "text"
+            || typeof content[0].text !== "string" || content[0].text.length > 1_048_576) return;
+        const final = operationReceipt.safeParse(JSON.parse(content[0].text));
+        if (!final.success || final.data.status === "unknown" || final.data.operationId !== operationId) return;
+        receipt = final.data;
+      }
       if (receipt.tool !== tool.name || receipt.argumentsHash !== expected) return;
       if (receipt.status === "applied" && receipt.result === undefined) return;
       return receipt;
