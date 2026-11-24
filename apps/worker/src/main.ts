@@ -420,35 +420,28 @@ export async function resolveForegroundQueueShardIndex(
   env: NodeJS.ProcessEnv,
   shardCount: number,
 ): Promise<number> {
-  // An explicit index is authoritative. Do not hide a typo by silently
-  // falling back to a DNS-derived assignment.
-  if (env.BERRY_FOREGROUND_QUEUE_SHARD_INDEX?.trim()) {
-    return foregroundQueueShardIndexFromEnv(env, shardCount);
-  }
-  try {
-    return foregroundQueueShardIndexFromEnv(env, shardCount);
-  } catch (error) {
-    const serviceName = env.BERRY_FOREGROUND_QUEUE_DNS_NAME?.trim() || "worker-foreground";
+  const configured = foregroundQueueShardIndexFromEnv(env, shardCount, true);
+  if (env.BERRY_FOREGROUND_QUEUE_SHARD_INDEX?.trim() || shardCount === 1) return configured;
+
+  const serviceName = env.BERRY_FOREGROUND_QUEUE_DNS_NAME?.trim() || "worker-foreground";
+  const ownAddresses = Object.values(networkInterfaces())
+    .flatMap((interfaces) => interfaces ?? [])
+    .filter((entry) => !entry.internal)
+    .map((entry) => entry.address);
+  const deadline = Date.now() + 60_000;
+  for (;;) {
     const records = await lookup(serviceName, { all: true, verbatim: false }).catch(() => []);
     const addresses = [...new Set(records.map((record) => record.address))].sort();
-    const ownAddresses = Object.values(networkInterfaces())
-      .flatMap((interfaces) => interfaces ?? [])
-      .filter((entry) => !entry.internal)
-      .map((entry) => entry.address);
-    // A partial DNS answer during a rolling/startup window is not enough to
-    // assign ownership: two containers could both choose shard zero. Let the
-    // supervisor restart this process once every replica is discoverable.
-    if (addresses.length !== shardCount) {
-      throw new Error(
-        `${error instanceof Error ? error.message : String(error)}; DNS ${serviceName} returned ${addresses.length} addresses, expected ${shardCount} foreground replicas`,
-      );
+    const index = addresses.findIndex((address) => ownAddresses.includes(address));
+    if (addresses.length === shardCount && index >= 0) return index;
+
+    // Exiting on a partial answer removes this replica from DNS and can leave
+    // every other replica waiting for a peer that has already exited.
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw new Error(`DNS ${serviceName} did not identify this worker in a complete set of ${shardCount} replicas (observed ${addresses.length})`);
     }
-    const ownAddress = ownAddresses.find((address) => addresses.includes(address));
-    const index = ownAddress === undefined ? -1 : addresses.indexOf(ownAddress);
-    if (index >= 0 && index < shardCount) return index;
-    throw new Error(
-      `${error instanceof Error ? error.message : String(error)}; DNS ${serviceName} did not identify this worker among ${shardCount} foreground replicas`,
-    );
+    await new Promise<void>((resolve) => setTimeout(resolve, Math.min(1000, remaining)));
   }
 }
 

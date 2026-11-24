@@ -1561,10 +1561,16 @@ describe("SandboxContinuityManager", () => {
     const url = "https://bucket.s3.eu-west-1.amazonaws.com/rfp/RFP.pdf?X-Amz-Credential=key&X-Amz-Signature=abc123";
     const pdf = Buffer.from("%PDF-1.7 attachment \u0000ÿ bytes", "latin1");
     const allowed = (): DurableTurnSnapshot => ({ ...snapshot(), runtimeRequest: { networkPolicy: { egress: "on", allowedDomains: ["*.amazonaws.com"] } } });
-    const sandboxFiles = (sizeBytes = pdf.byteLength) => ({
+    const sandboxFiles = (sizeBytes: number | null = pdf.byteLength) => ({
       read: vi.fn(async () => ({ path: "/workspace/inputs/file-1/RFP.pdf", content: pdf.toString("base64"), encoding: "base64" })),
       write: vi.fn(),
-      list: vi.fn(async () => ({ entries: [{ path: "/workspace/inputs/file-1/RFP.pdf", type: "file", size_bytes: sizeBytes }] })),
+      list: vi.fn(async ({ path }: { path: string }) => {
+        if (path === "/workspace") return { entries: [{ path: "/workspace/inputs", type: "directory" }] };
+        if (path === "/workspace/inputs") return { entries: [{ path: "/workspace/inputs/file-1", type: "directory" }] };
+        return { entries: path === "/workspace/inputs/file-1" && sizeBytes !== null
+          ? [{ path: "/workspace/inputs/file-1/RFP.pdf", type: "file", size_bytes: sizeBytes }]
+          : [] };
+      }),
     });
     const upload = (args: Record<string, unknown> = {}) => toolStep("upload_file", { path: "inputs/file-1/RFP.pdf", url, headers: { "Content-Type": "application/pdf" }, ...args });
 
@@ -1605,15 +1611,16 @@ describe("SandboxContinuityManager", () => {
 
     it("says nothing was sent for a missing, oversized or outside file", async () => {
       const uploadFetch = vi.fn<typeof fetch>();
-      const missing = { ...sandboxFiles(), list: vi.fn(async () => ({ entries: [] })) };
+      const missing = sandboxFiles(null);
       await expect(managerWithProvider(missing, undefined, { uploadFetch }).execute(allowed(), upload()))
-        .rejects.toThrow("/workspace/inputs/file-1/RFP.pdf does not exist in the workspace. Nothing was sent.");
+        .rejects.toThrow("The workspace file does not exist");
+      expect(missing.read).not.toHaveBeenCalled();
       const oversized = sandboxFiles(200 * 1024 * 1024);
       await expect(managerWithProvider(oversized, undefined, { uploadFetch }).execute(allowed(), upload()))
-        .rejects.toThrow("exceeds the 104857600-byte upload limit. Nothing was sent.");
+        .rejects.toThrow("The file exceeds the upload size limit");
       expect(oversized.read).not.toHaveBeenCalled();
       await expect(managerWithProvider(sandboxFiles(), undefined, { uploadFetch }).execute(allowed(), upload({ path: "/etc/passwd" })))
-        .rejects.toThrow("Sandbox reads must remain under /workspace");
+        .rejects.toThrow("Uploads must stay in the workspace");
       expect(uploadFetch).not.toHaveBeenCalled();
     });
 
