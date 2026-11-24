@@ -87,6 +87,44 @@ describe("Google connector tool policy", () => {
     await expect(read()).rejects.toThrow("401");
   });
 
+  it("pages a half-open Gmail window using verified receive times and explicit timezones", async () => {
+    const start = Date.parse("2026-11-23T04:48:30.747Z");
+    const end = start + 40 * 60_000;
+    const times = { early: start - 1, first: start, last: end - 1, late: end };
+    const fetcher = vi.fn(async (url: string) => {
+      const request = new URL(url);
+      if (request.pathname.endsWith("/messages")) {
+        expect(request.searchParams.get("q")).toBe(`after:${Math.floor(start / 1000) - 1} before:${Math.ceil(end / 1000) + 1}`);
+        expect(request.searchParams.get("pageToken")).toBe("prior");
+        return Response.json({ messages: [...Object.keys(times), "last"].map(id => ({ id })), nextPageToken: "next" });
+      }
+      const id = request.pathname.split("/").at(-1)! as keyof typeof times;
+      return Response.json({ id, internalDate: String(times[id]) });
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const read = (args: Record<string, unknown>) => executeGoogleTool("gmail", "read", "gmail_list_messages_in_window", "token", args, null, [GMAIL_READ]);
+    const bounds = { windowStart: "2026-11-23T08:48:30.747+04:00", windowEnd: new Date(end).toISOString(), pageToken: "prior" };
+    await expect(read(bounds)).resolves.toMatchObject({ listedCount: 5, uniqueCount: 4, inWindowCount: 2, nextPageToken: "next",
+      messages: [{ id: "first", receivedAt: new Date(start).toISOString() }, { id: "last", receivedAt: new Date(end - 1).toISOString() }] });
+    await expect(read({ ...bounds, windowStart: "2026-11-23T04:48:30" })).rejects.toThrow("timezone");
+    await expect(executeGoogleTool("gmail", "read", "gmail_search_messages", "token", { query: "after=1790000000 before=1790100000" }, null, [GMAIL_READ])).rejects.toThrow("colon");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(Response.json({ messages: [{ id: "m" }] })).mockResolvedValueOnce(Response.json({ id: "m" })));
+    await expect(read(bounds)).rejects.toThrow("verify every");
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ resultSizeEstimate: 0 })));
+    await expect(read(bounds)).resolves.toMatchObject({ messages: [], nextPageToken: null });
+  });
+
+  it("accepts a complete Unicode body reported in characters, and rejects truncated text", async () => {
+    const body = "The café is open.";
+    const message = (size: number) => Response.json({ id: "m", internalDate: "123", payload: {
+      partId: "", mimeType: "text/plain", body: { data: Buffer.from(body).toString("base64url"), size },
+    } });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(message(body.length)).mockResolvedValueOnce(message(body.length + 9)));
+    const read = () => executeGoogleTool("gmail", "read", "gmail_read_message", "token", { messageId: "m" }, null, [GMAIL_READ]);
+    await expect(read()).resolves.toMatchObject({ body: { text: body } });
+    await expect(read()).rejects.toThrow("Incomplete Gmail text part");
+  });
+
   it("returns compact decoded parts, complete forwards and link targets without file bytes", async () => {
     const body = "a🔎b\n> forwarded exactly";
     const html = '<a href="https://example.com/f">file</a>';

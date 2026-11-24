@@ -171,6 +171,12 @@ const workspaceTools: ToolDefinition[] = [
 const gmailTools: ToolDefinition[] = [
   tool("gmail_search_threads", "Search Gmail threads using Gmail API search syntax.", gmailSearchSchema("threads"), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl("users/me/threads", gmailSearchQuery(input)))),
   tool("gmail_search_messages", "Search individual Gmail messages using Gmail API search syntax.", gmailSearchSchema("messages"), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl("users/me/messages", gmailSearchQuery(input)))),
+  tool("gmail_list_messages_in_window", "List one page of individual messages received in an exact time window. Copy the supplied ISO timestamps. Berry builds the Gmail query and checks each message's internal receive time. Follow nextPageToken using the same bounds. Spam and trash are excluded.", object({
+    windowStart: string("Inclusive ISO 8601 timestamp with timezone.", { format: "date-time" }),
+    windowEnd: string("Exclusive ISO 8601 timestamp with timezone.", { format: "date-time" }),
+    pageToken: string("Continuation token from the previous page."),
+    maxResults: integer("Maximum Gmail results per page. Defaults to 100.", 1, 100),
+  }, ["windowStart", "windowEnd"]), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, listGmailMessagesInWindow),
   tool("gmail_get_thread", "Get a Gmail thread and its messages.", gmailGetSchema("threadId"), "read", { any: [SCOPE.gmailRead, SCOPE.gmailModify] }, (token, input) => googleJson(token, gmailUrl(`users/me/threads/${encodeURIComponent(requiredString(input.threadId, "threadId"))}`, gmailGetQuery(input)))),
   tool("gmail_get_messages_metadata", "Read IDs, receive times and selected headers for up to 25 messages in one call. Use after gmail_search_messages. Each requested ID has its own result or error.", object({
     messageIds: { ...stringArray("Gmail message IDs from this account.", 25), minItems: 1 },
@@ -504,7 +510,13 @@ function updateFormQuestion(token: string, input: Record<string, unknown>) { ret
 function setFormPublishState(token: string, input: Record<string, unknown>) { const published = requiredBoolean(input.isPublished, "isPublished"); const accepting = requiredBoolean(input.isAcceptingResponses, "isAcceptingResponses"); if (!published && accepting) throw new Error("A form cannot accept responses while unpublished"); return googleJson(token, formsUrl(`forms/${encodeURIComponent(requiredString(input.formId, "formId"))}:setPublishSettings`), { method: "POST", body: jsonBody({ publishSettings: { publishState: { isPublished: published, isAcceptingResponses: accepting } }, updateMask: "publishState" }) }); }
 
 function gmailSearchSchema(noun: string): Record<string, unknown> { return object({ query: string("Gmail search query."), maxResults: integer(`Maximum ${noun}.`, 1, 500), pageToken: string("Continuation token."), includeSpamTrash: boolean("Include spam and trash.") }); }
-function gmailSearchQuery(input: Record<string, unknown>): Record<string, QueryValue> { return { q: optionalString(input.query), maxResults: boundedInteger(input.maxResults, 50, 1, 500), pageToken: optionalString(input.pageToken), includeSpamTrash: optionalBoolean(input.includeSpamTrash) }; }
+function gmailSearchQuery(input: Record<string, unknown>): Record<string, QueryValue> {
+  const q = optionalString(input.query);
+  if (q && /(?:^|\s)-?(?:after|before|older|newer)\s*=\s*\d/i.test(q.replace(/"[^"]*"/g, ""))) {
+    throw new Error("Gmail date operators take a colon. Use gmail_list_messages_in_window for exact time ranges.");
+  }
+  return { q, maxResults: boundedInteger(input.maxResults, 50, 1, 500), pageToken: optionalString(input.pageToken), includeSpamTrash: optionalBoolean(input.includeSpamTrash) };
+}
 function gmailGetSchema(id: string, raw = false): Record<string, unknown> { return object({ [id]: string("Gmail resource ID."), format: string("Response format.", { enum: raw ? ["full", "metadata", "minimal", "raw"] : ["full", "metadata", "minimal"] }), metadataHeaders: stringArray("Headers returned with metadata format.", 100) }, [id]); }
 function gmailGetQuery(input: Record<string, unknown>): Record<string, QueryValue> { return { format: optionalString(input.format) ?? "full", metadataHeaders: optionalStringArray(input.metadataHeaders) }; }
 function mailSchema(extra: Record<string, unknown> = {}, extraRequired: string[] = []): Record<string, unknown> { return object({ to: stringArray("To recipients.", 500), cc: stringArray("CC recipients.", 500), bcc: stringArray("BCC recipients.", 500), subject: string("Email subject."), body: string("Email body."), contentType: string("Body format.", { enum: ["text/plain", "text/html"] }), attachments: { type: "array", maxItems: 20, items: object({ filename: string("Filename."), mimeType: string("MIME type."), dataBase64: string("Base64 attachment data.") }, ["filename", "dataBase64"]) }, threadId: string("Optional thread ID."), inReplyTo: string("Optional parent Message-ID."), references: string("Optional References header."), ...extra }, ["to", "subject", "body", ...extraRequired]); }
@@ -567,6 +579,48 @@ async function getGmailMetadataBatch(token: string, input: Record<string, unknow
   return { messages };
 }
 
+async function listGmailMessagesInWindow(token: string, input: Record<string, unknown>) {
+  const timestamp = (key: string) => {
+    const text = requiredString(input[key], key);
+    const ms = Date.parse(text);
+    if (!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?(?:Z|[+-]\d\d:\d\d)$/i.test(text) || !Number.isFinite(ms)) {
+      throw new Error(`${key} must be an ISO timestamp with an explicit timezone and at most millisecond precision`);
+    }
+    return ms;
+  };
+  const start = timestamp("windowStart");
+  const end = timestamp("windowEnd");
+  if (end <= start) throw new Error("windowEnd must be later than windowStart");
+  const pageToken = optionalString(input.pageToken);
+  const result = requiredObject(await googleJson(token, gmailUrl("users/me/messages", {
+    q: `after:${Math.floor(start / 1000) - 1} before:${Math.ceil(end / 1000) + 1}`,
+    includeSpamTrash: false, maxResults: boundedInteger(input.maxResults, 100, 1, 100),
+    pageToken, fields: "messages(id),nextPageToken,resultSizeEstimate",
+  })), "Gmail result");
+  if (result.messages !== undefined && !Array.isArray(result.messages)) throw new Error("Gmail returned an invalid message list");
+  const listed = (result.messages as unknown[] | undefined) ?? [];
+  if (!listed.length && result.messages === undefined && result.resultSizeEstimate !== 0 && !result.nextPageToken) {
+    throw new Error("Gmail did not confirm an empty page");
+  }
+  const nextPageToken = optionalString(result.nextPageToken) ?? null;
+  if (nextPageToken && nextPageToken === pageToken) throw new Error("Gmail repeated the same continuation token");
+  const ids = [...new Set(listed.map((message) => requiredString(record(message)?.id, "Gmail message ID")))];
+  const messages: Array<{ id: string; receivedAt: string }> = [];
+  for (let index = 0; index < ids.length; index += 25) {
+    const batch = await getGmailMetadataBatch(token, { messageIds: ids.slice(index, index + 25), metadataHeaders: [] });
+    for (const message of batch.messages) {
+      if (!("internalDate" in message) || typeof message.internalDate !== "string" || !/^\d+$/.test(message.internalDate)) {
+        throw new Error("Could not verify every Gmail receive time. Retry this page before completing coverage.");
+      }
+      const received = Number(message.internalDate);
+      if (!Number.isSafeInteger(received) || !Number.isFinite(new Date(received).getTime())) throw new Error("Gmail returned an invalid receive time");
+      if (received >= start && received < end) messages.push({ id: String(message.id), receivedAt: new Date(received).toISOString() });
+    }
+  }
+  return { windowStart: new Date(start).toISOString(), windowEnd: new Date(end).toISOString(),
+    listedCount: listed.length, uniqueCount: ids.length, inWindowCount: messages.length, messages, nextPageToken };
+}
+
 async function getGmailPayload(token: string, messageId: string) {
   const result = await googleJson(token, gmailUrl(`users/me/messages/${encodeURIComponent(messageId)}`, {
     format: "full", fields: "id,threadId,internalDate,payload",
@@ -587,6 +641,21 @@ function gmailCharset(contentType: string): string | undefined {
   return /(?:^|;)\s*charset\s*=\s*(?:"([^"]+)"|([^;\s]+))/i.exec(contentType)?.slice(1).find(Boolean);
 }
 
+// Gmail sometimes reports the decoded character count as the size of a text
+// body. Only accept that alternative for complete, strictly decodable body
+// text. Files and short or otherwise inconsistent payloads still fail closed.
+function gmailPartSizeMatches(bytes: Buffer, declared: number | null, part?: GmailPart) {
+  if (declared === null || bytes.byteLength === declared) return true;
+  if (!part || bytes.byteLength < declared || !/^text\//i.test(part.mimeType)
+      || part.filename || /^attachment\b/i.test(part.disposition ?? "")) return false;
+  try {
+    const text = new TextDecoder(gmailCharset(part.contentType) ?? "utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    return text.length === declared;
+  } catch {
+    return false;
+  }
+}
+
 async function gmailTextPage(token: string, messageId: string, part: GmailPart, offset: number, limit: number) {
   if (!/^text\//i.test(part.mimeType)) throw new Error("This MIME part is a file. Use gmail_get_attachment with its partId.");
   let data = part.data;
@@ -596,7 +665,7 @@ async function gmailTextPage(token: string, messageId: string, part: GmailPart, 
   }
   if (data === null && part.size !== 0) throw new Error("Gmail returned no text for this part");
   const bytes = decodeBase64Url(data ?? "");
-  if (part.size !== null && bytes.length !== part.size) throw new Error("Incomplete Gmail text part");
+  if (!gmailPartSizeMatches(bytes, part.size, part)) throw new Error("Incomplete Gmail text part");
   const charset = gmailCharset(part.contentType) ?? "utf-8";
   let text: string;
   try { text = new TextDecoder(charset, { fatal: true }).decode(bytes); }
@@ -651,7 +720,8 @@ async function getGmailAttachment(token: string, input: Record<string, unknown>,
     return googleJson(token, gmailAttachmentUrl(messageId, attachmentId));
   }
   let encoded: string;
-  let declaredSize = part?.size ?? null;
+  const partSize = part?.size ?? null;
+  let responseSize: number | null = null;
   if (attachmentId) {
     const response = await googleFetch(token, gmailAttachmentUrl(messageId, attachmentId), { signal: AbortSignal.timeout(GMAIL_ATTACHMENT_TIMEOUT_MS) });
     const text = await readBoundedText(
@@ -664,11 +734,7 @@ async function getGmailAttachment(token: string, input: Record<string, unknown>,
     try { body = record(JSON.parse(text)); } catch { body = null; }
     if (typeof body?.data !== "string") throw new Error("Gmail returned no attachment data");
     encoded = body.data;
-    const reportedSize = typeof body.size === "number" && Number.isSafeInteger(body.size) ? body.size : null;
-    if (reportedSize !== null && declaredSize !== null && reportedSize !== declaredSize) {
-      throw new Error(`Gmail reported two sizes for this attachment (${declaredSize} and ${reportedSize} bytes)`);
-    }
-    declaredSize = declaredSize ?? reportedSize;
+    responseSize = typeof body.size === "number" && Number.isSafeInteger(body.size) ? body.size : null;
   } else if (part?.data !== null && part?.data !== undefined) {
     encoded = part.data;
   } else if (part?.size === 0) {
@@ -678,8 +744,10 @@ async function getGmailAttachment(token: string, input: Record<string, unknown>,
   }
   const bytes = decodeBase64Url(encoded);
   if (bytes.byteLength > GMAIL_ATTACHMENT_LIMIT_BYTES) throw new Error("Gmail attachment exceeds Berry's 50 MB limit");
-  if (declaredSize !== null && bytes.byteLength !== declaredSize) {
-    throw new Error(`Gmail attachment data is incomplete: expected ${declaredSize} bytes, decoded ${bytes.byteLength}`);
+  for (const declaredSize of [partSize, responseSize]) {
+    if (!gmailPartSizeMatches(bytes, declaredSize, part)) {
+      throw new Error(`Gmail attachment data is incomplete: expected ${declaredSize} bytes, decoded ${bytes.byteLength}`);
+    }
   }
   // An attachment ID from an earlier read may no longer appear in the message;
   // the decoded size then picks the attachment if exactly one matches.

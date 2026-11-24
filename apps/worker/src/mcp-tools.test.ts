@@ -67,6 +67,24 @@ describe("durable MCP tool exposure", () => {
     }
   });
 
+  it("refreshes a reviewed observation only after a completed write on that connector", () => {
+    const server = connectorServer("records", "Records", true, "checkpoint", "Read progress");
+    server.cachedTools!.push({ name: "save", description: "Save progress", inputSchema: { type: "object" }, annotations: { readOnlyHint: false } });
+    const snapshot = mcpSnapshot("Check saved work");
+    snapshot.runtimeRequest = admittedRuntimeRequest(snapshot, server);
+    const executor = new DurableMcpToolExecutor({ execute: vi.fn() }, [server], undefined);
+    const step = (toolName: string, sequence: number): DurableTurnStep => ({
+      id: String(sequence), type: `tool.${toolName}`, sequence, state: "completed", input: { toolName },
+      output: null, retryClass: "non_idempotent_manual", attempt: 1, idempotencyKey: null, error: null,
+    });
+    const lookup = step("mcp__Records__checkpoint", 6);
+    snapshot.steps.push(step("mcp__Records__checkpoint", 1), step("mcp__Other__save", 2), { ...step("mcp__Records__save", 3), state: "failed" });
+    expect(executor.repeatContextSince(snapshot, lookup)).toBeUndefined();
+    snapshot.steps.push(step("mcp__Records__save", 4), step("mcp__Records__checkpoint", 5));
+    expect(executor.repeatContextSince(snapshot, lookup)).toBe(4);
+    expect(executor.repeatContextSince(snapshot, step("mcp__Records__save", 6))).toBeUndefined();
+  });
+
   it("uses the current lease before the deadline and suppresses calls after a confirmed reconnect requirement", async () => {
     const key = Buffer.alloc(32, 8).toString("base64");
     const server = connectorServer("connector_mcp_test", "Connect", true, "remove_record", "Remove a record");
