@@ -638,6 +638,42 @@ describe("durable MCP journal serialization", () => {
     } finally { spy.mockRestore(); }
   });
 
+  it("keeps mirrored connector data once and retains independent metadata", async () => {
+    let value = "x".repeat(7000);
+    let independent = false;
+    let saved = "";
+    const name = "mcp__Google_Calendar__list_events";
+    const list = McpToolSource.prototype.listTools;
+    const spy = vi.spyOn(McpToolSource.prototype, "listTools").mockImplementation(function (this: McpToolSource) {
+      return list.call(this).map((tool) => tool.name === name ? { ...tool, execute: async () => {
+        const structuredContent = { value, marker: "line 1\\nline 2" };
+        const content = [{ type: "text" as const, text: JSON.stringify(structuredContent) }];
+        return { content, details: { raw: content, structuredContent: independent ? { extraField: "extra evidence" } : structuredContent } };
+      } } : tool);
+    });
+    const store: ToolResultStore = {
+      put: vi.fn(async (_scope, _stepId, content) => {
+        saved = content;
+        return { id: "a".repeat(64), sha256: "b".repeat(64), characters: content.length };
+      }), get: vi.fn(async () => saved),
+    };
+    const tools = new DurableMcpToolExecutor({ execute: vi.fn() }, connectorServers(), undefined, 10_000, {}, store);
+    const snapshot = mcpSnapshot("List my Google Calendar events");
+    const read = () => tools.execute(snapshot, { id: "read", type: `tool.${name}`, input: { toolName: name, arguments: {} } } as unknown as DurableTurnStep);
+    try {
+      const inline = await read();
+      expect(store.put).not.toHaveBeenCalled();
+      expect((inline.output as { content: string }).content).toContain(value);
+      value = "x".repeat(24000);
+      await read();
+      expect(saved.length).toBeLessThan(25000);
+      expect(JSON.parse(JSON.parse(saved).content[0].text)).toEqual({ value, marker: "line 1\\nline 2" });
+      independent = true;
+      await read();
+      expect(JSON.parse(saved).details.structuredContent.extraField).toBe("extra evidence");
+    } finally { await tools.close(); spy.mockRestore(); }
+  });
+
   it("reports a storage failure without losing a successful connector call or inventing a recovery reference", async () => {
     const name = "mcp__Google_Calendar__list_events";
     const list = McpToolSource.prototype.listTools;

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { McpImageResults } from "./mcp-images.js";
 import {
   McpToolSource,
@@ -413,7 +414,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     let retentionFailed = false;
     if (this.resultStore) {
       // Store before any journal sanitization or model-facing truncation.
-      const complete = JSON.stringify({ tool: toolName, content: result.content, details: result.details }, null, 2);
+      const complete = serializeConnectorResult(toolName, result.content, result.details);
       if (complete.length > TOOL_RESULT_INLINE_CHARACTERS || hasImages) {
         try {
           storedResult = await this.resultStore.put(snapshot, step.id, complete, signal);
@@ -1528,6 +1529,24 @@ function documentProcessingHint(name: string, mediaType: string, indexed: boolea
 
 function jsonValue(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value ?? null)) as JsonValue;
+}
+
+// Some servers return the same JSON as text, raw blocks and structured content.
+// Retain the original text (including exact whitespace) when it contains every field.
+function serializeConnectorResult(tool: string, content: readonly unknown[], details: unknown): string {
+  const metadata = record(details);
+  const block = content.length === 1 ? record(content[0]) : undefined;
+  if (block?.type === "text" && typeof block.text === "string" && metadata
+    && Object.keys(metadata).every((key) => key === "raw" || key === "structuredContent")
+    && (metadata.raw === undefined || isDeepStrictEqual(metadata.raw, content))) {
+    if (metadata.structuredContent === undefined) return JSON.stringify({ tool, content });
+    try {
+      if (isDeepStrictEqual(JSON.parse(block.text), metadata.structuredContent)) return JSON.stringify({ tool, content });
+    } catch {
+      // Non-JSON text can accompany independent structured data.
+    }
+  }
+  return JSON.stringify({ tool, content, details }, null, 2);
 }
 
 const MCP_MODEL_TEXT_LIMIT = 120_000;
