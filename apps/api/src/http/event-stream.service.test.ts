@@ -29,6 +29,22 @@ describe("ApiEventStreamService", () => {
     await module.close();
   });
 
+  it("finishes live HTTP streams and stops polling as the API drains", async () => {
+    vi.useFakeTimers();
+    const eventsAfter = vi.fn(async () => []);
+    const service = new ApiEventStreamService({ eventsAfter } as unknown as DurableTurnService);
+    const stream = await service.streamDurable("tenant", "session");
+    const complete = vi.fn();
+    const streams = [stream.subscribe({ complete }), service.taskStream("task").subscribe({ complete }),
+      service.stream("legacy").subscribe({ complete })];
+    service.onModuleDestroy();
+    expect(complete).toHaveBeenCalledTimes(3);
+    expect(streams.every(subscription => subscription.closed)).toBe(true);
+    expect(stream.subscribe().closed).toBe(true);
+    await vi.advanceTimersByTimeAsync(DURABLE_EVENT_IDLE_POLL_MS);
+    expect(eventsAfter).toHaveBeenCalledOnce();
+  });
+
   it("drops a malformed durable cursor instead of polling from it forever", async () => {
     const durable = {
       eventsAfter: vi.fn(async () => []),
