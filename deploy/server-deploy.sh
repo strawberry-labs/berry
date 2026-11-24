@@ -223,7 +223,7 @@ if [ "$worker_scale_reconciled" = false ]; then
   # Reassert capacity on every revision without recreating healthy workers.
   # This repairs manual scale drift and prevents an unrelated deployment from
   # silently leaving the foreground pool below its configured replica count.
-  compose up -d --no-build --pull never --no-deps --wait --wait-timeout 120 \
+  compose up -d --no-build --pull never --no-deps --no-recreate --wait --wait-timeout 120 \
     $worker_scale_args worker worker-foreground
 fi
 
