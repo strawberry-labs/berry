@@ -23,6 +23,7 @@ export interface JsonSyntaxError {
 
 const ESCAPES = new Set(['"', "\\", "/", "b", "f", "n", "r", "t"]);
 const HEX = /[0-9a-fA-F]/;
+const UUID_FORMAT = /^(?:urn:uuid:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** The first JSON syntax error in `text` (RFC 8259, as JSON.parse), or null when it is valid. */
 export function jsonSyntaxError(text: string): JsonSyntaxError | null {
@@ -209,6 +210,10 @@ export function schemaArgumentProblems(schema: unknown, value: unknown, limit = 
     const types = (Array.isArray(rule.type) ? rule.type : [rule.type]).filter((type): type is string => typeof type === "string");
     if (types.length > 0 && !types.some((type) => matchesType(type, item))) {
       problems.push(`${field(path)} must be ${types.map(typeName).join(" or ")}, but ${describeValue(item)} was sent${typeHint(types, item)}`);
+      return;
+    }
+    if (rule.format === "uuid" && typeof item === "string" && !UUID_FORMAT.test(item) && !rule.$ref) {
+      problems.push(`${field(path)} must be a complete UUID. Copy the identifier from the tool result`);
       return;
     }
     if (Array.isArray(rule.enum) && rule.enum.length > 0 && !rule.enum.some((option) => JSON.stringify(option) === JSON.stringify(item))) {

@@ -48,6 +48,19 @@ describe("tool argument checks (H-011)", () => {
     expect(unparsedToolArguments({ raw: "hello" }, { type: "object", properties: { raw: { type: "string" } } })).toBeNull();
   });
 
+  it("catches a malformed UUID before invoking a connector or opening recovery", () => {
+    const schema = { type: "object", properties: {
+      itemId: { type: "string", format: "uuid" },
+      externalId: { type: "string" },
+    } };
+    expect(schemaArgumentProblems(schema, { itemId: "truncated-id", externalId: "ticket-7" }))
+      .toEqual(['"itemId" must be a complete UUID. Copy the identifier from the tool result']);
+    for (const itemId of ["00000000-0000-0000-0000-000000000000", "ABCD1234-5678-4ABC-8DEF-0123456789AB", "urn:uuid:00112233-4455-6677-8899-aabbccddeeff"]) {
+      expect(schemaArgumentProblems(schema, { itemId })).toEqual([]);
+    }
+    expect(schemaArgumentProblems({ $ref: "#/$defs/opaque", format: "uuid" }, "ticket-7")).toEqual([]);
+  });
+
   it("reports the exact wrong field in a selected connector action", () => {
     const variants = [
       { type: "object", required: ["action", "document"], properties: {
