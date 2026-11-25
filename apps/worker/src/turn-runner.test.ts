@@ -4323,6 +4323,7 @@ describe("durable turn runner", () => {
       turns: ScriptedCall[][],
       execute: (call: { name: string; args: Record<string, unknown> }) => unknown,
       argumentSchema?: (name: string) => unknown,
+      operationReceipt?: DurableTurnToolExecutor["operationReceipt"],
     ) {
       const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
       let modelCalls = 0;
@@ -4355,6 +4356,7 @@ describe("durable turn runner", () => {
           return { output: (await execute(call)) as never ?? { ok: true }, summary: "ok" };
         },
         ...(argumentSchema ? { argumentSchema: (_snapshot: DurableTurnSnapshot, name: string) => argumentSchema(name) } : {}),
+        ...(operationReceipt ? { operationReceipt } : {}),
       });
       let state: string = "calling_model";
       for (let turn = 0; turn < turns.length * 4 + 4 && (state === "calling_model" || state === "executing_tool"); turn += 1) {
@@ -4551,6 +4553,44 @@ describe("durable turn runner", () => {
       });
       expect(countOf(result.executed, call.name)).toBe(7);
       expect(result.toolSteps[6]?.state).toBe("completed");
+      expect(result.state).toBe("finalizing");
+    });
+
+    it("bounds verified connector rejections when only the request key changes", async () => {
+      const name = "mcp__CustomServer__reserve";
+      const call = (requestKey: string) => ({
+        name, args: { recordId: "record-1", revision: 5, requestKey }, retryClass: "non_idempotent_manual" as const,
+      });
+      const result = await driveCalls(
+        [[call("initial")], [call("retry")], [call("new-key")], [call("another-key")]],
+        () => { throw new Error("socket hang up"); },
+        undefined,
+        async () => ({ status: "rejected", code: "revision_conflict", httpStatus: 409 }),
+      );
+      expect(countOf(result.executed, name)).toBe(2);
+      expect(result.failure(2)).toMatchObject({ category: "rejected", refusedUnchangedRetry: true });
+      expect(result.modelText(2)).toContain("continue independent work");
+      expect(result.repository.current.progress?.budgetReason).toBe("connector_rejection_loop");
+    });
+
+    it("lets a corrected action and independent connector work continue after a repeated rejection", async () => {
+      const name = "mcp__CustomServer__reserve";
+      const call = (requestKey: string, revision = 5) => ({
+        name, args: { recordId: "record-1", revision, requestKey }, retryClass: "non_idempotent_manual" as const,
+      });
+      const lookup = { name: "mcp__CustomServer__lookup", args: { recordId: "record-2" } };
+      const result = await driveCalls(
+        [[call("initial")], [call("retry")], [call("new-key"), lookup], [call("corrected", 6)]],
+        ({ name: tool, args }) => {
+          if (tool === name && args.revision === 5) throw new Error("socket hang up");
+          return { recordId: args.recordId };
+        },
+        undefined,
+        async () => ({ status: "rejected", code: "revision_conflict", httpStatus: 409 }),
+      );
+      expect(result.failure(2)).toMatchObject({ refusedUnchangedRetry: true });
+      expect(result.toolSteps.slice(-2).map((step) => step.state)).toEqual(["completed", "completed"]);
+      expect(result.executed.map((step) => step.args.requestKey)).toEqual(["initial", "retry", undefined, "corrected"]);
       expect(result.state).toBe("finalizing");
     });
 

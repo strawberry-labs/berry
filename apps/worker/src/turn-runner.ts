@@ -119,6 +119,9 @@ const TERMINAL_STATES = new Set<TurnRunState>([
   "recovery_required",
 ]);
 const IDENTICAL_TOOL_FAILURE_LIMIT = 5;
+const CONNECTOR_REJECTION_LIMIT = 2;
+const CONNECTOR_REJECTION_STATUSES = new Set([400, 403, 404, 409, 422]);
+const CONNECTOR_REQUEST_KEYS = new Set(["requestKey", "request_key", "idempotencyKey", "idempotency_key"]);
 // Characters of a tool error a failed step stores; uncertainFailure reads them back.
 const STORED_TOOL_ERROR_LIMIT = 4_000;
 
@@ -1942,7 +1945,16 @@ export class DurableTurnRunner {
     }
     const repeatedFailure = repeatedToolFailure(snapshot, step);
     if (repeatedFailure) return this.stopToolUse(snapshot, step, identicalFailureGuard(step, repeatedFailure));
-    const unchangedRetry = step.state === "pending" ? unchangedFailedRetry(snapshot, step) : null;
+    const unchangedRetry = step.state === "pending"
+      ? repeatedConnectorRejection(snapshot, step) ?? unchangedFailedRetry(snapshot, step)
+      : null;
+    if (unchangedRetry?.repeatedRejection === "stop") {
+      return this.stopToolUse(snapshot, step, {
+        error: "connector_rejection_loop",
+        reason: "the connector repeatedly rejected the same action and no new work was confirmed after Berry refused the retry.",
+        progressKind: "repair_budget",
+      });
+    }
     if (unchangedRetry) return this.refuseUnchangedRetry(snapshot, step, unchangedRetry);
     const repeatAssessment = assessRepeatedToolCall(snapshot, step, this.tools.repeatContextSince?.(snapshot, step));
     const repeatGuardEnforced = this.toolRepeatGuardMode() === "enforce";
@@ -5887,6 +5899,54 @@ interface UnchangedFailedRetry {
   previous: DurableTurnStep;
   failure: ToolFailure;
   previousError: string;
+  repeatedRejection?: "refuse" | "stop";
+}
+
+// Ignore only top-level retry keys, and only when matching verified rejections.
+// This fingerprint never changes dispatch, operation receipts, or success matching.
+function connectorRejectionFingerprint(step: DurableTurnStep): string {
+  const argumentsValue = step.input.arguments;
+  const args = record(argumentsValue);
+  if (!args) return toolArgumentFingerprint(argumentsValue);
+  const action = Object.entries(args).filter(([key, value]) => !CONNECTOR_REQUEST_KEYS.has(key) || typeof value !== "string");
+  return toolArgumentFingerprint(action.length ? Object.fromEntries(action) : args);
+}
+
+function repeatedConnectorRejection(snapshot: DurableTurnSnapshot, step: DurableTurnStep): UnchangedFailedRetry | null {
+  if (!isMcpToolStep(step) || !toolMayChangeState(step)) return null;
+  const fingerprint = connectorRejectionFingerprint(step);
+  const matching = snapshot.steps
+    .filter((candidate) => candidate.sequence < step.sequence && candidate.type === step.type
+      && connectorRejectionFingerprint(candidate) === fingerprint)
+    .sort((left, right) => right.sequence - left.sequence);
+  let previous: { step: DurableTurnStep; failure: ToolFailure } | undefined;
+  let refusalSequence: number | undefined;
+  let count = 0;
+  for (const candidate of matching) {
+    const failure = storedToolFailure(candidate.output);
+    const refused = record(record(candidate.output)?.failure)?.refusedUnchangedRetry === true;
+    if (candidate.state !== "failed" || failure?.category !== "rejected" || failure.outcome !== "not_applied"
+      || failure.outcomeVersion !== TOOL_FAILURE_OUTCOME_VERSION || !failure.code
+      || !CONNECTOR_REJECTION_STATUSES.has(failure.status ?? 0)
+      || (!refused && candidate.outcomeCertainty !== "known")) break;
+    if (previous && (previous.failure.code !== failure.code || previous.failure.status !== failure.status)) break;
+    if (refused) {
+      refusalSequence ??= candidate.sequence;
+      continue;
+    }
+    previous ??= { step: candidate, failure };
+    count += 1;
+    if (count < CONNECTOR_REJECTION_LIMIT) continue;
+    const stopped = refusalSequence !== undefined
+      && (confirmedModelProgress(snapshot, step.sequence).lastResultSequence ?? -1) <= refusalSequence;
+    return {
+      previous: previous.step,
+      failure: previous.failure,
+      previousError: toolFailureIdentity(previous.step.error).split("\n")[0]?.slice(0, 500) ?? "",
+      repeatedRejection: stopped ? "stop" : "refuse",
+    };
+  }
+  return null;
 }
 
 function toolFailureJson(failure: ToolFailure): Record<string, JsonValue> {
@@ -6041,6 +6101,10 @@ function storedErrorMayBeCut(error: unknown): boolean {
 }
 
 function unchangedRetryMessage(retry: UnchangedFailedRetry): string {
+  if (retry.repeatedRejection) return [
+    "The connector repeatedly rejected this action. Inspect the current state and correct the request, or continue independent work.",
+    `Previous error: ${retry.previousError}`,
+  ].join("\n");
   return [
     "Not run: this exact call already failed in this task, and nothing since could make it succeed.",
     `Previous error: ${retry.previousError}`,
