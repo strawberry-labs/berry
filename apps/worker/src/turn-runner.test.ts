@@ -4598,6 +4598,60 @@ describe("durable turn runner", () => {
       expect(result.state).toBe("finalizing");
     });
 
+    const claimJobs: ScriptedCall = {
+      name: "mcp__WorkQueue__claim_jobs", args: { amount: 10 }, retryClass: "non_idempotent_manual",
+    };
+    function renewJob(job: number, extra: Record<string, unknown> = {}): ScriptedCall {
+      return {
+        name: "mcp__WorkQueue__update_job",
+        args: { jobId: "job-" + job, leaseId: "lease-" + job, action: "renew", ...extra },
+        retryClass: "non_idempotent_manual",
+      };
+    }
+    function jobLeaseReceipt({ name, args }: { name: string; args: Record<string, unknown> }) {
+      const leaseUntil = new Date(Date.now() + 15 * 60_000).toISOString();
+      const result = name === claimJobs.name
+        ? { items: Array.from({ length: 10 }, (_, i) => ({
+            id: "job-" + i,
+            leaseId: "lease-" + i,
+            leaseUntil: i === 7 ? new Date(Date.now() + 60_000).toISOString() : leaseUntil,
+          })) }
+        : args.action === "renew" ? { leaseUntil } : { finished: true };
+      return { details: { structuredContent: { result } } };
+    }
+    const earlyRenewals = Array.from({ length: 4 }, (_, i) => [renewJob(i)]);
+
+    it("warns once and stops a run that keeps renewing different fresh leases", async () => {
+      const result = await driveCalls(
+        [[claimJobs], ...earlyRenewals, [renewJob(4), renewJob(5)], [renewJob(6)]],
+        jobLeaseReceipt,
+      );
+      expect(result.executed.map(({ args }) => args.leaseId)).toEqual([
+        undefined, "lease-0", "lease-1", "lease-2", "lease-3",
+      ]);
+      expect(result.toolSteps.slice(5, 7).map(({ error }) => error)).toEqual([
+        "early_lease_renewal_suppressed", "early_lease_renewal_suppressed",
+      ]);
+      expect(result.modelText(5)).toContain("still has at least five minutes remaining");
+      expect(result.repository.current.progress?.budgetReason).toBe("lease_renewal_loop");
+    });
+
+    it.each([
+      ["finished work", { ...renewJob(6), args: { jobId: "job-6", leaseId: "lease-6", action: "complete" } }],
+      ["a lease close to expiring", renewJob(7)],
+      ["an explicit extension", renewJob(8, { ttlSeconds: 3600 })],
+    ])("keeps %s available even when it is queued with unnecessary renewals", async (_label, allowed) => {
+      const result = await driveCalls(
+        [[claimJobs], ...earlyRenewals, [renewJob(4)], [renewJob(5), allowed]],
+        jobLeaseReceipt,
+      );
+      expect(result.modelText(5)).toContain("still has at least five minutes remaining");
+      expect(result.toolSteps[6]?.error).toBe("early_lease_renewal_suppressed");
+      expect(result.executed.at(-1)?.args).toEqual(allowed.args);
+      expect(result.state).toBe("finalizing");
+      expect(result.repository.current.progress?.budgetReason).toBeNull();
+    });
+
     it("lets a transient read failure be retried within the existing limit", async () => {
       let attempts = 0;
       const read = { name: "read", args: { path: "remote.csv" } };
@@ -8114,6 +8168,8 @@ class FakeTurnRepository implements DurableTurnRepository {
         idempotencyKey: patch.idempotencyKey === undefined ? previous?.idempotencyKey ?? null : patch.idempotencyKey,
         attempt: (previous?.attempt ?? 0) + (patch.incrementAttempt ? 1 : 0),
         error: patch.error === undefined ? previous?.error ?? null : patch.error,
+        completedAt: patch.completedAt ?? previous?.completedAt
+          ?? (patch.state === "completed" ? new Date().toISOString() : null),
       };
       if (index >= 0) this.current.steps[index] = next;
       else this.current.steps.push(next);

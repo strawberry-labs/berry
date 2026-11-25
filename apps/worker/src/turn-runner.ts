@@ -132,6 +132,10 @@ export type ToolRepeatPolicy =
 
 const TOOL_REPEAT_HISTORY_LIMIT = 32;
 const DUPLICATE_TOOL_CALL_SUPPRESSED = "duplicate_tool_call_suppressed";
+const EARLY_LEASE_RENEWAL_SUPPRESSED = "early_lease_renewal_suppressed";
+const EARLY_LEASE_RENEWAL_LIMIT = 4;
+const FRESH_LEASE_AGE_MS = 90_000;
+const FRESH_LEASE_REMAINING_MS = 5 * 60_000;
 const UNCHANGED_RETRY_REFUSED = "unchanged_retry_refused";
 const DUPLICATE_TOOL_CALL_LOOP = "duplicate_tool_call_loop";
 const TOOL_USE_STOPPED = "tool_use_stopped";
@@ -2209,6 +2213,25 @@ export class DurableTurnRunner {
       return "waiting";
     }
 
+    if (repeatGuardEnforced && step.state === "pending" && !argumentError && !requiresApproval) {
+      const earlyRenewal = repeatedEarlyLeaseRenewal(snapshot, step, Date.now());
+      if (earlyRenewal) {
+        const otherWork = runnableSteps.some((candidate) => candidate.id !== step.id
+          && !earlyRenewal.canSuppress(candidate));
+        if (earlyRenewal.alreadyWarned && !otherWork) {
+          return this.stopToolUse(snapshot, step, {
+            error: "lease_renewal_loop",
+            reason: "the connector kept renewing fresh work leases without completing other work.",
+            progressKind: "result_repeated",
+          });
+        }
+        return this.suppressToolCall(snapshot, step, {
+          error: EARLY_LEASE_RENEWAL_SUPPRESSED,
+          summary: "Early lease renewal skipped.",
+          message: "The connector just issued this lease and it still has at least five minutes remaining. Use the current lease to do the work, or continue with independent work. Renew when the lease is close to expiring.",
+        });
+      }
+    }
     const toolLimits = toolExecutionLimits(toolName, this.options);
     const startedAt = interrupted ? Date.parse(step.startedAt ?? "") : Number.NaN;
     const toolStartedAt = Number.isFinite(startedAt) ? startedAt : Date.now();
@@ -3010,10 +3033,7 @@ export class DurableTurnRunner {
     step: DurableTurnStep,
     assessment: ToolRepeatAssessment,
   ): Promise<TurnRunState> {
-    const toolCallId = toolCallIdForStep(step);
     const toolName = toolNameForStep(step);
-    const entryId = randomUUID();
-    const iteration = modelIteration(snapshot.steps) + 1;
     const message = toolName === "persist_artifact"
       ? [
           "Duplicate publication suppressed.",
@@ -3033,6 +3053,24 @@ export class DurableTurnRunner {
           "Running it again would not provide new information.",
           repeatedReadGuidance(assessment),
         ].join("\n\n");
+    return this.suppressToolCall(snapshot, step, {
+      error: DUPLICATE_TOOL_CALL_SUPPRESSED,
+      summary: "Duplicate tool call suppressed.",
+      message,
+      repeat: assessment,
+    });
+  }
+
+  private async suppressToolCall(
+    snapshot: DurableTurnSnapshot,
+    step: DurableTurnStep,
+    refusal: { error: string; summary: string; message: string; repeat?: ToolRepeatAssessment },
+  ): Promise<TurnRunState> {
+    const { error, summary, message, repeat } = refusal;
+    const toolCallId = toolCallIdForStep(step);
+    const toolName = toolNameForStep(step);
+    const entryId = randomUUID();
+    const iteration = modelIteration(snapshot.steps) + 1;
     const progress = nextProgress(snapshot, {
       kind: "result_repeated",
       noProgress: true,
@@ -3048,10 +3086,12 @@ export class DurableTurnRunner {
         {
           ...step,
           state: "failed",
-          error: DUPLICATE_TOOL_CALL_SUPPRESSED,
-          repeatDecision: "suppress",
-          repeatSignature: assessment.signature,
-          repeatPolicy: assessment.policy,
+          error,
+          ...(repeat ? {
+            repeatDecision: "suppress" as const,
+            repeatSignature: repeat.signature,
+            repeatPolicy: repeat.policy,
+          } : { outcomeCertainty: "not_applicable" as const }),
         },
         ...(!remaining ? [{
           id: randomUUID(),
@@ -3068,7 +3108,7 @@ export class DurableTurnRunner {
           kind: "tool.end",
           toolCallId,
           status: "failed",
-          summary: "Duplicate tool call suppressed.",
+          summary,
         },
         {
           kind: "turn.progress",
@@ -3083,8 +3123,8 @@ export class DurableTurnRunner {
         name: toolName,
         input: (step.input.arguments ?? {}) as JsonValue,
         status: "failed",
-        output: { error: DUPLICATE_TOOL_CALL_SUPPRESSED, message },
-        summary: "Duplicate tool call suppressed.",
+        output: { error, message },
+        summary,
       },
       entries: [{
         entryId,
@@ -3107,8 +3147,8 @@ export class DurableTurnRunner {
       }],
       progress,
       nextAction: remaining
-        ? "Execute the next tool step after suppressing the duplicate tool call"
-        : "Give the model one correction turn after suppressing the duplicate tool call",
+        ? "Execute the next tool step after suppressing this call"
+        : "Give the model one correction turn after suppressing this call",
     });
     return nextState;
   }
@@ -6852,6 +6892,98 @@ function toolMayChangeState(step: DurableTurnStep): boolean {
   return isMcpToolStep(step)
     ? step.retryClass !== "read_only"
     : step.retryClass === "non_idempotent_manual";
+}
+
+// Recognize an explicit renewal of a known lease. A request with additional
+// controls (for example an explicit deadline) could be a different operation.
+function leaseRenewalId(step: DurableTurnStep): string | undefined {
+  if (!isMcpToolStep(step) || !toolMayChangeState(step)) return;
+  const args = record(step.input.arguments);
+  if (!args || (args.outcome ?? args.action) !== "renew") return;
+  if (Object.keys(args).some((key) =>
+    !/^(?:outcome|action|id|(?:lease|item|job|task|work|resource|request|idempotency)_?(?:id|key))$/i.test(key)
+  )) return;
+  return stringValue(args.leaseId ?? args.lease_id) ?? undefined;
+}
+
+function connectorNamespace(step: DurableTurnStep): string | undefined {
+  return /^mcp__([A-Za-z0-9_-]+?)__/.exec(toolNameForStep(step))?.[1];
+}
+
+function confirmedLeaseResult(step: DurableTurnStep): Record<string, unknown> | null {
+  if (step.state !== "completed" || step.error || step.outcomeCertainty === "unknown") return null;
+  const output = record(step.output);
+  if (output?.isError === true || output?.suppressed === true) return null;
+  return record(record(record(output?.details)?.structuredContent)?.result);
+}
+
+function repeatedEarlyLeaseRenewal(
+  snapshot: DurableTurnSnapshot,
+  step: DurableTurnStep,
+  now: number,
+) {
+  const leaseId = leaseRenewalId(step);
+  const connector = connectorNamespace(step);
+  if (!leaseId || !connector) return;
+  const issued = new Map<string, { observedAt: number; expiresAt: number }>();
+  const isEarly = (id: string, at: number) => {
+    const lease = issued.get(id);
+    return lease && at >= lease.observedAt && at - lease.observedAt <= FRESH_LEASE_AGE_MS
+      && lease.expiresAt - at >= FRESH_LEASE_REMAINING_MS;
+  };
+  const history = snapshot.steps
+    .filter((candidate) => candidate.sequence < step.sequence && isToolStep(candidate))
+    .slice(-TOOL_REPEAT_HISTORY_LIMIT);
+  let renewedEarly = 0;
+  let warnedAt: number | undefined;
+  for (const candidate of history) {
+    const sameConnector = connectorNamespace(candidate) === connector;
+    if (sameConnector && candidate.error === EARLY_LEASE_RENEWAL_SUPPRESSED) {
+      warnedAt = candidate.sequence;
+      continue;
+    }
+    if (candidate.state !== "completed") continue;
+    const result = sameConnector ? confirmedLeaseResult(candidate) : null;
+    const observedAt = Date.parse(candidate.completedAt ?? "");
+    const renewedLease = result ? leaseRenewalId(candidate) : undefined;
+    const renewalExpiry = Date.parse(stringValue(result?.leaseUntil ?? result?.lease_until) ?? "");
+    if (renewedLease && Number.isFinite(renewalExpiry) && isEarly(renewedLease, observedAt)) {
+      renewedEarly += 1;
+      issued.set(renewedLease, { observedAt, expiresAt: renewalExpiry });
+      continue;
+    }
+    const items = result?.items ?? result?.claims;
+    const receipts = (Array.isArray(items) ? items : result ? [result] : []).map((item: unknown) => {
+      const receipt = record(item);
+      return {
+        id: stringValue(receipt?.leaseId ?? receipt?.lease_id),
+        expiresAt: Date.parse(stringValue(receipt?.leaseUntil ?? receipt?.lease_until) ?? ""),
+      };
+    });
+    if (!renewedLease && Number.isFinite(observedAt) && receipts.length > 0
+      && receipts.every(({ id, expiresAt }) => id && expiresAt > observedAt)) {
+      for (const { id, expiresAt } of receipts) {
+        if (id) issued.set(id, { observedAt, expiresAt });
+      }
+      continue;
+    }
+    // A different successful tool can be real work, even within the same connector.
+    // Keep its receipts out of the count and let it reset the run of maintenance.
+    renewedEarly = 0;
+    warnedAt = undefined;
+    if (sameConnector && toolMayChangeState(candidate)) issued.clear();
+  }
+  if (!isEarly(leaseId, now) || (renewedEarly < EARLY_LEASE_RENEWAL_LIMIT && warnedAt === undefined)) return;
+  const lastModel = latestStep(snapshot.steps, "model.call");
+  return {
+    alreadyWarned: warnedAt !== undefined && (lastModel?.sequence ?? -1) > warnedAt,
+    canSuppress(candidate: DurableTurnStep): boolean {
+      const candidateLease = leaseRenewalId(candidate);
+      return candidate.state === "pending" && candidate.input.requiresApproval !== true
+        && !candidate.input.argumentError && connectorNamespace(candidate) === connector
+        && Boolean(candidateLease && isEarly(candidateLease, now));
+    },
+  };
 }
 
 function interruptedToolFailure(step: DurableTurnStep): ToolFailure {
