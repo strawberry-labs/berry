@@ -4011,9 +4011,13 @@ describe("durable turn runner", () => {
     });
   });
 
-  it.each([false, true])("resumes a temporarily unavailable connector read without repeating completed work (parallel=%s)", async (parallel) => {
-    const name = "mcp__Records__list";
-    const item = { ...toolStep("pending", "read_only", false), type: "tool." + name,
+  it.each([
+    { retryClass: "read_only", parallel: false },
+    { retryClass: "read_only", parallel: true },
+    { retryClass: "non_idempotent_manual", parallel: false },
+  ] as const)("resumes a temporarily unavailable connector action without repeating prior work (%o)", async ({ retryClass, parallel }) => {
+    const name = "mcp__Records__action";
+    const item = { ...toolStep("pending", retryClass, false), type: "tool." + name,
       input: { toolName: name, toolCallId: "records", arguments: {}, requiresApproval: false } };
     const sibling = readOnlyToolStep("read", 2, "/workspace/independent.txt");
     const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), item, ...(parallel ? [sibling] : [])]));

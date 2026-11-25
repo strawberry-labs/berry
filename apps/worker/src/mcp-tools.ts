@@ -610,11 +610,14 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   async #runManagedMcp<T>(snapshot: DurableTurnSnapshot, server: McpServerSpec, run: () => Promise<T>, toolName?: string, safeRead = false): Promise<T> {
     const blocked = snapshot.steps.flatMap(step => {
       const failure = storedToolFailure(step.output);
-      return failure?.blockedConnectorId === server.id && !(safeRead && temporaryMcpBlockExpired(failure, step.completedAt)) ? [failure] : [];
+      return failure?.blockedConnectorId === server.id && !temporaryMcpBlockExpired(failure, step.completedAt, safeRead) ? [failure] : [];
     })[0];
-    if (blocked) throw new McpConnectionError(blocked.reconnect ? "reauth_required" : "temporary", true, {
-      connectorId: server.id, exhausted: true, ...(blocked.reconnect ? { grantId: blocked.reconnect.grantId } : {}),
+    if (blocked?.reconnect) throw new McpConnectionError("reauth_required", true, {
+      connectorId: server.id, grantId: blocked.reconnect.grantId, exhausted: true,
     });
+    // A call declined during the cooldown never contacted the server. It
+    // cannot start a fresh cooldown or turn a temporary outage into a hold.
+    if (blocked) throw new McpConnectionError("temporary", true, { connectorId: server.id });
     try { return await run(); }
     catch (cause) {
       if (cause instanceof McpToolError && usesNativeGoogleOAuth(server, snapshot.userId)) {
