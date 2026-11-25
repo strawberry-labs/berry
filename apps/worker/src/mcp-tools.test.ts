@@ -1,6 +1,6 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { McpToolError, McpToolSource, type McpServerSpec } from "@berry/local-agent/mcp";
+import { McpConnectionError, McpToolError, McpToolSource, type McpServerSpec } from "@berry/local-agent/mcp";
 import { openDurableSecret, type DurableSecretEnvelope } from "@berry/shared";
 import type { ChatToolDefinition } from "@berry/router-client";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -126,6 +126,58 @@ describe("durable MCP tool exposure", () => {
     } finally {
       requests.mockRestore();
       await tools.close();
+    }
+  });
+
+  it("allows writes after a pre-dispatch cooldown without extending it on suppressed calls", async () => {
+    const server = connectorServer("connector_mcp_test", "Records", true, "save", "Save a record");
+    const name = "mcp__Records__save";
+    server.defaultTools = ["save"];
+    const snapshot = mcpSnapshot("Save a record");
+    snapshot.userId = "00000000-0000-7000-8000-000000000201";
+    snapshot.runtimeRequest = admittedRuntimeRequest(snapshot, {
+      ...server, credentialRef: `connector-oauth:${server.id}:${snapshot.userId}:${"a".repeat(64)}`,
+    } as McpServerSpec);
+    const executor = new DurableMcpToolExecutor({ execute: vi.fn() }, [], undefined, 1_000, {
+      BERRY_DURABLE_CAPABILITY_KEY: Buffer.alloc(32, 8).toString("base64"),
+      BERRY_WEB_API_INTERNAL_URL: "http://api:3000",
+    });
+    const step: DurableTurnStep = {
+      id: "save-record", sequence: 1, type: `tool.${name}`, state: "pending",
+      input: { toolName: name, arguments: { id: "42" }, requiresApproval: false },
+      retryClass: "non_idempotent_manual", attempt: 0, output: null, idempotencyKey: null, error: null,
+    };
+    const exhausted = classifyToolFailure(new McpConnectionError("temporary", true, {
+      connectorId: server.id, exhausted: true,
+    }), { changesState: true });
+    const initial: DurableTurnStep = {
+      ...step, state: "failed", completedAt: new Date(Date.now() - 60_000).toISOString(),
+      output: { failure: { ...exhausted } },
+    };
+    snapshot.steps = [initial];
+    const remote = vi.spyOn(McpToolSource.prototype, "executeTool").mockResolvedValue({
+      content: [{ type: "text", text: "Saved" }], details: {},
+    });
+    try {
+      const cooldown = await executor.execute(snapshot, step).then(
+        () => { throw new Error("Expected the existing cooldown to block the action"); },
+        (error: unknown) => classifyToolFailure(error, { changesState: true }),
+      );
+      expect(cooldown).toMatchObject({ code: "mcp_temporary", outcome: "not_applied" });
+      expect(cooldown.blockedConnectorId).toBeUndefined();
+      expect(remote).not.toHaveBeenCalled();
+      snapshot.steps.push({
+        ...step, id: "suppressed", sequence: 2, state: "failed",
+        completedAt: new Date().toISOString(), output: { failure: { ...cooldown } },
+      });
+      initial.completedAt = new Date(Date.now() - 121_000).toISOString();
+      await expect(executor.execute(snapshot, { ...step, id: "retry", sequence: 3 })).resolves.toMatchObject({
+        output: { content: "Saved" },
+      });
+      expect(remote).toHaveBeenCalledTimes(1);
+    } finally {
+      remote.mockRestore();
+      await executor.close();
     }
   });
 

@@ -96,7 +96,7 @@ import {
   operationalDuration,
   persistWorkerOperationalEvent,
 } from "./operational-telemetry.js";
-import { classifyToolFailure, storedToolFailure, temporaryMcpBlockExpired, TOOL_FAILURE_OUTCOME_VERSION, toolFailureAction, type ToolFailure } from "./tool-failures.js";
+import { classifyToolFailure, storedToolFailure, retryableMcpConnectionFailure, TOOL_FAILURE_OUTCOME_VERSION, toolFailureAction, type ToolFailure } from "./tool-failures.js";
 import {
   PROVIDER_CREDIT_EXHAUSTED_MESSAGE,
   raiseProviderCreditAlert,
@@ -2335,10 +2335,10 @@ export class DurableTurnRunner {
             changesState: toolMayChangeState(step),
             timedOut,
           });
-      const deferred = deferredMcpRead(step, failure);
+      const deferred = deferredMcpRetry(step, failure);
       if (deferred) {
         await this.commitAndWake(snapshot, { expectedState: "executing_tool", nextState: "executing_tool",
-          steps: [deferred], nextAction: "Waiting to reconnect for the pending read" }, deferred.input.connectorReadRetryAt);
+          steps: [deferred], nextAction: "Waiting to reconnect for the pending action" }, deferred.input.connectorReadRetryAt);
         return "executing_tool";
       }
       // A change outside the sandbox that the target may have applied before
@@ -2894,7 +2894,7 @@ export class DurableTurnRunner {
         : undefined;
       const message = (outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)).slice(0, 4_000).replace(/\u0000/g, "\uFFFD");
       const failure = classifyToolFailure(outcome.reason, { changesState: false, timedOut: outcome.reason instanceof DurableToolTimeoutError });
-      const deferred = deferredMcpRead(step, failure);
+      const deferred = deferredMcpRetry(step, failure);
       if (deferred) {
         mutations.push(deferred);
         continue;
@@ -5995,7 +5995,9 @@ function unchangedFailedRetry(snapshot: DurableTurnSnapshot, step: DurableTurnSt
   if (!previous || previous.state !== "failed") return null;
   const failure = storedToolFailure(previous.output);
   if (!failure) return null;
-  if (step.retryClass === "read_only" && temporaryMcpBlockExpired(failure, previous.completedAt)) return null;
+  // The connector executor owns the cooldown. A refusal here would restart
+  // it from each attempted retry instead of the original connection failure.
+  if (isMcpToolStep(step) && retryableMcpConnectionFailure(failure, step.retryClass === "read_only")) return null;
   if (isMcpToolStep(step) && !(failure.code?.startsWith("mcp_") && failure.deterministic)) return null;
   const stored = record(record(previous.output)?.failure);
   const previousError = stringValue(stored?.previousError)
@@ -6895,11 +6897,12 @@ function toolNameForStep(step: DurableTurnStep): string {
   return stringValue(step.input.toolName) ?? step.type.slice(5);
 }
 
-// The SDK has already attempted an immediate reconnect. Resume safe reads from
-// the durable queue so an outage costs no model calls and occupies no worker.
-function deferredMcpRead(step: DurableTurnStep, failure: ToolFailure) {
-  if (!isMcpToolStep(step) || step.retryClass !== "read_only" || step.input.requiresApproval === true
-      || failure.category !== "transient" || failure.code !== "mcp_temporary" || failure.outcome !== "not_applied") return;
+// The SDK already tried reconnecting. Schedule the same step without using a
+// worker or model call, but never replay a write that may have been dispatched.
+function deferredMcpRetry(step: DurableTurnStep, failure: ToolFailure) {
+  if (!isMcpToolStep(step) || step.input.requiresApproval === true
+      || !retryableMcpConnectionFailure(failure, step.retryClass === "read_only")) return;
+  // Keep the persisted retry field names so active runs can resume after deploy.
   const count = typeof step.input.connectorReadRetries === "number" ? step.input.connectorReadRetries : 0;
   const delay = [15_000, 60_000, 120_000][count];
   if (!delay) return;
