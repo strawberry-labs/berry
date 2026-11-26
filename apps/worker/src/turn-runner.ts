@@ -5977,6 +5977,7 @@ function repeatedConnectorRejection(snapshot: DurableTurnSnapshot, step: Durable
     previous ??= { step: candidate, failure };
     count += 1;
     if (count < CONNECTOR_REJECTION_LIMIT) continue;
+    if (connectorStateChangedAfter(snapshot, step, candidate.sequence)) return null;
     const stopped = refusalSequence !== undefined
       && (confirmedModelProgress(snapshot, step.sequence).lastResultSequence ?? -1) <= refusalSequence;
     return {
@@ -5987,6 +5988,48 @@ function repeatedConnectorRejection(snapshot: DurableTurnSnapshot, step: Durable
     };
   }
   return null;
+}
+
+const CONNECTOR_CONTEXT_IDS = new Set([
+  "requestid", "attemptid", "toolcallid", "actorid", "userid", "tenantid", "clientid", "workspaceid", "accountid", "leaseid",
+]);
+const CONNECTOR_STATE_FIELDS = new Set(["state", "status", "version", "revision", "etag", "leaseuntil", "expiresat"]);
+
+function connectorField(key: string): string {
+  return key.replace(/_/g, "").toLowerCase();
+}
+
+// A known rejection applies to the old remote state. Allow a fresh bounded
+// attempt when two successful receipts prove the same resource changed.
+function connectorStateChangedAfter(snapshot: DurableTurnSnapshot, step: DurableTurnStep, rejectedAt: number): boolean {
+  const connector = connectorNamespace(step);
+  const args = record(step.input.arguments);
+  if (!connector || !args) return false;
+  const targets = Object.entries(args)
+    .filter(([key, value]) => (key === "id" || /(?:Id|_id)$/.test(key))
+      && !CONNECTOR_CONTEXT_IDS.has(connectorField(key)) && (typeof value === "string" || typeof value === "number"))
+    .map(([key, value]) => ({ key: connectorField(key), value, observed: new Map<string, string | number>() }));
+  if (!targets.length) return false;
+
+  for (const candidate of snapshot.steps) {
+    if (candidate.sequence >= step.sequence) break;
+    if (connectorNamespace(candidate) !== connector) continue;
+    const result = confirmedConnectorResult(candidate);
+    if (!result) continue;
+    const fields = new Map(Object.entries(result).map(([key, value]) => [connectorField(key), value]));
+    for (const { key, value, observed } of targets) {
+      // A strongly unique ID can also be returned under the generic id field.
+      const matchingGenericId = typeof value === "string" && /^[a-z\d][a-z\d-]{15,}$/i.test(value) && fields.get("id") === value;
+      if (fields.get(key) !== value && !matchingGenericId) continue;
+      for (const [field, current] of fields) {
+        if (!CONNECTOR_STATE_FIELDS.has(field) || (typeof current !== "string" && typeof current !== "number")) continue;
+        const before = observed.get(field);
+        if (candidate.sequence > rejectedAt && before !== undefined && before !== current) return true;
+        observed.set(field, current);
+      }
+    }
+  }
+  return false;
 }
 
 function toolFailureJson(failure: ToolFailure): Record<string, JsonValue> {
@@ -6910,10 +6953,10 @@ function connectorNamespace(step: DurableTurnStep): string | undefined {
   return /^mcp__([A-Za-z0-9_-]+?)__/.exec(toolNameForStep(step))?.[1];
 }
 
-function confirmedLeaseResult(step: DurableTurnStep): Record<string, unknown> | null {
+function confirmedConnectorResult(step: DurableTurnStep): Record<string, unknown> | null {
   if (step.state !== "completed" || step.error || step.outcomeCertainty === "unknown") return null;
   const output = record(step.output);
-  if (output?.isError === true || output?.suppressed === true) return null;
+  if (output?.error || output?.isError === true || output?.success === false || output?.suppressed === true) return null;
   return record(record(record(output?.details)?.structuredContent)?.result);
 }
 
@@ -6943,7 +6986,7 @@ function repeatedEarlyLeaseRenewal(
       continue;
     }
     if (candidate.state !== "completed") continue;
-    const result = sameConnector ? confirmedLeaseResult(candidate) : null;
+    const result = sameConnector ? confirmedConnectorResult(candidate) : null;
     const observedAt = Date.parse(candidate.completedAt ?? "");
     const renewedLease = result ? leaseRenewalId(candidate) : undefined;
     const renewalExpiry = Date.parse(stringValue(result?.leaseUntil ?? result?.lease_until) ?? "");
