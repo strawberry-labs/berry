@@ -4598,6 +4598,37 @@ describe("durable turn runner", () => {
       expect(result.state).toBe("finalizing");
     });
 
+    it.each([
+      ["the same object changed", "target-1", "ready", 3],
+      ["the same object stayed unchanged", "target-1", "closed", 2],
+      ["a different object changed", "target-2", "ready", 2],
+    ])("rechecks a confirmed rejection only if %s", async (_label, reportedId, reportedState, dispatched) => {
+      const write = (requestKey: string) => ({
+        name: "mcp__WorkQueue__finish_job",
+        args: { jobId: "target-1", requestKey },
+        retryClass: "non_idempotent_manual" as const,
+      });
+      const lookup = (page: number) => ({ name: "mcp__WorkQueue__get_job", args: { page } });
+      const result = await driveCalls(
+        [[lookup(1)], [write("initial")], [write("retry")], [write("blocked")], [lookup(2)], [write("recheck")]],
+        ({ name, args }) => {
+          if (name === write("initial").name) {
+            if (args.requestKey === "recheck") return { done: true };
+            throw new Error("socket hang up");
+          }
+          return { details: { structuredContent: { result: {
+            jobId: args.page === 1 ? "target-1" : reportedId,
+            state: args.page === 1 ? "closed" : reportedState,
+          } } } };
+        },
+        undefined,
+        async () => ({ status: "rejected", code: "state_conflict", httpStatus: 409 }),
+      );
+      expect(countOf(result.executed, write("initial").name)).toBe(dispatched);
+      expect(result.failure(3)).toMatchObject({ outcome: "not_applied", refusedUnchangedRetry: true });
+      expect(result.toolSteps[5]?.state).toBe(dispatched === 3 ? "completed" : "failed");
+    });
+
     const claimJobs: ScriptedCall = {
       name: "mcp__WorkQueue__claim_jobs", args: { amount: 10 }, retryClass: "non_idempotent_manual",
     };
